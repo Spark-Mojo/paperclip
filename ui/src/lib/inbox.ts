@@ -26,7 +26,7 @@ export const INBOX_NESTING_KEY = "paperclip:inbox:nesting";
 export const INBOX_GROUP_BY_KEY = "paperclip:inbox:group-by";
 export const INBOX_FILTER_PREFERENCES_KEY_PREFIX = "paperclip:inbox:filters";
 export const INBOX_COLLAPSED_GROUPS_KEY_PREFIX = "paperclip:inbox:collapsed-groups";
-export type InboxTab = "mine" | "recent" | "unread" | "blocked" | "all";
+export type InboxTab = "mine" | "recent" | "unread" | "blocked" | "pending_questions" | "all";
 export type InboxCategoryFilter =
   | "everything"
   | "issues_i_touched"
@@ -647,6 +647,7 @@ export function loadLastInboxTab(): InboxTab {
       || raw === "recent"
       || raw === "mine"
       || raw === "blocked"
+      || raw === "pending_questions"
     ) return raw;
     if (raw === "new") return "mine";
     return "mine";
@@ -665,6 +666,10 @@ export function saveLastInboxTab(tab: InboxTab) {
 
 export function isMineInboxTab(tab: InboxTab): boolean {
   return tab === "mine";
+}
+
+export function isPendingQuestionsInboxTab(tab: InboxTab): boolean {
+  return tab === "pending_questions";
 }
 
 export function shouldShowCompanyAlerts(tab: InboxTab): boolean {

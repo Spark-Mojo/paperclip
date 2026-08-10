@@ -81,6 +81,7 @@ import {
 import { IssueFiltersPopover } from "../components/IssueFiltersPopover";
 import { IssueRow } from "../components/IssueRow";
 import { BlockedInboxView } from "../components/BlockedInboxView";
+import { PendingQuestionsInboxView } from "../components/PendingQuestionsInboxView";
 import { SwipeToArchive } from "../components/SwipeToArchive";
 
 import { StatusIcon } from "../components/StatusIcon";
@@ -741,6 +742,7 @@ export function Inbox() {
     || pathSegment === "all"
     || pathSegment === "unread"
     || pathSegment === "blocked"
+    || pathSegment === "pending_questions"
       ? pathSegment
       : "mine";
   const canArchiveFromTab = isMineInboxTab(tab);
@@ -2261,7 +2263,7 @@ export function Inbox() {
     .map((issue) => issue.id);
   const canMarkAllRead = unreadIssueIds.length > 0;
   const activeIssueFilterCount = countActiveIssueFilters(issueFilters, true);
-  const showGeneralIssueToolbarControls = tab !== "blocked";
+  const showGeneralIssueToolbarControls = tab !== "blocked" && tab !== "pending_questions";
   return (
     <div className="space-y-6">
       <div className="space-y-2">
@@ -2308,6 +2310,7 @@ export function Inbox() {
               },
               { value: "unread", label: "Unread" },
               { value: "blocked", label: "Blocked" },
+              { value: "pending_questions", label: "Pending Questions" },
               { value: "all", label: "All" },
             ]}
           />
@@ -2605,11 +2608,26 @@ export function Inbox() {
         />
       ) : null}
 
-      {tab !== "blocked" && !allLoaded && visibleSections.length === 0 && (
+      {tab === "pending_questions" ? (
+        <PendingQuestionsInboxView
+          companyId={selectedCompanyId!}
+          searchQuery={searchQuery}
+          issueLinkState={issueLinkState}
+          issueFilters={issueFilters}
+          currentUserId={currentUserId}
+          liveIssueIds={liveIssueIds}
+          workspaceFilterContext={inboxWorkspaceGrouping}
+          showStatusColumn={visibleIssueColumnSet.has("status") && availableIssueColumnSet.has("status")}
+          showIdentifierColumn={visibleIssueColumnSet.has("id") && availableIssueColumnSet.has("id")}
+          showUpdatedColumn={visibleIssueColumnSet.has("updated") && availableIssueColumnSet.has("updated")}
+        />
+      ) : null}
+
+      {tab !== "blocked" && tab !== "pending_questions" && !allLoaded && visibleSections.length === 0 && (
         <PageSkeleton variant="inbox" />
       )}
 
-      {tab !== "blocked" && allLoaded && visibleSections.length === 0 && (
+      {tab !== "blocked" && tab !== "pending_questions" && allLoaded && visibleSections.length === 0 && (
         <EmptyState
           icon={searchQuery.trim() ? Search : InboxIcon}
           message={
@@ -2626,7 +2644,7 @@ export function Inbox() {
         />
       )}
 
-      {tab !== "blocked" && showWorkItemsSection && (
+      {tab !== "blocked" && tab !== "pending_questions" && showWorkItemsSection && (
         <>
           {showSeparatorBefore("work_items") && <Separator />}
           <div>
