@@ -82,6 +82,8 @@ describe("issue validators", () => {
 
   describe("findUnsupportedMonitorSchedulingFields (RBR-1101)", () => {
     it("detects each flat monitor-scheduling field individually", () => {
+      expect(findUnsupportedMonitorSchedulingFields({ monitor: {} }))
+        .toEqual(["monitor"]);
       expect(findUnsupportedMonitorSchedulingFields({ monitorNextCheckAt: new Date().toISOString() }))
         .toEqual(["monitorNextCheckAt"]);
       expect(findUnsupportedMonitorSchedulingFields({ monitorNotes: "note" })).toEqual(["monitorNotes"]);

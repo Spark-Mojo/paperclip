@@ -2202,6 +2202,7 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       .patch(`/api/issues/${sourceIssueId}`)
       .send({
         status: "todo",
+        monitor: { nextCheckAt: new Date().toISOString(), notes: "retry later" },
         monitorNextCheckAt: new Date().toISOString(),
         monitorNotes: "retry the assignee at the provider reset time",
         monitorScheduledBy: "assignee",
@@ -2213,8 +2214,29 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     expect(flatFields.body.error).toContain("monitorScheduledBy");
     expect(flatFields.body.details).toMatchObject({
       code: "unsupported_monitor_scheduling_fields",
-      fields: expect.arrayContaining(["monitorNextCheckAt", "monitorNotes", "monitorScheduledBy"]),
+      fields: expect.arrayContaining(["monitor", "monitorNextCheckAt", "monitorNotes", "monitorScheduledBy"]),
     });
+
+    // Amendment (SPA-2830): a bare top-level `monitor` key (the bare flat field
+    // a client might send thinking it's the policy rather than under
+    // executionPolicy) is also rejected by the real PATCH path, not just
+    // asserted via the constant read.
+    const bareMonitorField = await request(app)
+      .patch(`/api/issues/${sourceIssueId}`)
+      .send({
+        status: "todo",
+        monitor: { nextCheckAt: new Date().toISOString(), notes: "retry later" },
+      })
+      .expect(400);
+    expect(bareMonitorField.body.code).toBe("unsupported_monitor_scheduling_fields");
+    expect(bareMonitorField.body.error).toContain("monitor");
+    expect(bareMonitorField.body.details).toMatchObject({
+      code: "unsupported_monitor_scheduling_fields",
+      fields: ["monitor"],
+    });
+
+    const [unchangedAfterBare] = await db.select().from(issues).where(eq(issues.id, sourceIssueId));
+    expect(unchangedAfterBare?.status).toBe(sourceIssue.status);
 
     const nestedField = await request(app)
       .patch(`/api/issues/${sourceIssueId}`)
