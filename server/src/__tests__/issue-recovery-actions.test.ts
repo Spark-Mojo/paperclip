@@ -2236,7 +2236,12 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     });
 
     const [unchangedAfterBare] = await db.select().from(issues).where(eq(issues.id, sourceIssueId));
+    // Non-vacuous: seedCompany seeded the source issue at `in_progress`, and the
+    // rejected request body sent `status: "todo"`. So this assertion proves the
+    // whole request was rejected (no partial write), not that todo→todo wrote
+    // nothing.
     expect(unchangedAfterBare?.status).toBe(sourceIssue.status);
+    expect(unchangedAfterBare?.status).not.toBe("todo");
 
     const nestedField = await request(app)
       .patch(`/api/issues/${sourceIssueId}`)
