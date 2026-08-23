@@ -24,6 +24,7 @@ import {
   updateIssueWorkProductSchema,
   type Issue,
   type IssueComment,
+  type IssueThreadInteraction,
   upsertIssueDocumentSchema,
   upsertIssueFeedbackVoteSchema,
 } from "@paperclipai/shared";
@@ -227,11 +228,37 @@ export function registerIssueCommands(program: Command): void {
       .command("get")
       .description("Get an issue by UUID or identifier (e.g. PC-12)")
       .argument("<idOrIdentifier>", "Issue ID or identifier")
-      .action(async (idOrIdentifier: string, opts: BaseClientOptions) => {
+      .option(
+        "--include-interactions",
+        "Augment output with `pendingInteractions` (default ON for interactive non-JSON use; default OFF for --json to keep scripts stable)",
+      )
+      .option("--no-include-interactions", "Disable pendingInteractions augmentation")
+      .action(async (idOrIdentifier: string, opts: BaseClientOptions & { includeInteractions?: boolean }) => {
         try {
           const ctx = resolveCommandContext(opts);
           const row = await ctx.api.get<Issue>(apiPath`/api/issues/${idOrIdentifier}`);
-          printOutput(row, { json: ctx.json });
+          const includeInteractions = opts.includeInteractions ?? (!ctx.json && Boolean(process.stdout.isTTY));
+          if (!includeInteractions) {
+            printOutput(row, { json: ctx.json });
+            return;
+          }
+          // ponytail: pending-only filter — terminal statuses (accepted/rejected/answered/cancelled/expired/failed)
+          // are not "awaiting James"; surfacing them defeats the warning signal. Status set lives in
+          // @paperclipai/shared ISSUE_THREAD_INTERACTION_STATUSES.
+          const interactions = await ctx.api.get<IssueThreadInteraction[]>(
+            apiPath`/api/issues/${idOrIdentifier}/interactions`,
+          );
+          const pendingInteractions = (interactions ?? [])
+            .filter((i) => i.status === "pending")
+            .map((i) => ({
+              id: i.id,
+              kind: i.kind,
+              status: i.status,
+              title: i.title ?? null,
+              summary: i.summary ?? null,
+              createdAt: i.createdAt,
+            }));
+          printOutput({ ...row, pendingInteractions }, { json: ctx.json });
         } catch (err) {
           handleCommandError(err);
         }
