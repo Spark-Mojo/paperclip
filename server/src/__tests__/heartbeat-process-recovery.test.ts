@@ -415,6 +415,54 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(run?.errorCode).toBe("process_lost");
   });
 
+  it("SPA-5034: output written between sweep snapshot and per-run liveness check still counts as FRESH", async () => {
+    const heartbeat = heartbeatService(db);
+    const { agentId, runId } = await seedRunFixture({
+      adapterType: "openclaw_gateway",
+      agentStatus: "running",
+      processPid: null,
+      processGroupId: null,
+      includeIssue: true,
+    });
+    // Simulate the race: the sweep already sampled `now`, then 1s later a
+    // concurrent adapter flush writes lastOutputAt milliseconds ahead of
+    // the sweep's sampled clock. The per-run check must still treat it
+    // as FRESH (inside the 5s concurrent-write tolerance) and skip the reap.
+    const sweepNowMs = Date.now();
+    const concurrentWriteAt = new Date(sweepNowMs + 800);
+    await db
+      .update(heartbeatRuns)
+      .set({ lastOutputAt: concurrentWriteAt })
+      .where(eq(heartbeatRuns.id, runId));
+
+    const result = await heartbeat.reapOrphanedRuns();
+    expect(result).toEqual({ reaped: 0, runIds: [] });
+    const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+    expect(run?.status).toBe("running");
+    expect(run?.errorCode).toBeNull();
+  });
+
+  it("SPA-5034: output 30 minutes in the future is NOT fresh (clock-skew guard remains)", async () => {
+    const heartbeat = heartbeatService(db);
+    const { agentId } = await seedRunFixture({
+      adapterType: "openclaw_gateway",
+      agentStatus: "idle",
+      processPid: null,
+      processGroupId: null,
+      includeIssue: true,
+    });
+    const farFuture = new Date(Date.now() + 30 * 60 * 1000);
+    await db
+      .update(heartbeatRuns)
+      .set({ lastOutputAt: farFuture })
+      .where(eq(heartbeatRuns.agentId, agentId));
+
+    const result = await heartbeat.reapOrphanedRuns();
+    expect(result.reaped).toBe(1);
+    const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, agentId));
+    expect(run?.status).toBe("failed");
+  });
+
   it("SPA-5005 (c): retries a genuinely dead run once, transfers executionRunId, and dedupes the second sweep", async () => {
     const heartbeat = heartbeatService(db);
     // Dead recorded pid on a tracked adapter: the base retry-eligible shape

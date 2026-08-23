@@ -432,6 +432,10 @@ export const WORKSPACE_BUSY_HOLDER_STALE_AFTER_MS = RECOVERY_ACTIVE_RUN_OUTPUT_S
 // recovery uses for suspicious silent runs so a truly stuck run still gets
 // reaped after the same window — smallest correct, no new tuning knob.
 export const PROCESS_LOSS_REAP_OUTPUT_GRACE_MS = RECOVERY_ACTIVE_RUN_OUTPUT_SUSPICION_THRESHOLD_MS;
+// Small future lead still counts as fresh: a concurrent adapter flush can write
+// lastOutputAt milliseconds after the sweep sampled `now` (SPA-5034). Material
+// clock skew far into the future remains stale.
+export const PROCESS_LOSS_REAP_CONCURRENT_WRITE_TOLERANCE_MS = 5_000;
 // Staleness signal emitted by the one-non-terminal-run-per-issue claim gate
 // (fix 3b). The claim path upgrades it to a workspace_busy deferral instead of
 // dropping the wake.
@@ -457,11 +461,15 @@ function isProcessLossReapFresh(
   if (!run.lastOutputAt) return false;
   const lastMs = new Date(run.lastOutputAt as unknown as string | Date).getTime();
   if (!Number.isFinite(lastMs)) return false;
-  // Future-dated output is stale by definition: a timestamp ahead of this
-  // server's clock must not extend the grace window past itself. Writer and
-  // reader share the host clock here, so legitimate ages are >= 0.
+  // Future-dated output that is far ahead of the reader clock is stale — a
+  // skewed timestamp must not extend the reap grace. A tiny lead (a single
+  // concurrent adapter flush that lands after this sweep sampled `now`)
+  // is distinguished and still counts as FRESH so the live run is not reaped
+  // (SPA-5034 sweep-clock race). The caller must sample `now` as late as
+  // possible — ideally per-run or immediately after the FOR UPDATE lock.
   const ageMs = now.getTime() - lastMs;
-  return ageMs >= 0 && ageMs < PROCESS_LOSS_REAP_OUTPUT_GRACE_MS;
+  return ageMs >= -PROCESS_LOSS_REAP_CONCURRENT_WRITE_TOLERANCE_MS
+    && ageMs < PROCESS_LOSS_REAP_OUTPUT_GRACE_MS;
 }
 
 type CodexTransientFallbackMode =
@@ -10068,7 +10076,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         const tracksLocal = isTrackedLocalChildProcessAdapter(agent.adapterType);
         const pidAlive = tracksLocal && lockedOld?.processPid ? isProcessAlive(lockedOld.processPid) : false;
         const groupAlive = tracksLocal && lockedOld?.processGroupId ? isProcessGroupAlive(lockedOld.processGroupId) : false;
-        const outputStillFresh = lockedOld ? isProcessLossReapFresh(lockedOld, now) : false;
+        // SPA-5034: sample a fresh clock AFTER the FOR UPDATE lock. The
+        // outer sweep's `now` is stale — a concurrent adapter flush could
+        // have written lastOutputAt milliseconds after the sweep scanned
+        // activeRuns. Checking via a stale `now` would misclassify that
+        // fresh output as stale (future-dated) and reap the live run.
+        const freshTxNow = new Date();
+        const outputStillFresh = lockedOld ? isProcessLossReapFresh(lockedOld, freshTxNow) : false;
         const stillNonTerminal = lockedOld
           ? MAX_TURN_CONTINUATION_LIVE_RUN_STATUSES.includes(
               lockedOld.status as (typeof MAX_TURN_CONTINUATION_LIVE_RUN_STATUSES)[number],
@@ -13375,7 +13389,6 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
   async function reapOrphanedRuns(opts?: { staleThresholdMs?: number }) {
     const staleThresholdMs = opts?.staleThresholdMs ?? 0;
-    const now = new Date();
 
     // Find all runs stuck in "running" state (queued runs are legitimately waiting; resumeQueuedRuns handles them)
     const activeRuns = await db
@@ -13414,12 +13427,17 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     const reaped: string[] = [];
 
     for (const { run, adapterType, adapterConfig } of activeRuns) {
+      // Fresh clock per run (SPA-5034): a concurrent adapter flush can write
+      // lastOutputAt after this sweep sampled its snapshot but before this
+      // iteration runs. Sampling now here ensures that fresh output is not
+      // misread as stale because the write timestamp lies ahead of a stale sweep-wide now.
+      const freshNow = new Date();
       if (runningProcesses.has(run.id) || activeRunExecutions.has(run.id)) continue;
 
       // Apply staleness threshold to avoid false positives
       if (staleThresholdMs > 0) {
         const refTime = run.updatedAt ? new Date(run.updatedAt).getTime() : 0;
-        if (now.getTime() - refTime < staleThresholdMs) continue;
+        if (freshNow.getTime() - refTime < staleThresholdMs) continue;
       }
 
       const tracksLocalChild = isTrackedLocalChildProcessAdapter(adapterType);
@@ -13465,7 +13483,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       // Fix (1): untracked-adapter or null-pid running runs with fresh output are
       // not proven dead — handle loss alone is not liveness evidence. Require
       // output staleness (same threshold recovery uses for suspicious silence).
-      if ((!tracksLocalChild || (!run.processPid && !run.processGroupId)) && isProcessLossReapFresh(run, now)) {
+      if ((!tracksLocalChild || (!run.processPid && !run.processGroupId)) && isProcessLossReapFresh(run, freshNow)) {
         await appendRunEvent(run, await nextRunEventSeq(run.id), {
           eventType: "lifecycle",
           stream: "system",
@@ -13490,7 +13508,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       const monitorDispatchLostWithoutFutureWake =
         readNonEmptyString(runContext.wakeReason) === "issue_monitor_due" &&
         monitorNextCheckAt !== undefined &&
-        (!monitorNextCheckAt || monitorNextCheckAt.getTime() <= now.getTime());
+        (!monitorNextCheckAt || monitorNextCheckAt.getTime() <= freshNow.getTime());
       const shouldRetry = (run.processLossRetryCount ?? 0) < 1 && (
         (tracksLocalChild && (!!run.processPid || !!run.processGroupId)) ||
         monitorDispatchLostWithoutFutureWake
@@ -13510,7 +13528,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       let finalizedRun = await setRunStatus(run.id, "failed", {
         error: shouldRetry ? `${baseMessage}; retrying once` : baseMessage,
         errorCode: "process_lost",
-        finishedAt: now,
+        finishedAt: freshNow,
         resultJson: (() => {
           const result = mergeRunStopMetadataForAgent(
             { adapterType, adapterConfig },
@@ -13531,7 +13549,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         })(),
       });
       await setWakeupStatus(run.wakeupRequestId, "failed", {
-        finishedAt: now,
+        finishedAt: freshNow,
         error: shouldRetry ? `${baseMessage}; retrying once` : baseMessage,
       });
       if (!finalizedRun) finalizedRun = await getRun(run.id);
@@ -13549,7 +13567,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       const retryAgent = await getAgent(run.agentId);
       if (shouldRetry) {
         if (retryAgent) {
-          retriedRun = await enqueueProcessLossRetry(finalizedRun, retryAgent, now);
+          retriedRun = await enqueueProcessLossRetry(finalizedRun, retryAgent, freshNow);
         }
       } else if (retryAgent) {
         const scheduled = await scheduleInteractionContinuationInfrastructureRetryIfEligible(finalizedRun, retryAgent);
