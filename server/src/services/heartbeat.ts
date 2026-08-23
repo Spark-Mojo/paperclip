@@ -457,10 +457,11 @@ function isProcessLossReapFresh(
   if (!run.lastOutputAt) return false;
   const lastMs = new Date(run.lastOutputAt as unknown as string | Date).getTime();
   if (!Number.isFinite(lastMs)) return false;
-  // Future-dated output is treated as stale rather than infinitely fresh: a
-  // clock-skewed timestamp must not extend the reap grace past its own window.
+  // Future-dated output is stale by definition: a timestamp ahead of this
+  // server's clock must not extend the grace window past itself. Writer and
+  // reader share the host clock here, so legitimate ages are >= 0.
   const ageMs = now.getTime() - lastMs;
-  return ageMs >= -PROCESS_LOSS_REAP_OUTPUT_GRACE_MS && ageMs < PROCESS_LOSS_REAP_OUTPUT_GRACE_MS;
+  return ageMs >= 0 && ageMs < PROCESS_LOSS_REAP_OUTPUT_GRACE_MS;
 }
 
 type CodexTransientFallbackMode =

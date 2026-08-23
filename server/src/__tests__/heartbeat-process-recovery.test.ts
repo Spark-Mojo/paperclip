@@ -392,6 +392,29 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(run?.errorCode).toBe("process_lost");
   });
 
+  it("SPA-5005 (b3): treats future-dated lastOutputAt as stale, not fresh (codex P2 on 661842e5a)", async () => {
+    const heartbeat = heartbeatService(db);
+    const { agentId } = await seedRunFixture({
+      adapterType: "openclaw_gateway",
+      agentStatus: "idle",
+      processPid: null,
+      processGroupId: null,
+      includeIssue: true,
+    });
+    const futureOutputAt = new Date(Date.now() + 30 * 60 * 1000);
+    await db
+      .update(heartbeatRuns)
+      .set({ lastOutputAt: futureOutputAt })
+      .where(eq(heartbeatRuns.agentId, agentId));
+
+    const result = await heartbeat.reapOrphanedRuns();
+
+    expect(result.reaped).toBe(1);
+    const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, agentId));
+    expect(run?.status).toBe("failed");
+    expect(run?.errorCode).toBe("process_lost");
+  });
+
   it("SPA-5005 (c): retries a genuinely dead run once, transfers executionRunId, and dedupes the second sweep", async () => {
     const heartbeat = heartbeatService(db);
     // Dead recorded pid on a tracked adapter: the base retry-eligible shape
