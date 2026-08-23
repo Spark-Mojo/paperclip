@@ -432,6 +432,10 @@ export const WORKSPACE_BUSY_HOLDER_STALE_AFTER_MS = RECOVERY_ACTIVE_RUN_OUTPUT_S
 // recovery uses for suspicious silent runs so a truly stuck run still gets
 // reaped after the same window — smallest correct, no new tuning knob.
 export const PROCESS_LOSS_REAP_OUTPUT_GRACE_MS = RECOVERY_ACTIVE_RUN_OUTPUT_SUSPICION_THRESHOLD_MS;
+// Staleness signal emitted by the one-non-terminal-run-per-issue claim gate
+// (fix 3b). The claim path upgrades it to a workspace_busy deferral instead of
+// dropping the wake.
+export const ISSUE_EXECUTION_CLAIM_GATE_STALENESS = "issue_execution_claim_gate_busy";
 // Issue-level executionWorkspaceSettings.mode values that unambiguously opt an
 // issue's runs out of the shared project workspace, and therefore out of
 // shared-workspace serialization ("isolated" is the legacy alias
@@ -442,16 +446,21 @@ const ISOLATED_EXECUTION_WORKSPACE_MODES = ["isolated_workspace", "operator_bran
 
 // Guard for reapOrphanedRuns fix (1): a running run that recently emitted output
 // has negative liveness evidence against "lost"; require staleness before reaping
-// untracked-adapter or null-pid runs.
+// untracked-adapter or null-pid runs. Output recency ONLY — never startedAt/createdAt.
+// A start/creation fallback would treat every young run as alive (and a skewed
+// clock as eternally alive), resurrecting the false-positive liveness this gate
+// exists to prevent; a null lastOutputAt simply carries no evidence either way.
 function isProcessLossReapFresh(
-  run: Pick<typeof heartbeatRuns.$inferSelect, "lastOutputAt" | "startedAt" | "createdAt">,
+  run: Pick<typeof heartbeatRuns.$inferSelect, "lastOutputAt">,
   now: Date,
 ): boolean {
-  const last = run.lastOutputAt ?? run.startedAt ?? run.createdAt ?? null;
-  if (!last) return false;
-  const lastMs = new Date(last as unknown as string | Date).getTime();
+  if (!run.lastOutputAt) return false;
+  const lastMs = new Date(run.lastOutputAt as unknown as string | Date).getTime();
   if (!Number.isFinite(lastMs)) return false;
-  return now.getTime() - lastMs < PROCESS_LOSS_REAP_OUTPUT_GRACE_MS;
+  // Future-dated output is treated as stale rather than infinitely fresh: a
+  // clock-skewed timestamp must not extend the reap grace past its own window.
+  const ageMs = now.getTime() - lastMs;
+  return ageMs >= -PROCESS_LOSS_REAP_OUTPUT_GRACE_MS && ageMs < PROCESS_LOSS_REAP_OUTPUT_GRACE_MS;
 }
 
 type CodexTransientFallbackMode =
@@ -9968,25 +9977,29 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     agent: typeof agents.$inferSelect,
     now: Date,
   ) {
-    const existingRetry = await db
+    // Dedupe probe outside the tx is advisory only — the authoritative check re-runs
+    // inside the tx below, so two concurrent sweeps cannot both enqueue a retry.
+    // Keyed on retryOfRunId (one owed retry per dead run); concurrency safety comes
+    // from the issue/run row lock inside the tx, NOT from this probe.
+    const existingRetryAdvisory = await db
       .select()
       .from(heartbeatRuns)
       .where(and(eq(heartbeatRuns.companyId, run.companyId), eq(heartbeatRuns.retryOfRunId, run.id)))
       .orderBy(asc(heartbeatRuns.createdAt))
       .limit(1)
       .then((rows) => rows[0] ?? null);
-    if (existingRetry) {
+    if (existingRetryAdvisory) {
       await appendRunEvent(run, await nextRunEventSeq(run.id), {
         eventType: "lifecycle",
         stream: "system",
         level: "warn",
         message: "Process-loss retry already exists; skipping duplicate retry enqueue",
         payload: {
-          retryRunId: existingRetry.id,
-          retryRunStatus: existingRetry.status,
+          retryRunId: existingRetryAdvisory.id,
+          retryRunStatus: existingRetryAdvisory.status,
         },
       });
-      return existingRetry;
+      return existingRetryAdvisory;
     }
 
     const invokability = await getAgentInvokability(agent);
@@ -10021,34 +10034,90 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     }, "normal_model");
     const responsibleUserId = await resolveResponsibleUserIdForRunContext(run, retryContextSnapshot);
 
-    const queued = await db.transaction(async (tx) => {
+    type ProcessLossRetryTxOutcome =
+      | { kind: "created"; retryRun: typeof heartbeatRuns.$inferSelect }
+      | { kind: "duplicate" }
+      | { kind: "refused_alive" };
+
+    const txOutcome = await db.transaction(async (tx): Promise<ProcessLossRetryTxOutcome> => {
+      // Serialize concurrent sweeps: issue-scoped runs take the issue row lock;
+      // issue-less runs fall back to the dead run's own row. Both give the
+      // re-verify + dedupe + insert below a single serialization point.
+      await tx.execute(
+        issueId
+          ? sql`select id from issues where company_id = ${run.companyId} and id = ${issueId} for update`
+          : sql`select id from heartbeat_runs where company_id = ${run.companyId} and id = ${run.id} for update`,
+      );
+
       if (issueId) {
         // Fix (2): re-verify old run is still dead INSIDE the tx before stealing executionRunId.
-        const freshOld = await tx
+        // (The issue row lock above already serializes concurrent sweeps; this read is the
+        // freshest post-lock view of the old run.)
+        const lockedOld = await tx
           .select({
             status: heartbeatRuns.status,
             lastOutputAt: heartbeatRuns.lastOutputAt,
-            startedAt: heartbeatRuns.startedAt,
-            createdAt: heartbeatRuns.createdAt,
             processPid: heartbeatRuns.processPid,
             processGroupId: heartbeatRuns.processGroupId,
           })
           .from(heartbeatRuns)
           .where(and(eq(heartbeatRuns.id, run.id), eq(heartbeatRuns.companyId, run.companyId)))
+          .for("update")
           .then((rows) => rows[0] ?? null);
-        const reverifyTracksLocal = isTrackedLocalChildProcessAdapter(agent.adapterType);
-        const reverifyFresh = freshOld ? isProcessLossReapFresh(freshOld as unknown as typeof run, now) : false;
-        const reverifyPidAlive = reverifyTracksLocal && freshOld?.processPid ? isProcessAlive(freshOld.processPid) : false;
-        const reverifyGroupAlive = reverifyTracksLocal && freshOld?.processGroupId ? isProcessGroupAlive(freshOld.processGroupId) : false;
-        // If freshness proves liveness, or a tracked pid is still alive, refuse even though
-        // reap already marked the row failed — freshness survives that update and proves the
-        // original run was still alive. Refuse the twin before stealing executionRunId.
-        if (reverifyFresh || reverifyPidAlive || reverifyGroupAlive) {
-          // Enqueue nothing, transfer nothing. The caller will release the execution lock instead.
-          // Append is outside tx (run-event is not transactional here) — push a warn now inside tx scope via no-op marker via the retry path.
-          // Use an early return with null by throwing a typed sentinel caught below; simpler: return null sentinel from tx and let caller suppress.
-          // Drizzle tx must return a value — return a sentinel that the outer caller interprets as refusal.
-          return null as unknown as typeof heartbeatRuns.$inferSelect;
+        const tracksLocal = isTrackedLocalChildProcessAdapter(agent.adapterType);
+        const pidAlive = tracksLocal && lockedOld?.processPid ? isProcessAlive(lockedOld.processPid) : false;
+        const groupAlive = tracksLocal && lockedOld?.processGroupId ? isProcessGroupAlive(lockedOld.processGroupId) : false;
+        const outputStillFresh = lockedOld ? isProcessLossReapFresh(lockedOld, now) : false;
+        const stillNonTerminal = lockedOld
+          ? MAX_TURN_CONTINUATION_LIVE_RUN_STATUSES.includes(
+              lockedOld.status as (typeof MAX_TURN_CONTINUATION_LIVE_RUN_STATUSES)[number],
+            )
+          : true;
+        // Refuse ONLY on positive evidence the old run is alive (or was revived by a
+        // concurrent path): live tracked pid/pgid, fresh lastOutputAt, or a status that
+        // left the terminal set after reap. Absence of output carries no evidence either
+        // way and must never block an owed retry — shutdown-drain fixtures legitimately
+        // have lastOutputAt = null.
+        if (pidAlive || groupAlive || outputStillFresh || stillNonTerminal) {
+          // Enqueue nothing, transfer nothing — the twin must not steal the execution lock
+          // from a run that may still be alive. Caller releases the execution lock instead.
+          return { kind: "refused_alive" };
+        }
+
+        // Authoritative dedupe, now inside the tx and behind the issue row lock: two
+        // concurrent sweeps serialize here, and only the first sees no existing retry.
+        const existingRetryInTx = await tx
+          .select({ id: heartbeatRuns.id })
+          .from(heartbeatRuns)
+          .where(
+            and(
+              eq(heartbeatRuns.companyId, run.companyId),
+              eq(heartbeatRuns.retryOfRunId, run.id),
+              inArray(heartbeatRuns.status, [...MAX_TURN_CONTINUATION_LIVE_RUN_STATUSES]),
+            ),
+          )
+          .orderBy(asc(heartbeatRuns.createdAt), asc(heartbeatRuns.id))
+          .limit(1)
+          .then((rows) => rows[0] ?? null);
+        if (existingRetryInTx) {
+          return { kind: "duplicate" };
+        }
+      } else {
+        const existingIssuelessRetryInTx = await tx
+          .select({ id: heartbeatRuns.id })
+          .from(heartbeatRuns)
+          .where(
+            and(
+              eq(heartbeatRuns.companyId, run.companyId),
+              eq(heartbeatRuns.retryOfRunId, run.id),
+              inArray(heartbeatRuns.status, [...MAX_TURN_CONTINUATION_LIVE_RUN_STATUSES]),
+            ),
+          )
+          .orderBy(asc(heartbeatRuns.createdAt), asc(heartbeatRuns.id))
+          .limit(1)
+          .then((rows) => rows[0] ?? null);
+        if (existingIssuelessRetryInTx) {
+          return { kind: "duplicate" };
         }
       }
 
@@ -10112,14 +10181,40 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           .where(and(eq(issues.id, issueId), eq(issues.companyId, run.companyId), eq(issues.executionRunId, run.id)));
       }
 
-      return retryRun;
-    }) as unknown as (typeof heartbeatRuns.$inferSelect | null);
-    if (!queued) {
+      return { kind: "created", retryRun };
+    });
+
+    if (txOutcome.kind === "duplicate") {
+      // Lost the in-tx dedupe race — a retry already exists. Surface it so the caller
+      // keeps the issue's execution path pointed at that retry instead of releasing.
+      const existing = await db
+        .select()
+        .from(heartbeatRuns)
+        .where(and(eq(heartbeatRuns.companyId, run.companyId), eq(heartbeatRuns.retryOfRunId, run.id)))
+        .orderBy(asc(heartbeatRuns.createdAt))
+        .limit(1)
+        .then((rows) => rows[0] ?? null);
+      if (!existing) return null;
       await appendRunEvent(run, await nextRunEventSeq(run.id), {
         eventType: "lifecycle",
         stream: "system",
         level: "warn",
-        message: "Process-loss retry refused inside tx: old run re-verified as alive (fresh output or live pid); executionRunId not transferred",
+        message: "Process-loss retry already exists; skipping duplicate retry enqueue",
+        payload: {
+          retryRunId: existing.id,
+          retryRunStatus: existing.status,
+        },
+      });
+      return existing;
+    }
+
+    if (txOutcome.kind === "refused_alive") {
+      await appendRunEvent(run, await nextRunEventSeq(run.id), {
+        eventType: "lifecycle",
+        stream: "system",
+        level: "warn",
+        message:
+          "Process-loss retry refused inside tx: old run re-verified as alive (live pid/pgid, fresh output, or revived status); executionRunId not transferred",
         payload: {
           deadRunId: run.id,
           lastOutputAt: run.lastOutputAt ? new Date(run.lastOutputAt as unknown as string | Date).toISOString() : null,
@@ -10127,6 +10222,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       });
       return null;
     }
+
+    const queued = txOutcome.retryRun;
 
     publishLiveEvent({
       companyId: queued.companyId,
@@ -12432,6 +12529,16 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
       const staleness = await evaluateQueuedRunStaleness(run, issueId, context);
       if (staleness.stale) {
+        // Claim-gate signal upgrades to a deferral (workspace_busy retry ladder), not a
+        // plain cancellation — the wake must survive as a retry, not drop.
+        if (staleness.errorCode === ISSUE_EXECUTION_CLAIM_GATE_STALENESS) {
+          await deferQueuedRunBehindLiveIssueRun(run, issueId, String(staleness.details.holderRunId ?? "unknown"));
+          logger.info(
+            { runId: run.id, issueId, holderRunId: staleness.details.holderRunId ?? null },
+            "claimQueuedRun: deferred queued run behind live issue run",
+          );
+          return null;
+        }
         await cancelQueuedRunForStaleIssue(run, issueId, staleness);
         logger.info(
           { runId: run.id, issueId, errorCode: staleness.errorCode },
@@ -12442,52 +12549,32 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
       // Fix (3): one-non-terminal-run-per-issue claim gate. Without this, isolated workspaces
       // bypass the shared-workspace holder check and two runs can claim the same issue concurrently
-      // (live repro: SPA-4929 twin verifier; see enqueue fix above). Use the same retry ladder
-      // workspace_busy uses — defer, don't drop — so a legitimate second wake survives as a retry.
-      const holder = await db
-        .select({ id: heartbeatRuns.id })
-        .from(heartbeatRuns)
-        .where(
-          and(
-            eq(heartbeatRuns.companyId, run.companyId),
-            inArray(heartbeatRuns.status, [...MAX_TURN_CONTINUATION_LIVE_RUN_STATUSES]),
-            ne(heartbeatRuns.id, run.id),
-            sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${issueId}`,
-          ),
-        )
-        .limit(1)
-        .then((rows: Array<{ id: string }>) => rows[0] ?? null);
-      if (holder) {
-        const cancelWrite = await setRunStatus(run.id, "cancelled", {
-          finishedAt: new Date(),
-          error: `Deferred: issue already has a non-terminal run ${holder.id}; rescheduled as ${WORKSPACE_BUSY_RETRY_REASON} retry`,
-          errorCode: WORKSPACE_BUSY_ERROR_CODE as unknown as string,
-        });
-        const cancelledForRetry = cancelWrite ?? await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, run.id)).then((r) => r[0] ?? null) as unknown as typeof run | null;
-        if (cancelledForRetry) {
-          await setWakeupStatus(run.wakeupRequestId, "cancelled", { finishedAt: new Date(), error: `Deferred: issue ${issueId} busy` }).catch(() => undefined);
-          const agentRow = await getAgent(run.agentId).catch(() => null);
-          if (agentRow) {
-            const retry = await scheduleBoundedRetryForRun(cancelledForRetry as unknown as typeof run, agentRow, {
-              retryReason: WORKSPACE_BUSY_RETRY_REASON,
-              wakeReason: WORKSPACE_BUSY_RETRY_WAKE_REASON,
-              delayMs: computeWorkspaceBusyRetryDelayMs(),
-            }).catch(() => null) as { outcome?: string; run?: { id: string } } | null;
-            const scheduled = retry && retry.outcome === "scheduled";
-            await appendRunEvent(cancelledForRetry as unknown as typeof run, await nextRunEventSeq(run.id), {
-              eventType: "lifecycle",
-              stream: "system",
-              level: scheduled ? "info" : "warn",
-              message: scheduled
-                ? `Deferred queued claim: issue ${issueId} already has live run ${holder.id}; rescheduled as workspace_busy retry ${retry?.run?.id ?? ""}`.trim()
-                : `Cancelled queued claim: issue ${issueId} already has live run ${holder.id} and retry could not be scheduled`,
-              payload: { issueId, holderRunId: holder.id, queuedRunId: run.id, ...(retry?.run?.id ? { retryRunId: retry.run.id } : {}) },
-            }).catch(() => undefined);
-            return null;
-          }
+      // (live repro: SPA-4929 twin verifier; see enqueue fix above).
+      //
+      // Carve-out: execution-review participant wakes and their recovery retries EXIST to
+      // run alongside a live holder — they are the lane that revives a pending review
+      // stage, and their enqueue path already refuses candidates that have an existing
+      // execution path for the participant. Cancelling them here would drop the only wake
+      // that revives a pending review stage, so they pass through this gate.
+      if (!isExecutionReviewParticipantRecoveryEligibleRun(run)) {
+        const holder = await db
+          .select({ id: heartbeatRuns.id })
+          .from(heartbeatRuns)
+          .where(
+            and(
+              eq(heartbeatRuns.companyId, run.companyId),
+              inArray(heartbeatRuns.status, [...MAX_TURN_CONTINUATION_LIVE_RUN_STATUSES]),
+              ne(heartbeatRuns.id, run.id),
+              sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${issueId}`,
+            ),
+          )
+          .orderBy(asc(heartbeatRuns.createdAt), asc(heartbeatRuns.id))
+          .limit(1)
+          .then((rows: Array<{ id: string }>) => rows[0] ?? null);
+        if (holder) {
+          await deferQueuedRunBehindLiveIssueRun(run, issueId, holder.id);
+          return null;
         }
-        await cancelRunInternal(run.id, `Cancelled: issue already has a non-terminal run ${holder.id}; single-run-per-issue invariant`).catch(() => undefined);
-        return null;
       }
     }
 
@@ -12629,6 +12716,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           | "issue_terminal_status"
           | "issue_not_in_progress"
           | "issue_execution_lock_changed"
+          | typeof ISSUE_EXECUTION_CLAIM_GATE_STALENESS
           | "issue_review_participant_changed"
           | "issue_continuation_waiting_on_review";
         details: Record<string, unknown>;
@@ -12759,11 +12847,12 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     }
 
     // Fix (3b): live-run invariant at evaluate time — a queued run whose issue
-    // already has a non-terminal run (queued/running/scheduled_retry) must not
-    // claim ahead of it. Signal as execution-lock staleness so the caller
-    // cancels/defers. claimQueuedRun handles the retry upgrade; evaluate path
-    // returning staleness here is sufficient for the throttle race.
-    {
+    // already has a non-terminal run must not claim ahead of it. Carve-outs mirror
+    // the claim gate above, plus the execution-review wake itself: those runs ARE
+    // the lane that revives a pending review stage while another run holds the
+    // issue, and their enqueue path already refuses candidates that have an existing
+    // execution path, so gating them here would only drop that recovery.
+    if (!isExecutionReviewParticipantRecoveryEligibleRun(run)) {
       const live = await db
         .select({ id: heartbeatRuns.id })
         .from(heartbeatRuns)
@@ -12775,13 +12864,14 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${issueId}`,
           ),
         )
+        .orderBy(asc(heartbeatRuns.createdAt), asc(heartbeatRuns.id))
         .limit(1)
         .then((rows: Array<{ id: string }>) => rows[0] ?? null);
       if (live) {
         return {
           stale: true,
-          errorCode: "issue_execution_lock_changed",
-          reason: `Cancelled because issue already has a non-terminal run ${live.id}; deferred as workspace_busy retry`,
+          errorCode: ISSUE_EXECUTION_CLAIM_GATE_STALENESS,
+          reason: `Issue already has a non-terminal run ${live.id}; deferring this wake as a ${WORKSPACE_BUSY_RETRY_REASON} retry`,
           details: { issueId, holderRunId: live.id, queuedRunId: run.id },
         };
       }
@@ -12809,6 +12899,141 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     }
 
     return { stale: false };
+  }
+
+  // Fix (3) helper: defer (never drop) a queued run whose issue already has a
+  // non-terminal run. Mirrors finalizeWorkspaceBusyDeferral: the run is cancelled as a
+  // contention deferral (not a failure), a workspace_busy scheduled retry is enqueued with
+  // no attempt ceiling — holder liveness, not a counter, bounds the wait — and the issue
+  // execution lock transfers to the retry inside scheduleBoundedRetryForRun so recovery
+  // leaves the issue alone while it waits. Only when no retry can be scheduled is the
+  // lock released for other runs.
+  async function deferQueuedRunBehindLiveIssueRun(
+    run: typeof heartbeatRuns.$inferSelect,
+    issueId: string,
+    holderRunId: string,
+  ) {
+    const now = new Date();
+    const message =
+      `Deferred: issue already has a non-terminal run ${holderRunId}; rescheduled as ${WORKSPACE_BUSY_RETRY_REASON} retry`;
+    // Claim-time runs are still `queued`, so the guard must accept queued OR running
+    // (a scheduled_retry promoted between check and write lands in queued too).
+    // Conditional UPDATE = the atomic handoff: if another path finalized the run
+    // first, updated comes back empty and we leave that outcome alone.
+    const cancelWrite = await db
+      .update(heartbeatRuns)
+      .set({
+        status: "cancelled",
+        error: message,
+        errorCode: WORKSPACE_BUSY_ERROR_CODE,
+        finishedAt: now,
+        resultJson: {
+          ...parseObject(run.resultJson),
+          stopReason: WORKSPACE_BUSY_ERROR_CODE,
+          effectiveTimeoutSec: 0,
+          timeoutConfigured: false,
+          timeoutSource: "issue_execution_claim_gate",
+          timeoutFired: false,
+        },
+        updatedAt: now,
+      })
+      .where(
+        and(
+          eq(heartbeatRuns.id, run.id),
+          inArray(heartbeatRuns.status, [...MAX_TURN_CONTINUATION_LIVE_RUN_STATUSES]),
+        ),
+      )
+      .returning()
+      .then((rows) => rows[0] ?? null);
+    if (!cancelWrite) {
+      logger.info(
+        { runId: run.id },
+        "skipping issue-execution claim-gate deferral because the run already left its live state",
+      );
+      return;
+    }
+    clearHeartbeatRunRuntimeStatus(cancelWrite.id);
+    publishLiveEvent({
+      companyId: cancelWrite.companyId,
+      type: "heartbeat.run.status",
+      payload: buildHeartbeatRunStatusLiveEventPayload(cancelWrite),
+    });
+    publishRunLifecyclePluginEvent(cancelWrite);
+    const cancelled = cancelWrite;
+
+    await setWakeupStatus(run.wakeupRequestId, "cancelled", {
+      finishedAt: now,
+      error: message,
+    }).catch(() => undefined);
+
+    let scheduleOutcome: string | null = null;
+    const agentRow = await getAgent(run.agentId).catch(() => null);
+    if (agentRow) {
+      // Record whether this wake was executing under assignee-ship BEFORE the deferral
+      // mutates context, so the retry's promotion gate treats an assignee mismatch as
+      // expected rather than as a reassignment race.
+      const issueRow = await db
+        .select({ assigneeAgentId: issues.assigneeAgentId })
+        .from(issues)
+        .where(and(eq(issues.id, issueId), eq(issues.companyId, run.companyId)))
+        .then((rows) => rows[0] ?? null)
+        .catch(() => null);
+      await db
+        .update(heartbeatRuns)
+        .set({
+          contextSnapshot: {
+            ...parseObject(cancelled.contextSnapshot),
+            workspaceBusyDeferredWhileAssignee: issueRow?.assigneeAgentId === run.agentId,
+          },
+          updatedAt: new Date(),
+        })
+        .where(eq(heartbeatRuns.id, run.id))
+        .catch(() => undefined);
+      const deferredRun = (await getRun(run.id).catch(() => null)) ?? cancelled;
+      const scheduleResult = await scheduleBoundedRetryForRun(deferredRun, agentRow, {
+        now,
+        retryReason: WORKSPACE_BUSY_RETRY_REASON,
+        wakeReason: WORKSPACE_BUSY_RETRY_WAKE_REASON,
+        maxAttempts: (deferredRun.scheduledRetryAttempt ?? 0) + 1,
+        delayMs: computeWorkspaceBusyRetryDelayMs(),
+      }).catch((scheduleErr) => {
+        logger.error(
+          { err: scheduleErr, runId: run.id },
+          "failed to schedule issue-execution claim-gate retry after deferral",
+        );
+        return null;
+      });
+      scheduleOutcome = scheduleResult?.outcome === "scheduled" ? "scheduled" : scheduleResult?.outcome ?? null;
+    }
+
+    await appendRunEvent(cancelled, await nextRunEventSeq(cancelled.id), {
+      eventType: "lifecycle",
+      stream: "system",
+      level: scheduleOutcome === "scheduled" ? "info" : "warn",
+      message:
+        scheduleOutcome === "scheduled"
+          ? `Deferred queued claim: issue ${issueId} already has live run ${holderRunId}; rescheduled as ${WORKSPACE_BUSY_RETRY_REASON} retry`
+          : `Cancelled queued claim: issue ${issueId} already has live run ${holderRunId} and no retry could be scheduled; releasing the execution lock`,
+      payload: {
+        issueId,
+        holderRunId,
+        queuedRunId: run.id,
+        retryScheduled: scheduleOutcome === "scheduled",
+      },
+    }).catch(() => undefined);
+
+    if (scheduleOutcome !== "scheduled") {
+      await releaseIssueExecutionAndPromote(cancelled).catch((releaseErr) => {
+        logger.error(
+          { err: releaseErr, runId: run.id },
+          "failed to release issue execution after claim-gate deferral",
+        );
+      });
+    }
+
+    await finalizeAgentStatus(run.agentId, "cancelled", null, {
+      wasFirstHeartbeat: timerClaimWasFirstHeartbeat(run),
+    }).catch(() => undefined);
   }
 
   async function cancelQueuedRunForStaleIssue(
@@ -19077,6 +19302,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     retryScheduledRetryNow,
 
     resumeQueuedRuns,
+    // Exposed for the SPA-5005 claim-gate test: drives one queued run through
+    // the full claim path (budget → staleness → single-run gate) without the
+    // per-agent slot loop.
+    claimQueuedRun,
 
     scheduleBoundedRetry: async (
       runId: string,

@@ -75,124 +75,6 @@ vi.mock("../services/local-service-supervisor.js", async () => {
     ...actual,
     terminateLocalService: mockTerminateLocalService,
   };
-// SPA-5005 — process_lost_retry must not reap live runs (untracked adapter / null-pid with fresh lastOutputAt).
-
-it("does not reap an untracked-adapter running run with fresh lastOutputAt", async () => {
-  const heartbeat = heartbeatService(db);
-  const fresh = new Date(Date.now() - 2 * 60 * 1000);
-  const { runId } = await seedRunFixture({
-    adapterType: "openclaw_gateway",
-    agentStatus: "idle",
-    processPid: null,
-    processGroupId: null,
-    includeIssue: true,
-    lastOutputAt: fresh,
-  });
-
-  const result = await heartbeat.reapOrphanedRuns();
-  expect(result).toEqual({ reaped: 0, runIds: [] });
-
-  const run = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId)).then((r) => r[0] ?? null);
-  expect(run?.status).toBe("running");
-  expect(run?.errorCode).toBeNull();
-
-  const events = await db.select().from(heartbeatRunEvents).where(eq(heartbeatRunEvents.heartbeatRunId, runId));
-  expect(events.some((e) => String((e.payload as Record<string, unknown> | null)?.lastOutputAt ?? e.message).length > 0)).toBeTruthy();
-});
-
-it("does not reap a claude_local running run with null pids and fresh lastOutputAt", async () => {
-  const heartbeat = heartbeatService(db);
-  const fresh = new Date(Date.now() - 2 * 60 * 1000);
-  const { runId } = await seedRunFixture({
-    adapterType: "claude_local",
-    agentStatus: "idle",
-    processPid: null,
-    processGroupId: null,
-    includeIssue: true,
-    lastOutputAt: fresh,
-  });
-
-  const result = await heartbeat.reapOrphanedRuns();
-  expect(result).toEqual({ reaped: 0, runIds: [] });
-
-  const run = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId)).then((r) => r[0] ?? null);
-  expect(run?.status).toBe("running");
-});
-
-it("retries a genuinely dead run exactly once and dedupes the second sweep", async () => {
-  const heartbeat = heartbeatService(db);
-
-  const { agentId, runId, issueId } = await seedRunFixture({
-    adapterType: "codex_local",
-    agentStatus: "idle",
-    processPid: 999_999_999,
-    processGroupId: null,
-    includeIssue: true,
-    lastOutputAt: null,
-    startedAt: new Date(Date.now() - 2 * 60 * 60 * 1000),
-  });
-
-  const first = await heartbeat.reapOrphanedRuns();
-  expect(first).toEqual({ reaped: 1, runIds: [runId] });
-
-  const runsAfterFirst = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, agentId));
-  const retry = runsAfterFirst.find((r) => r.retryOfRunId === runId);
-  expect(retry).toBeTruthy();
-  expect(retry?.status).toBe("queued");
-  expect(retry?.processLossRetryCount).toBe(1);
-
-  const issueAfterFirst = await db.select().from(issues).where(eq(issues.id, issueId)).then((r) => r[0] ?? null);
-  expect(issueAfterFirst?.executionRunId).toBe(retry?.id);
-
-  // Second sweep: no second retry — hits dedupe path on the already-dead run.
-  // Re-insert a second dead run copy attempt via re-running reap (there is no second running dead row now,
-  // so reaping again should reap 0 — the invariant is that only one retry exists for that runId).
-  const second = await heartbeat.reapOrphanedRuns();
-  expect(second.reaped).toBe(0);
-
-  const runsAfterSecond = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, agentId));
-  expect(runsAfterSecond.filter((r) => r.retryOfRunId === runId)).toHaveLength(1);
-});
-
-it("defers a queued run claiming an issue that already has a live run (single-run-per-issue invariant)", async () => {
-  // Seed a live running run that already holds the issue.
-  const companyId = randomUUID();
-  const agentId = randomUUID();
-  const issueId = randomUUID();
-  const liveRunId = randomUUID();
-  const queuedRunId = randomUUID();
-  const liveWakeupId = randomUUID();
-  const queuedWakeupId = randomUUID();
-  const now = new Date(Date.now());
-  const issuePrefix = `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
-
-  await db.insert(companies).values({ id: companyId, name: "Paperclip", issuePrefix, defaultResponsibleUserId: "responsible-user", requireBoardApprovalForNewAgents: false });
-  await db.insert(agents).values({ id: agentId, companyId, name: "CodexCoder", role: "engineer", status: "idle", adapterType: "claude_local", adapterConfig: {}, runtimeConfig: {}, permissions: {} });
-  await db.insert(issues).values({ id: issueId, companyId, title: "Single-run gate", status: "in_progress", priority: "medium", assigneeAgentId: agentId, checkoutRunId: liveRunId, executionRunId: liveRunId, responsibleUserId: "responsible-user", issueNumber: 1, identifier: `${issuePrefix}-1`, startedAt: now });
-
-  await db.insert(agentWakeupRequests).values({ id: liveWakeupId, companyId, agentId, source: "assignment", triggerDetail: "system", reason: "issue_assigned", payload: { issueId }, status: "claimed", runId: liveRunId, claimedAt: now, requestedAt: now });
-  await db.insert(heartbeatRuns).values({ id: liveRunId, companyId, agentId, invocationSource: "assignment", triggerDetail: "system", status: "running", wakeupRequestId: liveWakeupId, contextSnapshot: { issueId }, startedAt: now, updatedAt: now });
-
-  await db.insert(agentWakeupRequests).values({ id: queuedWakeupId, companyId, agentId, source: "assignment", triggerDetail: "system", reason: "process_lost_retry", payload: { issueId, retryOfRunId: "other", wakeReason: "process_lost_retry" }, status: "queued", runId: queuedRunId, requestedAt: now, updatedAt: now });
-  await db.insert(heartbeatRuns).values({ id: queuedRunId, companyId, agentId, invocationSource: "assignment", triggerDetail: "system", status: "queued", wakeupRequestId: queuedWakeupId, contextSnapshot: { issueId, wakeReason: "process_lost_retry" }, updatedAt: now, createdAt: now });
-
-  const heartbeat = heartbeatService(db);
-  await heartbeat.resumeQueuedRuns();
-  // Give the async claim path a moment to settle (resumeQueuedRuns dispatches fire-and-forget).
-  await new Promise((r) => setTimeout(r, 800));
-
-  const queued = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, queuedRunId)).then((r) => r[0] ?? null);
-  // Invariant: the second claim must not reach running while the live run still holds the issue.
-  expect(["cancelled", "scheduled_retry", "queued"]).toContain(queued?.status);
-  expect(queued?.status).not.toBe("running");
-
-  const scheduledRetries = await db.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, companyId), eq(heartbeatRuns.scheduledRetryReason, "workspace_busy")));
-  // Either we scheduled a workspace_busy retry for the deferred claim, or evaluateQueuedRunStaleness cancelled it with execution-lock changed — both satisfy the invariant.
-  const deferredEvidence = scheduledRetries.length > 0 || queued?.errorCode === "issue_execution_lock_changed" || queued?.errorCode === "workspace_busy";
-  expect(deferredEvidence).toBe(true);
-});
-
-
 });
 
 vi.mock("@paperclipai/shared/telemetry", async () => {
@@ -419,6 +301,287 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
   let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
   const childProcesses = new Set<ChildProcess>();
   const cleanupPids = new Set<number>();
+
+  // ------------------------------------------------------------------
+  // SPA-5005 — process_lost_retry must not reap live runs (untracked
+  // adapter / null-pid with fresh lastOutputAt) and must not let two
+  // non-terminal runs claim the same issue.
+  // Fixtures (a)-(d) from the SPA-5005 acceptance contract:
+  //   (a) untracked-adapter running run + fresh output  -> NOT reaped
+  //   (b) claude_local running run, null pids, fresh out-> NOT reaped
+  //   (c) genuinely dead run -> exactly one retry + executionRunId
+  //       transfer; second sweep hits the dedupe path
+  //   (d) queued run claiming an issue that already has a live run ->
+  //       deferred as a workspace_busy retry (never reaches running)
+  // ------------------------------------------------------------------
+
+  it("SPA-5005 (a): does not reap an untracked-adapter running run with fresh lastOutputAt", async () => {
+    const heartbeat = heartbeatService(db);
+    const { agentId } = await seedRunFixture({
+      adapterType: "openclaw_gateway",
+      agentStatus: "running",
+      processPid: null,
+      processGroupId: null,
+      includeIssue: true,
+    });
+    const freshOutputAt = new Date(Date.now() - 2 * 60 * 1000);
+    await db
+      .update(heartbeatRuns)
+      .set({ lastOutputAt: freshOutputAt })
+      .where(eq(heartbeatRuns.agentId, agentId));
+
+    const result = await heartbeat.reapOrphanedRuns();
+
+    expect(result).toEqual({ reaped: 0, runIds: [] });
+    const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, agentId));
+    expect(run?.status).toBe("running");
+    expect(run?.errorCode).toBeNull();
+    const events = await db
+      .select()
+      .from(heartbeatRunEvents)
+      .where(eq(heartbeatRunEvents.runId, run!.id));
+    expect(events.some((event) =>
+      event.level === "warn" &&
+      (event.message ?? "").includes("Skipping process-loss reap")
+    )).toBe(true);
+  });
+
+  it("SPA-5005 (b): does not reap a claude_local running run with null pids but fresh lastOutputAt", async () => {
+    const heartbeat = heartbeatService(db);
+    const { agentId } = await seedRunFixture({
+      adapterType: "claude_local",
+      agentStatus: "running",
+      processPid: null,
+      processGroupId: null,
+      includeIssue: true,
+    });
+    const freshOutputAt = new Date(Date.now() - 2 * 60 * 1000);
+    await db
+      .update(heartbeatRuns)
+      .set({ lastOutputAt: freshOutputAt })
+      .where(eq(heartbeatRuns.agentId, agentId));
+
+    const result = await heartbeat.reapOrphanedRuns();
+
+    expect(result).toEqual({ reaped: 0, runIds: [] });
+    const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, agentId));
+    expect(run?.status).toBe("running");
+    expect(run?.errorCode).toBeNull();
+  });
+
+  it("SPA-5005 (b2): reaps an untracked-adapter running run once its lastOutputAt goes stale", async () => {
+    const heartbeat = heartbeatService(db);
+    const { agentId } = await seedRunFixture({
+      adapterType: "openclaw_gateway",
+      agentStatus: "idle",
+      processPid: null,
+      processGroupId: null,
+      includeIssue: true,
+    });
+    const staleOutputAt = new Date(Date.now() - 2 * 60 * 60 * 1000 - 60 * 1000);
+    await db
+      .update(heartbeatRuns)
+      .set({ lastOutputAt: staleOutputAt })
+      .where(eq(heartbeatRuns.agentId, agentId));
+
+    const result = await heartbeat.reapOrphanedRuns();
+
+    expect(result.reaped).toBe(1);
+    const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, agentId));
+    expect(run?.status).toBe("failed");
+    expect(run?.errorCode).toBe("process_lost");
+  });
+
+  it("SPA-5005 (c): retries a genuinely dead run once, transfers executionRunId, and dedupes the second sweep", async () => {
+    const heartbeat = heartbeatService(db);
+    // Dead recorded pid on a tracked adapter: the base retry-eligible shape
+    // (same as "queues exactly one retry when the recorded local pid is dead").
+    const { agentId, runId, issueId } = await seedRunFixture({
+      adapterType: "codex_local",
+      agentStatus: "idle",
+      processPid: 999_999_999,
+      processGroupId: null,
+      includeIssue: true,
+    });
+
+    const first = await heartbeat.reapOrphanedRuns();
+    expect(first).toEqual({ reaped: 1, runIds: [runId] });
+
+    const retryRowsAfterFirstSweep = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(and(eq(heartbeatRuns.agentId, agentId), eq(heartbeatRuns.retryOfRunId, runId)));
+    // Two lanes enqueue a follow-up for this dead run: the process-loss retry
+    // (wakeReason process_lost_retry) from the reaper, and the stranded-issue
+    // continuation wake (issue_continuation_needed) from the release path's
+    // immediate-recovery sweep. Exactly one of each — never two twins of either.
+    const retry = retryRowsAfterFirstSweep.find(
+      (row) => (row.contextSnapshot as Record<string, unknown> | null)?.wakeReason === "process_lost_retry",
+    );
+    expect(retry).toBeTruthy();
+    expect(["queued", "running"]).toContain(retry!.status);
+    expect(retry!.processLossRetryCount).toBe(1);
+    // At most one follow-up per lane: the reaper's own startNextQueuedRunForAgent
+    // may claim the retry before we read back, so status is queued OR running —
+    // but exactly one process-loss retry exists either way.
+    expect(retryRowsAfterFirstSweep).toHaveLength(1);
+
+    // The dead run's execution lock transferred to the retry inside the enqueue tx.
+    const issueAfterFirst = await waitForValue(async () =>
+      db
+        .select()
+        .from(issues)
+        .where(eq(issues.id, issueId))
+        .then((rows) => {
+          const row = rows[0] ?? null;
+          return row?.executionRunId && row.executionRunId !== runId ? row : null;
+        }),
+    );
+    expect(issueAfterFirst?.executionRunId).toBe(retry!.id);
+
+    const second = await heartbeat.reapOrphanedRuns();
+    expect(second.reaped).toBe(0);
+
+    const retryRowsAfterSecondSweep = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(and(eq(heartbeatRuns.agentId, agentId), eq(heartbeatRuns.retryOfRunId, runId)));
+    // Second sweep must not add a twin of any lane.
+    expect(retryRowsAfterSecondSweep).toHaveLength(1);
+  });
+
+  it("SPA-5005 (d): defers a queued run claiming an issue that already has a live run", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const issueId = randomUUID();
+    const liveRunId = randomUUID();
+    const queuedRunId = randomUUID();
+    const now = new Date();
+    const issuePrefix = `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix,
+      defaultResponsibleUserId: "responsible-user",
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "TwinRunner",
+      role: "engineer",
+      status: "idle",
+      adapterType: "claude_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    // Runs first: issues.checkout_run_id / execution_run_id carry FK references to
+    // heartbeat_runs, so the issue row can only be inserted after its runs exist.
+    await db.insert(heartbeatRuns).values([
+      {
+        id: liveRunId,
+        companyId,
+        agentId,
+        invocationSource: "assignment",
+        triggerDetail: "system",
+        status: "running",
+        contextSnapshot: { issueId, taskId: issueId, wakeReason: "issue_assigned" },
+        startedAt: now,
+        updatedAt: now,
+      },
+      {
+        id: queuedRunId,
+        companyId,
+        agentId,
+        invocationSource: "assignment",
+        triggerDetail: "system",
+        status: "queued",
+        contextSnapshot: {
+          issueId,
+          taskId: issueId,
+          wakeReason: "process_lost_retry",
+          retryReason: "process_lost",
+          retryOfRunId: randomUUID(),
+        },
+        updatedAt: now,
+        createdAt: now,
+      },
+    ]);
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Single-run gate",
+      status: "in_progress",
+      priority: "medium",
+      assigneeAgentId: agentId,
+      checkoutRunId: liveRunId,
+      executionRunId: liveRunId,
+      responsibleUserId: "responsible-user",
+      issueNumber: 1,
+      identifier: `${issuePrefix}-1`,
+    });
+    await db.insert(agentWakeupRequests).values([
+      {
+        id: randomUUID(),
+        companyId,
+        agentId,
+        source: "assignment",
+        triggerDetail: "system",
+        reason: "issue_assigned",
+        payload: { issueId },
+        status: "claimed",
+        runId: liveRunId,
+        claimedAt: now,
+        requestedAt: now,
+      },
+      {
+        id: randomUUID(),
+        companyId,
+        agentId,
+        source: "assignment",
+        triggerDetail: "system",
+        reason: "process_lost_retry",
+        payload: { issueId, retryOfRunId: randomUUID(), wakeReason: "process_lost_retry", retryReason: "process_lost" },
+        status: "queued",
+        runId: queuedRunId,
+        requestedAt: now,
+        updatedAt: now,
+      },
+    ]);
+
+    const claimed = await heartbeatService(db).claimQueuedRun(
+      (await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, queuedRunId))).at(0)!,
+    );
+
+    expect(claimed).toBeNull();
+    const [queuedAfter] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, queuedRunId));
+    expect(queuedAfter?.status).not.toBe("running");
+    const [liveAfter] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, liveRunId));
+    expect(liveAfter?.status).toBe("running");
+
+    const scheduledRetryRow = await waitForValue(async () =>
+      (
+        await db
+          .select()
+          .from(heartbeatRuns)
+          .where(
+            and(
+              eq(heartbeatRuns.companyId, companyId),
+              eq(heartbeatRuns.scheduledRetryReason, "workspace_busy"),
+            ),
+          )
+      ).at(0) ?? null,
+    );
+    expect(scheduledRetryRow?.status).toBe("scheduled_retry");
+
+    // The deferred run never touched the execution lock: it still points at the
+    // live holder. The scheduled retry is what gets promoted once the holder
+    // finishes and its own claim gate passes.
+    const [issueAfterDeferral] = await db.select().from(issues).where(eq(issues.id, issueId));
+    expect(issueAfterDeferral?.executionRunId).toBe(liveRunId);
+  });
 
   beforeAll(async () => {
     tempDb = await startEmbeddedPostgresTestDatabase("paperclip-heartbeat-recovery-");
