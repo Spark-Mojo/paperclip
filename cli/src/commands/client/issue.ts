@@ -242,14 +242,16 @@ export function registerIssueCommands(program: Command): void {
             printOutput(row, { json: ctx.json });
             return;
           }
-          // ponytail: pending-only filter — terminal statuses (accepted/rejected/answered/cancelled/expired/failed)
-          // are not "awaiting James"; surfacing them defeats the warning signal. Status set lives in
-          // @paperclipai/shared ISSUE_THREAD_INTERACTION_STATUSES.
+          // SPA-4971: honest-state filter — pending (unanswered, still live) plus expired
+          // (the unanswered James-facing confirmation that timed out; hiding it repeats the
+          // SPA-4885 blind spot). Terminal statuses (accepted/rejected/answered/cancelled/
+          // failed) stay excluded. Status set lives in @paperclipai/shared
+          // ISSUE_THREAD_INTERACTION_STATUSES.
           const interactions = await ctx.api.get<IssueThreadInteraction[]>(
             apiPath`/api/issues/${idOrIdentifier}/interactions`,
           );
           const pendingInteractions = (interactions ?? [])
-            .filter((i) => i.status === "pending")
+            .filter((i) => i.status === "pending" || i.status === "expired")
             .map((i) => ({
               id: i.id,
               kind: i.kind,

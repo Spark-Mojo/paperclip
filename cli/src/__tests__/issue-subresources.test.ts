@@ -61,7 +61,7 @@ describe("issue subresource commands", () => {
     ]);
   });
 
-  it("augments issue get with pendingInteractions when --include-interactions is set", async () => {
+  it("augments issue get with pendingInteractions (pending + expired) when --include-interactions is set", async () => {
     const fetchMock = vi
       .fn()
       .mockImplementation((url: string) => {
@@ -75,6 +75,14 @@ describe("issue subresource commands", () => {
                 title: "Approve PR",
                 summary: "Ship it",
                 createdAt: "2026-08-22T00:00:00Z",
+              },
+              {
+                id: "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
+                kind: "request_confirmation",
+                status: "expired",
+                title: "Approve PR (expired)",
+                summary: null,
+                createdAt: "2026-08-20T00:00:00Z",
               },
               {
                 id: "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
@@ -96,6 +104,36 @@ describe("issue subresource commands", () => {
     expect(fetchMock.mock.calls.map((call) => call[0])).toEqual([
       `http://localhost:3100/api/issues/${ISSUE_ID}`,
       `http://localhost:3100/api/issues/${ISSUE_ID}/interactions`,
+    ]);
+    // SPA-4971 honest-state set: pending + expired surface; accepted does not.
+    expect(vi.mocked(console.log).mock.calls).toEqual([
+      [
+        JSON.stringify(
+          {
+            ...{ id: ISSUE_ID, status: "todo" },
+            pendingInteractions: [
+              {
+                id: INTERACTION_ID,
+                kind: "request_confirmation",
+                status: "pending",
+                title: "Approve PR",
+                summary: "Ship it",
+                createdAt: "2026-08-22T00:00:00Z",
+              },
+              {
+                id: "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
+                kind: "request_confirmation",
+                status: "expired",
+                title: "Approve PR (expired)",
+                summary: null,
+                createdAt: "2026-08-20T00:00:00Z",
+              },
+            ],
+          },
+          null,
+          2,
+        ),
+      ],
     ]);
   });
 
