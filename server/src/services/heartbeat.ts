@@ -10046,7 +10046,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     type ProcessLossRetryTxOutcome =
       | { kind: "created"; retryRun: typeof heartbeatRuns.$inferSelect }
       | { kind: "duplicate" }
-      | { kind: "refused_alive" };
+      | { kind: "refused_alive"; refusalReasons: string[] };
 
     const txOutcome = await db.transaction(async (tx): Promise<ProcessLossRetryTxOutcome> => {
       // Serialize concurrent sweeps: issue-scoped runs take the issue row lock;
@@ -10093,10 +10093,16 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         // left the terminal set after reap. Absence of output carries no evidence either
         // way and must never block an owed retry — shutdown-drain fixtures legitimately
         // have lastOutputAt = null.
-        if (pidAlive || groupAlive || outputStillFresh || stillNonTerminal) {
+        const refusalReasons: string[] = [];
+        if (pidAlive) refusalReasons.push("pid_alive");
+        if (groupAlive) refusalReasons.push("pgid_alive");
+        if (outputStillFresh) refusalReasons.push("output_fresh");
+        if (stillNonTerminal) refusalReasons.push(`status_${lockedOld?.status ?? "unknown"}`);
+        if (refusalReasons.length > 0) {
           // Enqueue nothing, transfer nothing — the twin must not steal the execution lock
-          // from a run that may still be alive. Caller releases the execution lock instead.
-          return { kind: "refused_alive" };
+          // from a run that may still be alive. Caller releases the execution lock instead,
+          // or restores a prematurely-finalized run (SPA-5043).
+          return { kind: "refused_alive", refusalReasons };
         }
 
         // Authoritative dedupe, now inside the tx and behind the issue row lock: two
@@ -10233,9 +10239,15 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         payload: {
           deadRunId: run.id,
           lastOutputAt: run.lastOutputAt ? new Date(run.lastOutputAt as unknown as string | Date).toISOString() : null,
+          refusalReasons: txOutcome.refusalReasons,
         },
       });
-      return null;
+      // SPA-5043 (codex 3838245812): a refusal is NOT the same as "no retry
+      // possible" — the caller may have already flipped this run to a terminal
+      // status before the in-tx re-verify caught it alive. Surface the refusal
+      // so the caller can undo that premature write instead of tearing down
+      // around an execution that is still live.
+      return { refusedAlive: true as const, refusalReasons: txOutcome.refusalReasons };
     }
 
     const queued = txOutcome.retryRun;
@@ -10724,22 +10736,31 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       const retry = await enqueueProcessLossRetry(interrupted, agent, now);
       if (!retry) {
         await releaseIssueExecutionAndPromote(interrupted);
+      } else if ("refusedAlive" in retry) {
+        // SPA-5043 (codex P1): the in-tx re-verify refused the retry as alive
+        // — the interrupted run's child was still running when the drain set
+        // its status to `interrupted`. Release the issue execution lock so
+        // hot-restart adoption (or a follow-up drain) can re-claim the
+        // workspace; do NOT enqueue a fresh retry against this run, do NOT
+        // re-mark its wakeup as failed, and do NOT finalize agent status
+        // (the agent slot may already have a successor queued for restart).
+        await releaseIssueExecutionAndPromote(interrupted);
       } else {
         retryRunIds.push(retry.id);
-      }
 
-      await appendRunEvent(interrupted, await nextRunEventSeq(interrupted.id), {
-        eventType: "lifecycle",
-        stream: "system",
-        level: "warn",
-        message,
-        payload: {
-          signal,
-          ...(run.processPid ? { processPid: run.processPid } : {}),
-          ...(run.processGroupId ? { processGroupId: run.processGroupId } : {}),
-          ...(retry ? { retryRunId: retry.id } : {}),
-        },
-      });
+        await appendRunEvent(interrupted, await nextRunEventSeq(interrupted.id), {
+          eventType: "lifecycle",
+          stream: "system",
+          level: "warn",
+          message,
+          payload: {
+            signal,
+            ...(run.processPid ? { processPid: run.processPid } : {}),
+            ...(run.processGroupId ? { processGroupId: run.processGroupId } : {}),
+            retryRunId: retry.id,
+          },
+        });
+      }
 
       await finalizeAgentStatus(run.agentId, "interrupted", message, {
         wasFirstHeartbeat: timerClaimWasFirstHeartbeat(run),
@@ -13525,7 +13546,19 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         }
         : null;
 
-      let finalizedRun = await setRunStatus(run.id, "failed", {
+      // SPA-5043 (codex P1 3838008781): make running→failed a COMPARE-AND-SET
+      // so the caller's terminal write cannot clobber a row that legitimately
+      // changed under us (a concurrent completion/cancel/flush). The predicate
+      // mirrors isProcessLossReapFresh (snapshot-phase guard) inverted: ONLY
+      // fire the transition when lastOutputAt is NULL, OLDER than the grace
+      // window, OR further into the future than the clock-skew tolerance —
+      // i.e. genuinely stale. A fresh concurrent flush (including the small
+      // within-tolerance future lead SPA-5034 allows) BLOCKS the write so the
+      // in-tx re-verify inside enqueueProcessLossRetry sees the run as alive.
+      const reapStaleCutoff = new Date(freshNow.getTime() - PROCESS_LOSS_REAP_OUTPUT_GRACE_MS);
+      const reapFutureSkewCutoff = new Date(freshNow.getTime() + PROCESS_LOSS_REAP_CONCURRENT_WRITE_TOLERANCE_MS);
+      const reapPatch = {
+        status: "failed" as const,
         error: shouldRetry ? `${baseMessage}; retrying once` : baseMessage,
         errorCode: "process_lost",
         finishedAt: freshNow,
@@ -13547,38 +13580,113 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             }
             : result;
         })(),
-      });
-      await setWakeupStatus(run.wakeupRequestId, "failed", {
-        finishedAt: freshNow,
-        error: shouldRetry ? `${baseMessage}; retrying once` : baseMessage,
-      });
-      if (!finalizedRun) finalizedRun = await getRun(run.id);
-      if (!finalizedRun) continue;
-      finalizedRun = await classifyAndPersistRunLiveness(finalizedRun, parseObject(finalizedRun.resultJson)) ?? finalizedRun;
-      await releaseEnvironmentLeasesForRun({
-        runId: finalizedRun.id,
-        companyId: finalizedRun.companyId,
-        agentId: finalizedRun.agentId,
-        status: finalizedRun.status,
-        failureReason: finalizedRun.error ?? undefined,
-      });
+        updatedAt: freshNow,
+      };
+      const reapWhere = and(
+        eq(heartbeatRuns.id, run.id),
+        eq(heartbeatRuns.companyId, run.companyId),
+        eq(heartbeatRuns.status, "running"),
+        or(
+          isNull(heartbeatRuns.lastOutputAt),
+          lte(heartbeatRuns.lastOutputAt, reapStaleCutoff),
+          gt(heartbeatRuns.lastOutputAt, reapFutureSkewCutoff),
+        ),
+      );
+      const reapedRows = await db
+        .update(heartbeatRuns)
+        .set(reapPatch)
+        .where(reapWhere)
+        .returning();
+      // The CAS may match multiple rows if the WHERE is mis-specified; assert a
+      // single-row invariant so a bug here fails loud rather than silently
+      // clobbering siblings. Defensive: also fall back to filtering by id if
+      // anything leaked through (it shouldn't, but the next guard prevents
+      // resurrecting a sibling row's id into the in-tx retry path).
+      const finalizedRun = reapedRows.length === 1 && reapedRows[0].id === run.id
+        ? reapedRows[0]
+        : null;
+      if (!finalizedRun) {
+        // Lost the compare-and-set. The row either left `running` (finalized by
+        // a sibling sweep / the adapter completion path) or grew fresh output
+        // (a concurrent flush landed between snapshot and this statement). No
+        // terminal side effects to undo — we never marked it failed.
+        continue;
+      }
 
+      // SPA-5043 (codex 3838245812): the in-tx liveness re-verify inside
+      // enqueueProcessLossRetry is the authoritative decision point on whether
+      // the run is genuinely dead. We run it BEFORE any irreversible side
+      // effects (wakeup failed, lease release, liveness classification, agent
+      // finalization) so a refusal restores cleanly without unwinding torn
+      // state across multiple tables. Until this call returns we own nothing
+      // beyond the terminal CAS write above.
       let retriedRun: typeof heartbeatRuns.$inferSelect | null = null;
+      let retryRefusedAlive = false;
       const retryAgent = await getAgent(run.agentId);
       if (shouldRetry) {
         if (retryAgent) {
-          retriedRun = await enqueueProcessLossRetry(finalizedRun, retryAgent, freshNow);
+          const enqueued = await enqueueProcessLossRetry(finalizedRun, retryAgent, freshNow);
+          if (enqueued && typeof enqueued === "object" && "refusedAlive" in enqueued) {
+            retryRefusedAlive = true;
+          } else {
+            retriedRun = enqueued;
+          }
         }
       } else if (retryAgent) {
         const scheduled = await scheduleInteractionContinuationInfrastructureRetryIfEligible(finalizedRun, retryAgent);
         retriedRun = scheduled?.outcome === "scheduled" ? scheduled.run : null;
       }
 
-      if (!retriedRun) {
-        await releaseIssueExecutionAndPromote(finalizedRun);
+      if (retryRefusedAlive) {
+        // SPA-5043: the re-verify proved the run alive after our terminal
+        // CAS write. Undo that single write — and only that — before returning;
+        // wakeup status, environment leases, liveness classification, agent
+        // status and queued-run dispatch were NOT touched because they sit
+        // below this branch. The run row re-emerges as running; the in-tx
+        // refusal already left executionRunId untouched, so the issue lock
+        // still points at this row.
+        const restored = await setRunStatus(run.id, "running", {
+          error: null,
+          errorCode: null,
+          finishedAt: null,
+          resultJson: parseObject(run.resultJson),
+        });
+        await appendRunEvent(restored ?? finalizedRun, await nextRunEventSeq(finalizedRun.id), {
+          eventType: "lifecycle",
+          stream: "system",
+          level: "warn",
+          message:
+            "Restored prematurely failed run to running after process-loss retry refused it as alive; execution lock retained",
+          payload: {
+            refusalReasons: (await getRun(run.id))?.errorCode ?? null,
+            lastOutputAt: finalizedRun.lastOutputAt
+              ? new Date(finalizedRun.lastOutputAt as unknown as string | Date).toISOString()
+              : null,
+          },
+        });
+        continue;
       }
 
-      await appendRunEvent(finalizedRun, await nextRunEventSeq(finalizedRun.id), {
+      // From here on the failure is real and irreversible — commit to the rest
+      // of the teardown in the same order as the pre-SPA-5043 code path.
+      await setWakeupStatus(run.wakeupRequestId, "failed", {
+        finishedAt: freshNow,
+        error: shouldRetry ? `${baseMessage}; retrying once` : baseMessage,
+      });
+      const classified = await classifyAndPersistRunLiveness(finalizedRun, parseObject(finalizedRun.resultJson)) ?? finalizedRun;
+      await releaseEnvironmentLeasesForRun({
+        runId: classified.id,
+        companyId: classified.companyId,
+        agentId: classified.agentId,
+        status: classified.status,
+        failureReason: classified.error ?? undefined,
+      });
+
+      if (!retriedRun) {
+        await releaseIssueExecutionAndPromote(classified);
+      }
+
+      await appendRunEvent(classified, await nextRunEventSeq(classified.id), {
         eventType: "lifecycle",
         stream: "system",
         level: "error",
@@ -19325,6 +19433,41 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     // the full claim path (budget → staleness → single-run gate) without the
     // per-agent slot loop.
     claimQueuedRun,
+    // Exposed for the SPA-5043 conditional-running-failed test: the CAS
+    // predicate that gates the running→failed transition in reapOrphanedRuns,
+    // isolated from the rest of the sweep so its freshness/identity boundaries
+    // are pinned without racing the snapshot vs. CAS window.
+    reapOrphanedRunsCASForTests: async (
+      run: typeof heartbeatRuns.$inferSelect,
+      patch: { error: string; errorCode: string; finishedAt: Date; resultJson: Record<string, unknown> },
+      opts: { freshNow?: Date } = {},
+    ) => {
+      const freshNow = opts.freshNow ?? new Date();
+      const reapStaleCutoff = new Date(freshNow.getTime() - PROCESS_LOSS_REAP_OUTPUT_GRACE_MS);
+      const reapFutureSkewCutoff = new Date(freshNow.getTime() + PROCESS_LOSS_REAP_CONCURRENT_WRITE_TOLERANCE_MS);
+      const rows = await db
+        .update(heartbeatRuns)
+        .set({
+          status: "failed",
+          error: patch.error,
+          errorCode: patch.errorCode,
+          finishedAt: patch.finishedAt,
+          resultJson: patch.resultJson,
+          updatedAt: freshNow,
+        })
+        .where(and(
+          eq(heartbeatRuns.id, run.id),
+          eq(heartbeatRuns.companyId, run.companyId),
+          eq(heartbeatRuns.status, "running"),
+          or(
+            isNull(heartbeatRuns.lastOutputAt),
+            lte(heartbeatRuns.lastOutputAt, reapStaleCutoff),
+            gt(heartbeatRuns.lastOutputAt, reapFutureSkewCutoff),
+          ),
+        ))
+        .returning();
+      return rows.length === 1 && rows[0].id === run.id ? rows[0] : null;
+    },
 
     scheduleBoundedRetry: async (
       runId: string,
