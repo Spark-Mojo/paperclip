@@ -809,11 +809,24 @@ function applyIssueExecutionStageTransition(input: TransitionInput): TransitionR
           };
         }
 
-        const participant = selectStageParticipant(nextStage, {
+        // SPA-5364 fingerprint: the sole next-stage participant can equal the
+        // returnAssignee. Excluding them would empty the candidate set and (pre-fix)
+        // collapse the workflow to terminal without ever routing to the configured
+        // approver. Re-select without the exclusion so the approval stage still
+        // lands on its sole participant. Mirrors the L750-771 graceful-fallback
+        // pattern, which already routes to the only available principal when the
+        // exclude filter would otherwise wipe the candidate set.
+        let nextParticipant = selectStageParticipant(nextStage, {
           preferred: explicitAssignee,
           exclude: existingState?.returnAssignee ?? null,
         });
-        if (!participant) {
+        if (!nextParticipant) {
+          nextParticipant = selectStageParticipant(nextStage, {
+            preferred: explicitAssignee,
+            exclude: null,
+          });
+        }
+        if (!nextParticipant) {
           patch.executionState = approvedState;
           return {
             patch,
@@ -831,7 +844,7 @@ function applyIssueExecutionStageTransition(input: TransitionInput): TransitionR
           previous: approvedState,
           policy: input.policy,
           stage: nextStage,
-          participant,
+          participant: nextParticipant,
           returnAssignee: existingState?.returnAssignee ?? currentAssignee ?? actor,
           reviewRequest: input.reviewRequest ?? null,
         });

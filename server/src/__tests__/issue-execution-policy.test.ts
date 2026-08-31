@@ -2087,9 +2087,12 @@ describe("review round circuit breaker", () => {
 });
 
 describe("approval advance when returnAssignee == approval participant", () => {
-  it("reviewer approves when returnAssignee equals the sole approval participant → approval completes (no throw)", () => {
-    // SPA-5364 fingerprint: review returnAssignee == approval participant,
-    // exclude filter would empty the next-stage set at L812-818 pre-fix.
+  it("reviewer approves → approval stage advances PENDING to the sole configured approver (no early terminal)", () => {
+    // SPA-5364 / SPA-5506 fingerprint: review returnAssignee == approval participant.
+    // The exclude filter on the next-stage lookup would empty the candidate set,
+    // and the pre-fix branch collapsed the workflow to terminal before the
+    // approval actor ever acted. The fix re-selects the sole participant
+    // without the exclude so the approval stage actually lands on its owner.
     const steveUserId = "steve-user";
     const policy = makePolicy([
       { type: "review", participants: [{ type: "agent", agentId: qaAgentId }] },
@@ -2123,16 +2126,26 @@ describe("approval advance when returnAssignee == approval participant", () => {
       commentBody: "Review pass",
     });
 
-    // Must NOT throw. Approval advances and, with nowhere to hand off, lands
-    // as completed with approved outcome (mirrors the L750-771 graceful clear).
+    // Review-stage decision is recorded as approved.
     expect(result.decision).toMatchObject({
       stageId: reviewStageId,
       stageType: "review",
       outcome: "approved",
     });
+    // The approval stage must be PENDING for its sole configured approver — NOT
+    // collapsed to terminal — and the assignee must be that approver so the
+    // approval gate is actually exercised.
+    expect(result.patch.status).toBe("in_review");
+    expect(result.patch.assigneeAgentId).toBeNull();
+    expect(result.patch.assigneeUserId).toBe(steveUserId);
     expect(result.patch.executionState).toMatchObject({
-      status: "completed",
-      completedStageIds: expect.arrayContaining([reviewStageId, approvalStageId]),
+      status: "pending",
+      currentStageId: approvalStageId,
+      currentStageType: "approval",
+      currentParticipant: { type: "user", userId: steveUserId },
+      completedStageIds: expect.arrayContaining([reviewStageId]),
     });
+    expect(result.patch.executionState?.completedStageIds).not.toContain(approvalStageId);
+    expect(result.workflowControlledAssignment).toBe(true);
   });
 });
