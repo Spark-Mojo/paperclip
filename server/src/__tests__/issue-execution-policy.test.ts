@@ -2085,3 +2085,54 @@ describe("review round circuit breaker", () => {
     });
   });
 });
+
+describe("approval advance when returnAssignee == approval participant", () => {
+  it("reviewer approves when returnAssignee equals the sole approval participant → approval completes (no throw)", () => {
+    // SPA-5364 fingerprint: review returnAssignee == approval participant,
+    // exclude filter would empty the next-stage set at L812-818 pre-fix.
+    const steveUserId = "steve-user";
+    const policy = makePolicy([
+      { type: "review", participants: [{ type: "agent", agentId: qaAgentId }] },
+      { type: "approval", participants: [{ type: "user", userId: steveUserId }] },
+    ]);
+    const reviewStageId = policy.stages[0].id;
+    const approvalStageId = policy.stages[1].id;
+
+    const result = applyIssueExecutionPolicyTransition({
+      issue: {
+        status: "in_review",
+        assigneeAgentId: qaAgentId,
+        assigneeUserId: null,
+        executionPolicy: policy,
+        executionState: {
+          status: "pending",
+          currentStageId: reviewStageId,
+          currentStageIndex: 0,
+          currentStageType: "review",
+          currentParticipant: { type: "agent", agentId: qaAgentId },
+          returnAssignee: { type: "user", userId: steveUserId },
+          completedStageIds: [],
+          lastDecisionId: null,
+          lastDecisionOutcome: null,
+        },
+      },
+      policy,
+      requestedStatus: "done",
+      requestedAssigneePatch: {},
+      actor: { agentId: qaAgentId },
+      commentBody: "Review pass",
+    });
+
+    // Must NOT throw. Approval advances and, with nowhere to hand off, lands
+    // as completed with approved outcome (mirrors the L750-771 graceful clear).
+    expect(result.decision).toMatchObject({
+      stageId: reviewStageId,
+      stageType: "review",
+      outcome: "approved",
+    });
+    expect(result.patch.executionState).toMatchObject({
+      status: "completed",
+      completedStageIds: expect.arrayContaining([reviewStageId, approvalStageId]),
+    });
+  });
+});

@@ -814,7 +814,16 @@ function applyIssueExecutionStageTransition(input: TransitionInput): TransitionR
           exclude: existingState?.returnAssignee ?? null,
         });
         if (!participant) {
-          throw unprocessable(`No eligible ${nextStage.type} participant is configured for this issue`);
+          patch.executionState = approvedState;
+          return {
+            patch,
+            decision: {
+              stageId: activeStage.id,
+              stageType: activeStage.type,
+              outcome: "approved",
+              body: input.commentBody.trim(),
+            },
+          };
         }
 
         buildPendingStagePatch({
