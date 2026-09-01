@@ -2085,3 +2085,188 @@ describe("review round circuit breaker", () => {
     });
   });
 });
+
+describe("approval advance when returnAssignee == approval participant", () => {
+  it("reviewer approves → approval stage advances PENDING to the sole configured approver (no early terminal)", () => {
+    // SPA-5364 / SPA-5506 fingerprint: review returnAssignee == approval participant.
+    // The exclude filter on the next-stage lookup would empty the candidate set,
+    // and the pre-fix branch collapsed the workflow to terminal before the
+    // approval actor ever acted. The fix re-selects the sole participant
+    // without the exclude so the approval stage actually lands on its owner.
+    const steveUserId = "steve-user";
+    const policy = makePolicy([
+      { type: "review", participants: [{ type: "agent", agentId: qaAgentId }] },
+      { type: "approval", participants: [{ type: "user", userId: steveUserId }] },
+    ]);
+    const reviewStageId = policy.stages[0].id;
+    const approvalStageId = policy.stages[1].id;
+
+    const result = applyIssueExecutionPolicyTransition({
+      issue: {
+        status: "in_review",
+        assigneeAgentId: qaAgentId,
+        assigneeUserId: null,
+        executionPolicy: policy,
+        executionState: {
+          status: "pending",
+          currentStageId: reviewStageId,
+          currentStageIndex: 0,
+          currentStageType: "review",
+          currentParticipant: { type: "agent", agentId: qaAgentId },
+          returnAssignee: { type: "user", userId: steveUserId },
+          completedStageIds: [],
+          lastDecisionId: null,
+          lastDecisionOutcome: null,
+        },
+      },
+      policy,
+      requestedStatus: "done",
+      requestedAssigneePatch: {},
+      actor: { agentId: qaAgentId },
+      commentBody: "Review pass",
+    });
+
+    // Review-stage decision is recorded as approved.
+    expect(result.decision).toMatchObject({
+      stageId: reviewStageId,
+      stageType: "review",
+      outcome: "approved",
+    });
+    // The approval stage must be PENDING for its sole configured approver — NOT
+    // collapsed to terminal — and the assignee must be that approver so the
+    // approval gate is actually exercised.
+    expect(result.patch.status).toBe("in_review");
+    expect(result.patch.assigneeAgentId).toBeNull();
+    expect(result.patch.assigneeUserId).toBe(steveUserId);
+    expect(result.patch.executionState).toMatchObject({
+      status: "pending",
+      currentStageId: approvalStageId,
+      currentStageType: "approval",
+      currentParticipant: { type: "user", userId: steveUserId },
+      completedStageIds: expect.arrayContaining([reviewStageId]),
+    });
+    expect(result.patch.executionState?.completedStageIds).not.toContain(approvalStageId);
+    expect(result.workflowControlledAssignment).toBe(true);
+  });
+
+  it("changes_requested re-entry routes approval stage back to sole approver (no 'No eligible' throw)", () => {
+    // SPA-5506 P1: after the approver requests changes, the next build attempt
+    // re-runs through the re-entry path (L1010-1042). Pre-fix, the exclude
+    // filter empties the candidate set and the engine throws
+    // "No eligible approval participant is configured for this issue",
+    // permanently stranding the issue. Fix mirrors the L820 fallback: when
+    // pendingStage.type === "approval", select without the exclude.
+    const steveUserId = "steve-user";
+    const policy = makePolicy([
+      { type: "review", participants: [{ type: "agent", agentId: qaAgentId }] },
+      { type: "approval", participants: [{ type: "user", userId: steveUserId }] },
+    ]);
+    const reviewStageId = policy.stages[0].id;
+    const approvalStageId = policy.stages[1].id;
+
+    // Re-entry state: changes_requested on the approval stage, returnAssignee is
+    // the sole approver, currentParticipant was the approver before changes.
+    const result = applyIssueExecutionPolicyTransition({
+      issue: {
+        status: "in_progress",
+        assigneeAgentId: null,
+        assigneeUserId: steveUserId,
+        executionPolicy: policy,
+        executionState: {
+          status: "changes_requested",
+          currentStageId: approvalStageId,
+          currentStageIndex: 1,
+          currentStageType: "approval",
+          currentParticipant: { type: "user", userId: steveUserId },
+          returnAssignee: { type: "user", userId: steveUserId },
+          completedStageIds: [reviewStageId],
+          lastDecisionId: null,
+          lastDecisionOutcome: "changes_requested",
+          changesRequestedCount: 1,
+        },
+      },
+      policy,
+      requestedStatus: "in_review",
+      requestedAssigneePatch: {},
+      actor: { agentId: qaAgentId },
+      commentBody: null,
+    });
+
+    // Must NOT throw. Approval stage must be PENDING with sole approver as
+    // currentParticipant — not stranded in an error state.
+    expect(result.patch.executionState).toMatchObject({
+      status: "pending",
+      currentStageId: approvalStageId,
+      currentStageType: "approval",
+      currentParticipant: { type: "user", userId: steveUserId },
+    });
+    expect(result.workflowControlledAssignment).toBe(true);
+  });
+
+  it("review nextStage with sole participant == returnAssignee does NOT fall back to self-review", () => {
+    // SPA-5506 P2 mirror: the L820 fallback only applies when nextStage.type
+    // === "approval". For a review nextStage where the sole participant equals
+    // returnAssignee, the early-terminal-clear path is preserved so the
+    // existing canAutoSkipPendingStage loop on re-entry can handle the
+    // self-review skip. Selecting the returnAssignee for the review stage
+    // would leave the issue in_review for a meaningless self-review.
+    const steveUserId = "steve-user";
+    const policy = makePolicy([
+      { type: "review", participants: [{ type: "agent", agentId: qaAgentId }] },
+      { type: "review", participants: [{ type: "user", userId: steveUserId }] },
+    ]);
+    const reviewStageId = policy.stages[0].id;
+    const secondReviewStageId = policy.stages[1].id;
+
+    const result = applyIssueExecutionPolicyTransition({
+      issue: {
+        status: "in_review",
+        assigneeAgentId: qaAgentId,
+        assigneeUserId: null,
+        executionPolicy: policy,
+        executionState: {
+          status: "pending",
+          currentStageId: reviewStageId,
+          currentStageIndex: 0,
+          currentStageType: "review",
+          currentParticipant: { type: "agent", agentId: qaAgentId },
+          returnAssignee: { type: "user", userId: steveUserId },
+          completedStageIds: [],
+          lastDecisionId: null,
+          lastDecisionOutcome: null,
+        },
+      },
+      policy,
+      requestedStatus: "done",
+      requestedAssigneePatch: {},
+      actor: { agentId: qaAgentId },
+      commentBody: "Review pass",
+    });
+
+    // First review stage records its approval, but the second review stage
+    // (sole participant = returnAssignee) must NOT be assigned to the
+    // returnAssignee here — instead the early-terminal path is taken so the
+    // re-entry auto-skip loop handles the meaningless self-review.
+    expect(result.decision).toMatchObject({
+      stageId: reviewStageId,
+      outcome: "approved",
+    });
+    // The patch should NOT route to the sole review-stage participant
+    // (= returnAssignee); either it marks the workflow terminal or it lands
+    // on the second review stage as PENDING only when the re-entry path
+    // resolves a different participant. The forbidden shape is:
+    //   patch.assigneeUserId === steveUserId AND patch.executionState.currentStageId === secondReviewStageId
+    if (
+      result.patch.executionState &&
+      (result.patch.executionState as { currentStageId?: string }).currentStageId === secondReviewStageId
+    ) {
+      expect(result.patch.assigneeUserId).not.toBe(steveUserId);
+    } else {
+      // Early terminal: assert it happened cleanly (not a self-review assignment).
+      expect(result.patch.executionState).toMatchObject({
+        status: "completed",
+        completedStageIds: expect.arrayContaining([reviewStageId]),
+      });
+    }
+  });
+});

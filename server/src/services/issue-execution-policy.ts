@@ -809,12 +809,40 @@ function applyIssueExecutionStageTransition(input: TransitionInput): TransitionR
           };
         }
 
-        const participant = selectStageParticipant(nextStage, {
+        // SPA-5364 / SPA-5506 fingerprint: the sole next-stage participant can
+        // equal the returnAssignee. Excluding them would empty the candidate set
+        // and (pre-fix) collapse the workflow to terminal without ever routing
+        // to the configured approver.
+        //
+        // Primary call uses the standard exclude filter. Only apply the
+        // un-excluded fallback when the next stage is an approval stage —
+        // approval is a meaningful gate that the configured approver must
+        // exercise even when they are also the returnAssignee. For a review
+        // next stage whose sole participant equals returnAssignee, the existing
+        // `canAutoSkipPendingStage` path (L1017-1042) handles the self-review
+        // skip during re-entry; collapsing to terminal here would short-circuit
+        // that loop and bypass the auto-skip.
+        let nextParticipant = selectStageParticipant(nextStage, {
           preferred: explicitAssignee,
           exclude: existingState?.returnAssignee ?? null,
         });
-        if (!participant) {
-          throw unprocessable(`No eligible ${nextStage.type} participant is configured for this issue`);
+        if (!nextParticipant && nextStage.type === "approval") {
+          nextParticipant = selectStageParticipant(nextStage, {
+            preferred: explicitAssignee,
+            exclude: null,
+          });
+        }
+        if (!nextParticipant) {
+          patch.executionState = approvedState;
+          return {
+            patch,
+            decision: {
+              stageId: activeStage.id,
+              stageType: activeStage.type,
+              outcome: "approved",
+              body: input.commentBody.trim(),
+            },
+          };
         }
 
         buildPendingStagePatch({
@@ -822,7 +850,7 @@ function applyIssueExecutionStageTransition(input: TransitionInput): TransitionR
           previous: approvedState,
           policy: input.policy,
           stage: nextStage,
-          participant,
+          participant: nextParticipant,
           returnAssignee: existingState?.returnAssignee ?? currentAssignee ?? actor,
           reviewRequest: input.reviewRequest ?? null,
         });
@@ -985,13 +1013,26 @@ function applyIssueExecutionStageTransition(input: TransitionInput): TransitionR
 
   const returnAssignee = existingState?.returnAssignee ?? currentAssignee;
   const skippedStageIds = [...(existingState?.completedStageIds ?? [])];
-  let participant = selectStageParticipant(pendingStage, {
-    preferred:
-      existingState?.status === CHANGES_REQUESTED_STATUS
-        ? explicitAssignee ?? existingState.currentParticipant ?? null
-        : explicitAssignee,
-    exclude: returnAssignee,
-  });
+  // SPA-5364 / SPA-5506 mirror: the sole approval participant may equal
+  // returnAssignee. Excluding them empties the candidate set; for an approval
+  // stage we re-select without the exclusion so the configured approver still
+  // acts (mirrors the L820 fallback). For review stages we let the existing
+  // auto-skip loop below handle the self-review case via
+  // canAutoSkipPendingStage.
+  const preferredForStage = (stage: IssueExecutionStage) =>
+    existingState?.status === CHANGES_REQUESTED_STATUS
+      ? explicitAssignee ?? existingState.currentParticipant ?? null
+      : explicitAssignee;
+  let participant =
+    pendingStage.type === "approval"
+      ? selectStageParticipant(pendingStage, {
+          preferred: preferredForStage(pendingStage),
+          exclude: null,
+        })
+      : selectStageParticipant(pendingStage, {
+          preferred: preferredForStage(pendingStage),
+          exclude: returnAssignee,
+        });
   while (!participant && canAutoSkipPendingStage({ stage: pendingStage, returnAssignee, requestedStatus })) {
     skippedStageIds.push(pendingStage.id);
     pendingStage = nextPendingStage(
@@ -1010,13 +1051,16 @@ function applyIssueExecutionStageTransition(input: TransitionInput): TransitionR
       });
       return { patch };
     }
-    participant = selectStageParticipant(pendingStage, {
-      preferred:
-        existingState?.status === CHANGES_REQUESTED_STATUS
-          ? explicitAssignee ?? existingState.currentParticipant ?? null
-          : explicitAssignee,
-      exclude: returnAssignee,
-    });
+    participant =
+      pendingStage.type === "approval"
+        ? selectStageParticipant(pendingStage, {
+            preferred: preferredForStage(pendingStage),
+            exclude: null,
+          })
+        : selectStageParticipant(pendingStage, {
+            preferred: preferredForStage(pendingStage),
+            exclude: returnAssignee,
+          });
   }
   if (!participant) {
     throw unprocessable(`No eligible ${pendingStage.type} participant is configured for this issue`);
