@@ -3900,9 +3900,10 @@ export function issueRoutes(
     issue: { identifier?: string | null; assigneeAgentId: string | null },
     code: IssueWriteDenialCode,
     extraDetails: Record<string, unknown> = {},
+    contextOverride: Partial<IssueWriteDenialContext> = {},
   ) {
     const labels = await issueWriteDenialLabels(req, issue);
-    const { status, body } = issueWriteDenialResponse(code, labels);
+    const { status, body } = issueWriteDenialResponse(code, { ...labels, ...contextOverride });
     res.status(status).json({
       error: body.error,
       details: { ...body.details, ...extraDetails },
@@ -9434,6 +9435,35 @@ export function issueRoutes(
         actor: { type: actor.actorType, id: actor.actorId },
         reviewPolicy: existing.reviewPolicy,
       });
+    }
+    // SPA-5916 — terminal re-complete guard (FINAL-SPEC §11.7).
+    // A routine PATCH that asks for the same terminal status the card already
+    // holds must NOT silently re-stamp completedAt/cancelledAt, replay the
+    // stored decision comment, or shift executionState.lastDecisionId. Reject
+    // before any side effect; explicit reopen/resume stays the sanctioned
+    // escape hatch and is checked by `reopenRequested`/`resumeRequested`
+    // elsewhere in this handler, so it never falls into this guard.
+    if (
+      (updateFields.status === "done" || updateFields.status === "cancelled") &&
+      updateFields.status === existing.status
+    ) {
+      const terminalStatus: "done" | "cancelled" = updateFields.status as "done" | "cancelled";
+      // Charge the cap so the rejected attempt still appears in the audit
+      // trail (per SPA-5916 SCOPE-OUT — rejected attempts keep their
+      // observed-count entry). The cap backstop is independent of this guard.
+      if (
+        req.actor.type === "agent"
+        && !(await assertCrossIssueInfluenceWithinRunCap(req, res, existing, "update"))
+      ) return;
+      await denyIssueWrite(
+        req,
+        res,
+        existing,
+        "issue_write_terminal_recomplete",
+        {},
+        { terminalStatus },
+      );
+      return;
     }
     const shouldCancelActiveRunForCancelledStatus =
       existing.status !== "cancelled" && updateFields.status === "cancelled";
