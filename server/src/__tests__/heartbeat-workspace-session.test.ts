@@ -28,6 +28,7 @@ import {
   resolveExecutionWorkspaceConfigFreshness,
   resolveExecutionWorkspaceReuseRequestForIssue,
   resolveExecutionWorkspaceReuseProvisioningPolicy,
+  resolveAllocatorExecutionWorkspaceReuseDecision,
   resolveNextSessionState,
   resolveTaskSessionConfigFreshness,
   isWorkspaceSyncConflictFailure,
@@ -1694,6 +1695,87 @@ describe("effective run execution workspace config freshness", () => {
       realizeWorkspace,
     })).rejects.toThrow(/could not be restored/);
     expect(realizeWorkspace).not.toHaveBeenCalled();
+  });
+
+  it("allocator reuses the existing workspace when the same open issue holds it (R1 same-issue path)", () => {
+    expect(
+      resolveAllocatorExecutionWorkspaceReuseDecision({
+        issueExecutionWorkspaceId: "workspace-1",
+        issueExecutionWorkspacePreference: "reuse_existing",
+        existingExecutionWorkspaceStatus: "ready",
+        executionWorkspaceHeldByAnotherOpenIssue: false,
+      }),
+    ).toEqual({
+      requestedExecutionWorkspaceId: "workspace-1",
+      shouldRestoreExistingWorkspace: true,
+      refusedCrossIssueBinding: false,
+    });
+  });
+
+  it("allocator refuses cross-issue reuse and clears the restore flag (R1 cross-issue path)", () => {
+    expect(
+      resolveAllocatorExecutionWorkspaceReuseDecision({
+        issueExecutionWorkspaceId: "workspace-1",
+        issueExecutionWorkspacePreference: "reuse_existing",
+        existingExecutionWorkspaceStatus: "ready",
+        executionWorkspaceHeldByAnotherOpenIssue: true,
+      }),
+    ).toEqual({
+      requestedExecutionWorkspaceId: "workspace-1",
+      shouldRestoreExistingWorkspace: false,
+      refusedCrossIssueBinding: true,
+    });
+  });
+
+  it("allocator reuses the existing workspace when the prior holder is done or cancelled (R1 recycle path)", () => {
+    expect(
+      resolveAllocatorExecutionWorkspaceReuseDecision({
+        issueExecutionWorkspaceId: "workspace-1",
+        issueExecutionWorkspacePreference: "reuse_existing",
+        existingExecutionWorkspaceStatus: "ready",
+        executionWorkspaceHeldByAnotherOpenIssue: false,
+      }),
+    ).toEqual({
+      requestedExecutionWorkspaceId: "workspace-1",
+      shouldRestoreExistingWorkspace: true,
+      refusedCrossIssueBinding: false,
+    });
+  });
+
+  it("cross-issue refuse flows into provisionExecutionWorkspaceForFreshnessDecision and calls realizeWorkspace fresh", async () => {
+    const metadata = buildWorkspaceConfigMetadata();
+    const decision = resolveExecutionWorkspaceConfigFreshness({
+      hasExistingWorkspace: false,
+      existingWorkspaceMetadata: null,
+      nextMetadata: metadata,
+    });
+    const restoreExistingWorkspace = vi.fn(async () => ({ id: "workspace-stale", warnings: [] }));
+    const realizeWorkspace = vi.fn(async () => ({ id: "workspace-fresh", warnings: [] }));
+
+    const allocatorDecision = resolveAllocatorExecutionWorkspaceReuseDecision({
+      issueExecutionWorkspaceId: "workspace-1",
+      issueExecutionWorkspacePreference: "reuse_existing",
+      existingExecutionWorkspaceStatus: "ready",
+      executionWorkspaceHeldByAnotherOpenIssue: true,
+    });
+    expect(allocatorDecision.shouldRestoreExistingWorkspace).toBe(false);
+
+    const result = await provisionExecutionWorkspaceForFreshnessDecision({
+      requestedShouldReuseExisting: allocatorDecision.shouldRestoreExistingWorkspace,
+      existingExecutionWorkspaceId: allocatorDecision.requestedExecutionWorkspaceId,
+      issueRef: { id: "issue-1", identifier: "PAP-42" },
+      runId: "run-1",
+      workspaceConfigFreshness: decision,
+      restoreExistingWorkspace: allocatorDecision.shouldRestoreExistingWorkspace
+        ? restoreExistingWorkspace
+        : null,
+      realizeWorkspace,
+    });
+
+    expect(restoreExistingWorkspace).not.toHaveBeenCalled();
+    expect(realizeWorkspace).toHaveBeenCalledTimes(1);
+    expect(result.executionWorkspace.id).toBe("workspace-fresh");
+    expect(result.reusedExecutionWorkspace).toBeNull();
   });
 
   it("formats a safe workspace operation payload for config drift decisions", () => {

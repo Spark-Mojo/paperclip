@@ -498,7 +498,7 @@ async function seedBranchContainmentRun(
       companyId,
       projectId,
       projectWorkspaceId,
-      title: "Same-workspace sibling",
+      title: "Sibling issue",
       status: "in_progress",
       workMode: "standard",
       priority: "medium",
@@ -510,8 +510,15 @@ async function seedBranchContainmentRun(
       responsibleUserId: "responsible-user",
       issueNumber: 2,
       identifier: sameSiblingIdentifier,
-      executionWorkspaceId: callSite === "finalize" ? null : sourceExecutionWorkspaceId,
-      executionWorkspacePreference: callSite === "finalize" ? null : "reuse_existing",
+      // R1 allocator exclusivity invariant: the sibling must NOT share the
+      // source's `executionWorkspaceId` while still open (`status != done`).
+      // Sharing would cause the source's spawn-time allocator to refuse the
+      // binding and provision fresh, so the persisted_restore call site that
+      // this test covers could not exercise the recorded branch validation
+      // path. Seed a separate sibling workspace (and a non-overlapping
+      // preference) so the source can restore as seeded.
+      executionWorkspaceId: null,
+      executionWorkspacePreference: null,
       executionWorkspaceSettings: {
         mode: "isolated_workspace",
       },
