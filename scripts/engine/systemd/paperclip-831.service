@@ -1,0 +1,44 @@
+# scripts/engine/systemd/paperclip-831.service
+#
+# systemd --user unit template for the bigbox "831" Paperclip engine
+# instance, installed at $HOME/.config/systemd/user/paperclip-831.service by
+# scripts/engine/install.sh (unit_ensure_installed in lib.sh).
+#
+# ExecStart deliberately goes through the paperclip-current symlink's own npm
+# bin shim (bin/paperclipai) rather than a fixed dist/index.js path in one
+# version prefix — that indirection is what makes "flip the symlink, restart
+# the unit" a real cutover between versions.
+#
+# This mirrors renderSystemdUnit() in cli/src/services/service-manager.ts —
+# same Type=notify (the server calls sd_notify; see
+# server/src/services/systemd-notify.ts and its import in
+# server/src/index.ts), same NotifyAccess, same three Environment= lines,
+# same Restart/RestartSec/TimeoutStopSec. It is a template (not
+# CLI-generated) because our unit name (paperclip-831.service) and the fact
+# that ExecStart targets an ops-managed symlink rather than the CLI's own
+# ~/.local/bin/paperclipai shim / ~/.paperclip/cli/current store differ from
+# what `paperclipai service install` would generate for this instance.
+#
+# If PAPERCLIP_HOME or the instance id ever change, this file (and
+# scripts/engine/lib.sh's defaults) must be updated together.
+
+[Unit]
+Description=Paperclip AI (bigbox engine, instance 831)
+After=network.target
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Type=notify
+NotifyAccess=all
+ExecStart="/home/jamesilsley/paperclip-current/bin/paperclipai" run --instance "default"
+Environment="PAPERCLIP_SERVICE_MANAGED=1"
+Environment="PAPERCLIP_INSTANCE_ID=default"
+Environment="PAPERCLIP_HOME=/home/jamesilsley/.paperclip-831"
+WorkingDirectory=%h
+Restart=always
+RestartSec=5
+TimeoutStopSec=300
+
+[Install]
+WantedBy=default.target
