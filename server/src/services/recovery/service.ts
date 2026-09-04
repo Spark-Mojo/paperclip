@@ -76,6 +76,7 @@ import {
   withRecoveryModelProfileHint,
 } from "./model-profile-hint.js";
 import { isAutomaticRecoverySuppressedByPauseHold } from "./pause-hold-guard.js";
+import { partitionChildrenSafeForBlocking } from "./continuation-wait-cycle-guard.js";
 
 const EXECUTION_PATH_HEARTBEAT_RUN_STATUSES = ["queued", "running", "scheduled_retry"] as const;
 const UNSUCCESSFUL_HEARTBEAT_RUN_TERMINAL_STATUSES = ["interrupted", "failed", "cancelled", "timed_out"] as const;
@@ -3256,13 +3257,36 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
           notInArray(issues.status, ["done", "cancelled"]),
         ),
       );
-    const blockedByIssueIds = [...new Set([...existingBlockers.map((row) => row.id), ...openChildren.map((row) => row.id)])];
+    // SPA-6057 cycle guard for the AWAITING-YOU shape: if an open child already has
+    // a `blocks` edge *into* this parent (issueId = child, the blocker side),
+    // adding that child to the parent's `blockedBy` would create a parent<->child
+    // cycle — the shape that made the fleet-wide recovery pass abort (SPA-5458).
+    // Exclude those children; the wait stays live through the existing edge.
+    const childrenCreatingParentEdge = await db
+      .select({ childIssueId: issueRelations.issueId })
+      .from(issueRelations)
+      .where(
+        and(
+          eq(issueRelations.companyId, issue.companyId),
+          eq(issueRelations.type, "blocks"),
+          inArray(
+            issueRelations.issueId,
+            openChildren.map((c) => c.id),
+          ),
+          eq(issueRelations.relatedIssueId, issue.id),
+        ),
+      );
+    const { safeChildren } = partitionChildrenSafeForBlocking(
+      openChildren,
+      childrenCreatingParentEdge.map((row) => row.childIssueId),
+    );
+    const blockedByIssueIds = [...new Set([...existingBlockers.map((row) => row.id), ...safeChildren.map((row) => row.id)])];
     if (blockedByIssueIds.length === 0) return null;
 
     const updated = await issuesSvc.update(issue.id, { status: "blocked", blockedByIssueIds });
     if (!updated) return null;
 
-    const waitingOn = formatIssueLinksForComment([...openChildren, ...existingBlockers]);
+    const waitingOn = formatIssueLinksForComment([...safeChildren, ...existingBlockers]);
     await issuesSvc.addComment(
       issue.id,
       `This task is waiting on ${waitingOn} to finish. ` +
@@ -3676,121 +3700,78 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     };
 
     for (const issue of candidates) {
-      const executionState = issue.status === "in_review"
-        ? parseIssueExecutionState(issue.executionState)
-        : null;
-      const pendingExecutionState = executionState?.status === "pending" ? executionState : null;
-      const currentParticipant = pendingExecutionState
-        ? pendingExecutionState.currentParticipant
-        : null;
-      const participantAgentId = currentParticipant?.type === "agent" ? currentParticipant.agentId : null;
-      const agentId = issue.status === "in_review" && participantAgentId
-        ? participantAgentId
-        : issue.assigneeAgentId;
-      if (!agentId) {
-        result.skipped += 1;
-        continue;
-      }
-
-      const agent = await getAgent(agentId);
-      const agentInvokable = agent && agent.companyId === issue.companyId
-        ? await isAgentInvokable(agent)
-        : false;
-      if (issue.status !== "in_review" && !agentInvokable) {
-        result.skipped += 1;
-        continue;
-      }
-
-      if (await hasActiveExecutionPath(
-        issue.companyId,
-        issue.id,
-        issue.status === "in_review" ? agentId : null,
-      )) {
-        result.skipped += 1;
-        continue;
-      }
-
-      if (await hasPendingWakeInteraction(issue.companyId, issue.id)) {
-        result.skipped += 1;
-        continue;
-      }
-
-      if (await isAutomaticRecoverySuppressedByPauseHold(db, issue.companyId, issue.id, treeControlSvc)) {
-        result.skipped += 1;
-        continue;
-      }
-
-      let latestRun = await getLatestIssueRun(issue.companyId, issue.id);
-      if (isOperatorCancelledRun(latestRun)) {
-        result.operatorCancelExempted += 1;
-        continue;
-      }
-      if (latestRun?.status === "succeeded" && await hasPersistedDurableWaitPath(issue)) {
-        result.skipped += 1;
-        continue;
-      }
-      const recoveryNow = new Date();
-      const participantLatestRunForRecovery = issue.status === "in_review" && participantAgentId
-        ? await getLatestIssueRunForAgent(issue.companyId, issue.id, participantAgentId)
-        : null;
-      const providerQuotaMonitorRun = issue.status === "in_review"
-        ? participantLatestRunForRecovery
-        : latestRun;
-      if (hasPendingProviderQuotaRecoveryMonitor(issue, providerQuotaMonitorRun, recoveryNow)) {
-        result.skipped += 1;
-        continue;
-      }
-      if (isStrandedIssueRecoveryIssue(issue) && isUnsuccessfulTerminalIssueRun(latestRun)) {
-        const updated = await escalateStrandedRecoveryIssueInPlace({
-          issue,
-          previousStatus: issue.status as StrandedPreviousStatus,
-          latestRun,
-        });
-        if (updated) {
-          result.escalated += 1;
-          result.issueIds.push(issue.id);
-        } else {
-          result.skipped += 1;
-        }
-        continue;
-      }
-
-      const adapterFailureClassification = issue.status !== "in_review" && latestRun && isUnsuccessfulTerminalIssueRun(latestRun)
-        ? classifyAdapterFailureForRecovery(latestRun, recoveryNow)
-        : null;
-      if (latestRun && adapterFailureClassification) {
-        const targetAgentId = getAdapterFailureRecoveryTargetAgentId(issue);
-        if (!targetAgentId || latestRun.agentId !== targetAgentId) {
+      try {
+        const executionState = issue.status === "in_review"
+          ? parseIssueExecutionState(issue.executionState)
+          : null;
+        const pendingExecutionState = executionState?.status === "pending" ? executionState : null;
+        const currentParticipant = pendingExecutionState
+          ? pendingExecutionState.currentParticipant
+          : null;
+        const participantAgentId = currentParticipant?.type === "agent" ? currentParticipant.agentId : null;
+        const agentId = issue.status === "in_review" && participantAgentId
+          ? participantAgentId
+          : issue.assigneeAgentId;
+        if (!agentId) {
           result.skipped += 1;
           continue;
         }
 
-        if (adapterFailureClassification.kind === "provider_quota") {
-          const monitored = await scheduleProviderQuotaRecoveryMonitor({
-            issue,
-            latestRun,
-            classification: adapterFailureClassification,
-          });
-          if (monitored) {
-            latestRun = await persistAdapterFailureRecoveryClassification(latestRun, adapterFailureClassification);
-            result.providerQuotaMonitored += 1;
-            result.issueIds.push(issue.id);
-            continue;
-          }
+        const agent = await getAgent(agentId);
+        const agentInvokable = agent && agent.companyId === issue.companyId
+          ? await isAgentInvokable(agent)
+          : false;
+        if (issue.status !== "in_review" && !agentInvokable) {
           result.skipped += 1;
           continue;
-        } else {
-          const updated = await escalateStrandedAssignedIssue({
+        }
+
+        if (await hasActiveExecutionPath(
+          issue.companyId,
+          issue.id,
+          issue.status === "in_review" ? agentId : null,
+        )) {
+          result.skipped += 1;
+          continue;
+        }
+
+        if (await hasPendingWakeInteraction(issue.companyId, issue.id)) {
+          result.skipped += 1;
+          continue;
+        }
+
+        if (await isAutomaticRecoverySuppressedByPauseHold(db, issue.companyId, issue.id, treeControlSvc)) {
+          result.skipped += 1;
+          continue;
+        }
+
+        let latestRun = await getLatestIssueRun(issue.companyId, issue.id);
+        if (isOperatorCancelledRun(latestRun)) {
+          result.operatorCancelExempted += 1;
+          continue;
+        }
+        if (latestRun?.status === "succeeded" && await hasPersistedDurableWaitPath(issue)) {
+          result.skipped += 1;
+          continue;
+        }
+        const recoveryNow = new Date();
+        const participantLatestRunForRecovery = issue.status === "in_review" && participantAgentId
+          ? await getLatestIssueRunForAgent(issue.companyId, issue.id, participantAgentId)
+          : null;
+        const providerQuotaMonitorRun = issue.status === "in_review"
+          ? participantLatestRunForRecovery
+          : latestRun;
+        if (hasPendingProviderQuotaRecoveryMonitor(issue, providerQuotaMonitorRun, recoveryNow)) {
+          result.skipped += 1;
+          continue;
+        }
+        if (isStrandedIssueRecoveryIssue(issue) && isUnsuccessfulTerminalIssueRun(latestRun)) {
+          const updated = await escalateStrandedRecoveryIssueInPlace({
             issue,
             previousStatus: issue.status as StrandedPreviousStatus,
             latestRun,
-            recoveryCause: "configuration_incomplete",
-            comment:
-              "Paperclip classified the latest adapter failure as `configuration_incomplete`. " +
-              "Moving the issue to `blocked` with the configuration fix recorded instead of creating a recovery takeover.",
           });
           if (updated) {
-            latestRun = await persistAdapterFailureRecoveryClassification(latestRun, adapterFailureClassification);
             result.escalated += 1;
             result.issueIds.push(issue.id);
           } else {
@@ -3798,68 +3779,213 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
           }
           continue;
         }
-      }
 
-      const acceptedContinuationInteraction = await getLatestAcceptedContinuationInteraction(issue.companyId, issue.id);
-      const acceptedInteractionResolvedAt = acceptedContinuationInteraction
-        ? acceptedContinuationInteraction.resolvedAt ?? acceptedContinuationInteraction.updatedAt
-        : null;
-      if (acceptedContinuationInteraction && acceptedInteractionResolvedAt && !pendingExecutionState) {
-        const successfulRunSinceResolution = await hasSuccessfulIssueRunSince(
-          issue.companyId,
-          issue.id,
-          agentId,
-          acceptedInteractionResolvedAt,
-          acceptedContinuationInteraction.id,
-        );
-
-        if (!successfulRunSinceResolution) {
-          if (!agentInvokable) {
+        const adapterFailureClassification = issue.status !== "in_review" && latestRun && isUnsuccessfulTerminalIssueRun(latestRun)
+          ? classifyAdapterFailureForRecovery(latestRun, recoveryNow)
+          : null;
+        if (latestRun && adapterFailureClassification) {
+          const targetAgentId = getAdapterFailureRecoveryTargetAgentId(issue);
+          if (!targetAgentId || latestRun.agentId !== targetAgentId) {
             result.skipped += 1;
             continue;
           }
 
-          if (await hasQueuedIssueWake(issue.companyId, issue.id, agentId)) {
-            result.skipped += 1;
-            continue;
-          }
-
-          if (await isInvocationBudgetBlocked(issue, agentId)) {
-            result.skipped += 1;
-            continue;
-          }
-
-          const latestPostResolutionRun = await getLatestIssueRunSince(
-            issue.companyId,
-            issue.id,
-            agentId,
-            acceptedInteractionResolvedAt,
-          );
-          const { consecutive } = await summarizeRecentContinuationRetries(
-            issue.companyId,
-            issue.id,
-            agentId,
-            CONTINUATION_WAITING_ON_REVIEW_ERROR_CODE,
-            acceptedInteractionResolvedAt,
-          );
-          if (consecutive >= INTERACTION_CONTINUATION_REQUEUE_MAX_ATTEMPTS && latestPostResolutionRun) {
-            const resolved = await resolveContinuationWaitingOnReview(issue);
-            if (resolved) {
-              result.waitingOnReviewResolved += 1;
+          if (adapterFailureClassification.kind === "provider_quota") {
+            const monitored = await scheduleProviderQuotaRecoveryMonitor({
+              issue,
+              latestRun,
+              classification: adapterFailureClassification,
+            });
+            if (monitored) {
+              latestRun = await persistAdapterFailureRecoveryClassification(latestRun, adapterFailureClassification);
+              result.providerQuotaMonitored += 1;
               result.issueIds.push(issue.id);
               continue;
             }
-
+            result.skipped += 1;
+            continue;
+          } else {
             const updated = await escalateStrandedAssignedIssue({
               issue,
               previousStatus: issue.status as StrandedPreviousStatus,
-              latestRun: latestPostResolutionRun,
+              latestRun,
+              recoveryCause: "configuration_incomplete",
               comment:
-                `Paperclip stopped requeueing accepted interaction \`${acceptedContinuationInteraction.id}\` after ` +
-                `${consecutive} consecutive continuation wakes were cancelled while waiting on review. ` +
-                "Moving the issue to `blocked` so the missing execution path is visible for intervention.",
+                "Paperclip classified the latest adapter failure as `configuration_incomplete`. " +
+                "Moving the issue to `blocked` with the configuration fix recorded instead of creating a recovery takeover.",
             });
             if (updated) {
+              latestRun = await persistAdapterFailureRecoveryClassification(latestRun, adapterFailureClassification);
+              result.escalated += 1;
+              result.issueIds.push(issue.id);
+            } else {
+              result.skipped += 1;
+            }
+            continue;
+          }
+        }
+
+        const acceptedContinuationInteraction = await getLatestAcceptedContinuationInteraction(issue.companyId, issue.id);
+        const acceptedInteractionResolvedAt = acceptedContinuationInteraction
+          ? acceptedContinuationInteraction.resolvedAt ?? acceptedContinuationInteraction.updatedAt
+          : null;
+        if (acceptedContinuationInteraction && acceptedInteractionResolvedAt && !pendingExecutionState) {
+          const successfulRunSinceResolution = await hasSuccessfulIssueRunSince(
+            issue.companyId,
+            issue.id,
+            agentId,
+            acceptedInteractionResolvedAt,
+            acceptedContinuationInteraction.id,
+          );
+
+          if (!successfulRunSinceResolution) {
+            if (!agentInvokable) {
+              result.skipped += 1;
+              continue;
+            }
+
+            if (await hasQueuedIssueWake(issue.companyId, issue.id, agentId)) {
+              result.skipped += 1;
+              continue;
+            }
+
+            if (await isInvocationBudgetBlocked(issue, agentId)) {
+              result.skipped += 1;
+              continue;
+            }
+
+            const latestPostResolutionRun = await getLatestIssueRunSince(
+              issue.companyId,
+              issue.id,
+              agentId,
+              acceptedInteractionResolvedAt,
+            );
+            const { consecutive } = await summarizeRecentContinuationRetries(
+              issue.companyId,
+              issue.id,
+              agentId,
+              CONTINUATION_WAITING_ON_REVIEW_ERROR_CODE,
+              acceptedInteractionResolvedAt,
+            );
+            if (consecutive >= INTERACTION_CONTINUATION_REQUEUE_MAX_ATTEMPTS && latestPostResolutionRun) {
+              const resolved = await resolveContinuationWaitingOnReview(issue);
+              if (resolved) {
+                result.waitingOnReviewResolved += 1;
+                result.issueIds.push(issue.id);
+                continue;
+              }
+
+              const updated = await escalateStrandedAssignedIssue({
+                issue,
+                previousStatus: issue.status as StrandedPreviousStatus,
+                latestRun: latestPostResolutionRun,
+                comment:
+                  `Paperclip stopped requeueing accepted interaction \`${acceptedContinuationInteraction.id}\` after ` +
+                  `${consecutive} consecutive continuation wakes were cancelled while waiting on review. ` +
+                  "Moving the issue to `blocked` so the missing execution path is visible for intervention.",
+              });
+              if (updated) {
+                result.escalated += 1;
+                result.issueIds.push(issue.id);
+              } else {
+                result.skipped += 1;
+              }
+              continue;
+            }
+
+            const queued = await enqueueStrandedIssueRecovery({
+              issueId: issue.id,
+              agentId,
+              reason: "issue_continuation_needed",
+              retryReason: "issue_continuation_needed",
+              source: "issue.interaction_continuation_recovery",
+              retryOfRunId: latestPostResolutionRun?.id ?? acceptedContinuationInteraction.sourceRunId ?? latestRun?.id ?? null,
+              extraContext: {
+                mutation: "interaction",
+                interactionId: acceptedContinuationInteraction.id,
+                interactionKind: acceptedContinuationInteraction.kind,
+                interactionStatus: acceptedContinuationInteraction.status,
+                interactionContinuationPolicy: acceptedContinuationInteraction.continuationPolicy,
+                interactionResolvedAt: acceptedInteractionResolvedAt.toISOString(),
+              },
+            });
+            if (queued) {
+              result.continuationRequeued += 1;
+              result.issueIds.push(issue.id);
+            } else {
+              result.skipped += 1;
+            }
+            continue;
+          }
+        }
+
+        if (issue.status === "in_review") {
+          if (!participantAgentId || !pendingExecutionState) {
+            result.skipped += 1;
+            continue;
+          }
+          const participantLatestRun = participantLatestRunForRecovery;
+
+          if (!participantLatestRun || !isTerminalIssueRun(participantLatestRun)) {
+            if (!agentInvokable) {
+              const updated = await escalateStrandedAssignedIssue({
+                issue,
+                previousStatus: "in_review",
+                latestRun: participantLatestRun,
+                comment: buildExecutionReviewParticipantUnavailableComment(participantLatestRun),
+                recoveryCause: EXECUTION_REVIEW_PARTICIPANT_RECOVERY_REASON,
+                recoveryOwnerAgentId: participantAgentId,
+              });
+              if (updated) {
+                result.escalated += 1;
+                result.issueIds.push(issue.id);
+              } else {
+                result.skipped += 1;
+              }
+            } else {
+              result.skipped += 1;
+            }
+            continue;
+          }
+
+          const participantAdapterFailureClassification = isUnsuccessfulTerminalIssueRun(participantLatestRun)
+            ? classifyAdapterFailureForRecovery(participantLatestRun, recoveryNow)
+            : null;
+          if (participantAdapterFailureClassification?.kind === "provider_quota") {
+            const monitored = await scheduleProviderQuotaRecoveryMonitor({
+              issue,
+              latestRun: participantLatestRun,
+              classification: participantAdapterFailureClassification,
+            });
+            if (monitored) {
+              latestRun = await persistAdapterFailureRecoveryClassification(
+                participantLatestRun,
+                participantAdapterFailureClassification,
+              );
+              result.providerQuotaMonitored += 1;
+              result.issueIds.push(issue.id);
+            } else {
+              result.skipped += 1;
+            }
+            continue;
+          }
+          if (participantAdapterFailureClassification?.kind === "configuration_incomplete") {
+            const updated = await escalateStrandedAssignedIssue({
+              issue,
+              previousStatus: "in_review",
+              latestRun: participantLatestRun,
+              recoveryCause: "configuration_incomplete",
+              recoveryOwnerAgentId: participantAgentId,
+              comment:
+                "Paperclip classified the active review participant's latest adapter failure as " +
+                "`configuration_incomplete`. Moving the issue to `blocked` with the configuration fix " +
+                "recorded instead of repeatedly requeueing the reviewer.",
+            });
+            if (updated) {
+              latestRun = await persistAdapterFailureRecoveryClassification(
+                participantLatestRun,
+                participantAdapterFailureClassification,
+              );
               result.escalated += 1;
               result.issueIds.push(issue.id);
             } else {
@@ -3868,40 +3994,6 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
             continue;
           }
 
-          const queued = await enqueueStrandedIssueRecovery({
-            issueId: issue.id,
-            agentId,
-            reason: "issue_continuation_needed",
-            retryReason: "issue_continuation_needed",
-            source: "issue.interaction_continuation_recovery",
-            retryOfRunId: latestPostResolutionRun?.id ?? acceptedContinuationInteraction.sourceRunId ?? latestRun?.id ?? null,
-            extraContext: {
-              mutation: "interaction",
-              interactionId: acceptedContinuationInteraction.id,
-              interactionKind: acceptedContinuationInteraction.kind,
-              interactionStatus: acceptedContinuationInteraction.status,
-              interactionContinuationPolicy: acceptedContinuationInteraction.continuationPolicy,
-              interactionResolvedAt: acceptedInteractionResolvedAt.toISOString(),
-            },
-          });
-          if (queued) {
-            result.continuationRequeued += 1;
-            result.issueIds.push(issue.id);
-          } else {
-            result.skipped += 1;
-          }
-          continue;
-        }
-      }
-
-      if (issue.status === "in_review") {
-        if (!participantAgentId || !pendingExecutionState) {
-          result.skipped += 1;
-          continue;
-        }
-        const participantLatestRun = participantLatestRunForRecovery;
-
-        if (!participantLatestRun || !isTerminalIssueRun(participantLatestRun)) {
           if (!agentInvokable) {
             const updated = await escalateStrandedAssignedIssue({
               issue,
@@ -3917,253 +4009,17 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
             } else {
               result.skipped += 1;
             }
-          } else {
-            result.skipped += 1;
-          }
-          continue;
-        }
-
-        const participantAdapterFailureClassification = isUnsuccessfulTerminalIssueRun(participantLatestRun)
-          ? classifyAdapterFailureForRecovery(participantLatestRun, recoveryNow)
-          : null;
-        if (participantAdapterFailureClassification?.kind === "provider_quota") {
-          const monitored = await scheduleProviderQuotaRecoveryMonitor({
-            issue,
-            latestRun: participantLatestRun,
-            classification: participantAdapterFailureClassification,
-          });
-          if (monitored) {
-            latestRun = await persistAdapterFailureRecoveryClassification(
-              participantLatestRun,
-              participantAdapterFailureClassification,
-            );
-            result.providerQuotaMonitored += 1;
-            result.issueIds.push(issue.id);
-          } else {
-            result.skipped += 1;
-          }
-          continue;
-        }
-        if (participantAdapterFailureClassification?.kind === "configuration_incomplete") {
-          const updated = await escalateStrandedAssignedIssue({
-            issue,
-            previousStatus: "in_review",
-            latestRun: participantLatestRun,
-            recoveryCause: "configuration_incomplete",
-            recoveryOwnerAgentId: participantAgentId,
-            comment:
-              "Paperclip classified the active review participant's latest adapter failure as " +
-              "`configuration_incomplete`. Moving the issue to `blocked` with the configuration fix " +
-              "recorded instead of repeatedly requeueing the reviewer.",
-          });
-          if (updated) {
-            latestRun = await persistAdapterFailureRecoveryClassification(
-              participantLatestRun,
-              participantAdapterFailureClassification,
-            );
-            result.escalated += 1;
-            result.issueIds.push(issue.id);
-          } else {
-            result.skipped += 1;
-          }
-          continue;
-        }
-
-        if (!agentInvokable) {
-          const updated = await escalateStrandedAssignedIssue({
-            issue,
-            previousStatus: "in_review",
-            latestRun: participantLatestRun,
-            comment: buildExecutionReviewParticipantUnavailableComment(participantLatestRun),
-            recoveryCause: EXECUTION_REVIEW_PARTICIPANT_RECOVERY_REASON,
-            recoveryOwnerAgentId: participantAgentId,
-          });
-          if (updated) {
-            result.escalated += 1;
-            result.issueIds.push(issue.id);
-          } else {
-            result.skipped += 1;
-          }
-          continue;
-        }
-
-        if (didAutomaticRecoveryFail(participantLatestRun, EXECUTION_REVIEW_PARTICIPANT_RECOVERY_REASON)) {
-          const updated = await escalateStrandedAssignedIssue({
-            issue,
-            previousStatus: "in_review",
-            latestRun: participantLatestRun,
-            comment: buildExecutionReviewParticipantRecoveryComment(participantLatestRun),
-            recoveryCause: EXECUTION_REVIEW_PARTICIPANT_RECOVERY_REASON,
-            recoveryOwnerAgentId: participantAgentId,
-          });
-          if (updated) {
-            result.escalated += 1;
-            result.issueIds.push(issue.id);
-          } else {
-            result.skipped += 1;
-          }
-          continue;
-        }
-
-        if (await hasQueuedIssueWake(issue.companyId, issue.id, participantAgentId)) {
-          result.skipped += 1;
-          continue;
-        }
-
-        if (await isInvocationBudgetBlocked(issue, participantAgentId)) {
-          result.skipped += 1;
-          continue;
-        }
-
-        const queued = await enqueueStrandedIssueRecovery({
-          issueId: issue.id,
-          agentId: participantAgentId,
-          reason: EXECUTION_REVIEW_PARTICIPANT_RECOVERY_REASON,
-          retryReason: EXECUTION_REVIEW_PARTICIPANT_RECOVERY_REASON,
-          source: "issue.execution_review_recovery",
-          retryOfRunId: participantLatestRun.id,
-          extraContext: {
-            currentStageId: pendingExecutionState.currentStageId ?? null,
-            currentStageType: pendingExecutionState.currentStageType ?? null,
-            reviewRecoveryInstruction:
-              "The previous reviewer run ended while this execution-review stage was still pending. Submit the review decision now, or mark the issue blocked with the exact unblock action.",
-          },
-        });
-        if (queued) {
-          result.reviewParticipantRequeued += 1;
-          result.issueIds.push(issue.id);
-        } else {
-          result.skipped += 1;
-        }
-        continue;
-      }
-
-      if (issue.status === "todo") {
-        if (!latestRun) {
-          if (await hasQueuedIssueWake(issue.companyId, issue.id)) {
-            result.skipped += 1;
             continue;
           }
 
-          if (await isInvocationBudgetBlocked(issue, agentId)) {
-            result.skipped += 1;
-            continue;
-          }
-
-          const queued = await enqueueInitialAssignedTodoDispatch(issue, agentId);
-          if (queued) {
-            result.assignmentDispatched += 1;
-            result.issueIds.push(issue.id);
-          } else {
-            result.skipped += 1;
-          }
-          continue;
-        }
-
-        if (
-          latestRun.status === "succeeded" &&
-          !(await wasTodoHandedBackDuringOrAfterLatestRun(issue, latestRun))
-        ) {
-          result.skipped += 1;
-          continue;
-        }
-
-        if (didAutomaticRecoveryFail(latestRun, "assignment_recovery")) {
-          const failureSummary = summarizeRunFailureForIssueComment(latestRun);
-          const updated = await escalateStrandedAssignedIssue({
-            issue,
-            previousStatus: "todo",
-            latestRun,
-            comment:
-              "Paperclip automatically retried dispatch for this assigned `todo` issue after a lost wake/run, " +
-              `but it still has no live execution path.${failureSummary ?? ""} ` +
-              "Moving it to `blocked` so it is visible for intervention.",
-          });
-          if (updated) {
-            result.escalated += 1;
-            result.issueIds.push(issue.id);
-          } else {
-            result.skipped += 1;
-          }
-          continue;
-        }
-
-        if (await isInvocationBudgetBlocked(issue, agentId)) {
-          result.skipped += 1;
-          continue;
-        }
-
-        const queued = await enqueueStrandedIssueRecovery({
-          issueId: issue.id,
-          agentId,
-          reason: "issue_assignment_recovery",
-          retryReason: "assignment_recovery",
-          source: "issue.assignment_recovery",
-          retryOfRunId: latestRun.id,
-        });
-        if (queued) {
-          result.dispatchRequeued += 1;
-          result.issueIds.push(issue.id);
-        } else {
-          result.skipped += 1;
-        }
-        continue;
-      }
-
-      if (!latestRun && !issue.checkoutRunId && !issue.executionRunId) {
-        result.skipped += 1;
-        continue;
-      }
-      const handoffEvidence = isExhaustedSuccessfulRunHandoff(latestRun);
-      if (handoffEvidence) {
-        if (!handoffEvidence.exhausted) {
-          result.skipped += 1;
-          continue;
-        }
-
-        const updated = await escalateStrandedAssignedIssue({
-          issue,
-          previousStatus: "in_progress",
-          latestRun,
-          recoveryCause: SUCCESSFUL_RUN_MISSING_STATE_REASON,
-          successfulRunHandoffEvidence: handoffEvidence,
-        });
-        if (updated) {
-          result.successfulRunHandoffEscalated += 1;
-          result.issueIds.push(issue.id);
-        } else {
-          result.skipped += 1;
-        }
-        continue;
-      }
-      if (isSuccessfulInProgressContinuationRun(latestRun)) {
-        const successfulRun = latestRun;
-
-        if (!isProductiveContinuationRun(successfulRun)) {
-          result.successfulContinuationObserved += 1;
-          result.skipped += 1;
-          continue;
-        }
-
-        if (isRepeatedProductiveContinuationRecovery(successfulRun)) {
-          // GGU-809: skip escalation if the assignee has shown visible progress
-          // (comment or attachment) within the exemption window. Falling
-          // through here lets the normal continuation-retry path enqueue the
-          // next wake, which is the correct behaviour for batch workflows.
-          const exempted = await hasRecentVisibleProgress(
-            issue.companyId,
-            issue.id,
-            agentId,
-            STRANDED_RECENT_PROGRESS_EXEMPTION_MS,
-          );
-          if (!exempted) {
+          if (didAutomaticRecoveryFail(participantLatestRun, EXECUTION_REVIEW_PARTICIPANT_RECOVERY_REASON)) {
             const updated = await escalateStrandedAssignedIssue({
               issue,
-              previousStatus: "in_progress",
-              latestRun: successfulRun,
-              comment:
-                "Paperclip automatically retried continuation for this assigned `in_progress` issue and the retry " +
-                "made progress, but it still has no live execution path. Moving it to `blocked` so it is visible for intervention.",
+              previousStatus: "in_review",
+              latestRun: participantLatestRun,
+              comment: buildExecutionReviewParticipantRecoveryComment(participantLatestRun),
+              recoveryCause: EXECUTION_REVIEW_PARTICIPANT_RECOVERY_REASON,
+              recoveryOwnerAgentId: participantAgentId,
             });
             if (updated) {
               result.escalated += 1;
@@ -4173,7 +4029,272 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
             }
             continue;
           }
-          result.recentProgressExempted += 1;
+
+          if (await hasQueuedIssueWake(issue.companyId, issue.id, participantAgentId)) {
+            result.skipped += 1;
+            continue;
+          }
+
+          if (await isInvocationBudgetBlocked(issue, participantAgentId)) {
+            result.skipped += 1;
+            continue;
+          }
+
+          const queued = await enqueueStrandedIssueRecovery({
+            issueId: issue.id,
+            agentId: participantAgentId,
+            reason: EXECUTION_REVIEW_PARTICIPANT_RECOVERY_REASON,
+            retryReason: EXECUTION_REVIEW_PARTICIPANT_RECOVERY_REASON,
+            source: "issue.execution_review_recovery",
+            retryOfRunId: participantLatestRun.id,
+            extraContext: {
+              currentStageId: pendingExecutionState.currentStageId ?? null,
+              currentStageType: pendingExecutionState.currentStageType ?? null,
+              reviewRecoveryInstruction:
+                "The previous reviewer run ended while this execution-review stage was still pending. Submit the review decision now, or mark the issue blocked with the exact unblock action.",
+            },
+          });
+          if (queued) {
+            result.reviewParticipantRequeued += 1;
+            result.issueIds.push(issue.id);
+          } else {
+            result.skipped += 1;
+          }
+          continue;
+        }
+
+        if (issue.status === "todo") {
+          if (!latestRun) {
+            if (await hasQueuedIssueWake(issue.companyId, issue.id)) {
+              result.skipped += 1;
+              continue;
+            }
+
+            if (await isInvocationBudgetBlocked(issue, agentId)) {
+              result.skipped += 1;
+              continue;
+            }
+
+            const queued = await enqueueInitialAssignedTodoDispatch(issue, agentId);
+            if (queued) {
+              result.assignmentDispatched += 1;
+              result.issueIds.push(issue.id);
+            } else {
+              result.skipped += 1;
+            }
+            continue;
+          }
+
+          if (
+            latestRun.status === "succeeded" &&
+            !(await wasTodoHandedBackDuringOrAfterLatestRun(issue, latestRun))
+          ) {
+            result.skipped += 1;
+            continue;
+          }
+
+          if (didAutomaticRecoveryFail(latestRun, "assignment_recovery")) {
+            const failureSummary = summarizeRunFailureForIssueComment(latestRun);
+            const updated = await escalateStrandedAssignedIssue({
+              issue,
+              previousStatus: "todo",
+              latestRun,
+              comment:
+                "Paperclip automatically retried dispatch for this assigned `todo` issue after a lost wake/run, " +
+                `but it still has no live execution path.${failureSummary ?? ""} ` +
+                "Moving it to `blocked` so it is visible for intervention.",
+            });
+            if (updated) {
+              result.escalated += 1;
+              result.issueIds.push(issue.id);
+            } else {
+              result.skipped += 1;
+            }
+            continue;
+          }
+
+          if (await isInvocationBudgetBlocked(issue, agentId)) {
+            result.skipped += 1;
+            continue;
+          }
+
+          const queued = await enqueueStrandedIssueRecovery({
+            issueId: issue.id,
+            agentId,
+            reason: "issue_assignment_recovery",
+            retryReason: "assignment_recovery",
+            source: "issue.assignment_recovery",
+            retryOfRunId: latestRun.id,
+          });
+          if (queued) {
+            result.dispatchRequeued += 1;
+            result.issueIds.push(issue.id);
+          } else {
+            result.skipped += 1;
+          }
+          continue;
+        }
+
+        if (!latestRun && !issue.checkoutRunId && !issue.executionRunId) {
+          result.skipped += 1;
+          continue;
+        }
+        const handoffEvidence = isExhaustedSuccessfulRunHandoff(latestRun);
+        if (handoffEvidence) {
+          if (!handoffEvidence.exhausted) {
+            result.skipped += 1;
+            continue;
+          }
+
+          const updated = await escalateStrandedAssignedIssue({
+            issue,
+            previousStatus: "in_progress",
+            latestRun,
+            recoveryCause: SUCCESSFUL_RUN_MISSING_STATE_REASON,
+            successfulRunHandoffEvidence: handoffEvidence,
+          });
+          if (updated) {
+            result.successfulRunHandoffEscalated += 1;
+            result.issueIds.push(issue.id);
+          } else {
+            result.skipped += 1;
+          }
+          continue;
+        }
+        if (isSuccessfulInProgressContinuationRun(latestRun)) {
+          const successfulRun = latestRun;
+
+          if (!isProductiveContinuationRun(successfulRun)) {
+            result.successfulContinuationObserved += 1;
+            result.skipped += 1;
+            continue;
+          }
+
+          if (isRepeatedProductiveContinuationRecovery(successfulRun)) {
+            // GGU-809: skip escalation if the assignee has shown visible progress
+            // (comment or attachment) within the exemption window. Falling
+            // through here lets the normal continuation-retry path enqueue the
+            // next wake, which is the correct behaviour for batch workflows.
+            const exempted = await hasRecentVisibleProgress(
+              issue.companyId,
+              issue.id,
+              agentId,
+              STRANDED_RECENT_PROGRESS_EXEMPTION_MS,
+            );
+            if (!exempted) {
+              const updated = await escalateStrandedAssignedIssue({
+                issue,
+                previousStatus: "in_progress",
+                latestRun: successfulRun,
+                comment:
+                  "Paperclip automatically retried continuation for this assigned `in_progress` issue and the retry " +
+                  "made progress, but it still has no live execution path. Moving it to `blocked` so it is visible for intervention.",
+              });
+              if (updated) {
+                result.escalated += 1;
+                result.issueIds.push(issue.id);
+              } else {
+                result.skipped += 1;
+              }
+              continue;
+            }
+            result.recentProgressExempted += 1;
+          }
+
+          if (await isInvocationBudgetBlocked(issue, agentId)) {
+            result.skipped += 1;
+            continue;
+          }
+
+          const queued = await enqueueStrandedIssueRecovery({
+            issueId: issue.id,
+            agentId,
+            reason: "issue_continuation_needed",
+            retryReason: "issue_continuation_needed",
+            source: "issue.productive_terminal_continuation_recovery",
+            retryOfRunId: successfulRun.id,
+          });
+          if (queued) {
+            result.continuationRequeued += 1;
+            result.issueIds.push(issue.id);
+          } else {
+            result.skipped += 1;
+          }
+          continue;
+        }
+        if (isUnsuccessfulTerminalIssueRun(latestRun)) {
+          const classification = classifyContinuationFailure(latestRun);
+
+          if (classification.errorCode === CONTINUATION_WAITING_ON_REVIEW_ERROR_CODE) {
+            const resolved = await resolveContinuationWaitingOnReview(issue);
+            if (resolved) {
+              result.waitingOnReviewResolved += 1;
+              result.issueIds.push(issue.id);
+              continue;
+            }
+          }
+
+          if (classification.kind === "non_retryable") {
+            const failureSummary = summarizeRunFailureForIssueComment(latestRun);
+            const updated = await escalateStrandedAssignedIssue({
+              issue,
+              previousStatus: "in_progress",
+              latestRun,
+              comment:
+                "Paperclip detected a non-retryable failure on this issue's continuation run " +
+                `(\`${classification.errorCode}\`). Skipping automatic retries and moving it to \`blocked\` ` +
+                `so it is visible for intervention.${failureSummary ?? ""}`,
+            });
+            if (updated) {
+              result.escalated += 1;
+              result.issueIds.push(issue.id);
+            } else {
+              result.skipped += 1;
+            }
+            continue;
+          }
+
+          if (didAutomaticRecoveryFail(latestRun, "issue_continuation_needed")) {
+            const { consecutive, latestFinishedAt } = await summarizeRecentContinuationRetries(
+              issue.companyId,
+              issue.id,
+              agentId,
+              classification.errorCode,
+            );
+            if (consecutive >= classification.maxAttempts) {
+              const failureSummary = summarizeRunFailureForIssueComment(latestRun);
+              const attemptCopy = consecutive <= 1 ? "" : ` (${consecutive}× attempts)`;
+              const causeCopy = classification.errorCode
+                ? ` Latest cause: \`${classification.errorCode}\`.`
+                : "";
+              const updated = await escalateStrandedAssignedIssue({
+                issue,
+                previousStatus: "in_progress",
+                latestRun,
+                comment:
+                  "Paperclip automatically retried continuation for this assigned `in_progress` issue after its live " +
+                  `execution disappeared, but it still has no live execution path${attemptCopy}.${causeCopy}${failureSummary ?? ""} ` +
+                  "Moving it to `blocked` so it is visible for intervention.",
+              });
+              if (updated) {
+                result.escalated += 1;
+                result.issueIds.push(issue.id);
+              } else {
+                result.skipped += 1;
+              }
+              continue;
+            }
+
+            if (classification.baseBackoffMs > 0 && latestFinishedAt) {
+              const elapsed = Date.now() - latestFinishedAt.getTime();
+              const requiredDelay = classification.baseBackoffMs *
+                Math.pow(2, Math.max(0, consecutive - 1));
+              if (elapsed < requiredDelay) {
+                result.skipped += 1;
+                continue;
+              }
+            }
+          }
         }
 
         if (await isInvocationBudgetBlocked(issue, agentId)) {
@@ -4186,8 +4307,8 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
           agentId,
           reason: "issue_continuation_needed",
           retryReason: "issue_continuation_needed",
-          source: "issue.productive_terminal_continuation_recovery",
-          retryOfRunId: successfulRun.id,
+          source: "issue.continuation_recovery",
+          retryOfRunId: latestRun?.id ?? issue.checkoutRunId ?? null,
         });
         if (queued) {
           result.continuationRequeued += 1;
@@ -4195,105 +4316,22 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         } else {
           result.skipped += 1;
         }
-        continue;
-      }
-      if (isUnsuccessfulTerminalIssueRun(latestRun)) {
-        const classification = classifyContinuationFailure(latestRun);
-
-        if (classification.errorCode === CONTINUATION_WAITING_ON_REVIEW_ERROR_CODE) {
-          const resolved = await resolveContinuationWaitingOnReview(issue);
-          if (resolved) {
-            result.waitingOnReviewResolved += 1;
-            result.issueIds.push(issue.id);
-            continue;
-          }
-        }
-
-        if (classification.kind === "non_retryable") {
-          const failureSummary = summarizeRunFailureForIssueComment(latestRun);
-          const updated = await escalateStrandedAssignedIssue({
-            issue,
-            previousStatus: "in_progress",
-            latestRun,
-            comment:
-              "Paperclip detected a non-retryable failure on this issue's continuation run " +
-              `(\`${classification.errorCode}\`). Skipping automatic retries and moving it to \`blocked\` ` +
-              `so it is visible for intervention.${failureSummary ?? ""}`,
-          });
-          if (updated) {
-            result.escalated += 1;
-            result.issueIds.push(issue.id);
-          } else {
-            result.skipped += 1;
-          }
-          continue;
-        }
-
-        if (didAutomaticRecoveryFail(latestRun, "issue_continuation_needed")) {
-          const { consecutive, latestFinishedAt } = await summarizeRecentContinuationRetries(
-            issue.companyId,
-            issue.id,
-            agentId,
-            classification.errorCode,
-          );
-          if (consecutive >= classification.maxAttempts) {
-            const failureSummary = summarizeRunFailureForIssueComment(latestRun);
-            const attemptCopy = consecutive <= 1 ? "" : ` (${consecutive}× attempts)`;
-            const causeCopy = classification.errorCode
-              ? ` Latest cause: \`${classification.errorCode}\`.`
-              : "";
-            const updated = await escalateStrandedAssignedIssue({
-              issue,
-              previousStatus: "in_progress",
-              latestRun,
-              comment:
-                "Paperclip automatically retried continuation for this assigned `in_progress` issue after its live " +
-                `execution disappeared, but it still has no live execution path${attemptCopy}.${causeCopy}${failureSummary ?? ""} ` +
-                "Moving it to `blocked` so it is visible for intervention.",
-            });
-            if (updated) {
-              result.escalated += 1;
-              result.issueIds.push(issue.id);
-            } else {
-              result.skipped += 1;
-            }
-            continue;
-          }
-
-          if (classification.baseBackoffMs > 0 && latestFinishedAt) {
-            const elapsed = Date.now() - latestFinishedAt.getTime();
-            const requiredDelay = classification.baseBackoffMs *
-              Math.pow(2, Math.max(0, consecutive - 1));
-            if (elapsed < requiredDelay) {
-              result.skipped += 1;
-              continue;
-            }
-          }
-        }
-      }
-
-      if (await isInvocationBudgetBlocked(issue, agentId)) {
-        result.skipped += 1;
-        continue;
-      }
-
-      const queued = await enqueueStrandedIssueRecovery({
-        issueId: issue.id,
-        agentId,
-        reason: "issue_continuation_needed",
-        retryReason: "issue_continuation_needed",
-        source: "issue.continuation_recovery",
-        retryOfRunId: latestRun?.id ?? issue.checkoutRunId ?? null,
-      });
-      if (queued) {
-        result.continuationRequeued += 1;
-        result.issueIds.push(issue.id);
-      } else {
+      } catch (err) {
+        logger.error(
+          { err, issueId: issue.id, identifier: issue.identifier, companyId: issue.companyId },
+          "reconcileStrandedAssignedIssues per-issue failure; skipping and continuing",
+        );
         result.skipped += 1;
       }
     }
 
-    const orphanBlockerRecovery = await reconcileUnassignedBlockingIssues();
+    let orphanBlockerRecovery;
+    try {
+      orphanBlockerRecovery = await reconcileUnassignedBlockingIssues();
+    } catch (err) {
+      logger.error({ err }, "reconcileUnassignedBlockingIssues failed; skipping");
+      orphanBlockerRecovery = { assigned: 0, skipped: 0, issueIds: [] };
+    }
     result.orphanBlockersAssigned = orphanBlockerRecovery.assigned;
     result.skipped += orphanBlockerRecovery.skipped;
     result.issueIds.push(...orphanBlockerRecovery.issueIds);
