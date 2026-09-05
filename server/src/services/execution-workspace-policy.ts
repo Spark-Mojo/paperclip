@@ -23,6 +23,14 @@ export type UnrunnableWorktreeIssueRef = {
   projectWorkspaceId?: string | null;
   executionWorkspaceId?: string | null;
   executionWorkspacePreference?: string | null;
+  /**
+   * Set to `true` when the execution workspace is already bound to a DIFFERENT
+   * open issue (`status NOT IN ('done','cancelled')`). The allocator must treat
+   * a cross-issue binding as refused even if the requesting issue opted into
+   * `reuse_existing`; a fresh workspace is provisioned instead. R1 exclusivity
+   * invariant from SPA-5693.
+   */
+  executionWorkspaceHeldByAnotherOpenIssue?: boolean | null;
 };
 
 function cloneRecord(value: Record<string, unknown> | null | undefined): Record<string, unknown> | null {
@@ -85,7 +93,16 @@ export function resolvePinnedIssueWorkspaceStrategyType(input: {
 }
 
 export function hasReusableExecutionWorkspaceBinding(issue: UnrunnableWorktreeIssueRef): boolean {
-  return Boolean(issue.executionWorkspaceId && issue.executionWorkspacePreference === "reuse_existing");
+  if (!issue.executionWorkspaceId || issue.executionWorkspacePreference !== "reuse_existing") {
+    return false;
+  }
+  // R1 exclusivity invariant: a binding that points at a workspace held by
+  // another open issue is NOT reusable. The allocator must refuse the binding
+  // and provision a fresh workspace instead.
+  if (issue.executionWorkspaceHeldByAnotherOpenIssue === true) {
+    return false;
+  }
+  return true;
 }
 
 export function isUnrunnableWorktreeCombo(input: {

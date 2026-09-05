@@ -20578,21 +20578,57 @@ export function heartbeatService(
           bindingId: persistedNativeExecutionWorkspaceId,
           persistedWorkspaceFound: existingExecutionWorkspace !== null,
         });
-      const workspaceReuseRequest =
-        resolveExecutionWorkspaceReuseRequestForIssue({
-          issueExecutionWorkspaceId: requestedExecutionWorkspaceId,
-          issueExecutionWorkspacePreference: nativeRecoveryExecutionWorkspaceId
-            ? "reuse_existing"
-            : (issueRef?.executionWorkspacePreference ?? null),
-          existingExecutionWorkspaceStatus:
-            existingExecutionWorkspace?.status ?? null,
-        });
+      // R1 allocator exclusivity: refuse cross-issue reuse. If the requested
+      // workspace is already bound to a DIFFERENT open issue, the caller must
+      // provision a fresh workspace instead. SPA-5693 follow-up.
+      const executionWorkspaceHeldByAnotherOpenIssue = requestedExecutionWorkspaceId
+        ? Boolean(
+            await db
+              .select({ id: issues.id })
+              .from(issues)
+              .where(
+                and(
+                  eq(issues.companyId, run.companyId),
+                  eq(issues.executionWorkspaceId, requestedExecutionWorkspaceId),
+                  notInArray(issues.status, ["done", "cancelled"]),
+                  issueId ? ne(issues.id, issueId) : sql`true`,
+                ),
+              )
+              .limit(1)
+              .then((rows) => rows[0] ?? null),
+          )
+        : false;
+      // R1 exclusivity invariant: when the requested execution workspace is already
+      // bound to a DIFFERENT open issue, the allocator must refuse the binding and
+      // provision a fresh workspace instead. The reuse request is therefore cleared
+      // locally before any downstream policy/provisioning decision sees it, so the
+      // provisioning path always falls through to realizeWorkspace() rather than
+      // hitting the `inherited_workspace_reuse_unavailable` throw.
+      const allocatorDecision = resolveAllocatorExecutionWorkspaceReuseDecision({
+        issueExecutionWorkspaceId: requestedExecutionWorkspaceId,
+        issueExecutionWorkspacePreference: nativeRecoveryExecutionWorkspaceId
+          ? "reuse_existing"
+          : (issueRef?.executionWorkspacePreference ?? null),
+        existingExecutionWorkspaceStatus:
+          existingExecutionWorkspace?.status ?? null,
+        executionWorkspaceHeldByAnotherOpenIssue,
+      });
       const requestedShouldReuseExisting =
-        workspaceReuseRequest.requestedShouldReuseExisting;
+        allocatorDecision.shouldRestoreExistingWorkspace;
       const reusableExistingExecutionWorkspace =
-        workspaceReuseRequest.existingExecutionWorkspaceAvailable
+        allocatorDecision.shouldRestoreExistingWorkspace
           ? existingExecutionWorkspace
           : null;
+      if (allocatorDecision.refusedCrossIssueBinding) {
+        logger.info(
+          {
+            runId: run.id,
+            issueId,
+            requestedExecutionWorkspaceId: allocatorDecision.requestedExecutionWorkspaceId,
+          },
+          "allocator refuses cross-issue execution_workspace reuse (R1); provisioning fresh workspace",
+        );
+      }
       const requestedReusableExecutionWorkspaceConfig =
         reusableExistingExecutionWorkspace?.config ?? null;
       const localEnvironment = await environmentsSvc.ensureLocalEnvironment(
@@ -21285,7 +21321,7 @@ export function heartbeatService(
         heartbeatRunId: run.id,
         executionWorkspaceId:
           workspaceReuseProvisioningPolicy.shouldRestoreExistingWorkspace
-            ? workspaceReuseRequest.requestedExecutionWorkspaceId
+            ? allocatorDecision.requestedExecutionWorkspaceId
             : null,
         issueId,
       });
@@ -21309,7 +21345,7 @@ export function heartbeatService(
         {
           requestedShouldReuseExisting,
           existingExecutionWorkspaceId:
-            workspaceReuseRequest.requestedExecutionWorkspaceId,
+            allocatorDecision.requestedExecutionWorkspaceId,
           issueRef,
           runId: run.id,
           workspaceConfigFreshness,
@@ -21616,7 +21652,7 @@ export function heartbeatService(
               workspace: {
                 id:
                   reusableExistingExecutionWorkspace?.id ??
-                  workspaceReuseRequest.requestedExecutionWorkspaceId ??
+                  allocatorDecision.requestedExecutionWorkspaceId ??
                   `transient-${run.id}`,
                 cwd: executionWorkspace.cwd,
                 providerType:
@@ -21674,7 +21710,7 @@ export function heartbeatService(
         configSnapshotRefreshed:
           resolvedWorkspaceReusePolicy.shouldRefreshWorkspaceConfigSnapshot,
         previousWorkspaceId:
-          workspaceReuseRequest.requestedExecutionWorkspaceId,
+          allocatorDecision.requestedExecutionWorkspaceId,
         activeWorkspaceId: persistedExecutionWorkspace?.id ?? null,
       });
       if (
@@ -22280,7 +22316,7 @@ export function heartbeatService(
           inferredFingerprint: workspaceConfigFreshness.inferredFingerprint,
           nextFingerprint: workspaceConfigFreshness.nextFingerprint,
           previousWorkspaceId:
-            workspaceReuseRequest.requestedExecutionWorkspaceId,
+            allocatorDecision.requestedExecutionWorkspaceId,
           activeWorkspaceId: persistedExecutionWorkspace?.id ?? null,
         },
       };
