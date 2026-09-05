@@ -32,6 +32,7 @@ export const ISSUE_WRITE_DENIAL_CODES = [
   "cross_issue_influence_cap_exceeded",
   "cross_issue_influence_run_context_required",
   "issue_write_attribution_spoof_rejected",
+  "issue_write_terminal_recomplete",
 ] as const;
 
 export type IssueWriteDenialCode = (typeof ISSUE_WRITE_DENIAL_CODES)[number];
@@ -75,6 +76,8 @@ export interface IssueWriteDenialContext {
   count?: number | null;
   /** ISO timestamp at which log-only rollout becomes enforcement. */
   enforceAt?: string | null;
+  /** Terminal status the PATCH tried to re-assert (SPA-5916). */
+  terminalStatus?: "done" | "cancelled" | null;
 }
 
 export function isIssueWriteDenialCode(
@@ -279,6 +282,35 @@ export function describeIssueWriteDenial(
           `Remove \`onBehalfOfUserId\` from the request and retry; the server fills in ` +
           `${responsible} from your run.`,
       };
+
+    case "issue_write_terminal_recomplete": {
+      // FINAL-SPEC §11.7: finished work stays finished. A routine PATCH that
+      // re-asserts a card's existing terminal status must not silently re-stamp
+      // `completedAt`/`cancelledAt`, replay a stored decision comment, or shift
+      // `executionState.lastDecisionId`. An explicit reopen/resume stays the
+      // sanctioned escape hatch — that path is checked before this guard fires.
+      const alreadyAt =
+        context.terminalStatus === "cancelled" ? "already cancelled" : "already done";
+      return {
+        code,
+        status: 409,
+        tone: "boundary",
+        boundary: "Terminal status",
+        title: `${issue} is ${alreadyAt} — PATCH will not re-complete it`,
+        description:
+          `${issue} is in a terminal status, and FINAL-SPEC §11.7 makes that ` +
+          `state immutable to routine updates. A PATCH that asks for the same ` +
+          `terminal status the card already holds would silently re-stamp the ` +
+          `completion timestamp and replay the stored decision text, which is ` +
+          `how a misrouted PATCH recently corrupted an unrelated closed card.`,
+        whoCanAct:
+          `${assignee} (or any board member) if the work actually needs to move.`,
+        sanctionedPath:
+          `Comment instead of PATCH (comments stay open on closed cards and ` +
+          `wake ${assignee}), or set \`reopen: true\` / \`resume: true\` on the ` +
+          `PATCH to deliberately move the card back to \`todo\` first.`,
+      };
+    }
   }
 }
 
