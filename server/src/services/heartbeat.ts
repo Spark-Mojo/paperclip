@@ -4480,6 +4480,13 @@ export function resolveExecutionWorkspaceReuseRequestForIssue(input: {
   existingExecutionWorkspaceStatus?: string | null;
   requestedExistingBranch?: string | null;
   existingExecutionWorkspaceBranchName?: string | null;
+  /**
+   * R1 exclusivity invariant: when `true`, the requested execution workspace is
+   * already bound to a DIFFERENT open issue (`status NOT IN ('done','cancelled')`).
+   * The allocator must refuse the binding even if the requesting issue opted
+   * into `reuse_existing`; a fresh workspace is provisioned instead.
+   */
+  executionWorkspaceHeldByAnotherOpenIssue?: boolean | null;
 }): ExecutionWorkspaceReuseRequestForIssue {
   const requestedExecutionWorkspaceId = readNonEmptyString(input.issueExecutionWorkspaceId);
   // An explicitly pinned existing branch outranks an inherited reuse_existing
@@ -4495,14 +4502,62 @@ export function resolveExecutionWorkspaceReuseRequestForIssue(input: {
     requestedExecutionWorkspaceId !== null &&
     existingWorkspaceMatchesRequestedBranch;
 
+  const baseAvailable =
+    requestedShouldReuseExisting &&
+    input.existingExecutionWorkspaceStatus !== null &&
+    input.existingExecutionWorkspaceStatus !== undefined &&
+    input.existingExecutionWorkspaceStatus !== "archived";
+
   return {
     requestedExecutionWorkspaceId,
     requestedShouldReuseExisting,
     existingExecutionWorkspaceAvailable:
-      requestedShouldReuseExisting &&
-      input.existingExecutionWorkspaceStatus !== null &&
-      input.existingExecutionWorkspaceStatus !== undefined &&
-      input.existingExecutionWorkspaceStatus !== "archived",
+      baseAvailable && input.executionWorkspaceHeldByAnotherOpenIssue !== true,
+  };
+}
+
+export type AllocatorExecutionWorkspaceReuseDecision = {
+  requestedExecutionWorkspaceId: string | null;
+  /**
+   * `true` only when the allocator should attempt to restore the existing
+   * execution workspace. `false` whenever the request is invalid for any
+   * reason (no id, wrong preference, archived, or — per R1 — bound to a
+   * different open issue).
+   */
+  shouldRestoreExistingWorkspace: boolean;
+  /** `true` when R1 explicitly refused the binding; useful for logging/metrics. */
+  refusedCrossIssueBinding: boolean;
+};
+
+/**
+ * R1 allocator exclusivity invariant, factored as a pure helper so the
+ * "cross-issue reuse → fresh provisioned" decision is unit-testable without a
+ * heartbeat caller.
+ *
+ * When the requested `execution_workspace_id` is already bound to a DIFFERENT
+ * open issue (`status NOT IN ('done','cancelled')`), the allocator MUST refuse
+ * the binding and provision a fresh workspace instead of attempting to restore
+ * the existing one. This helper centralizes that decision alongside
+ * `resolveExecutionWorkspaceReuseRequestForIssue` so callers cannot forget to
+ * apply it before handing off to `provisionExecutionWorkspaceForFreshnessDecision`.
+ */
+export function resolveAllocatorExecutionWorkspaceReuseDecision(input: {
+  issueExecutionWorkspaceId?: string | null;
+  issueExecutionWorkspacePreference?: string | null;
+  existingExecutionWorkspaceStatus?: string | null;
+  requestedExistingBranch?: string | null;
+  existingExecutionWorkspaceBranchName?: string | null;
+  executionWorkspaceHeldByAnotherOpenIssue?: boolean | null;
+}): AllocatorExecutionWorkspaceReuseDecision {
+  const reuseRequest = resolveExecutionWorkspaceReuseRequestForIssue(input);
+  const refusedCrossIssueBinding =
+    reuseRequest.existingExecutionWorkspaceAvailable === false &&
+    reuseRequest.requestedShouldReuseExisting;
+  return {
+    requestedExecutionWorkspaceId: reuseRequest.requestedExecutionWorkspaceId,
+    shouldRestoreExistingWorkspace:
+      reuseRequest.existingExecutionWorkspaceAvailable,
+    refusedCrossIssueBinding,
   };
 }
 
@@ -14550,17 +14605,50 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     const requestedExecutionWorkspaceId = readNonEmptyString(issueRef?.executionWorkspaceId);
     const existingExecutionWorkspace =
       requestedExecutionWorkspaceId ? await executionWorkspacesSvc.getById(requestedExecutionWorkspaceId) : null;
-    const workspaceReuseRequest = resolveExecutionWorkspaceReuseRequestForIssue({
+    // R1 allocator exclusivity: refuse cross-issue reuse. If the requested
+    // workspace is already bound to a DIFFERENT open issue, the caller must
+    // provision a fresh workspace instead. SPA-5693 follow-up.
+    const executionWorkspaceHeldByAnotherOpenIssue = requestedExecutionWorkspaceId
+      ? Boolean(await db
+        .select({ id: issues.id })
+        .from(issues)
+        .where(and(
+          eq(issues.companyId, run.companyId),
+          eq(issues.executionWorkspaceId, requestedExecutionWorkspaceId),
+          notInArray(issues.status, ["done", "cancelled"]),
+          issueId ? ne(issues.id, issueId) : sql`true`,
+        ))
+        .limit(1)
+        .then((rows) => rows[0] ?? null))
+      : false;
+    // R1 exclusivity invariant: when the requested execution workspace is already
+    // bound to a DIFFERENT open issue, the allocator must refuse the binding and
+    // provision a fresh workspace instead. The reuse request is therefore cleared
+    // locally before any downstream policy/provisioning decision sees it, so the
+    // provisioning path always falls through to realizeWorkspace() rather than
+    // hitting the `inherited_workspace_reuse_unavailable` throw.
+    const allocatorDecision = resolveAllocatorExecutionWorkspaceReuseDecision({
       issueExecutionWorkspaceId: requestedExecutionWorkspaceId,
       issueExecutionWorkspacePreference: issueRef?.executionWorkspacePreference ?? null,
       existingExecutionWorkspaceStatus: existingExecutionWorkspace?.status ?? null,
       requestedExistingBranch: issueExecutionWorkspaceSettings?.workspaceStrategy?.existingBranch ?? null,
       existingExecutionWorkspaceBranchName: existingExecutionWorkspace?.branchName ?? null,
+      executionWorkspaceHeldByAnotherOpenIssue,
     });
-    const requestedShouldReuseExisting = workspaceReuseRequest.requestedShouldReuseExisting;
-    const reusableExistingExecutionWorkspace = workspaceReuseRequest.existingExecutionWorkspaceAvailable
+    const requestedShouldReuseExisting = allocatorDecision.shouldRestoreExistingWorkspace;
+    const reusableExistingExecutionWorkspace = allocatorDecision.shouldRestoreExistingWorkspace
       ? existingExecutionWorkspace
       : null;
+    if (allocatorDecision.refusedCrossIssueBinding) {
+      logger.info(
+        {
+          runId: run.id,
+          issueId,
+          requestedExecutionWorkspaceId: allocatorDecision.requestedExecutionWorkspaceId,
+        },
+        "allocator refuses cross-issue execution_workspace reuse (R1); provisioning fresh workspace",
+      );
+    }
     const requestedReusableExecutionWorkspaceConfig = reusableExistingExecutionWorkspace?.config ?? null;
     const localEnvironment = await environmentsSvc.ensureLocalEnvironment(agent.companyId);
     const resolvedInstanceSettings = await instanceSettings.get();
@@ -15059,7 +15147,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       companyId: agent.companyId,
       heartbeatRunId: run.id,
       executionWorkspaceId: workspaceReuseProvisioningPolicy.shouldRestoreExistingWorkspace
-        ? workspaceReuseRequest.requestedExecutionWorkspaceId
+        ? allocatorDecision.requestedExecutionWorkspaceId
         : null,
       issueId,
     });
@@ -15073,7 +15161,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     const { executionWorkspace, reusedExecutionWorkspace, policy: resolvedWorkspaceReusePolicy } =
       await provisionExecutionWorkspaceForFreshnessDecision<RealizedExecutionWorkspace>({
         requestedShouldReuseExisting,
-        existingExecutionWorkspaceId: workspaceReuseRequest.requestedExecutionWorkspaceId,
+        existingExecutionWorkspaceId: allocatorDecision.requestedExecutionWorkspaceId,
         issueRef,
         runId: run.id,
         workspaceConfigFreshness,
@@ -15259,7 +15347,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             workspace: {
               id:
                 reusableExistingExecutionWorkspace?.id
-                ?? workspaceReuseRequest.requestedExecutionWorkspaceId
+                ?? allocatorDecision.requestedExecutionWorkspaceId
                 ?? `transient-${run.id}`,
               cwd: executionWorkspace.cwd,
               providerType: executionWorkspace.strategy === "git_worktree" ? "git_worktree" : "local_fs",
@@ -15303,7 +15391,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       reuseRequested: requestedShouldReuseExisting,
       workspaceReused: Boolean(reusedExecutionWorkspace),
       configSnapshotRefreshed: resolvedWorkspaceReusePolicy.shouldRefreshWorkspaceConfigSnapshot,
-      previousWorkspaceId: workspaceReuseRequest.requestedExecutionWorkspaceId,
+      previousWorkspaceId: allocatorDecision.requestedExecutionWorkspaceId,
       activeWorkspaceId: persistedExecutionWorkspace?.id ?? null,
     });
     if (
@@ -15688,7 +15776,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         storedFingerprint: workspaceConfigFreshness.storedFingerprint,
         inferredFingerprint: workspaceConfigFreshness.inferredFingerprint,
         nextFingerprint: workspaceConfigFreshness.nextFingerprint,
-        previousWorkspaceId: workspaceReuseRequest.requestedExecutionWorkspaceId,
+        previousWorkspaceId: allocatorDecision.requestedExecutionWorkspaceId,
         activeWorkspaceId: persistedExecutionWorkspace?.id ?? null,
       },
     };
@@ -18565,10 +18653,27 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               ))
               .then((rows) => rows[0]?.status ?? null)
             : null;
+          // R1 allocator exclusivity: refuse cross-issue reuse. If the requested
+          // workspace is already bound to a DIFFERENT open issue, the caller
+          // must provision a fresh workspace instead. SPA-5693 follow-up.
+          const executionWorkspaceHeldByAnotherOpenIssue = issue.executionWorkspaceId
+            ? Boolean(await tx
+              .select({ id: issues.id })
+              .from(issues)
+              .where(and(
+                eq(issues.companyId, issue.companyId),
+                eq(issues.executionWorkspaceId, issue.executionWorkspaceId),
+                notInArray(issues.status, ["done", "cancelled"]),
+                issue.id ? ne(issues.id, issue.id) : sql`true`,
+              ))
+              .limit(1)
+              .then((rows) => rows[0] ?? null))
+            : false;
           const reuseRequest = resolveExecutionWorkspaceReuseRequestForIssue({
             issueExecutionWorkspaceId: issue.executionWorkspaceId,
             issueExecutionWorkspacePreference: issue.executionWorkspacePreference,
             existingExecutionWorkspaceStatus,
+            executionWorkspaceHeldByAnotherOpenIssue,
           });
           const hasResolvablePriorSessionWorkspace = await resolveHasResolvablePriorSessionWorkspace();
 

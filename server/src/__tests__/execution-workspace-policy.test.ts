@@ -7,6 +7,7 @@ import {
   buildExecutionWorkspaceAdapterConfig,
   defaultIssueExecutionWorkspaceSettingsForProject,
   gateProjectExecutionWorkspacePolicy,
+  hasReusableExecutionWorkspaceBinding,
   isUnrunnableWorktreeCombo,
   issueExecutionWorkspaceModeForPersistedWorkspace,
   parseIssueExecutionWorkspaceSettings,
@@ -530,5 +531,57 @@ describe("execution workspace policy helpers", () => {
         true,
       ),
     ).toEqual({ enabled: true, defaultMode: "isolated_workspace" });
+  });
+
+  it("treats a reusable binding as available when held by the same open issue", () => {
+    expect(
+      hasReusableExecutionWorkspaceBinding({
+        projectId: null,
+        projectWorkspaceId: null,
+        executionWorkspaceId: "workspace-1",
+        executionWorkspacePreference: "reuse_existing",
+        executionWorkspaceHeldByAnotherOpenIssue: false,
+      }),
+    ).toBe(true);
+  });
+
+  it("refuses cross-issue reuse when another open issue already holds the workspace", () => {
+    expect(
+      hasReusableExecutionWorkspaceBinding({
+        projectId: null,
+        projectWorkspaceId: null,
+        executionWorkspaceId: "workspace-1",
+        executionWorkspacePreference: "reuse_existing",
+        executionWorkspaceHeldByAnotherOpenIssue: true,
+      }),
+    ).toBe(false);
+  });
+
+  it("refuses cross-issue reuse even when only the unrunnable-worktree gate reads it", () => {
+    expect(
+      isUnrunnableWorktreeCombo({
+        issue: {
+          projectId: null,
+          projectWorkspaceId: null,
+          executionWorkspaceId: "workspace-1",
+          executionWorkspacePreference: "reuse_existing",
+          executionWorkspaceHeldByAnotherOpenIssue: true,
+        },
+        resolvedMode: "isolated_workspace",
+        resolvedStrategy: "git_worktree",
+      }),
+    ).toBe(true);
+  });
+
+  it("treats reuse as runnable when another issue holding the workspace is done or cancelled", () => {
+    expect(
+      hasReusableExecutionWorkspaceBinding({
+        projectId: null,
+        projectWorkspaceId: null,
+        executionWorkspaceId: "workspace-1",
+        executionWorkspacePreference: "reuse_existing",
+        executionWorkspaceHeldByAnotherOpenIssue: false,
+      }),
+    ).toBe(true);
   });
 });
