@@ -5002,6 +5002,20 @@ export function recoveryService(
         }
         continue;
       }
+      if (isProductiveContinuationRun(latestRun)) {
+        // Backport of upstream paperclipai/paperclip #12744
+        // ("fix(recovery): continue productive successful handoffs",
+        // head 9d68e0545027): a productive exhausted handoff takes one
+        // bounded normal continuation before any board escalation.
+        // NOTE: on this fork (rebuild/v2026.831.1-survivors) this is a
+        // CARRIED FORK PATCH, not a direct vendored upstream release.
+        // The bounded continuation is enforced by commit f5fe4eede
+        // (HANDOFF_BOUNDED_CONTINUATION_MARKER) and the repeat-escalation
+        // bypass by commit 77ed419d3; do not undo them.
+        result.successfulContinuationObserved += 1;
+        result.skipped += 1;
+        continue;
+      }
       if (isSuccessfulInProgressContinuationRun(latestRun)) {
         const successfulRun = latestRun;
 
