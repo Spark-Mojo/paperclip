@@ -4146,20 +4146,32 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
             continue;
           }
 
-          const updated = await escalateStrandedAssignedIssue({
-            issue,
-            previousStatus: "in_progress",
-            latestRun,
-            recoveryCause: SUCCESSFUL_RUN_MISSING_STATE_REASON,
-            successfulRunHandoffEvidence: handoffEvidence,
-          });
-          if (updated) {
-            result.successfulRunHandoffEscalated += 1;
-            result.issueIds.push(issue.id);
-          } else {
-            result.skipped += 1;
+          // Backport of upstream paperclipai/paperclip #12744
+          // ("fix(recovery): continue productive successful handoffs",
+          // head 9d68e0545027): a productive exhausted handoff takes one
+          // bounded normal continuation before any board escalation.
+          // Retire this note once an upstream release containing #12744
+          // is vendored into this fork.
+          if (!isProductiveContinuationRun(latestRun)) {
+            const updated = await escalateStrandedAssignedIssue({
+              issue,
+              previousStatus: "in_progress",
+              latestRun,
+              recoveryCause: SUCCESSFUL_RUN_MISSING_STATE_REASON,
+              successfulRunHandoffEvidence: handoffEvidence,
+            });
+            if (updated) {
+              result.successfulRunHandoffEscalated += 1;
+              result.issueIds.push(issue.id);
+            } else {
+              result.skipped += 1;
+            }
+            continue;
           }
-          continue;
+
+          // A productive handoff run has a normal continuation path. Let the
+          // bounded continuation recovery below queue its one normal-model wake.
+          // Failed or nonproductive handoffs still need a board recovery.
         }
         if (isSuccessfulInProgressContinuationRun(latestRun)) {
           const successfulRun = latestRun;
