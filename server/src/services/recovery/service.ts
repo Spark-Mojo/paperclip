@@ -112,6 +112,15 @@ export const STRANDED_RECENT_PROGRESS_EXEMPTION_MS = Math.max(
   Number(process.env.STRANDED_RECENT_PROGRESS_EXEMPTION_MS) || 30 * 60 * 1000,
 );
 
+// Marker stamped on the single bounded continuation that an exhausted
+// successful-run handoff is allowed before board escalation. On the next scan
+// that continuation is a repeated productive continuation; this marker tells the
+// GGU-809 guard to bypass the recent-visible-progress exemption and escalate,
+// so a handoff cannot avoid escalation indefinitely by posting progress.
+// Ordinary (non-handoff) batch continuations never carry this marker and keep
+// the GGU-809 exemption.
+export const HANDOFF_BOUNDED_CONTINUATION_MARKER = "handoffBoundedContinuation";
+
 type RecoveryWakeupOptions = {
   source?: "timer" | "assignment" | "on_demand" | "automation";
   triggerDetail?: "manual" | "ping" | "callback" | "system";
@@ -4139,6 +4148,10 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
           result.skipped += 1;
           continue;
         }
+        // Set below when a productive exhausted successful-run handoff is allowed
+        // exactly one bounded normal continuation; the continuation enqueue reads
+        // it to stamp the bounded marker. Reset every iteration.
+        let handoffBoundedContext: { sourceRunId: string | null; correctiveRunId: string } | null = null;
         const handoffEvidence = isExhaustedSuccessfulRunHandoff(latestRun);
         if (handoffEvidence) {
           if (!handoffEvidence.exhausted) {
@@ -4152,6 +4165,12 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
           // bounded normal continuation before any board escalation.
           // Retire this note once an upstream release containing #12744
           // is vendored into this fork.
+          //
+          // SPA-6335 follow-up: that single continuation must be strictly
+          // bounded. Stamp it with HANDOFF_BOUNDED_CONTINUATION_MARKER so the
+          // GGU-809 guard below escalates after exactly one continuation, even
+          // if the agent posts visible progress. Without this, a handoff could
+          // avoid escalation indefinitely through repeated progress.
           if (!isProductiveContinuationRun(latestRun)) {
             const updated = await escalateStrandedAssignedIssue({
               issue,
@@ -4170,8 +4189,15 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
           }
 
           // A productive handoff run has a normal continuation path. Let the
-          // bounded continuation recovery below queue its one normal-model wake.
-          // Failed or nonproductive handoffs still need a board recovery.
+          // bounded continuation recovery below queue its one normal-model wake,
+          // stamped with the bounded marker and source/corrective run identity.
+          // Failed or nonproductive handoffs not already handled by a
+          // higher-priority canonical recovery policy (e.g. the provider-quota
+          // monitor) still need a board recovery.
+          handoffBoundedContext = {
+            sourceRunId: handoffEvidence.sourceRunId,
+            correctiveRunId: handoffEvidence.correctiveRunId,
+          };
         }
         if (isSuccessfulInProgressContinuationRun(latestRun)) {
           const successfulRun = latestRun;
@@ -4183,11 +4209,19 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
           }
 
           if (isRepeatedProductiveContinuationRecovery(successfulRun)) {
-            // GGU-809: skip escalation if the assignee has shown visible progress
-            // (comment or attachment) within the exemption window. Falling
-            // through here lets the normal continuation-retry path enqueue the
-            // next wake, which is the correct behaviour for batch workflows.
-            const exempted = await hasRecentVisibleProgress(
+            // SPA-6335 bounded-handoff carve-out: the continuation created from
+            // an exhausted productive handoff carries HANDOFF_BOUNDED_MARKER.
+            // Read it from THIS run's own context (not the per-iteration handoff
+            // detector — the continuation's wakeReason is not a handoff reason).
+            // On the repeat, escalate regardless of visible progress — otherwise
+            // an agent could avoid escalation indefinitely by posting progress
+            // every heartbeat. GGU-809 still protects ordinary non-handoff
+            // batch continuations, which never carry the marker.
+            const isHandoffBounded = asBoolean(
+              parseObject(successfulRun.contextSnapshot)[HANDOFF_BOUNDED_CONTINUATION_MARKER],
+              false,
+            );
+            const exempted = isHandoffBounded ? false : await hasRecentVisibleProgress(
               issue.companyId,
               issue.id,
               agentId,
@@ -4198,9 +4232,11 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
                 issue,
                 previousStatus: "in_progress",
                 latestRun: successfulRun,
-                comment:
-                  "Paperclip automatically retried continuation for this assigned `in_progress` issue and the retry " +
-                  "made progress, but it still has no live execution path. Moving it to `blocked` so it is visible for intervention.",
+                comment: isHandoffBounded
+                  ? "Paperclip gave this exhausted successful-run handoff its one bounded normal continuation; " +
+                    "the continuation made progress, so escalating to the board now instead of queuing another."
+                  : "Paperclip automatically retried continuation for this assigned `in_progress` issue and the retry " +
+                    "made progress, but it still has no live execution path. Moving it to `blocked` so it is visible for intervention.",
               });
               if (updated) {
                 result.escalated += 1;
@@ -4225,6 +4261,13 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
             retryReason: "issue_continuation_needed",
             source: "issue.productive_terminal_continuation_recovery",
             retryOfRunId: successfulRun.id,
+            extraContext: handoffBoundedContext
+              ? {
+                  [HANDOFF_BOUNDED_CONTINUATION_MARKER]: true,
+                  handoffSourceRunId: handoffBoundedContext.sourceRunId,
+                  handoffCorrectiveRunId: handoffBoundedContext.correctiveRunId,
+                }
+              : undefined,
           });
           if (queued) {
             result.continuationRequeued += 1;

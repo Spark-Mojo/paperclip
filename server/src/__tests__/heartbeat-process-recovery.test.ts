@@ -117,6 +117,7 @@ import {
   SUCCESSFUL_RUN_HANDOFF_REQUIRED_NOTICE_BODY,
   SUCCESSFUL_RUN_MISSING_STATE_REASON,
 } from "../services/recovery/index.ts";
+import { HANDOFF_BOUNDED_CONTINUATION_MARKER } from "../services/recovery/service.ts";
 import {
   UNMANAGED_BACKGROUND_TASK_LIVENESS_REASON,
   UNMANAGED_BACKGROUND_TASK_STOP_REASON,
@@ -3757,6 +3758,10 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       retryReason: "issue_continuation_needed",
       retryOfRunId: runId,
       source: "issue.productive_terminal_continuation_recovery",
+      // SPA-6335 bounded-continuation stamp: one continuation, then escalate.
+      [HANDOFF_BOUNDED_CONTINUATION_MARKER]: true,
+      handoffSourceRunId: sourceRunId,
+      handoffCorrectiveRunId: runId,
     });
 
     const recoveryActions = await db
@@ -3767,6 +3772,87 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
 
     if (retryRun) {
       await waitForRunToSettle(heartbeat, retryRun.id);
+    }
+  });
+
+  // SPA-6335 P1 regression: the repeat of a handoff-derived bounded
+  // continuation still carries the bounded marker, so it escalates after its
+  // one normal continuation even when the agent just posted visible progress.
+  // Ordinary non-handoff batch continuations keep the GGU-809 exemption.
+  it("escalates the repeat of a handoff-derived continuation despite recent progress", async () => {
+    const { companyId, agentId, runId, issueId } =
+      await seedStrandedIssueFixture({
+        status: "in_progress",
+        runStatus: "succeeded",
+        retryReason: "issue_continuation_needed",
+        runSource: "issue.productive_terminal_continuation_recovery",
+        livenessState: "advanced",
+      });
+    const handoffSourceRunId = randomUUID();
+    await db
+      .update(heartbeatRuns)
+      .set({
+        contextSnapshot: {
+          issueId,
+          taskId: issueId,
+          wakeReason: "issue_continuation_needed",
+          retryReason: "issue_continuation_needed",
+          retryOfRunId: randomUUID(),
+          source: "issue.productive_terminal_continuation_recovery",
+          [HANDOFF_BOUNDED_CONTINUATION_MARKER]: true,
+          handoffSourceRunId,
+          handoffCorrectiveRunId: randomUUID(),
+        },
+      })
+      .where(eq(heartbeatRuns.id, runId));
+    // Recent agent-authored comment would trigger the GGU-809 exemption on an
+    // ordinary batch continuation — the bounded marker must bypass it.
+    await db.insert(issueComments).values({
+      companyId,
+      issueId,
+      authorAgentId: agentId,
+      body: "handoff follow-up posted, attaching shortly",
+    });
+    const heartbeat = heartbeatService(db);
+
+    const result = await heartbeat.reconcileStrandedAssignedIssues();
+    expect(result.escalated).toBe(1);
+    expect(result.recentProgressExempted).toBe(0);
+    expect(result.continuationRequeued).toBe(0);
+    expect(result.issueIds).toEqual([issueId]);
+
+    const issue = await db
+      .select()
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0] ?? null);
+    expect(issue?.status).toBe("blocked");
+
+    // The escalation path queues its own source-scoped recovery wake (not a
+    // continuation), so at most one extra run may appear.
+    const runs = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.agentId, agentId));
+    expect(runs.length).toBeLessThanOrEqual(2);
+    for (const run of runs) {
+      if (run.id === runId) continue;
+      expect(
+        (run.contextSnapshot as Record<string, unknown> | null)?.retryReason,
+      ).not.toBe("issue_continuation_needed");
+    }
+
+    const recoveryAction = await expectSourceScopedStrandedRecoveryAction({
+      companyId,
+      agentId,
+      issueId,
+      runId,
+      previousStatus: "in_progress",
+      retryReason: "issue_continuation_needed",
+    });
+
+    if (recoveryAction) {
+      await waitForRunToSettle(heartbeat, runId);
     }
   });
 
