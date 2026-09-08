@@ -2,6 +2,7 @@ import { and, desc, eq, sql } from "drizzle-orm";
 import { activityLog, type Db } from "@paperclipai/db";
 import type { IssueReviewPolicy } from "@paperclipai/shared";
 import { forbidden } from "../errors.js";
+import { normalizeIssueExecutionPolicy, parseIssueExecutionState } from "./issue-execution-policy.js";
 
 export interface IssueReviewVerdictActor {
   type: "agent" | "user";
@@ -133,5 +134,31 @@ export async function assertIssueReviewVerdictActorAllowed(
       allowedActor: "writer_other_than_review_requester",
       remediation: "Have another writer with issue write access submit the verdict, or change reviewPolicy to `anyone`.",
     },
+  );
+}
+
+/**
+ * HW-5 (SPA-6268): the stalled-review recovery route admits the active
+ * configured review participant without granting general board authority.
+ * Returns true only when the issue carries an active (pending) review or
+ * approval execution stage whose configured participants include the calling
+ * agent. Every other caller — including agents assigned to the issue but not
+ * configured on the stage — is rejected by the route with 403.
+ */
+export function isActiveReviewStageAgentParticipant(
+  issue: {
+    executionPolicy?: unknown;
+    executionState?: unknown;
+  },
+  agentId: string | null | undefined,
+): boolean {
+  if (!agentId) return false;
+  const policy = normalizeIssueExecutionPolicy(issue.executionPolicy ?? null);
+  const state = parseIssueExecutionState(issue.executionState ?? null);
+  if (!policy || !state || state.status !== "pending" || !state.currentStageId) return false;
+  const stage = policy.stages.find((candidate) => candidate.id === state.currentStageId) ?? null;
+  if (!stage || (stage.type !== "review" && stage.type !== "approval")) return false;
+  return stage.participants.some(
+    (participant) => participant.type === "agent" && participant.agentId === agentId,
   );
 }

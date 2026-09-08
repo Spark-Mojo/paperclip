@@ -1,13 +1,16 @@
+import { randomUUID } from "node:crypto";
 import { and, eq } from "drizzle-orm";
-import { issues, type Db } from "@paperclipai/db";
+import { heartbeatRuns, issueExecutionDecisions, issues, type Db } from "@paperclipai/db";
 import type { StalledReviewDecisionAction } from "@paperclipai/shared";
 import { conflict, notFound } from "../errors.js";
 import { logActivity } from "./activity-log.js";
+import { normalizeIssueExecutionPolicy, parseIssueExecutionState } from "./issue-execution-policy.js";
 import { visibleIssueCondition } from "./issue-visibility.js";
 import { issueService } from "./issues.js";
 
 export interface StalledReviewDecisionActor {
-  userId: string;
+  userId?: string | null;
+  agentId?: string | null;
   runId?: string | null;
 }
 
@@ -53,44 +56,103 @@ export function stalledReviewDecisionService(db: Db) {
         });
       }
 
+      // An agent-owned review stage records its verdict in
+      // issue_execution_decisions exactly like the live PATCH path does, so a
+      // stalled recovery decision completes the stage instead of stranding it.
+      // Issues without an active review/approval execution stage (the
+      // board-only recovery case) keep the previous behavior: status move plus
+      // comment, no decision row.
+      const isAgent = !!input.actor.agentId;
+      const actorId = isAgent ? input.actor.agentId! : input.actor.userId ?? "board";
+      const policy = normalizeIssueExecutionPolicy(lockedIssue.executionPolicy ?? null);
+      const state = parseIssueExecutionState(lockedIssue.executionState ?? null);
+      const activeStage = policy && state && state.status === "pending" && state.currentStageId
+        ? policy.stages.find((stage) =>
+            stage.id === state.currentStageId &&
+            (stage.type === "review" || stage.type === "approval"),
+          ) ?? null
+        : null;
+      const decisionId = activeStage ? randomUUID() : null;
+      const outcome = input.action === "approve" ? "approved" : "changes_requested";
+      // Invalid/stale run ids must not 500 the inserts — null out unknowns,
+      // the same way comment creation does.
+      const decisionRunId = input.actor.runId
+        ? await tx
+            .select({ id: heartbeatRuns.id })
+            .from(heartbeatRuns)
+            .where(and(
+              eq(heartbeatRuns.id, input.actor.runId),
+              eq(heartbeatRuns.companyId, lockedIssue.companyId),
+            ))
+            .then((rows) => rows[0]?.id ?? null)
+        : null;
+
       const comment = input.note
         ? await svc.addComment(
             lockedIssue.id,
             input.note,
-            { userId: input.actor.userId, runId: input.actor.runId ?? null },
-            { authorType: "user" },
+            isAgent
+              ? { agentId: input.actor.agentId!, runId: input.actor.runId ?? null }
+              : { userId: input.actor.userId!, runId: input.actor.runId ?? null },
+            isAgent ? { authorType: "agent" } : { authorType: "user" },
             tx,
           )
         : null;
       const status = input.action === "approve" ? "done" : "todo";
       const updated = await svc.update(lockedIssue.id, {
         status,
-        actorUserId: input.actor.userId,
+        ...(isAgent
+          ? { actorAgentId: input.actor.agentId! }
+          : { actorUserId: input.actor.userId! }),
+        ...(decisionId && state
+          ? {
+              executionState: {
+                ...state,
+                lastDecisionId: decisionId,
+                lastDecisionOutcome: outcome,
+              },
+            }
+          : {}),
       }, tx);
       if (!updated) throw notFound("Issue not found");
+
+      if (decisionId && activeStage) {
+        await tx.insert(issueExecutionDecisions).values({
+          id: decisionId,
+          companyId: updated.companyId,
+          issueId: updated.id,
+          stageId: activeStage.id,
+          stageType: activeStage.type,
+          actorAgentId: input.actor.agentId ?? null,
+          actorUserId: isAgent ? null : (input.actor.userId ?? null),
+          outcome,
+          body: input.note ?? "",
+          createdByRunId: decisionRunId,
+        });
+      }
 
       if (comment) {
         await logActivity(txDb, {
           companyId: updated.companyId,
-          actorType: "user",
-          actorId: input.actor.userId,
-          runId: input.actor.runId ?? null,
+          actorType: isAgent ? "agent" : "user",
+          actorId,
+          runId: decisionRunId,
           action: "issue.comment_added",
           entityType: "issue",
           entityId: updated.id,
           issueId: updated.id,
           details: {
             commentId: comment.id,
-            authorUserId: input.actor.userId,
+            ...(isAgent ? { authorAgentId: input.actor.agentId! } : { authorUserId: input.actor.userId! }),
             source: "stalled_review_decision",
           },
         });
       }
       await logActivity(txDb, {
         companyId: updated.companyId,
-        actorType: "user",
-        actorId: input.actor.userId,
-        runId: input.actor.runId ?? null,
+        actorType: isAgent ? "agent" : "user",
+        actorId,
+        runId: decisionRunId,
         action: "issue.stalled_review_decided",
         entityType: "issue",
         entityId: updated.id,
@@ -100,7 +162,10 @@ export function stalledReviewDecisionService(db: Db) {
           status,
           identifier: updated.identifier,
           commentId: comment?.id ?? null,
-          authorUserId: comment ? input.actor.userId : null,
+          ...(isAgent
+            ? { authorAgentId: comment ? input.actor.agentId! : null }
+            : { authorUserId: comment ? input.actor.userId! : null }),
+          decisionId,
           _previous: { status: lockedIssue.status },
         },
       });
