@@ -8349,9 +8349,15 @@ export function issueRoutes(
       if (actor.actorType === "agent") {
         // HW-5 (SPA-6268): the active configured review participant records
         // approve/request_changes through this scoped route. No board
-        // authority is granted: any agent not configured on the issue's active
-        // review/approval execution stage is rejected here.
-        if (!actor.agentId || !isActiveReviewStageAgentParticipant(issue, actor.agentId)) {
+        // authority is granted: an agent that is neither a configured
+        // participant of the active review/approval stage nor the issue's
+        // current assignee is rejected here. The assignee check lets a
+        // legitimately-routed agent reach the service when the stage has
+        // already completed (the issue left `in_review`), so the service can
+        // return the semantically-correct 409 instead of a misleading 403.
+        const isParticipant = !!actor.agentId && isActiveReviewStageAgentParticipant(issue, actor.agentId);
+        const isAssignee = !!actor.agentId && actor.agentId === issue.assigneeAgentId;
+        if (!isParticipant && !isAssignee) {
           throw forbidden("Only a configured participant of the active review stage may record this decision");
         }
       } else {
@@ -8383,6 +8389,7 @@ export function issueRoutes(
         action: req.body.action,
         note: req.body.note,
         actor: {
+          type: actor.actorType,
           userId: actor.actorType === "user" ? actor.actorId : null,
           agentId: actor.agentId ?? null,
           runId: actor.runId,
