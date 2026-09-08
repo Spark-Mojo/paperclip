@@ -217,6 +217,7 @@ import { externalObjectService } from "../services/external-objects.js";
 import { deliverAgentUnblockNotification } from "../services/routable-blocked.js";
 import {
   assertIssueReviewVerdictActorAllowed,
+  isActiveReviewStageAgentParticipant,
   isIssueReviewVerdictInteraction,
 } from "../services/issue-review-policy.js";
 import {
@@ -8343,35 +8344,54 @@ export function issueRoutes(
       const id = req.params.id as string;
       const issue = await getAccessibleResource(req, res, svc.getById(id), "Issue not found");
       if (!issue) return;
-      assertBoard(req);
+      const actor = getActorInfo(req);
 
-      if (req.actor.source !== "local_implicit") {
-        const userId = req.actor.userId?.trim();
-        const membership = userId
-          ? await db
-              .select({ membershipRole: companyMemberships.membershipRole })
-              .from(companyMemberships)
-              .where(and(
-                eq(companyMemberships.companyId, issue.companyId),
-                eq(companyMemberships.principalType, "user"),
-                eq(companyMemberships.principalId, userId),
-                eq(companyMemberships.status, "active"),
-              ))
-              .then((rows) => rows[0] ?? null)
-          : null;
-        if (!membership?.membershipRole || membership.membershipRole === "viewer") {
-          throw forbidden("Active non-viewer company membership required");
+      if (actor.actorType === "agent") {
+        // HW-5 (SPA-6268): the active configured review participant records
+        // approve/request_changes through this scoped route. No board
+        // authority is granted: an agent that is neither a configured
+        // participant of the active review/approval stage nor the issue's
+        // current assignee is rejected here. The assignee check lets a
+        // legitimately-routed agent reach the service when the stage has
+        // already completed (the issue left `in_review`), so the service can
+        // return the semantically-correct 409 instead of a misleading 403.
+        const isParticipant = !!actor.agentId && isActiveReviewStageAgentParticipant(issue, actor.agentId);
+        const isAssignee = !!actor.agentId && actor.agentId === issue.assigneeAgentId;
+        if (!isParticipant && !isAssignee) {
+          throw forbidden("Only a configured participant of the active review stage may record this decision");
+        }
+      } else {
+        assertBoard(req);
+
+        if (req.actor.source !== "local_implicit") {
+          const userId = req.actor.userId?.trim();
+          const membership = userId
+            ? await db
+                .select({ membershipRole: companyMemberships.membershipRole })
+                .from(companyMemberships)
+                .where(and(
+                  eq(companyMemberships.companyId, issue.companyId),
+                  eq(companyMemberships.principalType, "user"),
+                  eq(companyMemberships.principalId, userId),
+                  eq(companyMemberships.status, "active"),
+                ))
+                .then((rows) => rows[0] ?? null)
+            : null;
+          if (!membership?.membershipRole || membership.membershipRole === "viewer") {
+            throw forbidden("Active non-viewer company membership required");
+          }
         }
       }
 
-      const actor = getActorInfo(req);
       const result = await stalledReviewDecisionService(db).decide({
         issueId: issue.id,
         companyId: issue.companyId,
         action: req.body.action,
         note: req.body.note,
         actor: {
-          userId: actor.actorId,
+          type: actor.actorType,
+          userId: actor.actorType === "user" ? actor.actorId : null,
+          agentId: actor.agentId ?? null,
           runId: actor.runId,
         },
       });
@@ -8407,7 +8427,7 @@ export function issueRoutes(
 
       let wakeQueued = false;
       if (req.body.action !== "approve" && result.issue.assigneeAgentId) {
-        const userAuthoredNote = result.comment
+        const userAuthoredNote = actor.actorType === "user" && result.comment
           ? { commentId: result.comment.id, authorUserId: actor.actorId }
           : undefined;
         try {
@@ -8416,7 +8436,7 @@ export function issueRoutes(
             triggerDetail: "system",
             reason: "issue_status_changed",
             idempotencyKey: `stalled-review-decision:${result.issue.id}:${req.body.action}`,
-            requestedByActorType: "user",
+            requestedByActorType: actor.actorType,
             requestedByActorId: actor.actorId,
             payload: {
               issueId: result.issue.id,
