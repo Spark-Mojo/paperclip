@@ -91,11 +91,13 @@ export function stalledReviewDecisionService(db: Db) {
         });
       }
 
-      // Fix 2: authorize the EXACT current participant under the same row
-      // lock. `currentParticipant` (not stage membership, not the assignee
-      // column) is the execution lane's statement of who may advance the
-      // stage right now — re-reading the drifted column is not enough, and a
-      // pre-lock check races with stage/policy mutation.
+      // Fix 2: authorize AGENTS as the EXACT current participant under the
+      // same row lock. `currentParticipant` (not stage membership, not the
+      // assignee column) is the execution lane's statement of which agent may
+      // advance the stage right now — re-reading the drifted column is not
+      // enough, and a pre-lock check races with stage/policy mutation.
+      // Authorized board users retain stalled-review recovery authority and
+      // are governed by the locked review-policy guard below.
       const policy = normalizeIssueExecutionPolicy(lockedIssue.executionPolicy ?? null);
       const state = parseIssueExecutionState(lockedIssue.executionState ?? null);
       const lockedStage = policy && state?.currentStageId
@@ -110,19 +112,15 @@ export function stalledReviewDecisionService(db: Db) {
         (lockedStage.type === "review" || lockedStage.type === "approval") &&
         !!currentParticipant;
 
-      if (isExecutionVerdict) {
-        const callerId = input.actor.type === "agent" ? input.actor.agentId : input.actor.userId;
-        const participantId = currentParticipant.type === "agent"
-          ? currentParticipant.agentId
-          : currentParticipant.userId;
+      if (isExecutionVerdict && input.actor.type === "agent") {
         if (
-          !callerId ||
-          currentParticipant.type !== input.actor.type ||
-          participantId !== callerId
+          !input.actor.agentId ||
+          currentParticipant.type !== "agent" ||
+          currentParticipant.agentId !== input.actor.agentId
         ) {
           throw forbidden("Only the current participant of the active review stage may record this decision");
         }
-      } else if (input.actor.type === "agent") {
+      } else if (!isExecutionVerdict && input.actor.type === "agent") {
         // No active execution verdict to record (board-only recovery shape):
         // agents hold no authority here.
         throw forbidden("Only a configured participant of the active review stage may record this decision");
@@ -191,6 +189,11 @@ export function stalledReviewDecisionService(db: Db) {
               agentId: isAgent ? input.actor.agentId ?? null : null,
               userId: isAgent ? null : (input.actor.userId ?? null),
             },
+            // The locked route/service authorization and review-policy checks
+            // above admit only a board user here. Preserve that real actor for
+            // the canonical decision while allowing it to recover an agent
+            // participant's stalled stage without a state-clearing override.
+            allowCurrentStageDecisionOverride: input.actor.type === "user",
             commentBody,
           })
         : { patch: {} as Record<string, unknown>, decision: undefined };
