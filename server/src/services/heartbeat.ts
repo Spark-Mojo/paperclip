@@ -17480,6 +17480,21 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           sql`select id from issues where id = ${issueId} and company_id = ${agent.companyId} for update`,
         );
 
+        if (opts.idempotencyKey?.startsWith("handoff_bounded_continuation:")) {
+          const existing = await tx.select({ id: agentWakeupRequests.id })
+            .from(agentWakeupRequests)
+            .where(and(
+              eq(agentWakeupRequests.companyId, agent.companyId),
+              eq(agentWakeupRequests.agentId, agentId),
+              eq(agentWakeupRequests.idempotencyKey, opts.idempotencyKey),
+              ne(agentWakeupRequests.status, "skipped"),
+            ))
+            .limit(1);
+          // Terminal queue rows also consume C1. Returning no run prevents a
+          // stale recovery worker from counting or executing the winner again.
+          if (existing.length > 0) return { kind: "skipped" as const };
+        }
+
         const issue = await tx
           .select({
             id: issues.id,
