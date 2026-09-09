@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { and, eq } from "drizzle-orm";
+import { and, eq, sql } from "drizzle-orm";
 import { heartbeatRuns, issueExecutionDecisions, issues, type Db } from "@paperclipai/db";
 import { isUuidLike, type StalledReviewDecisionAction } from "@paperclipai/shared";
 import { conflict, forbidden, notFound } from "../errors.js";
@@ -136,9 +136,10 @@ export function stalledReviewDecisionService(db: Db) {
         actor: { type: input.actor.type, id: actorId },
       });
 
-      // Fix 4 (continued): stale, foreign-company, and foreign-agent ids
-      // resolve to null before they reach UUID audit columns. A heartbeat run
-      // is provenance for its exact agent, not a reusable company-scoped token.
+      // Fix 4 (continued): stale, foreign-company, foreign-agent, wrong-issue,
+      // and unbound ids resolve to null before they reach UUID audit columns. A
+      // heartbeat run is provenance for its exact agent and target issue, not a
+      // reusable company-scoped token.
       const candidateRunId = resolveRunIdForDecisionColumn(input.actor.runId);
       const decisionRunId = candidateRunId && input.actor.type === "agent" && input.actor.agentId
         ? await tx
@@ -148,6 +149,7 @@ export function stalledReviewDecisionService(db: Db) {
               eq(heartbeatRuns.id, candidateRunId),
               eq(heartbeatRuns.companyId, lockedIssue.companyId),
               eq(heartbeatRuns.agentId, input.actor.agentId),
+              sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${lockedIssue.id}`,
             ))
             .then((rows) => rows[0]?.id ?? null)
         : null;

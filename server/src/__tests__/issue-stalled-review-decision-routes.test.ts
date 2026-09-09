@@ -197,7 +197,12 @@ describeEmbeddedPostgres("stalled review decision routes", () => {
     };
   }
 
-  async function seedRun(companyId: string, agentId: string, issueId: string) {
+  async function seedRun(
+    companyId: string,
+    agentId: string,
+    issueId: string | null,
+    status: "running" | "succeeded" = "running",
+  ) {
     const runId = randomUUID();
     await db.insert(heartbeatRuns).values({
       id: runId,
@@ -205,8 +210,8 @@ describeEmbeddedPostgres("stalled review decision routes", () => {
       agentId,
       invocationSource: "assignment",
       triggerDetail: "system",
-      status: "running",
-      contextSnapshot: { issueId, wakeReason: "issue_assigned" },
+      status,
+      contextSnapshot: issueId ? { issueId, wakeReason: "issue_assigned" } : {},
     });
     return runId;
   }
@@ -506,6 +511,40 @@ describeEmbeddedPostgres("stalled review decision routes", () => {
         action: "request_changes",
         commentId: response.body.comment.id,
       },
+    });
+  });
+
+  it("requires a note for board send_back and preserves request-changes recovery semantics", async () => {
+    const seeded = await seedCompany("SBK");
+    const issueId = await seedReview({
+      companyId: seeded.companyId,
+      assigneeAgentId: seeded.assigneeAgentId,
+      identifier: "SBK-1",
+    });
+    const actor = boardActor(seeded.companyId, seeded.memberUserId);
+
+    await request(app(actor))
+      .post(`/api/issues/${issueId}/stalled-review-decision`)
+      .send({ action: "send_back" })
+      .expect(422);
+
+    const res = await request(app(actor))
+      .post(`/api/issues/${issueId}/stalled-review-decision`)
+      .send({ action: "send_back", note: "Please revise the edge case." })
+      .expect(200);
+    expect(res.body).toMatchObject({
+      action: "send_back",
+      wakeQueued: true,
+      issue: { id: issueId, status: "todo" },
+      comment: {
+        issueId,
+        authorUserId: seeded.memberUserId,
+        body: "Please revise the edge case.",
+      },
+    });
+    expect(enqueueWakeup.mock.calls[0]?.[1]).toMatchObject({
+      payload: { issueId, reviewDecision: "send_back" },
+      contextSnapshot: { issueId, reviewDecision: "send_back" },
     });
   });
 
@@ -857,7 +896,7 @@ describeEmbeddedPostgres("stalled review decision routes", () => {
     });
   });
 
-  it("normalizes malformed, stale, foreign, and mismatched-agent run ids to null without failing the decision", async () => {
+  it("normalizes malformed, stale, foreign, mismatched-agent, wrong-issue, and unbound run ids to null without failing the decision", async () => {
     // HW-5 (SPA-6268 fix 4): the run id travels into a UUID column
     // (issue_execution_decisions.createdByRunId). A malformed id, a valid id
     // that is absent from heartbeatRuns, and a foreign-company id must all
@@ -902,14 +941,23 @@ describeEmbeddedPostgres("stalled review decision routes", () => {
       return issueId;
     };
 
-    const validRunId = await seedRun(seeded.companyId, reviewerAgentId, "RUN-1");
     const validIssueId = await makeIssue("RUN-1");
     const malformedIssueId = await makeIssue("RUN-2");
     const staleIssueId = await makeIssue("RUN-3");
     const foreignCompanyIssueId = await makeIssue("RUN-4");
     const mismatchedAgentIssueId = await makeIssue("RUN-5");
+    const wrongIssueId = await makeIssue("RUN-6");
+    const unboundIssueId = await makeIssue("RUN-7");
+    const validRunId = await seedRun(seeded.companyId, reviewerAgentId, validIssueId, "succeeded");
     const foreignCompanyRunId = await seedRun(foreign.companyId, foreign.assigneeAgentId, "FRUN-1");
-    const mismatchedAgentRunId = await seedRun(seeded.companyId, seeded.peerAgentId, "RUN-5");
+    const mismatchedAgentRunId = await seedRun(
+      seeded.companyId,
+      seeded.peerAgentId,
+      mismatchedAgentIssueId,
+      "succeeded",
+    );
+    const wrongIssueRunId = await seedRun(seeded.companyId, reviewerAgentId, validIssueId, "succeeded");
+    const unboundRunId = await seedRun(seeded.companyId, reviewerAgentId, null, "succeeded");
 
     // Same-company valid run: attributed.
     const validRes = await request(app(agentActor(seeded.companyId, reviewerAgentId, validRunId)))
@@ -947,6 +995,20 @@ describeEmbeddedPostgres("stalled review decision routes", () => {
       .expect(200);
     expect(mismatchedAgentRes.body.issue.status).toBe("done");
 
+    // Same-agent runs are bound to the issue recorded at invocation; they
+    // cannot be replayed on another review, and runs without an issue binding
+    // are not provenance for any decision.
+    const wrongIssueRes = await request(app(agentActor(seeded.companyId, reviewerAgentId, wrongIssueRunId)))
+      .post(`/api/issues/${wrongIssueId}/stalled-review-decision`)
+      .send({ action: "approve", note: "Wrong-issue run." })
+      .expect(200);
+    expect(wrongIssueRes.body.issue.status).toBe("done");
+    const unboundRes = await request(app(agentActor(seeded.companyId, reviewerAgentId, unboundRunId)))
+      .post(`/api/issues/${unboundIssueId}/stalled-review-decision`)
+      .send({ action: "approve", note: "Unbound run." })
+      .expect(200);
+    expect(unboundRes.body.issue.status).toBe("done");
+
     const decisions = await db
       .select()
       .from(issueExecutionDecisions)
@@ -957,5 +1019,7 @@ describeEmbeddedPostgres("stalled review decision routes", () => {
     expect(byIssue.get(staleIssueId)?.createdByRunId).toBeNull();
     expect(byIssue.get(foreignCompanyIssueId)?.createdByRunId).toBeNull();
     expect(byIssue.get(mismatchedAgentIssueId)?.createdByRunId).toBeNull();
+    expect(byIssue.get(wrongIssueId)?.createdByRunId).toBeNull();
+    expect(byIssue.get(unboundIssueId)?.createdByRunId).toBeNull();
   });
 });

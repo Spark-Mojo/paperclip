@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
-import { Router, type Request, type Response } from "express";
+import { Router, type NextFunction, type Request, type Response } from "express";
 import multer from "multer";
 import { z } from "zod";
 import { and, asc, desc, eq, inArray, isNull, notInArray } from "drizzle-orm";
@@ -231,6 +231,16 @@ const MAX_ISSUE_COMMENT_LIMIT = 500;
 const updateIssueRouteSchema = updateIssueSchema.extend({
   interrupt: z.boolean().optional(),
 });
+
+function validateStalledReviewDecision(req: Request, _res: Response, next: NextFunction) {
+  const parsed = stalledReviewDecisionSchema.safeParse(req.body);
+  if (!parsed.success) {
+    next(unprocessable("Invalid stalled review decision", { issues: parsed.error.issues }));
+    return;
+  }
+  req.body = parsed.data;
+  next();
+}
 
 function prefersMinimalIssueUpdateResponse(req: Request) {
   return (req.get("Prefer") ?? "")
@@ -8339,7 +8349,7 @@ export function issueRoutes(
 
   router.post(
     "/issues/:id/stalled-review-decision",
-    validate(stalledReviewDecisionSchema),
+    validateStalledReviewDecision,
     async (req, res) => {
       const id = req.params.id as string;
       const issue = await getAccessibleResource(req, res, svc.getById(id), "Issue not found");
