@@ -825,16 +825,75 @@ describeEmbeddedPostgres("stalled review decision routes", () => {
     expect(activities.length).toBeGreaterThan(0);
     for (const row of activities) expect(row.actorType).toBe("agent");
 
-    // Completes exactly once: the retry sees a non-review status.
+    // Completion removes the active-stage configuration, so a retry cannot
+    // regain decision-route authority through the now-stale assignee column.
     await request(app(agentActor(seeded.companyId, reviewerAgentId)))
       .post(`/api/issues/${issueId}/stalled-review-decision`)
       .send({ action: "approve", note: "Second approval." })
-      .expect(409);
+      .expect(403);
     const decisionsAfter = await db
       .select({ id: issueExecutionDecisions.id })
       .from(issueExecutionDecisions)
       .where(eq(issueExecutionDecisions.issueId, issueId));
     expect(decisionsAfter).toHaveLength(1);
+  });
+
+  it("rejects an assigned but unconfigured agent before stalled-review decision mutation", async () => {
+    const seeded = await seedCompany("NPA");
+    const reviewerAgentId = seeded.assigneeAgentId;
+    const issueId = await seedReview({
+      companyId: seeded.companyId,
+      assigneeAgentId: seeded.peerAgentId,
+      identifier: "NPA-1",
+    });
+    const stageId = randomUUID();
+    await db.update(agents).set({ status: "paused" }).where(eq(agents.id, reviewerAgentId));
+    await db.update(issues).set({
+      executionPolicy: {
+        mode: "normal",
+        commentRequired: true,
+        stages: [{
+          id: stageId,
+          type: "review",
+          approvalsNeeded: 1,
+          participants: [{ id: randomUUID(), type: "agent", agentId: reviewerAgentId }],
+        }],
+      },
+      executionState: {
+        status: "pending",
+        currentStageId: stageId,
+        currentStageIndex: 0,
+        currentStageType: "review",
+        currentParticipant: { type: "agent", agentId: reviewerAgentId },
+        returnAssignee: { type: "agent", agentId: seeded.peerAgentId },
+        completedStageIds: [],
+        lastDecisionId: null,
+        lastDecisionOutcome: null,
+      },
+    }).where(eq(issues.id, issueId));
+
+    const denied = await request(app(agentActor(seeded.companyId, seeded.peerAgentId)))
+      .post(`/api/issues/${issueId}/stalled-review-decision`)
+      .send({ action: "approve", note: "Assigned but not configured." })
+      .expect(403);
+    expect(denied.body.error).toBe("Only a configured participant of the active review stage may record this decision");
+    expect(enqueueWakeup).not.toHaveBeenCalled();
+
+    const [issueAfter] = await db
+      .select({ status: issues.status, assigneeAgentId: issues.assigneeAgentId })
+      .from(issues)
+      .where(eq(issues.id, issueId));
+    expect(issueAfter).toEqual({ status: "in_review", assigneeAgentId: seeded.peerAgentId });
+    expect(await db.select().from(issueExecutionDecisions).where(eq(issueExecutionDecisions.issueId, issueId)))
+      .toHaveLength(0);
+    expect(await db.select().from(issueComments).where(eq(issueComments.issueId, issueId)))
+      .toHaveLength(0);
+
+    const approved = await request(app(agentActor(seeded.companyId, reviewerAgentId)))
+      .post(`/api/issues/${issueId}/stalled-review-decision`)
+      .send({ action: "approve", note: "Configured participant approval." })
+      .expect(200);
+    expect(approved.body.issue).toMatchObject({ id: issueId, status: "done" });
   });
 
   it("returns execution-stage request_changes to returnAssignee", async () => {
