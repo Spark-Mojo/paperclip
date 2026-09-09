@@ -8,6 +8,7 @@ import {
   formatEmbeddedPostgresError,
 } from "./embedded-postgres-error.js";
 import { prepareEmbeddedPostgresNativeRuntime } from "./embedded-postgres-native.js";
+import { assertDisposableTestDatabaseTarget } from "./test-database-safety.js";
 
 // Time budget (ms) for a vitest test in the embedded-Postgres cost class: a
 // test that starts an embedded Postgres cluster and runs migrations. Measured
@@ -280,8 +281,10 @@ export async function startEmbeddedPostgresTestDatabase(
 
   try {
     const adminConnectionString = `postgres://paperclip:paperclip@127.0.0.1:${port}/postgres`;
+    assertDisposableTestDatabaseTarget(adminConnectionString);
     await ensurePostgresDatabase(adminConnectionString, "paperclip");
     const connectionString = `postgres://paperclip:paperclip@127.0.0.1:${port}/paperclip`;
+    assertDisposableTestDatabaseTarget(connectionString);
     await applyPendingMigrations(connectionString);
 
     return {
