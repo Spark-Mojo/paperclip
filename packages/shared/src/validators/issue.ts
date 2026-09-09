@@ -1367,7 +1367,7 @@ export const createIssueThreadInteractionSchema = z.discriminatedUnion("kind", [
     sourceRunId: z.string().guid().nullable().optional(),
     title: z.string().trim().max(240).nullable().optional(),
     summary: z.string().trim().max(1000).nullable().optional(),
-    continuationPolicy: issueThreadInteractionContinuationPolicySchema.optional().default("none"),
+    continuationPolicy: issueThreadInteractionContinuationPolicySchema.optional().default("wake_assignee"),
     payload: requestConfirmationPayloadSchema,
   }),
   z.object({
