@@ -81,19 +81,25 @@ function toReadModel(row: IssueRecoveryActionRow): IssueRecoveryAction {
 }
 
 function isUniqueRecoveryActionConflict(error: unknown) {
-  const maybe = error as { code?: string; constraint?: string; message?: string } | null;
-  return Boolean(
-    maybe &&
-      maybe.code === "23505" &&
-      (
-        maybe.constraint === "issue_recovery_actions_active_source_uq" ||
-        maybe.constraint === "issue_recovery_actions_active_fingerprint_uq" ||
-        typeof maybe.message === "string" && (
-          maybe.message.includes("issue_recovery_actions_active_source_uq") ||
-          maybe.message.includes("issue_recovery_actions_active_fingerprint_uq")
-        )
-      ),
-  );
+  const candidates = [
+    error,
+    error && typeof error === "object" ? (error as { cause?: unknown }).cause : null,
+  ];
+  return candidates.some((candidate) => {
+    const maybe = candidate as { code?: string; constraint?: string; message?: string } | null;
+    return Boolean(
+      maybe &&
+        maybe.code === "23505" &&
+        (
+          maybe.constraint === "issue_recovery_actions_active_source_uq" ||
+          maybe.constraint === "issue_recovery_actions_active_fingerprint_uq" ||
+          typeof maybe.message === "string" && (
+            maybe.message.includes("issue_recovery_actions_active_source_uq") ||
+            maybe.message.includes("issue_recovery_actions_active_fingerprint_uq")
+          )
+        ),
+    );
+  });
 }
 
 export function issueRecoveryActionService(db: Db) {

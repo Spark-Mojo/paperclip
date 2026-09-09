@@ -8,6 +8,7 @@ import {
   formatEmbeddedPostgresError,
 } from "./embedded-postgres-error.js";
 import { prepareEmbeddedPostgresNativeRuntime } from "./embedded-postgres-native.js";
+import { assertDisposableTestDatabaseTarget } from "./test-database-safety.js";
 
 type EmbeddedPostgresInstance = {
   initialise(): Promise<void>;
@@ -272,8 +273,10 @@ export async function startEmbeddedPostgresTestDatabase(
 
   try {
     const adminConnectionString = `postgres://paperclip:paperclip@127.0.0.1:${port}/postgres`;
+    assertDisposableTestDatabaseTarget(adminConnectionString);
     await ensurePostgresDatabase(adminConnectionString, "paperclip");
     const connectionString = `postgres://paperclip:paperclip@127.0.0.1:${port}/paperclip`;
+    assertDisposableTestDatabaseTarget(connectionString);
     await applyPendingMigrations(connectionString);
 
     return {
