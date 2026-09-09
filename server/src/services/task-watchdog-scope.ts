@@ -1,5 +1,6 @@
 import { and, eq } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
+import { isUuidLike } from "@paperclipai/shared";
 import { heartbeatRuns, issues, issueWatchdogs } from "@paperclipai/db";
 
 const MAX_WATCHDOG_SCOPE_ANCESTRY_DEPTH = 100;
@@ -56,7 +57,7 @@ export async function resolveTaskWatchdogMutationScope(
   const agentId = readString(actor.agentId);
   const runId = readString(actor.runId);
   const actorCompanyId = readString(actor.companyId);
-  if (!agentId || !runId) return { kind: "none" };
+  if (!agentId || !runId || !isUuidLike(runId)) return { kind: "none" };
 
   const run = await db
     .select({

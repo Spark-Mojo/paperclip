@@ -2706,6 +2706,7 @@ export function issueRoutes(
       agentId: string,
       options: Parameters<ReturnType<typeof heartbeatService>["wakeup"]>[1],
     ) => ReturnType<ReturnType<typeof heartbeatService>["wakeup"]>;
+    createStalledReviewDecisionService?: typeof stalledReviewDecisionService;
     issueListDiagnostics?: IssueListDiagnostics;
     approveToolActionRequest?: (input: {
       companyId: string;
@@ -2724,6 +2725,7 @@ export function issueRoutes(
     pluginWorkerManager: opts.pluginWorkerManager,
   });
   const enqueueStalledReviewDecisionWakeup = opts.stalledReviewDecisionEnqueueWakeup ?? heartbeat.wakeup;
+  const createStalledReviewDecisionService = opts.createStalledReviewDecisionService ?? stalledReviewDecisionService;
   const enqueueRecoveryActionWakeup = opts.recoveryActionEnqueueWakeup ?? heartbeat.wakeup;
   const feedback = feedbackService(db);
   const companiesSvc = companyService(db);
@@ -2841,7 +2843,8 @@ export function issueRoutes(
     companyId: string,
     actor: ReturnType<typeof getActorInfo>,
   ): Promise<string | null> {
-    if (actor.actorType !== "agent" || !actor.agentId || !actor.runId) return null;
+    const runId = typeof actor.runId === "string" ? actor.runId.trim() : "";
+    if (actor.actorType !== "agent" || !actor.agentId || !isUuidLike(runId)) return null;
     const run = await db
       .select({
         agentId: heartbeatRuns.agentId,
@@ -2849,7 +2852,7 @@ export function issueRoutes(
       })
       .from(heartbeatRuns)
       .where(and(
-        eq(heartbeatRuns.id, actor.runId),
+        eq(heartbeatRuns.id, runId),
         eq(heartbeatRuns.companyId, companyId),
       ))
       .then((rows) => rows[0] ?? null);
@@ -2873,9 +2876,10 @@ export function issueRoutes(
     issue?: { companyId: string; projectId?: string | null; executionPolicy?: unknown } | null,
   ): Promise<TrustPresetResolution | null> {
     if (!input.agentId) return null;
+    const runId = typeof input.runId === "string" ? input.runId.trim() : "";
     const [agent, run] = await Promise.all([
       agentsSvc.getById(input.agentId),
-      input.runId
+      isUuidLike(runId)
         ? db
             .select({
               companyId: heartbeatRuns.companyId,
@@ -2883,7 +2887,7 @@ export function issueRoutes(
               contextSnapshot: heartbeatRuns.contextSnapshot,
             })
             .from(heartbeatRuns)
-            .where(and(eq(heartbeatRuns.id, input.runId), eq(heartbeatRuns.companyId, companyId)))
+            .where(and(eq(heartbeatRuns.id, runId), eq(heartbeatRuns.companyId, companyId)))
             .then((rows) => rows[0] ?? null)
         : Promise.resolve(null),
     ]);
@@ -8357,6 +8361,12 @@ export function issueRoutes(
       const actor = getActorInfo(req);
 
       if (actor.actorType === "agent") {
+        // A configured/current stage participant still needs the ordinary
+        // agent mutation authorization used by PATCH: task-watchdog scope and
+        // low-trust control-plane boundaries are not bypassed by stage state.
+        if (await assertLowTrustControlPlaneDenied(req, res, issue.companyId, issue)) return;
+        if (!(await assertAgentIssueMutationAllowed(req, res, issue, { allowVisibleIssueWrite: true }))) return;
+
         // HW-5 (SPA-6268): only a configured review participant may enter
         // this scoped decision route. The service then revalidates exact
         // executionState.currentParticipant equality under its issue lock.
@@ -8387,7 +8397,7 @@ export function issueRoutes(
         }
       }
 
-      const result = await stalledReviewDecisionService(db).decide({
+      const result = await createStalledReviewDecisionService(db).decide({
         issueId: issue.id,
         companyId: issue.companyId,
         action: req.body.action,
@@ -8397,6 +8407,7 @@ export function issueRoutes(
           userId: actor.actorType === "user" ? actor.actorId : null,
           agentId: actor.agentId ?? null,
           runId: actor.runId,
+          isLocalImplicit: req.actor.source === "local_implicit",
         },
       });
 
@@ -8430,7 +8441,30 @@ export function issueRoutes(
       }
 
       let wakeQueued = false;
-      if (req.body.action !== "approve" && result.issue.assigneeAgentId) {
+      const executionStageWakeup = req.body.action === "approve"
+        ? buildExecutionStageWakeup({
+            issueId: result.issue.id,
+            previousState: result.previousExecutionState,
+            nextState: parseIssueExecutionState(result.issue.executionState),
+            interruptedRunId: null,
+            requestedByActorType: actor.actorType,
+            requestedByActorId: actor.actorId,
+          })
+        : null;
+      if (executionStageWakeup) {
+        try {
+          const wake = await enqueueStalledReviewDecisionWakeup(
+            executionStageWakeup.agentId,
+            executionStageWakeup.wakeup,
+          );
+          wakeQueued = wake !== null;
+        } catch (err) {
+          logger.warn(
+            { err, issueId: result.issue.id, agentId: executionStageWakeup.agentId },
+            "failed to enqueue stalled-review decision execution-stage wake",
+          );
+        }
+      } else if (req.body.action !== "approve" && result.issue.assigneeAgentId) {
         const userAuthoredNote = actor.actorType === "user" && result.comment
           ? { commentId: result.comment.id, authorUserId: actor.actorId }
           : undefined;

@@ -1,8 +1,9 @@
 import { randomUUID } from "node:crypto";
 import express from "express";
 import request from "supertest";
-import { eq } from "drizzle-orm";
+import { and, eq } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
+import { LOW_TRUST_REVIEW_PRESET } from "@paperclipai/shared";
 import {
   activityLog,
   agentWakeupRequests,
@@ -18,10 +19,12 @@ import {
   issueInboxArchives,
   issueRecoveryActions,
   issueThreadInteractions,
+  issueWatchdogs,
   issues,
 } from "@paperclipai/db";
 import { errorHandler } from "../middleware/index.js";
 import { issueRoutes } from "../routes/issues.js";
+import { stalledReviewDecisionService } from "../services/stalled-review-decisions.js";
 import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
@@ -162,7 +165,10 @@ describeEmbeddedPostgres("stalled review decision routes", () => {
     return issueId;
   }
 
-  function app(actor: Record<string, unknown>) {
+  function app(
+    actor: Record<string, unknown>,
+    options: { createStalledReviewDecisionService?: typeof stalledReviewDecisionService } = {},
+  ) {
     const testApp = express();
     testApp.use(express.json());
     testApp.use((req, _res, next) => {
@@ -171,6 +177,7 @@ describeEmbeddedPostgres("stalled review decision routes", () => {
     });
     testApp.use("/api", issueRoutes(db, {} as any, {
       stalledReviewDecisionEnqueueWakeup: enqueueWakeup as any,
+      ...options,
     }));
     testApp.use(errorHandler);
     return testApp;
@@ -648,6 +655,7 @@ describeEmbeddedPostgres("stalled review decision routes", () => {
         },
       },
     });
+    expect(enqueueWakeup).not.toHaveBeenCalled();
     const decision = await db
       .select()
       .from(issueExecutionDecisions)
@@ -802,6 +810,7 @@ describeEmbeddedPostgres("stalled review decision routes", () => {
       issue: { id: issueId, status: "done" },
       comment: { issueId, body: "Review complete. Shipping." },
     });
+    expect(enqueueWakeup).not.toHaveBeenCalled();
 
     const decisions = await db
       .select()
@@ -894,6 +903,258 @@ describeEmbeddedPostgres("stalled review decision routes", () => {
       .send({ action: "approve", note: "Configured participant approval." })
       .expect(200);
     expect(approved.body.issue).toMatchObject({ id: issueId, status: "done" });
+  });
+
+  it("denies a low-trust exact current participant before stalled-review decision mutation", async () => {
+    const seeded = await seedCompany("LTR");
+    const reviewerAgentId = seeded.assigneeAgentId;
+    const issueId = await seedReview({
+      companyId: seeded.companyId,
+      assigneeAgentId: reviewerAgentId,
+      identifier: "LTR-1",
+    });
+    const stageId = randomUUID();
+    await db.update(agents).set({
+      status: "paused",
+      permissions: {
+        trustPreset: LOW_TRUST_REVIEW_PRESET,
+        authorizationPolicy: {
+          trustBoundary: {
+            mode: LOW_TRUST_REVIEW_PRESET,
+            companyId: seeded.companyId,
+            rootIssueId: issueId,
+            issueIds: [issueId],
+          },
+        },
+      },
+    }).where(eq(agents.id, reviewerAgentId));
+    await db.update(issues).set({
+      executionPolicy: {
+        mode: "normal",
+        commentRequired: true,
+        stages: [{
+          id: stageId,
+          type: "review",
+          approvalsNeeded: 1,
+          participants: [{ id: randomUUID(), type: "agent", agentId: reviewerAgentId }],
+        }],
+      },
+      executionState: {
+        status: "pending",
+        currentStageId: stageId,
+        currentStageIndex: 0,
+        currentStageType: "review",
+        currentParticipant: { type: "agent", agentId: reviewerAgentId },
+        returnAssignee: { type: "agent", agentId: seeded.peerAgentId },
+        completedStageIds: [],
+        lastDecisionId: null,
+        lastDecisionOutcome: null,
+      },
+    }).where(eq(issues.id, issueId));
+
+    const denied = await request(app(agentActor(seeded.companyId, reviewerAgentId)))
+      .post(`/api/issues/${issueId}/stalled-review-decision`)
+      .send({ action: "approve", note: "Low-trust approval." })
+      .expect(403);
+    expect(denied.body.error).toBe("Low-trust actors cannot use this control-plane surface");
+    expect(enqueueWakeup).not.toHaveBeenCalled();
+
+    const [issueAfter] = await db
+      .select({ status: issues.status, assigneeAgentId: issues.assigneeAgentId })
+      .from(issues)
+      .where(eq(issues.id, issueId));
+    expect(issueAfter).toEqual({ status: "in_review", assigneeAgentId: reviewerAgentId });
+    expect(await db.select().from(issueExecutionDecisions).where(eq(issueExecutionDecisions.issueId, issueId)))
+      .toHaveLength(0);
+    expect(await db.select().from(issueComments).where(eq(issueComments.issueId, issueId)))
+      .toHaveLength(0);
+  });
+
+  it("denies a task-watchdog exact current participant outside its watched subtree", async () => {
+    const seeded = await seedCompany("TWD");
+    const reviewerAgentId = seeded.assigneeAgentId;
+    const issueId = await seedReview({
+      companyId: seeded.companyId,
+      assigneeAgentId: reviewerAgentId,
+      identifier: "TWD-1",
+    });
+    const watchedIssueId = await seedReview({
+      companyId: seeded.companyId,
+      assigneeAgentId: reviewerAgentId,
+      identifier: "TWD-2",
+      status: "todo",
+    });
+    const stageId = randomUUID();
+    await db.update(agents).set({ status: "paused" }).where(eq(agents.id, reviewerAgentId));
+    await db.update(issues).set({
+      executionPolicy: {
+        mode: "normal",
+        commentRequired: true,
+        stages: [{
+          id: stageId,
+          type: "review",
+          approvalsNeeded: 1,
+          participants: [{ id: randomUUID(), type: "agent", agentId: reviewerAgentId }],
+        }],
+      },
+      executionState: {
+        status: "pending",
+        currentStageId: stageId,
+        currentStageIndex: 0,
+        currentStageType: "review",
+        currentParticipant: { type: "agent", agentId: reviewerAgentId },
+        returnAssignee: { type: "agent", agentId: seeded.peerAgentId },
+        completedStageIds: [],
+        lastDecisionId: null,
+        lastDecisionOutcome: null,
+      },
+    }).where(eq(issues.id, issueId));
+    const runId = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: runId,
+      companyId: seeded.companyId,
+      agentId: reviewerAgentId,
+      invocationSource: "assignment",
+      triggerDetail: "system",
+      status: "succeeded",
+      contextSnapshot: {
+        issueId,
+        taskWatchdog: { watchedIssueId, stopFingerprint: "task_watchdog_stop:test" },
+      },
+    });
+    await db.insert(issueWatchdogs).values({
+      companyId: seeded.companyId,
+      issueId: watchedIssueId,
+      watchdogAgentId: reviewerAgentId,
+      status: "active",
+    });
+
+    const denied = await request(app(agentActor(seeded.companyId, reviewerAgentId, runId)))
+      .post(`/api/issues/${issueId}/stalled-review-decision`)
+      .send({ action: "approve", note: "Out-of-scope watchdog approval." })
+      .expect(403);
+    expect(denied.body.error).toBe("Task-watchdog runs can only mutate the watched issue subtree.");
+    expect(enqueueWakeup).not.toHaveBeenCalled();
+
+    const [issueAfter] = await db
+      .select({ status: issues.status, assigneeAgentId: issues.assigneeAgentId })
+      .from(issues)
+      .where(eq(issues.id, issueId));
+    expect(issueAfter).toEqual({ status: "in_review", assigneeAgentId: reviewerAgentId });
+    expect(await db.select().from(issueExecutionDecisions).where(eq(issueExecutionDecisions.issueId, issueId)))
+      .toHaveLength(0);
+    expect(await db.select().from(issueComments).where(eq(issueComments.issueId, issueId)))
+      .toHaveLength(0);
+  });
+
+  it("wakes the next agent stage exactly once after concurrent approval replay", async () => {
+    const seeded = await seedCompany("NXT");
+    const reviewerAgentId = seeded.assigneeAgentId;
+    const nextAgentId = seeded.peerAgentId;
+    const issueId = await seedReview({
+      companyId: seeded.companyId,
+      assigneeAgentId: reviewerAgentId,
+      identifier: "NXT-1",
+    });
+    const reviewStageId = randomUUID();
+    const approvalStageId = randomUUID();
+    await db.update(agents).set({ status: "paused" }).where(eq(agents.id, reviewerAgentId));
+    await db.update(issues).set({
+      executionPolicy: {
+        mode: "normal",
+        commentRequired: true,
+        stages: [
+          {
+            id: reviewStageId,
+            type: "review",
+            approvalsNeeded: 1,
+            participants: [{ id: randomUUID(), type: "agent", agentId: reviewerAgentId }],
+          },
+          {
+            id: approvalStageId,
+            type: "approval",
+            approvalsNeeded: 1,
+            participants: [{ id: randomUUID(), type: "agent", agentId: nextAgentId }],
+          },
+        ],
+      },
+      executionState: {
+        status: "pending",
+        currentStageId: reviewStageId,
+        currentStageIndex: 0,
+        currentStageType: "review",
+        currentParticipant: { type: "agent", agentId: reviewerAgentId },
+        returnAssignee: { type: "agent", agentId: reviewerAgentId },
+        completedStageIds: [],
+        lastDecisionId: null,
+        lastDecisionOutcome: null,
+      },
+    }).where(eq(issues.id, issueId));
+
+    const results = await Promise.all([
+      request(app(agentActor(seeded.companyId, reviewerAgentId)))
+        .post(`/api/issues/${issueId}/stalled-review-decision`)
+        .send({ action: "approve", note: "Advance to approval." }),
+      request(app(agentActor(seeded.companyId, reviewerAgentId)))
+        .post(`/api/issues/${issueId}/stalled-review-decision`)
+        .send({ action: "approve", note: "Replay advance." }),
+    ]);
+    expect(results.map((result) => result.status).sort()).toEqual([200, 409]);
+    expect(enqueueWakeup).toHaveBeenCalledTimes(1);
+    expect(enqueueWakeup).toHaveBeenCalledWith(nextAgentId, expect.objectContaining({
+      reason: "execution_approval_requested",
+      payload: expect.objectContaining({
+        issueId,
+        executionStage: expect.objectContaining({
+          stageId: approvalStageId,
+          currentParticipant: expect.objectContaining({ type: "agent", agentId: nextAgentId }),
+        }),
+      }),
+    }));
+    expect(results.find((result) => result.status === 200)?.body).toMatchObject({ wakeQueued: true });
+    expect(await db.select().from(issueExecutionDecisions).where(eq(issueExecutionDecisions.issueId, issueId)))
+      .toHaveLength(1);
+  });
+
+  it("rechecks board membership after route admission and before the locked transition", async () => {
+    const seeded = await seedCompany("TOC");
+    const issueId = await seedReview({
+      companyId: seeded.companyId,
+      assigneeAgentId: seeded.assigneeAgentId,
+      identifier: "TOC-1",
+    });
+    const onIssueLocked = vi.fn(async (lockedIssue: { id: string; companyId: string }) => {
+      expect(lockedIssue).toEqual({ id: issueId, companyId: seeded.companyId });
+      await db.update(companyMemberships).set({ membershipRole: "viewer" }).where(and(
+        eq(companyMemberships.companyId, seeded.companyId),
+        eq(companyMemberships.principalType, "user"),
+        eq(companyMemberships.principalId, seeded.memberUserId),
+      ));
+    });
+
+    const denied = await request(app(
+      boardActor(seeded.companyId, seeded.memberUserId),
+      {
+        createStalledReviewDecisionService: (serviceDb) => stalledReviewDecisionService(serviceDb, { onIssueLocked }),
+      },
+    ))
+      .post(`/api/issues/${issueId}/stalled-review-decision`)
+      .send({ action: "approve", note: "Revoked before transition." });
+
+    expect(onIssueLocked).toHaveBeenCalledTimes(1);
+    expect(denied.status).toBe(403);
+    expect(denied.body.error).toBe("Active non-viewer company membership required");
+    expect(enqueueWakeup).not.toHaveBeenCalled();
+
+    const [issueAfter] = await db
+      .select({ status: issues.status, assigneeAgentId: issues.assigneeAgentId })
+      .from(issues)
+      .where(eq(issues.id, issueId));
+    expect(issueAfter).toEqual({ status: "in_review", assigneeAgentId: seeded.assigneeAgentId });
+    expect(await db.select().from(issueExecutionDecisions).where(eq(issueExecutionDecisions.issueId, issueId)))
+      .toHaveLength(0);
+    expect(await db.select().from(issueComments).where(eq(issueComments.issueId, issueId)))
+      .toHaveLength(0);
   });
 
   it("returns execution-stage request_changes to returnAssignee", async () => {
