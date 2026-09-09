@@ -121,6 +121,10 @@ import {
 } from "../services/recovery/index.ts";
 import { collectDispositionRepairSourceState } from "../services/recovery/disposition-repair.ts";
 import {
+  HANDOFF_BOUNDED_CONTINUATION_MARKER,
+  recoveryService,
+} from "../services/recovery/service.ts";
+import {
   UNMANAGED_BACKGROUND_TASK_LIVENESS_REASON,
   UNMANAGED_BACKGROUND_TASK_STOP_REASON,
 } from "@paperclipai/adapter-utils/server-utils";
@@ -817,6 +821,154 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     return { companyId, agentId, runId, wakeupRequestId, issueId, rootIssueId };
   }
 
+  async function seedSuccessfulHandoffSourceRun(input: {
+    companyId: string;
+    agentId: string;
+    issueId: string;
+    sourceRunId?: string;
+  }) {
+    const sourceRunId = input.sourceRunId ?? randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: sourceRunId,
+      companyId: input.companyId,
+      agentId: input.agentId,
+      invocationSource: "assignment",
+      triggerDetail: "system",
+      status: "succeeded",
+      contextSnapshot: {
+        issueId: input.issueId,
+        taskId: input.issueId,
+        wakeReason: "issue_assigned",
+      },
+      livenessState: "advanced",
+      createdAt: new Date("2026-03-18T00:00:00.000Z"),
+      startedAt: new Date("2026-03-18T00:00:00.000Z"),
+      finishedAt: new Date("2026-03-18T00:05:00.000Z"),
+      updatedAt: new Date("2026-03-18T00:05:00.000Z"),
+    });
+    return sourceRunId;
+  }
+
+  async function seedSuccessfulHandoffCorrectiveRun(input: {
+    companyId: string;
+    agentId: string;
+    issueId: string;
+    sourceRunId: string;
+    correctiveRunId?: string;
+  }) {
+    const correctiveRunId = input.correctiveRunId ?? randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: correctiveRunId,
+      companyId: input.companyId,
+      agentId: input.agentId,
+      invocationSource: "automation",
+      triggerDetail: "system",
+      status: "succeeded",
+      contextSnapshot: {
+        issueId: input.issueId,
+        taskId: input.issueId,
+        wakeReason: "finish_successful_run_handoff",
+        sourceRunId: input.sourceRunId,
+        resumeFromRunId: input.sourceRunId,
+        handoffRequired: true,
+        handoffReason: "successful_run_missing_state",
+        missingDisposition: "clear_next_step",
+        handoffAttempt: 1,
+        maxHandoffAttempts: 1,
+      },
+      livenessState: "advanced",
+      createdAt: new Date("2026-03-18T01:00:00.000Z"),
+      startedAt: new Date("2026-03-18T01:00:00.000Z"),
+      finishedAt: new Date("2026-03-18T01:05:00.000Z"),
+      updatedAt: new Date("2026-03-18T01:05:00.000Z"),
+    });
+    return correctiveRunId;
+  }
+
+  async function stampExhaustedSuccessfulHandoffRun(input: {
+    companyId: string;
+    agentId: string;
+    issueId: string;
+    runId: string;
+    sourceRunId?: string;
+    resumeFromRunId?: string;
+  }) {
+    const sourceRunId = input.sourceRunId ?? await seedSuccessfulHandoffSourceRun(input);
+    await db
+      .update(heartbeatRuns)
+      .set({
+        contextSnapshot: {
+          issueId: input.issueId,
+          taskId: input.issueId,
+          wakeReason: "finish_successful_run_handoff",
+          sourceRunId,
+          resumeFromRunId: input.resumeFromRunId ?? sourceRunId,
+          handoffRequired: true,
+          handoffReason: "successful_run_missing_state",
+          missingDisposition: "clear_next_step",
+          handoffAttempt: 1,
+          maxHandoffAttempts: 1,
+        },
+      })
+      .where(eq(heartbeatRuns.id, input.runId));
+    return sourceRunId;
+  }
+
+  async function stampBoundedHandoffContinuationRun(input: {
+    companyId: string;
+    agentId: string;
+    issueId: string;
+    runId: string;
+  }) {
+    const sourceRunId = await seedSuccessfulHandoffSourceRun(input);
+    const correctiveRunId = await seedSuccessfulHandoffCorrectiveRun({
+      ...input,
+      sourceRunId,
+    });
+    await db
+      .update(heartbeatRuns)
+      .set({
+        contextSnapshot: {
+          issueId: input.issueId,
+          taskId: input.issueId,
+          wakeReason: "issue_continuation_needed",
+          retryReason: "issue_continuation_needed",
+          retryOfRunId: correctiveRunId,
+          source: "issue.productive_terminal_continuation_recovery",
+          [HANDOFF_BOUNDED_CONTINUATION_MARKER]: true,
+          handoffSourceRunId: sourceRunId,
+          handoffCorrectiveRunId: correctiveRunId,
+        },
+      })
+      .where(eq(heartbeatRuns.id, input.runId));
+    return { sourceRunId, correctiveRunId };
+  }
+
+  function recoveryServiceForTest(input: { persistWakeup?: boolean } = {}) {
+    return recoveryService(db, {
+      enqueueWakeup: async (agentId, options = {}) => {
+        if (!input.persistWakeup) return null;
+        const [agent] = await db
+          .select({ companyId: agents.companyId })
+          .from(agents)
+          .where(eq(agents.id, agentId));
+        if (!agent) throw new Error(`Missing test recovery wake agent ${agentId}`);
+        await db.insert(agentWakeupRequests).values({
+          companyId: agent.companyId,
+          agentId,
+          source: options.source ?? "on_demand",
+          triggerDetail: options.triggerDetail ?? null,
+          reason: options.reason ?? null,
+          payload: options.payload ?? null,
+          requestedByActorType: options.requestedByActorType ?? null,
+          requestedByActorId: options.requestedByActorId ?? null,
+          idempotencyKey: options.idempotencyKey ?? null,
+        });
+        return null;
+      },
+    });
+  }
+
   async function seedInReviewParticipantRunFixture(input?: {
     wakeReason?: string;
     retryReason?: string | null;
@@ -1005,6 +1157,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     kind?: string;
     previousOwnerAgentId?: string | null;
     returnOwnerAgentId?: string | null;
+    expectRecoveryRun?: boolean;
   }) {
     const action = await waitForValue(async () =>
       db.select().from(issueRecoveryActions).where(
@@ -1057,10 +1210,54 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       ));
     expect(recoveryIssues).toHaveLength(0);
 
-    const recoveryWakeups = await db.select().from(agentWakeupRequests).where(
-      sql`${agentWakeupRequests.payload} ->> 'recoveryActionId' = ${action.id}`,
-    );
-    expect(recoveryWakeups).toHaveLength(0);
+    const recoveryWakeup = await waitForValue(async () => {
+      const wakeups = await db
+        .select()
+        .from(agentWakeupRequests)
+        .where(eq(agentWakeupRequests.agentId, input.agentId));
+      return wakeups.find((wakeup) => {
+        const payload = wakeup.payload as Record<string, unknown> | null;
+        return payload?.issueId === input.issueId &&
+          payload?.sourceIssueId === input.issueId &&
+          payload?.recoveryActionId === action.id &&
+          payload?.strandedRunId === input.runId;
+      }) ?? null;
+    });
+    expect(recoveryWakeup).toMatchObject({
+      companyId: input.companyId,
+      reason: "source_scoped_recovery_action",
+      source: "assignment",
+      payload: expect.objectContaining({
+        modelProfile: "cheap",
+        allowDeliverableWork: false,
+        allowDocumentUpdates: false,
+        resumeRequiresNormalModel: true,
+      }),
+    });
+
+    if (input.expectRecoveryRun ?? true) {
+      const recoveryRun = recoveryWakeup?.runId
+        ? await db
+          .select()
+          .from(heartbeatRuns)
+          .where(eq(heartbeatRuns.id, recoveryWakeup.runId))
+          .then((rows) => rows[0] ?? null)
+        : null;
+      expect(recoveryRun?.contextSnapshot).toMatchObject({
+        issueId: input.issueId,
+        taskId: input.issueId,
+        source: "issue_recovery_action",
+        recoveryActionId: action.id,
+        sourceIssueId: input.issueId,
+        strandedRunId: input.runId,
+        modelProfile: "cheap",
+        allowDeliverableWork: false,
+        allowDocumentUpdates: false,
+        resumeRequiresNormalModel: true,
+      });
+    } else {
+      expect(recoveryWakeup?.runId).toBeNull();
+    }
     await waitForHeartbeatIdle(db);
     const sourceIssue = await db
       .select()
@@ -3966,7 +4163,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       runErrorCode: "adapter_failed",
       runError: "Authorization: Bearer sk-test-successful-handoff-secret",
     });
-    const sourceRunId = randomUUID();
+    const sourceRunId = await seedSuccessfulHandoffSourceRun({ companyId, agentId, issueId });
     await db
       .update(heartbeatRuns)
       .set({
@@ -4053,13 +4250,13 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
   // Backport regression for upstream paperclipai/paperclip #12744
   // (productive exhausted handoff takes one bounded normal continuation).
   it("requeues a productive exhausted successful handoff through the bounded continuation path", async () => {
-    const { agentId, runId, issueId } =
+    const { companyId, agentId, runId, issueId } =
       await seedStrandedIssueFixture({
         status: "in_progress",
         runStatus: "succeeded",
         livenessState: "advanced",
       });
-    const sourceRunId = randomUUID();
+    const sourceRunId = await seedSuccessfulHandoffSourceRun({ companyId, agentId, issueId });
     await db
       .update(heartbeatRuns)
       .set({
@@ -4097,7 +4294,12 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       .select()
       .from(heartbeatRuns)
       .where(eq(heartbeatRuns.agentId, agentId));
-    const retryRun = runs.find((row) => row.id !== runId);
+    const retryRun = runs.find((row) => {
+      const context = row.contextSnapshot as Record<string, unknown> | null;
+      return row.id !== runId
+        && context?.retryOfRunId === runId
+        && context?.[HANDOFF_BOUNDED_CONTINUATION_MARKER] === true;
+    });
     expect(
       retryRun?.contextSnapshot as Record<string, unknown> | undefined,
     ).toMatchObject({
@@ -4117,6 +4319,312 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     if (retryRun) {
       await waitForRunToSettle(heartbeat, retryRun.id);
     }
+  });
+
+  // SPA-6335 P1 regression: the repeat of a handoff-derived bounded
+  // continuation still carries the bounded marker, so it escalates after its
+  // one normal continuation even when the agent just posted visible progress.
+  // Ordinary non-handoff batch continuations keep the GGU-809 exemption.
+  it("escalates the repeat of a handoff-derived continuation despite recent progress", async () => {
+    const { companyId, agentId, runId, issueId } =
+      await seedStrandedIssueFixture({
+        status: "in_progress",
+        runStatus: "succeeded",
+        retryReason: "issue_continuation_needed",
+        runSource: "issue.productive_terminal_continuation_recovery",
+        livenessState: "advanced",
+      });
+    const handoffSourceRunId = await seedSuccessfulHandoffSourceRun({ companyId, agentId, issueId });
+    const handoffCorrectiveRunId = await seedSuccessfulHandoffCorrectiveRun({
+      companyId,
+      agentId,
+      issueId,
+      sourceRunId: handoffSourceRunId,
+    });
+    await db
+      .update(heartbeatRuns)
+      .set({
+        contextSnapshot: {
+          issueId,
+          taskId: issueId,
+          wakeReason: "issue_continuation_needed",
+          retryReason: "issue_continuation_needed",
+          retryOfRunId: handoffCorrectiveRunId,
+          source: "issue.productive_terminal_continuation_recovery",
+          [HANDOFF_BOUNDED_CONTINUATION_MARKER]: true,
+          handoffSourceRunId,
+          handoffCorrectiveRunId,
+        },
+      })
+      .where(eq(heartbeatRuns.id, runId));
+    // Recent agent-authored comment would trigger the GGU-809 exemption on an
+    // ordinary batch continuation — the bounded marker must bypass it.
+    await db.insert(issueComments).values({
+      companyId,
+      issueId,
+      authorAgentId: agentId,
+      body: "handoff follow-up posted, attaching shortly",
+    });
+    const heartbeat = recoveryServiceForTest({ persistWakeup: true });
+
+    const result = await heartbeat.reconcileStrandedAssignedIssues();
+    expect(result.escalated).toBe(1);
+    expect(result.successfulRunHandoffEscalated).toBe(0);
+    expect(result.recentProgressExempted).toBe(0);
+    expect(result.continuationRequeued).toBe(0);
+    expect(result.issueIds).toEqual([issueId]);
+
+    const issue = await db
+      .select()
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0] ?? null);
+    expect(issue?.status).toBe("blocked");
+
+    // The durable source and corrective lineage add two historical runs. The
+    // recovery wake is persisted without executing a worker, so no C2 run may
+    // be added after the bounded continuation.
+    const runs = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.agentId, agentId));
+    expect(runs).toHaveLength(3);
+    expect(runs.filter((run) => {
+      const context = run.contextSnapshot as Record<string, unknown> | null;
+      return context?.retryReason === "issue_continuation_needed";
+    })).toEqual([expect.objectContaining({ id: runId })]);
+
+    const recoveryAction = await expectSourceScopedStrandedRecoveryAction({
+      companyId,
+      agentId,
+      issueId,
+      runId,
+      previousStatus: "in_progress",
+      retryReason: "issue_continuation_needed",
+      cause: SUCCESSFUL_RUN_MISSING_STATE_REASON,
+      kind: "missing_disposition",
+      expectRecoveryRun: false,
+    });
+
+    expect(recoveryAction).toBeDefined();
+  });
+
+  it.each(["failed", "timed_out", "cancelled"] as const)(
+    "escalates a terminal bounded handoff continuation without queueing C2 (%s)",
+    async (runStatus) => {
+      const { companyId, agentId, issueId, runId } = await seedStrandedIssueFixture({
+        status: "in_progress",
+        runStatus,
+        retryReason: "issue_continuation_needed",
+        runSource: "issue.productive_terminal_continuation_recovery",
+        livenessState: null,
+      });
+      await stampBoundedHandoffContinuationRun({ companyId, agentId, issueId, runId });
+
+      const result = await recoveryServiceForTest().reconcileStrandedAssignedIssues();
+      expect(result.continuationRequeued).toBe(0);
+      expect(result.successfulRunHandoffEscalated).toBe(1);
+      expect(result.escalated).toBe(0);
+      expect(result.issueIds).toEqual([issueId]);
+
+      const continuationRuns = await db
+        .select()
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.agentId, agentId));
+      expect(
+        continuationRuns.filter((run) =>
+          (run.contextSnapshot as Record<string, unknown> | null)?.source ===
+          "issue.productive_terminal_continuation_recovery",
+        ),
+      ).toHaveLength(1);
+
+      const actions = await db
+        .select()
+        .from(issueRecoveryActions)
+        .where(and(
+          eq(issueRecoveryActions.companyId, companyId),
+          eq(issueRecoveryActions.sourceIssueId, issueId),
+        ));
+      expect(actions).toHaveLength(1);
+      expect(actions[0]?.cause).toBe(SUCCESSFUL_RUN_MISSING_STATE_REASON);
+    },
+  );
+
+  it.each(["nonexistent", "wrong_company", "wrong_issue", "wrong_agent", "unbound"] as const)(
+    "does not trust an invalid successful-handoff source run (%s)",
+    async (kind) => {
+      const { companyId, agentId, issueId, runId } = await seedStrandedIssueFixture({
+        status: "in_progress",
+        runStatus: "succeeded",
+        livenessState: "advanced",
+      });
+      let sourceRunId = randomUUID();
+      let resumeFromRunId: string | undefined;
+
+      if (kind === "wrong_company") {
+        const foreign = await seedStrandedIssueFixture({
+          status: "in_progress",
+          runStatus: "succeeded",
+          livenessState: "advanced",
+        });
+        sourceRunId = foreign.runId;
+      } else if (kind === "wrong_issue") {
+        sourceRunId = await seedSuccessfulHandoffSourceRun({
+          companyId,
+          agentId,
+          issueId: randomUUID(),
+        });
+      } else if (kind === "wrong_agent") {
+        const foreignAgentId = randomUUID();
+        await db.insert(agents).values({
+          id: foreignAgentId,
+          companyId,
+          name: "ForeignAgent",
+          role: "engineer",
+          status: "idle",
+          adapterType: "codex_local",
+          adapterConfig: {},
+          runtimeConfig: {},
+          permissions: {},
+        });
+        sourceRunId = await seedSuccessfulHandoffSourceRun({
+          companyId,
+          agentId: foreignAgentId,
+          issueId,
+        });
+      } else if (kind === "unbound") {
+        sourceRunId = await seedSuccessfulHandoffSourceRun({ companyId, agentId, issueId });
+        resumeFromRunId = randomUUID();
+      }
+
+      await stampExhaustedSuccessfulHandoffRun({
+        companyId,
+        agentId,
+        issueId,
+        runId,
+        sourceRunId,
+        resumeFromRunId,
+      });
+
+      const result = await recoveryServiceForTest().reconcileStrandedAssignedIssues();
+      expect(result.continuationRequeued).toBe(0);
+      expect(result.successfulRunHandoffEscalated).toBe(0);
+      expect(result.escalated).toBe(0);
+
+      const [issue] = await db.select().from(issues).where(eq(issues.id, issueId));
+      expect(issue?.status).toBe("in_progress");
+      const actions = await db
+        .select()
+        .from(issueRecoveryActions)
+        .where(eq(issueRecoveryActions.sourceIssueId, issueId));
+      expect(actions).toHaveLength(0);
+      const handoffActivity = await db
+        .select()
+        .from(activityLog)
+        .where(and(
+          eq(activityLog.companyId, companyId),
+          eq(activityLog.entityId, issueId),
+          eq(activityLog.action, "issue.successful_run_handoff_escalated"),
+        ));
+      expect(handoffActivity).toHaveLength(0);
+    },
+  );
+
+  it("does not recover from a latest handoff run owned by a foreign agent", async () => {
+    const { companyId, agentId, issueId } = await seedStrandedIssueFixture({
+      status: "in_progress",
+      runStatus: "succeeded",
+      livenessState: "advanced",
+    });
+    const foreignAgentId = randomUUID();
+    const foreignRunId = randomUUID();
+    await db.insert(agents).values({
+      id: foreignAgentId,
+      companyId,
+      name: "ForeignAgent",
+      role: "engineer",
+      status: "idle",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    const sourceRunId = await seedSuccessfulHandoffSourceRun({
+      companyId,
+      agentId: foreignAgentId,
+      issueId,
+    });
+    await db.insert(heartbeatRuns).values({
+      id: foreignRunId,
+      companyId,
+      agentId: foreignAgentId,
+      invocationSource: "automation",
+      triggerDetail: "system",
+      status: "succeeded",
+      contextSnapshot: {
+        issueId,
+        taskId: issueId,
+        wakeReason: "finish_successful_run_handoff",
+        sourceRunId,
+        resumeFromRunId: sourceRunId,
+        handoffRequired: true,
+        handoffReason: "successful_run_missing_state",
+        handoffAttempt: 1,
+        maxHandoffAttempts: 1,
+      },
+      livenessState: "advanced",
+    });
+
+    const result = await recoveryServiceForTest().reconcileStrandedAssignedIssues();
+    expect(result.continuationRequeued).toBe(0);
+    expect(result.successfulRunHandoffEscalated).toBe(0);
+    expect(result.escalated).toBe(0);
+    const actions = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.sourceIssueId, issueId));
+    expect(actions).toHaveLength(0);
+    expect(agentId).not.toBe(foreignAgentId);
+  });
+
+  it("creates one durable bounded-handoff escalation wake across concurrent replay", async () => {
+    const { companyId, agentId, issueId, runId } = await seedStrandedIssueFixture({
+      status: "in_progress",
+      runStatus: "failed",
+      retryReason: "issue_continuation_needed",
+      runSource: "issue.productive_terminal_continuation_recovery",
+    });
+    await stampBoundedHandoffContinuationRun({ companyId, agentId, issueId, runId });
+
+    const first = recoveryServiceForTest({ persistWakeup: true });
+    const second = recoveryServiceForTest({ persistWakeup: true });
+    await Promise.all([
+      first.reconcileStrandedAssignedIssues(),
+      second.reconcileStrandedAssignedIssues(),
+    ]);
+    await db
+      .update(issues)
+      .set({ status: "in_progress", updatedAt: new Date() })
+      .where(eq(issues.id, issueId));
+    await recoveryServiceForTest({ persistWakeup: true }).reconcileStrandedAssignedIssues();
+
+    const idempotencyKey = `handoff_bounded_continuation_escalation:${companyId}:${issueId}:${runId}`;
+    const wakes = await db
+      .select()
+      .from(agentWakeupRequests)
+      .where(and(
+        eq(agentWakeupRequests.companyId, companyId),
+        eq(agentWakeupRequests.idempotencyKey, idempotencyKey),
+      ));
+    expect(wakes).toHaveLength(1);
+    const actions = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(and(
+        eq(issueRecoveryActions.companyId, companyId),
+        eq(issueRecoveryActions.sourceIssueId, issueId),
+      ));
+    expect(actions).toHaveLength(1);
   });
 
   it("converts a continuation parked for review into a dependency wait on its open sub-tasks", async () => {
