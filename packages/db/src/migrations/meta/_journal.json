@@ -1457,6 +1457,13 @@
       "when": 1786020026023,
       "tag": "0209_heartbeat_context_snapshot_indexes",
       "breakpoints": true
+    },
+    {
+      "idx": 238,
+      "version": "7",
+      "when": 1788936081506,
+      "tag": "0238_handoff_bounded_continuation_escalation_idempotency",
+      "breakpoints": true
     }
   ]
 }
