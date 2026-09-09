@@ -2,6 +2,7 @@ import { and, desc, eq, sql } from "drizzle-orm";
 import { activityLog, type Db } from "@paperclipai/db";
 import type { IssueReviewPolicy } from "@paperclipai/shared";
 import { forbidden } from "../errors.js";
+import { normalizeIssueExecutionPolicy, parseIssueExecutionState } from "./issue-execution-policy.js";
 
 export interface IssueReviewVerdictActor {
   type: "agent" | "user";
@@ -133,5 +134,35 @@ export async function assertIssueReviewVerdictActorAllowed(
       allowedActor: "writer_other_than_review_requester",
       remediation: "Have another writer with issue write access submit the verdict, or change reviewPolicy to `anyone`.",
     },
+  );
+}
+
+/**
+ * HW-5 (SPA-6268) pre-lock admissibility hint for the stalled-review recovery
+ * route. Returns true only when the issue carries a pending review or approval
+ * execution stage with the calling agent among its configured participants.
+ *
+ * This is NOT the authorization decision: the service revalidates the EXACT
+ * `executionState.currentParticipant` under the row lock (a configured but
+ * non-current participant is rejected there), because stage membership and
+ * the assignee column both race with stage/policy mutation. The route keeps
+ * this cheap pre-check so non-participant agents get a fast 403 without
+ * touching the decision transaction; the lock is where the verdict is earned.
+ */
+export function isActiveReviewStageAgentParticipant(
+  issue: {
+    executionPolicy?: unknown;
+    executionState?: unknown;
+  },
+  agentId: string | null | undefined,
+): boolean {
+  if (!agentId) return false;
+  const policy = normalizeIssueExecutionPolicy(issue.executionPolicy ?? null);
+  const state = parseIssueExecutionState(issue.executionState ?? null);
+  if (!policy || !state || state.status !== "pending" || !state.currentStageId) return false;
+  const stage = policy.stages.find((candidate) => candidate.id === state.currentStageId) ?? null;
+  if (!stage || (stage.type !== "review" && stage.type !== "approval")) return false;
+  return stage.participants.some(
+    (participant) => participant.type === "agent" && participant.agentId === agentId,
   );
 }
