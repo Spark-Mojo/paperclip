@@ -8357,17 +8357,11 @@ export function issueRoutes(
       const actor = getActorInfo(req);
 
       if (actor.actorType === "agent") {
-        // HW-5 (SPA-6268): the active configured review participant records
-        // approve/request_changes through this scoped route. No board
-        // authority is granted: an agent that is neither a configured
-        // participant of the active review/approval stage nor the issue's
-        // current assignee is rejected here. The assignee check lets a
-        // legitimately-routed agent reach the service when the stage has
-        // already completed (the issue left `in_review`), so the service can
-        // return the semantically-correct 409 instead of a misleading 403.
+        // HW-5 (SPA-6268): only a configured review participant may enter
+        // this scoped decision route. The service then revalidates exact
+        // executionState.currentParticipant equality under its issue lock.
         const isParticipant = !!actor.agentId && isActiveReviewStageAgentParticipant(issue, actor.agentId);
-        const isAssignee = !!actor.agentId && actor.agentId === issue.assigneeAgentId;
-        if (!isParticipant && !isAssignee) {
+        if (!isParticipant) {
           throw forbidden("Only a configured participant of the active review stage may record this decision");
         }
       } else {
