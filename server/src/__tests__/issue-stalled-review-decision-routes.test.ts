@@ -574,7 +574,10 @@ describeEmbeddedPostgres("stalled review decision routes", () => {
           id: stageId,
           type: "review",
           approvalsNeeded: 1,
-          participants: [{ id: randomUUID(), type: "agent", agentId: reviewerAgentId }],
+          participants: [
+            { id: randomUUID(), type: "agent", agentId: reviewerAgentId },
+            { id: randomUUID(), type: "agent", agentId: seeded.peerAgentId },
+          ],
         }],
       },
       executionState: {
@@ -590,10 +593,12 @@ describeEmbeddedPostgres("stalled review decision routes", () => {
       },
     }).where(eq(issues.id, issueId));
 
-    // A non-participant agent is still rejected: no general board authority.
+    // The peer is configured on the stage, so the route admits it. The
+    // service must nevertheless reject it under the issue row lock because
+    // only executionState.currentParticipant may advance this exact stage.
     await request(app(agentActor(seeded.companyId, seeded.peerAgentId)))
       .post(`/api/issues/${issueId}/stalled-review-decision`)
-      .send({ action: "approve", note: "Outsider approval." })
+      .send({ action: "approve", note: "Non-current approval." })
       .expect(403);
 
     const res = await request(app(agentActor(seeded.companyId, reviewerAgentId)))
@@ -639,5 +644,166 @@ describeEmbeddedPostgres("stalled review decision routes", () => {
       .from(issueExecutionDecisions)
       .where(eq(issueExecutionDecisions.issueId, issueId));
     expect(decisionsAfter).toHaveLength(1);
+  });
+
+  it("returns execution-stage request_changes to returnAssignee", async () => {
+    const seeded = await seedCompany("RTN");
+    const reviewerAgentId = seeded.assigneeAgentId;
+    const issueId = await seedReview({
+      companyId: seeded.companyId,
+      assigneeAgentId: reviewerAgentId,
+      identifier: "RTN-1",
+    });
+    const stageId = randomUUID();
+    await db.update(agents).set({ status: "paused" }).where(eq(agents.id, reviewerAgentId));
+    await db.update(issues).set({
+      executionPolicy: {
+        mode: "normal",
+        commentRequired: true,
+        stages: [{
+          id: stageId,
+          type: "review",
+          approvalsNeeded: 1,
+          participants: [{ id: randomUUID(), type: "agent", agentId: reviewerAgentId }],
+        }],
+      },
+      executionState: {
+        status: "pending",
+        currentStageId: stageId,
+        currentStageIndex: 0,
+        currentStageType: "review",
+        currentParticipant: { type: "agent", agentId: reviewerAgentId },
+        returnAssignee: { type: "agent", agentId: seeded.peerAgentId },
+        completedStageIds: [],
+        lastDecisionId: null,
+        lastDecisionOutcome: null,
+      },
+    }).where(eq(issues.id, issueId));
+
+    const res = await request(app(agentActor(seeded.companyId, reviewerAgentId)))
+      .post(`/api/issues/${issueId}/stalled-review-decision`)
+      .send({ action: "request_changes", note: "Please revise the implementation." })
+      .expect(200);
+
+    expect(res.body).toMatchObject({
+      action: "request_changes",
+      issue: {
+        id: issueId,
+        status: "in_progress",
+        assigneeAgentId: seeded.peerAgentId,
+      },
+    });
+    const decision = await db
+      .select()
+      .from(issueExecutionDecisions)
+      .where(eq(issueExecutionDecisions.issueId, issueId))
+      .then((rows) => rows[0] ?? null);
+    expect(decision).toMatchObject({
+      stageId,
+      outcome: "changes_requested",
+      actorAgentId: reviewerAgentId,
+    });
+  });
+
+  it("normalizes malformed, stale, foreign, and mismatched-agent run ids to null without failing the decision", async () => {
+    // HW-5 (SPA-6268 fix 4): the run id travels into a UUID column
+    // (issue_execution_decisions.createdByRunId). A malformed id, a valid id
+    // that is absent from heartbeatRuns, and a foreign-company id must all
+    // resolve to null — never 500 the insert — while a same-company valid id
+    // is correctly attributed.
+    const seeded = await seedCompany("RUN");
+    const foreign = await seedCompany("FRUN");
+    const reviewerAgentId = seeded.assigneeAgentId;
+    // Pause the reviewer so each review reads `stalled` despite the live run
+    // (an invokable currentParticipant is a maintained, i.e. `covered`, path).
+    await db.update(agents).set({ status: "paused" }).where(eq(agents.id, reviewerAgentId));
+    const stageId = randomUUID();
+    const makeIssue = async (identifier: string) => {
+      const issueId = await seedReview({
+        companyId: seeded.companyId,
+        assigneeAgentId: reviewerAgentId,
+        identifier,
+      });
+      await db.update(issues).set({
+        executionPolicy: {
+          mode: "normal",
+          commentRequired: true,
+          stages: [{
+            id: stageId,
+            type: "review",
+            approvalsNeeded: 1,
+            participants: [{ id: randomUUID(), type: "agent", agentId: reviewerAgentId }],
+          }],
+        },
+        executionState: {
+          status: "pending",
+          currentStageId: stageId,
+          currentStageIndex: 0,
+          currentStageType: "review",
+          currentParticipant: { type: "agent", agentId: reviewerAgentId },
+          returnAssignee: { type: "agent", agentId: seeded.peerAgentId },
+          completedStageIds: [],
+          lastDecisionId: null,
+          lastDecisionOutcome: null,
+        },
+      }).where(eq(issues.id, issueId));
+      return issueId;
+    };
+
+    const validRunId = await seedRun(seeded.companyId, reviewerAgentId, "RUN-1");
+    const validIssueId = await makeIssue("RUN-1");
+    const malformedIssueId = await makeIssue("RUN-2");
+    const staleIssueId = await makeIssue("RUN-3");
+    const foreignCompanyIssueId = await makeIssue("RUN-4");
+    const mismatchedAgentIssueId = await makeIssue("RUN-5");
+    const foreignCompanyRunId = await seedRun(foreign.companyId, foreign.assigneeAgentId, "FRUN-1");
+    const mismatchedAgentRunId = await seedRun(seeded.companyId, seeded.peerAgentId, "RUN-5");
+
+    // Same-company valid run: attributed.
+    const validRes = await request(app(agentActor(seeded.companyId, reviewerAgentId, validRunId)))
+      .post(`/api/issues/${validIssueId}/stalled-review-decision`)
+      .send({ action: "approve", note: "Valid run." })
+      .expect(200);
+    expect(validRes.body.issue.status).toBe("done");
+
+    // Malformed id (non-UUID): does not 500, resolves to null.
+    const malformedRes = await request(app(agentActor(seeded.companyId, reviewerAgentId, "not-a-uuid")))
+      .post(`/api/issues/${malformedIssueId}/stalled-review-decision`)
+      .send({ action: "approve", note: "Malformed run." })
+      .expect(200);
+    expect(malformedRes.body.issue.status).toBe("done");
+
+    // Stale id (well-formed UUID, absent from heartbeatRuns): null.
+    const staleRes = await request(app(agentActor(seeded.companyId, reviewerAgentId, randomUUID())))
+      .post(`/api/issues/${staleIssueId}/stalled-review-decision`)
+      .send({ action: "approve", note: "Stale run." })
+      .expect(200);
+    expect(staleRes.body.issue.status).toBe("done");
+
+    // A valid UUID from another company cannot cross the tenant boundary.
+    const foreignCompanyRes = await request(app(agentActor(seeded.companyId, reviewerAgentId, foreignCompanyRunId)))
+      .post(`/api/issues/${foreignCompanyIssueId}/stalled-review-decision`)
+      .send({ action: "approve", note: "Foreign-company run." })
+      .expect(200);
+    expect(foreignCompanyRes.body.issue.status).toBe("done");
+
+    // A same-company run still belongs to its originating agent, not another
+    // stage participant who happens to know its UUID.
+    const mismatchedAgentRes = await request(app(agentActor(seeded.companyId, reviewerAgentId, mismatchedAgentRunId)))
+      .post(`/api/issues/${mismatchedAgentIssueId}/stalled-review-decision`)
+      .send({ action: "approve", note: "Mismatched-agent run." })
+      .expect(200);
+    expect(mismatchedAgentRes.body.issue.status).toBe("done");
+
+    const decisions = await db
+      .select()
+      .from(issueExecutionDecisions)
+      .where(eq(issueExecutionDecisions.actorAgentId, reviewerAgentId));
+    const byIssue = new Map(decisions.map((d) => [d.issueId, d]));
+    expect(byIssue.get(validIssueId)?.createdByRunId).toBe(validRunId);
+    expect(byIssue.get(malformedIssueId)?.createdByRunId).toBeNull();
+    expect(byIssue.get(staleIssueId)?.createdByRunId).toBeNull();
+    expect(byIssue.get(foreignCompanyIssueId)?.createdByRunId).toBeNull();
+    expect(byIssue.get(mismatchedAgentIssueId)?.createdByRunId).toBeNull();
   });
 });

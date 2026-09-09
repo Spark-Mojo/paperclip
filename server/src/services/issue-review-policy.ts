@@ -138,12 +138,16 @@ export async function assertIssueReviewVerdictActorAllowed(
 }
 
 /**
- * HW-5 (SPA-6268): the stalled-review recovery route admits the active
- * configured review participant without granting general board authority.
- * Returns true only when the issue carries an active (pending) review or
- * approval execution stage whose configured participants include the calling
- * agent. Every other caller — including agents assigned to the issue but not
- * configured on the stage — is rejected by the route with 403.
+ * HW-5 (SPA-6268) pre-lock admissibility hint for the stalled-review recovery
+ * route. Returns true only when the issue carries a pending review or approval
+ * execution stage with the calling agent among its configured participants.
+ *
+ * This is NOT the authorization decision: the service revalidates the EXACT
+ * `executionState.currentParticipant` under the row lock (a configured but
+ * non-current participant is rejected there), because stage membership and
+ * the assignee column both race with stage/policy mutation. The route keeps
+ * this cheap pre-check so non-participant agents get a fast 403 without
+ * touching the decision transaction; the lock is where the verdict is earned.
  */
 export function isActiveReviewStageAgentParticipant(
   issue: {
