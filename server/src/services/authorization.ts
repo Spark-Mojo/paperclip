@@ -20,7 +20,7 @@ import type {
   SkillTestAgentKeyScope,
   TaskBridgeAgentKeyScope,
 } from "@paperclipai/shared";
-import { LOW_TRUST_REVIEW_PRESET, extractAgentMentionIds, type LowTrustBoundary } from "@paperclipai/shared";
+import { isUuidLike, LOW_TRUST_REVIEW_PRESET, extractAgentMentionIds, type LowTrustBoundary } from "@paperclipai/shared";
 import {
   LOW_TRUST_ISSUE_ANCESTRY_MAX_DEPTH,
   isIssueWithinLowTrustBoundary,
@@ -772,7 +772,8 @@ export function authorizationService(db: Db) {
   }
 
   async function loadRunPolicy(runId: string | null | undefined, companyId: string, agentId: string) {
-    if (!runId) return null;
+    const normalizedRunId = typeof runId === "string" ? runId.trim() : "";
+    if (!isUuidLike(normalizedRunId)) return null;
     const row = await db
       .select({
         id: heartbeatRuns.id,
@@ -781,7 +782,7 @@ export function authorizationService(db: Db) {
         contextSnapshot: heartbeatRuns.contextSnapshot,
       })
       .from(heartbeatRuns)
-      .where(eq(heartbeatRuns.id, runId))
+      .where(eq(heartbeatRuns.id, normalizedRunId))
       .then((rows) => rows[0] ?? null);
     if (!row || row.companyId !== companyId || row.agentId !== agentId) return null;
     const context = isPlainRecord(row.contextSnapshot) ? row.contextSnapshot : null;
@@ -791,7 +792,8 @@ export function authorizationService(db: Db) {
   }
 
   async function loadRunIssueId(runId: string | null | undefined, companyId: string, agentId: string) {
-    if (!runId) return null;
+    const normalizedRunId = typeof runId === "string" ? runId.trim() : "";
+    if (!isUuidLike(normalizedRunId)) return null;
     const row = await db
       .select({
         companyId: heartbeatRuns.companyId,
@@ -799,7 +801,7 @@ export function authorizationService(db: Db) {
         contextSnapshot: heartbeatRuns.contextSnapshot,
       })
       .from(heartbeatRuns)
-      .where(eq(heartbeatRuns.id, runId))
+      .where(eq(heartbeatRuns.id, normalizedRunId))
       .then((rows) => rows[0] ?? null);
     if (!row || row.companyId !== companyId || row.agentId !== agentId) return null;
     const context = isPlainRecord(row.contextSnapshot) ? row.contextSnapshot : null;

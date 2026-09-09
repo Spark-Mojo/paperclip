@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { and, eq, sql } from "drizzle-orm";
-import { heartbeatRuns, issueExecutionDecisions, issues, type Db } from "@paperclipai/db";
+import { companyMemberships, heartbeatRuns, issueExecutionDecisions, issues, type Db } from "@paperclipai/db";
 import { isUuidLike, type StalledReviewDecisionAction } from "@paperclipai/shared";
 import { conflict, forbidden, notFound } from "../errors.js";
 import { logActivity } from "./activity-log.js";
@@ -18,6 +18,7 @@ export interface StalledReviewDecisionActor {
   agentId?: string | null;
   userId?: string | null;
   runId?: string | null;
+  isLocalImplicit?: boolean;
 }
 
 export interface DecideStalledReviewInput {
@@ -27,6 +28,14 @@ export interface DecideStalledReviewInput {
   /** `send_back` is accepted by the schema but retires here: see below. */
   note?: string;
   actor: StalledReviewDecisionActor;
+}
+
+export interface StalledReviewDecisionServiceOptions {
+  /**
+   * Internal orchestration seam. It runs only after the issue row lock has
+   * been acquired and before the service's locked board-membership lookup.
+   */
+  onIssueLocked?: (issue: { id: string; companyId: string }) => Promise<void> | void;
 }
 
 /**
@@ -57,7 +66,10 @@ function resolveRunIdForDecisionColumn(
   return normalized;
 }
 
-export function stalledReviewDecisionService(db: Db) {
+export function stalledReviewDecisionService(
+  db: Db,
+  options: StalledReviewDecisionServiceOptions = {},
+) {
   return {
     decide: async (input: DecideStalledReviewInput) => db.transaction(async (tx) => {
       const txDb = tx as unknown as Db;
@@ -79,6 +91,8 @@ export function stalledReviewDecisionService(db: Db) {
           currentStatus: lockedIssue.status,
         });
       }
+
+      await options.onIssueLocked?.({ id: lockedIssue.id, companyId: lockedIssue.companyId });
 
       const svc = issueService(txDb);
       const reviewAttention = await svc
@@ -161,17 +175,29 @@ export function stalledReviewDecisionService(db: Db) {
       const requestedStatus = input.action === "approve" ? "done" : "todo";
       const commentBody = input.note?.trim() ? input.note : undefined;
 
-      const comment = commentBody
-        ? await svc.addComment(
-            lockedIssue.id,
-            commentBody,
-            isAgent
-              ? { agentId: input.actor.agentId!, runId: decisionRunId }
-              : { userId: input.actor.userId!, runId: decisionRunId },
-            isAgent ? { authorType: "agent" } : { authorType: "user" },
-            tx,
-          )
-        : null;
+      // Session board membership is checked once at route admission for prompt
+      // feedback, then rechecked under this issue lock before the canonical
+      // transition. The request actor snapshot alone cannot authorize a
+      // decision after the membership has been revoked or downgraded.
+      if (input.actor.type === "user" && !input.actor.isLocalImplicit) {
+        const userId = input.actor.userId?.trim();
+        const membership = userId
+          ? await tx
+              .select({ membershipRole: companyMemberships.membershipRole })
+              .from(companyMemberships)
+              .where(and(
+                eq(companyMemberships.companyId, lockedIssue.companyId),
+                eq(companyMemberships.principalType, "user"),
+                eq(companyMemberships.principalId, userId),
+                eq(companyMemberships.status, "active"),
+              ))
+              .for("update")
+              .then((rows) => rows[0] ?? null)
+          : null;
+        if (!membership?.membershipRole || membership.membershipRole === "viewer") {
+          throw forbidden("Active non-viewer company membership required");
+        }
+      }
 
       // Fix 1: the verdict travels through the canonical row-locked
       // execution-policy stage transition — never a raw status write. Approve
@@ -199,6 +225,18 @@ export function stalledReviewDecisionService(db: Db) {
             commentBody,
           })
         : { patch: {} as Record<string, unknown>, decision: undefined };
+
+      const comment = commentBody
+        ? await svc.addComment(
+            lockedIssue.id,
+            commentBody,
+            isAgent
+              ? { agentId: input.actor.agentId!, runId: decisionRunId }
+              : { userId: input.actor.userId!, runId: decisionRunId },
+            isAgent ? { authorType: "agent" } : { authorType: "user" },
+            tx,
+          )
+        : null;
       const transitionDecision = transition.decision;
       const decisionId = transitionDecision ? randomUUID() : null;
       if (decisionId && transition.patch.executionState && typeof transition.patch.executionState === "object") {
@@ -271,7 +309,7 @@ export function stalledReviewDecisionService(db: Db) {
         },
       });
 
-      return { issue: updated, comment };
+      return { issue: updated, comment, previousExecutionState: state };
     }),
   };
 }
