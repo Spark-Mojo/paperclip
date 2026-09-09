@@ -184,6 +184,20 @@ export const STRANDED_RECENT_PROGRESS_EXEMPTION_MS = Math.max(
 // Ordinary (non-handoff) batch continuations never carry this marker and keep
 // the GGU-809 exemption.
 export const HANDOFF_BOUNDED_CONTINUATION_MARKER = "handoffBoundedContinuation";
+export const HANDOFF_BOUNDED_ESCALATION_IDEMPOTENCY_PREFIX = "handoff_bounded_continuation_escalation";
+
+export function buildBoundedHandoffEscalationIdempotencyKey(input: {
+  companyId: string;
+  issueId: string;
+  boundedContinuationRunId: string;
+}) {
+  return [
+    HANDOFF_BOUNDED_ESCALATION_IDEMPOTENCY_PREFIX,
+    input.companyId,
+    input.issueId,
+    input.boundedContinuationRunId,
+  ].join(":");
+}
 
 type RecoveryWakeupOptions = {
   source?: "timer" | "assignment" | "on_demand" | "automation";
@@ -771,6 +785,13 @@ function isExhaustedSuccessfulRunHandoff(latestRun: LatestIssueRun) {
   return { ...evidence, exhausted: true };
 }
 
+function isBoundedHandoffContinuationRun(latestRun: LatestIssueRun) {
+  return asBoolean(
+    parseObject(latestRun?.contextSnapshot)[HANDOFF_BOUNDED_CONTINUATION_MARKER],
+    false,
+  );
+}
+
 function issueIdFromRunContext(contextSnapshot: unknown) {
   const context = parseObject(contextSnapshot);
   return (
@@ -959,6 +980,104 @@ export function recoveryService(
       .orderBy(desc(heartbeatRuns.createdAt), desc(heartbeatRuns.id))
       .limit(1)
       .then((rows) => rows[0] ?? null);
+  }
+
+  async function getVerifiedSuccessfulRunHandoffEvidence(input: {
+    issue: typeof issues.$inferSelect;
+    agentId: string;
+    latestRun: LatestIssueRun;
+  }): Promise<(SuccessfulRunHandoffRecoveryEvidence & { exhausted: boolean }) | null> {
+    const evidence = isExhaustedSuccessfulRunHandoff(input.latestRun);
+    if (!evidence || !input.latestRun || input.latestRun.agentId !== input.agentId || !evidence.sourceRunId) {
+      return null;
+    }
+
+    const latestContext = parseObject(input.latestRun.contextSnapshot);
+    if (readNonEmptyString(latestContext.sourceRunId) !== evidence.sourceRunId ||
+      readNonEmptyString(latestContext.resumeFromRunId) !== evidence.sourceRunId) {
+      return null;
+    }
+
+    const sourceRun = await db
+      .select({
+        id: heartbeatRuns.id,
+        agentId: heartbeatRuns.agentId,
+        status: heartbeatRuns.status,
+        error: heartbeatRuns.error,
+        errorCode: heartbeatRuns.errorCode,
+        contextSnapshot: heartbeatRuns.contextSnapshot,
+        livenessState: heartbeatRuns.livenessState,
+        resultJson: heartbeatRuns.resultJson,
+        startedAt: heartbeatRuns.startedAt,
+        createdAt: heartbeatRuns.createdAt,
+      })
+      .from(heartbeatRuns)
+      .where(and(
+        eq(heartbeatRuns.id, evidence.sourceRunId),
+        eq(heartbeatRuns.companyId, input.issue.companyId),
+        eq(heartbeatRuns.agentId, input.agentId),
+      ))
+      .then((rows) => rows[0] ?? null);
+    if (!sourceRun || sourceRun.status !== "succeeded" ||
+      issueIdFromRunContext(sourceRun.contextSnapshot) !== input.issue.id ||
+      !isProductiveContinuationRun(sourceRun) ||
+      successfulRunHandoffRecoveryEvidence(sourceRun)) {
+      return null;
+    }
+
+    return evidence;
+  }
+
+  async function getVerifiedBoundedHandoffContinuationEvidence(input: {
+    issue: typeof issues.$inferSelect;
+    agentId: string;
+    latestRun: LatestIssueRun;
+  }) {
+    if (!isBoundedHandoffContinuationRun(input.latestRun) || !input.latestRun ||
+      input.latestRun.agentId !== input.agentId) {
+      return null;
+    }
+    const context = parseObject(input.latestRun.contextSnapshot);
+    const sourceRunId = readNonEmptyString(context.handoffSourceRunId);
+    const correctiveRunId = readNonEmptyString(context.handoffCorrectiveRunId);
+    if (!sourceRunId || !correctiveRunId ||
+      readNonEmptyString(context.retryOfRunId) !== correctiveRunId ||
+      readNonEmptyString(context.retryReason) !== "issue_continuation_needed" ||
+      readNonEmptyString(context.source) !== "issue.productive_terminal_continuation_recovery") {
+      return null;
+    }
+
+    const correctiveRun = await db
+      .select({
+        id: heartbeatRuns.id,
+        agentId: heartbeatRuns.agentId,
+        status: heartbeatRuns.status,
+        error: heartbeatRuns.error,
+        errorCode: heartbeatRuns.errorCode,
+        contextSnapshot: heartbeatRuns.contextSnapshot,
+        livenessState: heartbeatRuns.livenessState,
+        resultJson: heartbeatRuns.resultJson,
+        startedAt: heartbeatRuns.startedAt,
+        createdAt: heartbeatRuns.createdAt,
+      })
+      .from(heartbeatRuns)
+      .where(and(
+        eq(heartbeatRuns.id, correctiveRunId),
+        eq(heartbeatRuns.companyId, input.issue.companyId),
+        eq(heartbeatRuns.agentId, input.agentId),
+      ))
+      .then((rows) => rows[0] ?? null);
+    if (!correctiveRun || correctiveRun.status !== "succeeded" ||
+      issueIdFromRunContext(correctiveRun.contextSnapshot) !== input.issue.id) {
+      return null;
+    }
+
+    const evidence = await getVerifiedSuccessfulRunHandoffEvidence({
+      issue: input.issue,
+      agentId: input.agentId,
+      latestRun: correctiveRun,
+    });
+    return evidence?.sourceRunId === sourceRunId ? evidence : null;
   }
 
   async function getLatestIssueRunForAgent(
@@ -2546,6 +2665,62 @@ export function recoveryService(
     return action;
   }
 
+  function isBoundedHandoffEscalationIdempotencyConflict(error: unknown) {
+    const conflict = unwrapDatabaseConflictError(error);
+    return conflict?.code === "23505" &&
+      (conflict.constraint === "agent_wakeup_requests_handoff_bounded_escalation_uq" ||
+        conflict.constraint_name === "agent_wakeup_requests_handoff_bounded_escalation_uq" ||
+        conflict.message?.includes("agent_wakeup_requests_handoff_bounded_escalation_uq"));
+  }
+
+  async function enqueueSourceScopedStrandedRecoveryWake(input: {
+    action: Awaited<ReturnType<typeof recoveryActionsSvc.upsertSourceScoped>>;
+    issue: typeof issues.$inferSelect;
+    latestRun: LatestIssueRun;
+    recoveryCause: StrandedRecoveryCause;
+    boundedHandoffContinuationRunId?: string | null;
+  }) {
+    if (input.recoveryCause === "provider_quota" && !input.action.ownerAgentId) return;
+    if (input.recoveryCause === "configuration_incomplete") return;
+    if (!input.action.ownerAgentId) return;
+    const idempotencyKey = input.boundedHandoffContinuationRunId
+      ? buildBoundedHandoffEscalationIdempotencyKey({
+        companyId: input.issue.companyId,
+        issueId: input.issue.id,
+        boundedContinuationRunId: input.boundedHandoffContinuationRunId,
+      })
+      : `source_scoped_recovery_action:${input.action.id}:${input.action.attemptCount}`;
+    await deps.enqueueWakeup(input.action.ownerAgentId, {
+      source: "assignment",
+      triggerDetail: "system",
+      reason: "source_scoped_recovery_action",
+      idempotencyKey,
+      payload: withRecoveryModelProfileHint({
+        issueId: input.issue.id,
+        sourceIssueId: input.issue.id,
+        recoveryActionId: input.action.id,
+        strandedRunId: input.latestRun?.id ?? null,
+        recoveryCause: input.recoveryCause,
+      }, "status_only"),
+      requestedByActorType: "system",
+      requestedByActorId: null,
+      contextSnapshot: withRecoveryModelProfileHint({
+        issueId: input.issue.id,
+        taskId: input.issue.id,
+        wakeReason: "source_scoped_recovery_action",
+        skipIssueComment: true,
+        source: "issue_recovery_action",
+        recoveryActionId: input.action.id,
+        sourceIssueId: input.issue.id,
+        strandedRunId: input.latestRun?.id ?? null,
+        recoveryCause: input.recoveryCause,
+      }, "status_only"),
+    }).catch((error: unknown) => {
+      if (input.boundedHandoffContinuationRunId && isBoundedHandoffEscalationIdempotencyConflict(error)) return null;
+      throw error;
+    });
+  }
+
   function readProviderQuotaRetryAt(latestRun: LatestIssueRun, now: Date) {
     const result = parseObject(latestRun?.resultJson);
     const context = parseObject(latestRun?.contextSnapshot);
@@ -3741,6 +3916,7 @@ export function recoveryService(
     notice?: StrandedRecoveryNoticeSeed | null;
     recoveryCause?: StrandedRecoveryCause;
     successfulRunHandoffEvidence?: SuccessfulRunHandoffRecoveryEvidence | null;
+    boundedHandoffContinuationRunId?: string | null;
   }) {
     if (isStrandedIssueRecoveryIssue(input.issue)) {
       return escalateStrandedRecoveryIssueInPlace({
@@ -3968,6 +4144,37 @@ export function recoveryService(
         blockerIssueIds: blockerIds,
       },
     });
+
+    await enqueueSourceScopedStrandedRecoveryWake({
+      action: recoveryAction,
+      issue: input.issue,
+      latestRun: input.latestRun,
+      recoveryCause,
+      boundedHandoffContinuationRunId: input.boundedHandoffContinuationRunId,
+    });
+
+    if (recoveryAction.ownerAgentId && recoveryAction.ownerAgentId === input.issue.assigneeAgentId) {
+      const [currentIssue] = await db
+        .select({
+          status: issues.status,
+          assigneeAgentId: issues.assigneeAgentId,
+        })
+        .from(issues)
+        .where(eq(issues.id, input.issue.id))
+        .limit(1);
+      if (
+        currentIssue &&
+        (currentIssue.status !== "blocked" ||
+          currentIssue.assigneeAgentId !== recoveryAction.ownerAgentId)
+      ) {
+        const reblocked = await issuesSvc.update(input.issue.id, {
+          status: "blocked",
+          blockedByIssueIds: blockerIds,
+          assigneeAgentId: recoveryAction.ownerAgentId,
+        });
+        if (reblocked) return reblocked;
+      }
+    }
 
     if (!sourceAssigneePreserved) {
       logger.error(
@@ -4989,7 +5196,48 @@ export function recoveryService(
       // exactly one bounded normal continuation; the continuation enqueue reads
       // it to stamp the bounded marker. Reset every iteration.
       let handoffBoundedContext: { sourceRunId: string | null; correctiveRunId: string } | null = null;
-      const handoffEvidence = isExhaustedSuccessfulRunHandoff(latestRun);
+      // Validate handoff provenance against durable run rows before any handoff
+      // classification. Context JSON is agent-authored evidence, not authority.
+      const handoffCandidate = isExhaustedSuccessfulRunHandoff(latestRun);
+      const handoffEvidence = handoffCandidate
+        ? await getVerifiedSuccessfulRunHandoffEvidence({ issue, agentId, latestRun })
+        : null;
+      if (handoffCandidate && !handoffEvidence) {
+        result.skipped += 1;
+        continue;
+      }
+
+      // A bounded C1 is also provenance-bound: it must point to a real,
+      // matching corrective handoff and original productive source run.
+      const boundedHandoffEvidence = await getVerifiedBoundedHandoffContinuationEvidence({
+        issue,
+        agentId,
+        latestRun,
+      });
+      if (isBoundedHandoffContinuationRun(latestRun) && !boundedHandoffEvidence) {
+        result.skipped += 1;
+        continue;
+      }
+      // SPA-6335 bounded-failed escalation: a bounded continuation that ran and
+      // exited unsuccessfully escalates via the handoff-cause path with a stable
+      // idempotency key, not via the generic failure paths below.
+      if (boundedHandoffEvidence && isUnsuccessfulTerminalIssueRun(latestRun)) {
+        const updated = await escalateStrandedAssignedIssue({
+          issue,
+          previousStatus: "in_progress",
+          latestRun,
+          recoveryCause: SUCCESSFUL_RUN_MISSING_STATE_REASON,
+          successfulRunHandoffEvidence: boundedHandoffEvidence,
+          boundedHandoffContinuationRunId: latestRun?.id ?? null,
+        });
+        if (updated) {
+          result.successfulRunHandoffEscalated += 1;
+          result.issueIds.push(issue.id);
+        } else {
+          result.skipped += 1;
+        }
+        continue;
+      }
       if (handoffEvidence) {
         if (isPluginManagedIssueLifecycle(issue)) {
           result.skipped += 1;
@@ -5061,18 +5309,15 @@ export function recoveryService(
         }
 
         if (isRepeatedProductiveContinuationRecovery(successfulRun)) {
-          // SPA-6335 bounded-handoff carve-out: the continuation created from
-          // an exhausted productive handoff carries HANDOFF_BOUNDED_CONTINUATION_MARKER.
-          // Read it from THIS run's own context (not the per-iteration handoff
-          // detector — the continuation's wakeReason is not a handoff reason).
-          // On the repeat, escalate regardless of visible progress — otherwise
-          // an agent could avoid escalation indefinitely by posting progress
-          // every heartbeat. GGU-809 still protects ordinary non-handoff
-          // batch continuations, which never carry the marker.
-          const isHandoffBounded = asBoolean(
-            parseObject(successfulRun.contextSnapshot)[HANDOFF_BOUNDED_CONTINUATION_MARKER],
-            false,
-          );
+          // SPA-6335 bounded-handoff carve-out (durability upgrade): the
+          // continuation created from an exhausted productive handoff is
+          // provenance-verified against durable runs (boundedHandoffEvidence),
+          // not trusted from context JSON. On the repeat, escalate regardless
+          // of visible progress — otherwise an agent could avoid escalation
+          // indefinitely by posting progress every heartbeat. GGU-809 still
+          // protects ordinary non-handoff batch continuations, which carry
+          // no verified bounded evidence.
+          const isHandoffBounded = Boolean(boundedHandoffEvidence);
           const exempted = isHandoffBounded ? false : await hasRecentVisibleProgress(
             issue.companyId,
             issue.id,
@@ -5089,6 +5334,13 @@ export function recoveryService(
                   "the continuation made progress, so escalating to the board now instead of queuing another."
                 : "Paperclip automatically retried continuation for this assigned `in_progress` issue and the retry " +
                   "made progress, but it still has no live execution path. Moving it to `blocked` so it is visible for intervention.",
+              ...(isHandoffBounded
+                ? {
+                  recoveryCause: SUCCESSFUL_RUN_MISSING_STATE_REASON,
+                  successfulRunHandoffEvidence: boundedHandoffEvidence,
+                  boundedHandoffContinuationRunId: successfulRun.id,
+                }
+                : {}),
             });
             if (updated) {
               result.escalated += 1;
