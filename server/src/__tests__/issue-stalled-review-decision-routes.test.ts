@@ -546,6 +546,158 @@ describeEmbeddedPostgres("stalled review decision routes", () => {
     expect(results.map((result) => result.status).sort()).toEqual([200, 409]);
   });
 
+  it("lets an authorized board user resolve an active agent review under human_only", async () => {
+    const seeded = await seedCompany("HBR");
+    const reviewerAgentId = seeded.assigneeAgentId;
+    const issueId = await seedReview({
+      companyId: seeded.companyId,
+      assigneeAgentId: reviewerAgentId,
+      identifier: "HBR-1",
+      reviewPolicy: "human_only",
+    });
+    const stageId = randomUUID();
+    const approvalStageId = randomUUID();
+    await db.update(agents).set({ status: "paused" }).where(eq(agents.id, reviewerAgentId));
+    await db.update(issues).set({
+      executionPolicy: {
+        mode: "normal",
+        commentRequired: true,
+        stages: [
+          {
+            id: stageId,
+            type: "review",
+            approvalsNeeded: 1,
+            participants: [{ id: randomUUID(), type: "agent", agentId: reviewerAgentId }],
+          },
+          {
+            id: approvalStageId,
+            type: "approval",
+            approvalsNeeded: 1,
+            participants: [{ id: randomUUID(), type: "user", userId: seeded.memberUserId }],
+          },
+        ],
+      },
+      executionState: {
+        status: "pending",
+        currentStageId: stageId,
+        currentStageIndex: 0,
+        currentStageType: "review",
+        currentParticipant: { type: "agent", agentId: reviewerAgentId },
+        returnAssignee: { type: "agent", agentId: seeded.peerAgentId },
+        completedStageIds: [],
+        lastDecisionId: null,
+        lastDecisionOutcome: null,
+      },
+    }).where(eq(issues.id, issueId));
+
+    const res = await request(app(boardActor(seeded.companyId, seeded.peerUserId)))
+      .post(`/api/issues/${issueId}/stalled-review-decision`)
+      .send({ action: "approve", note: "Human recovery approval." })
+      .expect(200);
+
+    expect(res.body).toMatchObject({
+      action: "approve",
+      issue: {
+        id: issueId,
+        status: "in_review",
+        assigneeAgentId: null,
+        assigneeUserId: seeded.memberUserId,
+        executionState: {
+          status: "pending",
+          currentStageId: approvalStageId,
+          currentParticipant: { type: "user", userId: seeded.memberUserId },
+        },
+      },
+    });
+    const decision = await db
+      .select()
+      .from(issueExecutionDecisions)
+      .where(eq(issueExecutionDecisions.issueId, issueId))
+      .then((rows) => rows[0] ?? null);
+    expect(decision).toMatchObject({
+      stageId,
+      outcome: "approved",
+      actorAgentId: null,
+      actorUserId: seeded.peerUserId,
+    });
+  });
+
+  it("enforces not_creator for board recovery of an active agent review", async () => {
+    const seeded = await seedCompany("NBR");
+    const reviewerAgentId = seeded.assigneeAgentId;
+    const issueId = await seedReview({
+      companyId: seeded.companyId,
+      assigneeAgentId: reviewerAgentId,
+      identifier: "NBR-1",
+      reviewPolicy: "not_creator",
+    });
+    const stageId = randomUUID();
+    await db.update(agents).set({ status: "paused" }).where(eq(agents.id, reviewerAgentId));
+    await db.insert(activityLog).values({
+      companyId: seeded.companyId,
+      actorType: "user",
+      actorId: seeded.memberUserId,
+      action: "issue.updated",
+      entityType: "issue",
+      entityId: issueId,
+      details: { status: "in_review", _previous: { status: "in_progress" } },
+    });
+    await db.update(issues).set({
+      executionPolicy: {
+        mode: "normal",
+        commentRequired: true,
+        stages: [{
+          id: stageId,
+          type: "review",
+          approvalsNeeded: 1,
+          participants: [{ id: randomUUID(), type: "agent", agentId: reviewerAgentId }],
+        }],
+      },
+      executionState: {
+        status: "pending",
+        currentStageId: stageId,
+        currentStageIndex: 0,
+        currentStageType: "review",
+        currentParticipant: { type: "agent", agentId: reviewerAgentId },
+        returnAssignee: { type: "agent", agentId: seeded.peerAgentId },
+        completedStageIds: [],
+        lastDecisionId: null,
+        lastDecisionOutcome: null,
+      },
+    }).where(eq(issues.id, issueId));
+
+    const creator = await request(app(boardActor(seeded.companyId, seeded.memberUserId)))
+      .post(`/api/issues/${issueId}/stalled-review-decision`)
+      .send({ action: "approve", note: "Creator approval." })
+      .expect(403);
+    expect(creator.body).toMatchObject({
+      details: { code: "review_policy_denied", policy: "not_creator" },
+    });
+
+    const res = await request(app(boardActor(seeded.companyId, seeded.peerUserId)))
+      .post(`/api/issues/${issueId}/stalled-review-decision`)
+      .send({ action: "request_changes", note: "Independent revision request." })
+      .expect(200);
+    expect(res.body).toMatchObject({
+      action: "request_changes",
+      issue: {
+        id: issueId,
+        status: "in_progress",
+        assigneeAgentId: seeded.peerAgentId,
+      },
+    });
+    const decision = await db
+      .select()
+      .from(issueExecutionDecisions)
+      .where(eq(issueExecutionDecisions.issueId, issueId))
+      .then((rows) => rows[0] ?? null);
+    expect(decision).toMatchObject({
+      stageId,
+      outcome: "changes_requested",
+      actorUserId: seeded.peerUserId,
+    });
+  });
+
   it("lets the active review-stage agent participant record the decision with zero board writes", async () => {
     // HW-5 (SPA-6268): the Argus reviewer owned the review stage but held no
     // live run or wake, so the review read `stalled` and the only recovery

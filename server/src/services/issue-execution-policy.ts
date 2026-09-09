@@ -50,6 +50,11 @@ type TransitionInput = {
   requestedAssigneePatch: RequestedAssigneePatch;
   actor: ActorLike;
   allowBoardOverride?: boolean;
+  /**
+   * Allows a separately-authorized human recovery actor to record the active
+   * stage's normal canonical decision without clearing execution state.
+   */
+  allowCurrentStageDecisionOverride?: boolean;
   commentBody?: string | null;
   reviewRequest?: IssueExecutionState["reviewRequest"] | null;
   monitorExplicitlyUpdated?: boolean;
@@ -783,7 +788,7 @@ function applyIssueExecutionStageTransition(input: TransitionInput): TransitionR
       };
     }
 
-    if (principalsEqual(currentParticipant, actor)) {
+    if (principalsEqual(currentParticipant, actor) || input.allowCurrentStageDecisionOverride) {
       if (requestedStatus === "done") {
         if (!input.commentBody?.trim()) {
           throw unprocessable(`Approving a review or approval stage requires a comment. ${STAGE_DECISION_COMMENT_HINT}`);
