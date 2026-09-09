@@ -560,11 +560,11 @@ export const stalledReviewDecisionSchema = z.object({
   action: z.enum(["approve", "request_changes", "send_back"]),
   note: multilineTextSchema.pipe(z.string().min(1)).optional(),
 }).strict().superRefine((value, ctx) => {
-  if (value.action === "request_changes" && !value.note?.trim()) {
+  if ((value.action === "request_changes" || value.action === "send_back") && !value.note?.trim()) {
     ctx.addIssue({
       code: z.ZodIssueCode.custom,
       path: ["note"],
-      message: "Request changes requires a note",
+      message: "Request changes and send back require a note",
     });
   }
 });

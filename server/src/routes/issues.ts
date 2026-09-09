@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
-import { Router, type Request, type Response } from "express";
+import { Router, type NextFunction, type Request, type Response } from "express";
 import multer from "multer";
 import { z } from "zod";
 import { and, asc, desc, eq, inArray, isNull, notInArray } from "drizzle-orm";
@@ -217,6 +217,7 @@ import { externalObjectService } from "../services/external-objects.js";
 import { deliverAgentUnblockNotification } from "../services/routable-blocked.js";
 import {
   assertIssueReviewVerdictActorAllowed,
+  isActiveReviewStageAgentParticipant,
   isIssueReviewVerdictInteraction,
 } from "../services/issue-review-policy.js";
 import {
@@ -230,6 +231,16 @@ const MAX_ISSUE_COMMENT_LIMIT = 500;
 const updateIssueRouteSchema = updateIssueSchema.extend({
   interrupt: z.boolean().optional(),
 });
+
+function validateStalledReviewDecision(req: Request, _res: Response, next: NextFunction) {
+  const parsed = stalledReviewDecisionSchema.safeParse(req.body);
+  if (!parsed.success) {
+    next(unprocessable("Invalid stalled review decision", { issues: parsed.error.issues }));
+    return;
+  }
+  req.body = parsed.data;
+  next();
+}
 
 function prefersMinimalIssueUpdateResponse(req: Request) {
   return (req.get("Prefer") ?? "")
@@ -2695,6 +2706,7 @@ export function issueRoutes(
       agentId: string,
       options: Parameters<ReturnType<typeof heartbeatService>["wakeup"]>[1],
     ) => ReturnType<ReturnType<typeof heartbeatService>["wakeup"]>;
+    createStalledReviewDecisionService?: typeof stalledReviewDecisionService;
     issueListDiagnostics?: IssueListDiagnostics;
     approveToolActionRequest?: (input: {
       companyId: string;
@@ -2713,6 +2725,7 @@ export function issueRoutes(
     pluginWorkerManager: opts.pluginWorkerManager,
   });
   const enqueueStalledReviewDecisionWakeup = opts.stalledReviewDecisionEnqueueWakeup ?? heartbeat.wakeup;
+  const createStalledReviewDecisionService = opts.createStalledReviewDecisionService ?? stalledReviewDecisionService;
   const enqueueRecoveryActionWakeup = opts.recoveryActionEnqueueWakeup ?? heartbeat.wakeup;
   const feedback = feedbackService(db);
   const companiesSvc = companyService(db);
@@ -2830,7 +2843,8 @@ export function issueRoutes(
     companyId: string,
     actor: ReturnType<typeof getActorInfo>,
   ): Promise<string | null> {
-    if (actor.actorType !== "agent" || !actor.agentId || !actor.runId) return null;
+    const runId = typeof actor.runId === "string" ? actor.runId.trim() : "";
+    if (actor.actorType !== "agent" || !actor.agentId || !isUuidLike(runId)) return null;
     const run = await db
       .select({
         agentId: heartbeatRuns.agentId,
@@ -2838,7 +2852,7 @@ export function issueRoutes(
       })
       .from(heartbeatRuns)
       .where(and(
-        eq(heartbeatRuns.id, actor.runId),
+        eq(heartbeatRuns.id, runId),
         eq(heartbeatRuns.companyId, companyId),
       ))
       .then((rows) => rows[0] ?? null);
@@ -2862,9 +2876,10 @@ export function issueRoutes(
     issue?: { companyId: string; projectId?: string | null; executionPolicy?: unknown } | null,
   ): Promise<TrustPresetResolution | null> {
     if (!input.agentId) return null;
+    const runId = typeof input.runId === "string" ? input.runId.trim() : "";
     const [agent, run] = await Promise.all([
       agentsSvc.getById(input.agentId),
-      input.runId
+      isUuidLike(runId)
         ? db
             .select({
               companyId: heartbeatRuns.companyId,
@@ -2872,7 +2887,7 @@ export function issueRoutes(
               contextSnapshot: heartbeatRuns.contextSnapshot,
             })
             .from(heartbeatRuns)
-            .where(and(eq(heartbeatRuns.id, input.runId), eq(heartbeatRuns.companyId, companyId)))
+            .where(and(eq(heartbeatRuns.id, runId), eq(heartbeatRuns.companyId, companyId)))
             .then((rows) => rows[0] ?? null)
         : Promise.resolve(null),
     ]);
@@ -8338,41 +8353,61 @@ export function issueRoutes(
 
   router.post(
     "/issues/:id/stalled-review-decision",
-    validate(stalledReviewDecisionSchema),
+    validateStalledReviewDecision,
     async (req, res) => {
       const id = req.params.id as string;
       const issue = await getAccessibleResource(req, res, svc.getById(id), "Issue not found");
       if (!issue) return;
-      assertBoard(req);
+      const actor = getActorInfo(req);
 
-      if (req.actor.source !== "local_implicit") {
-        const userId = req.actor.userId?.trim();
-        const membership = userId
-          ? await db
-              .select({ membershipRole: companyMemberships.membershipRole })
-              .from(companyMemberships)
-              .where(and(
-                eq(companyMemberships.companyId, issue.companyId),
-                eq(companyMemberships.principalType, "user"),
-                eq(companyMemberships.principalId, userId),
-                eq(companyMemberships.status, "active"),
-              ))
-              .then((rows) => rows[0] ?? null)
-          : null;
-        if (!membership?.membershipRole || membership.membershipRole === "viewer") {
-          throw forbidden("Active non-viewer company membership required");
+      if (actor.actorType === "agent") {
+        // A configured/current stage participant still needs the ordinary
+        // agent mutation authorization used by PATCH: task-watchdog scope and
+        // low-trust control-plane boundaries are not bypassed by stage state.
+        if (await assertLowTrustControlPlaneDenied(req, res, issue.companyId, issue)) return;
+        if (!(await assertAgentIssueMutationAllowed(req, res, issue, { allowVisibleIssueWrite: true }))) return;
+
+        // HW-5 (SPA-6268): only a configured review participant may enter
+        // this scoped decision route. The service then revalidates exact
+        // executionState.currentParticipant equality under its issue lock.
+        const isParticipant = !!actor.agentId && isActiveReviewStageAgentParticipant(issue, actor.agentId);
+        if (!isParticipant) {
+          throw forbidden("Only a configured participant of the active review stage may record this decision");
+        }
+      } else {
+        assertBoard(req);
+
+        if (req.actor.source !== "local_implicit") {
+          const userId = req.actor.userId?.trim();
+          const membership = userId
+            ? await db
+                .select({ membershipRole: companyMemberships.membershipRole })
+                .from(companyMemberships)
+                .where(and(
+                  eq(companyMemberships.companyId, issue.companyId),
+                  eq(companyMemberships.principalType, "user"),
+                  eq(companyMemberships.principalId, userId),
+                  eq(companyMemberships.status, "active"),
+                ))
+                .then((rows) => rows[0] ?? null)
+            : null;
+          if (!membership?.membershipRole || membership.membershipRole === "viewer") {
+            throw forbidden("Active non-viewer company membership required");
+          }
         }
       }
 
-      const actor = getActorInfo(req);
-      const result = await stalledReviewDecisionService(db).decide({
+      const result = await createStalledReviewDecisionService(db).decide({
         issueId: issue.id,
         companyId: issue.companyId,
         action: req.body.action,
         note: req.body.note,
         actor: {
-          userId: actor.actorId,
+          type: actor.actorType,
+          userId: actor.actorType === "user" ? actor.actorId : null,
+          agentId: actor.agentId ?? null,
           runId: actor.runId,
+          isLocalImplicit: req.actor.source === "local_implicit",
         },
       });
 
@@ -8406,8 +8441,31 @@ export function issueRoutes(
       }
 
       let wakeQueued = false;
-      if (req.body.action !== "approve" && result.issue.assigneeAgentId) {
-        const userAuthoredNote = result.comment
+      const executionStageWakeup = req.body.action === "approve"
+        ? buildExecutionStageWakeup({
+            issueId: result.issue.id,
+            previousState: result.previousExecutionState,
+            nextState: parseIssueExecutionState(result.issue.executionState),
+            interruptedRunId: null,
+            requestedByActorType: actor.actorType,
+            requestedByActorId: actor.actorId,
+          })
+        : null;
+      if (executionStageWakeup) {
+        try {
+          const wake = await enqueueStalledReviewDecisionWakeup(
+            executionStageWakeup.agentId,
+            executionStageWakeup.wakeup,
+          );
+          wakeQueued = wake !== null;
+        } catch (err) {
+          logger.warn(
+            { err, issueId: result.issue.id, agentId: executionStageWakeup.agentId },
+            "failed to enqueue stalled-review decision execution-stage wake",
+          );
+        }
+      } else if (req.body.action !== "approve" && result.issue.assigneeAgentId) {
+        const userAuthoredNote = actor.actorType === "user" && result.comment
           ? { commentId: result.comment.id, authorUserId: actor.actorId }
           : undefined;
         try {
@@ -8416,7 +8474,7 @@ export function issueRoutes(
             triggerDetail: "system",
             reason: "issue_status_changed",
             idempotencyKey: `stalled-review-decision:${result.issue.id}:${req.body.action}`,
-            requestedByActorType: "user",
+            requestedByActorType: actor.actorType,
             requestedByActorId: actor.actorId,
             payload: {
               issueId: result.issue.id,

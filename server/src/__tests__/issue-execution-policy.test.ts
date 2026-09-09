@@ -303,6 +303,49 @@ describe("issue execution policy transitions", () => {
       });
     });
 
+    it("allows an explicit human recovery override to canonically advance an agent stage", () => {
+      const reviewStageId = policy.stages[0].id;
+      const approvalStageId = policy.stages[1].id;
+      const result = applyIssueExecutionPolicyTransition({
+        issue: {
+          status: "in_review",
+          assigneeAgentId: qaAgentId,
+          assigneeUserId: null,
+          executionPolicy: policy,
+          executionState: {
+            status: "pending",
+            currentStageId: reviewStageId,
+            currentStageIndex: 0,
+            currentStageType: "review",
+            currentParticipant: { type: "agent", agentId: qaAgentId },
+            returnAssignee: { type: "agent", agentId: coderAgentId },
+            completedStageIds: [],
+            lastDecisionId: null,
+            lastDecisionOutcome: null,
+          },
+        },
+        policy,
+        requestedStatus: "done",
+        requestedAssigneePatch: {},
+        actor: { userId: boardUserId },
+        allowCurrentStageDecisionOverride: true,
+        commentBody: "Human recovery approval",
+      });
+
+      expect(result.decision).toMatchObject({
+        stageId: reviewStageId,
+        stageType: "review",
+        outcome: "approved",
+      });
+      expect(result.patch.executionState).toMatchObject({
+        status: "pending",
+        currentStageId: approvalStageId,
+        currentParticipant: { type: "user", userId: ctoUserId },
+      });
+      expect(result.patch.assigneeAgentId).toBeNull();
+      expect(result.patch.assigneeUserId).toBe(ctoUserId);
+    });
+
     it("lets a reviewer provide loose instructions for the next approval stage", () => {
       const reviewStageId = policy.stages[0].id;
       const approvalInstructions = "Please decide whether this is ready to ship, with any launch caveats.";
