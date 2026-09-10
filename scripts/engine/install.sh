@@ -90,8 +90,17 @@ preflight() {
     die "Node $node_major found; Paperclip requires Node >= 20 (package.json engines.node)."
   fi
 
+  if [ "$SOURCE_KIND" = "fork" ] && [ "$DRY_RUN" != "1" ]; then
+    log "Preflight: fork Rust toolchain"
+    assert_fork_rust_toolchain "$(fork_source_repo)"
+  fi
+
   log "Preflight: systemd unit compatibility"
-  unit_assert_compatible "$SCRIPT_DIR/systemd/$UNIT_NAME"
+  if [ -n "$PAPERCLIP_ENGINE_ADOPT_EXISTING_PREFIX" ]; then
+    prepare_existing_prefix_adoption
+  else
+    unit_assert_compatible "$SCRIPT_DIR/systemd/$UNIT_NAME"
+  fi
 
   log "Preflight: disk space at $ENGINE_ROOT"
   mkdir -p "$ENGINE_ROOT"
@@ -109,7 +118,7 @@ preflight() {
     if connection_string="$(connection_string_from_config "$INSTANCE_CONFIG" 2>/dev/null)"; then
       log "Preflight: postgres reachability"
       if [ "$DRY_RUN" != "1" ]; then
-        if ! psql "$connection_string" -tAc 'select 1' >/dev/null 2>&1; then
+        if ! database_reachable "$connection_string" >/dev/null 2>&1; then
           die "Cannot reach postgres at the configured connectionString. Aborting before touching the running instance."
         fi
       fi
@@ -139,10 +148,7 @@ install_from_npm() {
     stage_fake_payload "$staging" "$version"
   else
     # Mirrors installNpmPayload() in cli/src/commands/install.ts.
-    run npm install --prefix "$staging" "paperclipai@$version" \
-      --registry=https://registry.npmjs.org \
-      "--@paperclipai:registry=https://registry.npmjs.org" \
-      --no-audit --no-fund
+    install_npm_payload "$staging" "$version"
   fi
 
   mv "$staging" "$prefix"
@@ -203,7 +209,7 @@ install_from_fork() {
 
   local build_env_path="$PATH"
   # Workspace build scripts invoke bare `pnpm`; corepack provisions it.
-  run corepack enable pnpm --install-directory "$staging_root/pnpm-bin"
+  prepare_pnpm_toolchain "$staging_root"
   export PATH="$staging_root/pnpm-bin:$build_env_path"
 
   (cd "$checkout" && run corepack pnpm install --frozen-lockfile)
@@ -274,7 +280,7 @@ install_from_fork() {
     die "Required @paperclipai/server workspace tarball was not produced. Aborting before install, migrations, or cutover."
   fi
 
-  run npm install --prefix "$payload" "$cli_tarball" "${workspace_tarballs[@]}" --no-audit --no-fund
+  install_fork_payload "$payload" "$cli_tarball" "${workspace_tarballs[@]}"
 
   verify_fork_server_package "$payload" "$server_tarball"
 
@@ -317,16 +323,16 @@ EOF
 # NOT set that on the unit; migrations here are the only place they run.
 run_migrations() {
   local prefix="$1"
+  if [ ! -f "$INSTANCE_CONFIG" ]; then
+    log "No instance config at $INSTANCE_CONFIG; no existing database to migrate."
+    return 0
+  fi
   if [ "$DRY_RUN" = "1" ]; then
     log "+DRYRUN would run @paperclipai/db migrations from $prefix"
     return 0
   fi
   local migrate_js
-  migrate_js="$(find "$prefix/lib/node_modules" -maxdepth 5 -path '*/@paperclipai/db/dist/migrate.js' 2>/dev/null | head -1)"
-  if [ -z "$migrate_js" ]; then
-    log "WARNING: no @paperclipai/db/dist/migrate.js found under $prefix — skipping explicit migration run. The server will refuse to start if the schema is stale (see above); this is a fail-safe, not silent drift."
-    return 0
-  fi
+  migrate_js="$(resolve_migration_artifact "$prefix")"
   log "Running migrations via $migrate_js"
   PAPERCLIP_HOME="$PAPERCLIP_HOME" PAPERCLIP_INSTANCE_ID="$PAPERCLIP_INSTANCE_ID" PAPERCLIP_CONFIG="$INSTANCE_CONFIG" \
     run node "$migrate_js"
@@ -362,7 +368,9 @@ main() {
   previous="$(current_target)"
   record_previous_target "$previous"
 
-  unit_ensure_installed "$SCRIPT_DIR/systemd/$UNIT_NAME"
+  if [ -z "$PAPERCLIP_ENGINE_ADOPT_EXISTING_PREFIX" ]; then
+    unit_ensure_installed "$SCRIPT_DIR/systemd/$UNIT_NAME"
+  fi
   unit_stop
   flip_symlink "$NEW_PREFIX"
 

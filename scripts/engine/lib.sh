@@ -36,6 +36,11 @@
 #   STATE_DIR               default: $ENGINE_ROOT/.paperclip-engine
 #   HEALTH_TIMEOUT_SECS      default: 90
 #   HEALTH_POLL_SECS         default: 2
+#   PAPERCLIP_ENGINE_ADOPT_EXISTING_PREFIX
+#                            opt-in absolute npm prefix already serving the
+#                            instance (for bigbox, /usr). Seeds CURRENT_LINK
+#                            to that prefix and redirects the existing unit
+#                            with one managed ExecStart-only drop-in.
 #
 # The systemd unit's ExecStart is
 #   "$CURRENT_LINK/bin/paperclipai" run --instance "$PAPERCLIP_INSTANCE_ID"
@@ -82,6 +87,8 @@ STATE_DIR="${STATE_DIR:-$ENGINE_ROOT/.paperclip-engine}"
 HEALTH_TIMEOUT_SECS="${HEALTH_TIMEOUT_SECS:-90}"
 HEALTH_POLL_SECS="${HEALTH_POLL_SECS:-2}"
 MIN_FREE_KB="${MIN_FREE_KB:-2097152}" # 2GiB
+PAPERCLIP_ENGINE_ADOPT_EXISTING_PREFIX="${PAPERCLIP_ENGINE_ADOPT_EXISTING_PREFIX:-}"
+ADOPTION_DROPIN_NAME="zzzz-paperclip-engine-current.conf"
 
 # Local git source used to resolve/clone a `fork:<ref>` install. Defaults to
 # the repo this script itself lives in. On bigbox, point this at whatever
@@ -120,6 +127,45 @@ run() {
   fi
   log "+ $*"
   "$@"
+}
+
+prepare_pnpm_toolchain() {
+  local staging_root="$1"
+  local install_dir="$staging_root/pnpm-bin"
+  mkdir -p "$install_dir"
+  run corepack enable pnpm --install-directory "$install_dir"
+}
+
+install_fork_payload() {
+  local prefix="$1"
+  shift
+  run npm install --global --prefix "$prefix" "$@" --no-audit --no-fund
+}
+
+install_npm_payload() {
+  local prefix="$1" version="$2"
+  run npm install --global --prefix "$prefix" "paperclipai@$version" \
+    --registry=https://registry.npmjs.org \
+    "--@paperclipai:registry=https://registry.npmjs.org" \
+    --no-audit --no-fund
+}
+
+assert_fork_rust_toolchain() {
+  local source_repo="$1"
+  local toolchain_dir="$source_repo/packages/paperclip-runner"
+  local toolchain_file="$toolchain_dir/rust-toolchain.toml"
+  [ -f "$toolchain_file" ] || die "Fork runner toolchain file is missing: $toolchain_file"
+  local required cargo_version rustc_version
+  required="$(sed -n 's/^[[:space:]]*channel[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' "$toolchain_file")"
+  [ -n "$required" ] || die "Cannot read pinned Rust version from $toolchain_file"
+  command -v cargo >/dev/null 2>&1 || die "Fork build requires Cargo from pinned Rust $required before topology adoption or backup."
+  command -v rustc >/dev/null 2>&1 || die "Fork build requires rustc from pinned Rust $required before topology adoption or backup."
+  cargo_version="$(cd "$toolchain_dir" && cargo --version 2>/dev/null | awk '{print $2}')" || true
+  rustc_version="$(cd "$toolchain_dir" && rustc --version 2>/dev/null | awk '{print $2}')" || true
+  if [ "$cargo_version" != "$required" ] || [ "$rustc_version" != "$required" ]; then
+    die "Fork build requires pinned Rust $required; found cargo ${cargo_version:-unavailable} and rustc ${rustc_version:-unavailable}."
+  fi
+  log "Preflight: pinned Rust $required available"
 }
 
 # ---------------------------------------------------------------------------
@@ -185,6 +231,83 @@ connection_string_from_config() {
     if (db.mode !== "postgres" || !db.connectionString) { process.exit(1); }
     process.stdout.write(db.connectionString);
   ' "$config_path"
+}
+
+# Run a libpq client without placing the connection URI or password in its
+# argv, environment, or logs. Credentials live only in temporary mode-0600
+# libpq files inside a mode-0700 directory and are removed on every exit.
+secure_database_command() (
+  local connection_string="$1"
+  shift
+  local credential_dir service_file pass_file
+  credential_dir="$(mktemp -d "${TMPDIR:-/tmp}/paperclip-db.XXXXXX")"
+  chmod 0700 "$credential_dir"
+  service_file="$credential_dir/pg_service.conf"
+  pass_file="$credential_dir/pgpass"
+  trap 'rm -rf "$credential_dir"' EXIT
+  trap 'exit 129' HUP
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+
+  if ! printf '%s' "$connection_string" | node -e '
+    const fs = require("fs");
+    let raw = "";
+    process.stdin.on("data", chunk => raw += chunk);
+    process.stdin.on("end", () => {
+      try {
+        const uri = new URL(raw);
+        if (!['"'"'postgres:'"'"', '"'"'postgresql:'"'"'].includes(uri.protocol)) throw new Error();
+        if (!uri.hostname || !uri.pathname || uri.pathname === "/") throw new Error();
+        const allowed = new Set([
+          "application_name", "channel_binding", "connect_timeout", "gssencmode",
+          "keepalives", "keepalives_count", "keepalives_idle", "keepalives_interval",
+          "options", "sslcert", "sslcrl", "sslcrldir", "sslkey", "sslmode",
+          "sslrootcert", "target_session_attrs", "tcp_user_timeout"
+        ]);
+        const options = [];
+        for (const [key, value] of uri.searchParams) {
+          if (!allowed.has(key)) {
+            process.stderr.write(`Unsupported PostgreSQL connection option: ${key}\n`);
+            process.exit(2);
+          }
+          if (options.some(([seen]) => seen === key)) throw new Error();
+          options.push([key, value]);
+        }
+        const fields = {
+          host: uri.hostname,
+          port: uri.port || "5432",
+          dbname: decodeURIComponent(uri.pathname.slice(1)),
+          user: decodeURIComponent(uri.username)
+        };
+        for (const value of [...Object.values(fields), ...options.map(([, value]) => value)]) {
+          if (/[\r\n]/.test(value)) throw new Error();
+        }
+        const service = ["[paperclip_engine]", ...Object.entries(fields).map(([k, v]) => `${k}=${v}`), ...options.map(([k, v]) => `${k}=${v}`), ""].join("\n");
+        const pgpassEscape = value => value.replace(/\\/g, "\\\\").replace(/:/g, "\\:");
+        const password = decodeURIComponent(uri.password);
+        if (/[\r\n]/.test(password)) throw new Error();
+        const pass = [fields.host, fields.port, fields.dbname, fields.user, password].map(pgpassEscape).join(":") + "\n";
+        fs.writeFileSync(process.argv[1], service, { mode: 0o600 });
+        fs.writeFileSync(process.argv[2], pass, { mode: 0o600 });
+        fs.chmodSync(process.argv[1], 0o600);
+        fs.chmodSync(process.argv[2], 0o600);
+      } catch {
+        process.stderr.write("Invalid or unsupported PostgreSQL connection URI.\n");
+        process.exit(2);
+      }
+    });
+  ' "$service_file" "$pass_file"; then
+    die "Cannot create temporary libpq credentials from instance configuration."
+  fi
+
+  export PGSERVICE=paperclip_engine
+  export PGSERVICEFILE="$service_file"
+  export PGPASSFILE="$pass_file"
+  run "$@"
+)
+
+database_reachable() {
+  secure_database_command "$1" psql -tAc 'select 1'
 }
 
 server_port_from_config() {
@@ -278,8 +401,47 @@ verify_fork_server_package() {
   ' "$packed_json" "$installed_json"; then
     die "Installed fork server package does not match produced workspace tarball $server_tarball. Aborting before migrations or cutover."
   fi
+  verify_packed_runner_binary "$prefix" "$server_tarball" "$installed_pkg"
   log "Verified fork server package $installed_pkg matches produced workspace tarball $server_tarball"
 }
+
+file_sha256() {
+  node -e '
+    const fs = require("fs");
+    const crypto = require("crypto");
+    const hash = crypto.createHash("sha256");
+    hash.update(fs.readFileSync(process.argv[1]));
+    process.stdout.write(hash.digest("hex"));
+  ' "$1"
+}
+
+file_mode() {
+  node -e 'process.stdout.write((require("fs").statSync(process.argv[1]).mode & 0o777).toString(8))' "$1"
+}
+
+verify_packed_runner_binary() (
+  local prefix="$1" server_tarball="$2" installed_pkg="$3"
+  local scratch packed_runner installed_runner
+  scratch="$(mktemp -d "${TMPDIR:-/tmp}/paperclip-runner-verify.XXXXXX")"
+  trap 'rm -rf "$scratch"' EXIT
+  packed_runner="$scratch/package/dist/vendor/paperclip-runner/bin/paperclip-runnerd"
+  installed_runner="$(dirname "$installed_pkg")/dist/vendor/paperclip-runner/bin/paperclip-runnerd"
+  tar -xzf "$server_tarball" -C "$scratch" package/dist/vendor/paperclip-runner/bin/paperclip-runnerd 2>/dev/null \
+    || die "Packed fork server has no paperclip-runnerd binary. Aborting before migrations or cutover."
+  [ -f "$packed_runner" ] && [ ! -L "$packed_runner" ] && [ -s "$packed_runner" ] \
+    || die "Packed fork server paperclip-runnerd binary is empty. Aborting before migrations or cutover."
+  [ -f "$installed_runner" ] && [ ! -L "$installed_runner" ] && [ -s "$installed_runner" ] \
+    || die "Installed fork server paperclip-runnerd binary is missing or empty. Aborting before migrations or cutover."
+  chmod 0755 "$installed_runner" \
+    || die "Cannot make installed fork server paperclip-runnerd executable. Aborting before migrations or cutover."
+  [ "$(file_mode "$installed_runner")" = "755" ] \
+    || die "Installed fork server paperclip-runnerd must have mode 0755. Aborting before migrations or cutover."
+  [ -x "$installed_runner" ] \
+    || die "Installed fork server paperclip-runnerd is not executable. Aborting before migrations or cutover."
+  [ "$(file_sha256 "$packed_runner")" = "$(file_sha256 "$installed_runner")" ] \
+    || die "Installed fork server runner binary hash mismatch against packed artifact. Aborting before migrations or cutover."
+  log "Verified packed and installed paperclip-runnerd hashes and mode 0755"
+)
 
 current_target() {
   if [ -L "$CURRENT_LINK" ]; then
@@ -357,6 +519,74 @@ unit_assert_compatible() {
   fi
 }
 
+valid_paperclip_prefix() {
+  local prefix="$1"
+  [ -f "$prefix/lib/node_modules/paperclipai/package.json" ] &&
+    [ -x "$prefix/bin/paperclipai" ]
+}
+
+prepare_existing_prefix_adoption() {
+  local adopted="$PAPERCLIP_ENGINE_ADOPT_EXISTING_PREFIX"
+  [ -n "$adopted" ] || return 0
+
+  case "$adopted" in
+    /*) ;;
+    *) die "PAPERCLIP_ENGINE_ADOPT_EXISTING_PREFIX must be an absolute npm prefix." ;;
+  esac
+  valid_paperclip_prefix "$adopted" \
+    || die "Adopted prefix $adopted is not valid: require package.json and executable bin/paperclipai."
+
+  local unit_path="$HOME/.config/systemd/user/$UNIT_NAME"
+  [ -f "$unit_path" ] || die "Adoption requires existing unit $unit_path; refusing to create a second unit."
+
+  if [ -L "$CURRENT_LINK" ]; then
+    local target
+    target="$(readlink "$CURRENT_LINK")"
+    case "$target" in
+      "$adopted"|"$ENGINE_ROOT"/paperclip-*) ;;
+      *) die "Current link $CURRENT_LINK points outside the adopted or managed prefixes: $target" ;;
+    esac
+    valid_paperclip_prefix "$target" \
+      || die "Current link target $target is not a valid Paperclip prefix."
+  elif [ -e "$CURRENT_LINK" ]; then
+    die "Current link path $CURRENT_LINK exists but is not a symlink."
+  else
+    mkdir -p "$(dirname "$CURRENT_LINK")"
+    flip_symlink "$adopted"
+    log "Seeded current link from adopted prefix: $CURRENT_LINK -> $adopted"
+  fi
+
+  local dropin_dir="$HOME/.config/systemd/user/$UNIT_NAME.d"
+  local dropin_path="$dropin_dir/$ADOPTION_DROPIN_NAME"
+  if [ "$DRY_RUN" = "1" ]; then
+    log "+DRYRUN would ensure adoption drop-in $dropin_path for $CURRENT_LINK/bin/paperclipai"
+    return 0
+  fi
+
+  mkdir -p "$dropin_dir"
+  local tmp
+  tmp="$(mktemp "$dropin_dir/.${ADOPTION_DROPIN_NAME}.XXXXXX")"
+  printf '%s\n' \
+    '[Service]' \
+    'ExecStart=' \
+    "ExecStart=\"$CURRENT_LINK/bin/paperclipai\" run --instance \"$PAPERCLIP_INSTANCE_ID\"" > "$tmp"
+  chmod 0644 "$tmp"
+  if [ -f "$dropin_path" ] && cmp -s "$tmp" "$dropin_path"; then
+    rm -f "$tmp"
+  else
+    mv "$tmp" "$dropin_path"
+  fi
+  run systemctl --user daemon-reload
+
+  local effective
+  effective="$(systemctl --user show "$UNIT_NAME" --property=ExecStart --value)"
+  case "$effective" in
+    *"$CURRENT_LINK/bin/paperclipai"*" run "*) ;;
+    *) die "Effective ExecStart for $UNIT_NAME does not use $CURRENT_LINK/bin/paperclipai run: $effective" ;;
+  esac
+  log "Verified effective ExecStart for $UNIT_NAME uses $CURRENT_LINK/bin/paperclipai"
+}
+
 # Refuses to silently overwrite a unit file that already exists with
 # different content — another operator/script (e.g. leaf 2's own install)
 # may have put a different ExecStart there. Set
@@ -365,6 +595,9 @@ unit_assert_compatible() {
 unit_ensure_installed() {
   local unit_path="$HOME/.config/systemd/user/$UNIT_NAME"
   local template="$1"
+  if [ -n "$PAPERCLIP_ENGINE_ADOPT_EXISTING_PREFIX" ]; then
+    return 0
+  fi
   unit_assert_compatible "$template"
   if [ "$DRY_RUN" = "1" ]; then
     log "+DRYRUN would ensure unit file at $unit_path from $template"
@@ -427,7 +660,7 @@ migration_count() {
     echo "0"
     return 0
   fi
-  psql "$connection_string" -tAc 'select count(*) from "drizzle"."__drizzle_migrations"' 2>/dev/null | tr -d ' '
+  secure_database_command "$connection_string" psql -tAc 'select count(*) from "drizzle"."__drizzle_migrations"' 2>/dev/null | tr -d ' '
 }
 
 agents_paused_count() {
@@ -441,7 +674,7 @@ agents_paused_count() {
   # eq(agentsTable.status, "paused")) — not paused_at, which the schema
   # (packages/db/src/schema/agents.ts) only documents as "when", not as the
   # source of truth for whether an agent is currently paused.
-  psql "$connection_string" -tAc "select count(*) from agents where status = 'paused'" 2>/dev/null | tr -d ' '
+  secure_database_command "$connection_string" psql -tAc "select count(*) from agents where status = 'paused'" 2>/dev/null | tr -d ' '
 }
 
 backup_database() {
@@ -451,6 +684,31 @@ backup_database() {
   local ts
   ts="$(date -u +%Y%m%dT%H%M%SZ)"
   local dump_path="$BACKUP_DIR/${ts}-${label}.dump"
-  run pg_dump -Fc "$connection_string" -f "$dump_path"
+  if ! secure_database_command "$connection_string" pg_dump -Fc -f "$dump_path"; then
+    die "Database backup failed; refusing to build, migrate, or cut over."
+  fi
+  if [ "$DRY_RUN" != "1" ]; then
+    [ -s "$dump_path" ] \
+      || die "Database backup is empty: $dump_path. Refusing to build, migrate, or cut over."
+    if ! pg_restore --list "$dump_path" >/dev/null 2>&1; then
+      die "Database backup is not a readable PostgreSQL archive: $dump_path. Refusing to build, migrate, or cut over."
+    fi
+  fi
   echo "$dump_path"
+}
+
+resolve_migration_artifact() {
+  local prefix="$1"
+  local hoisted="$prefix/lib/node_modules/@paperclipai/db/dist/migrate.js"
+  local nested="$prefix/lib/node_modules/paperclipai/node_modules/@paperclipai/db/dist/migrate.js"
+  local matches=()
+  [ -f "$hoisted" ] && matches+=("$hoisted")
+  [ -f "$nested" ] && matches+=("$nested")
+  if [ "${#matches[@]}" -eq 0 ]; then
+    die "Installed prefix $prefix has no installed @paperclipai/db migration artifact."
+  fi
+  if [ "${#matches[@]}" -ne 1 ]; then
+    die "Installed prefix $prefix has ambiguous @paperclipai/db migration artifacts: ${matches[*]}"
+  fi
+  printf '%s\n' "${matches[0]}"
 }
