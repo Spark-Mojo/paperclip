@@ -101,7 +101,7 @@ if [ -n "$RESTORE_DUMP" ]; then
   connection_string="$(connection_string_from_config "$INSTANCE_CONFIG")"
   log "Restoring database from $RESTORE_DUMP (--yes confirmed)"
   restore_ok=1
-  run pg_restore --clean --if-exists --exit-on-error --single-transaction -d "$connection_string" "$RESTORE_DUMP" || restore_ok=0
+  secure_database_command "$connection_string" pg_restore --clean --if-exists --exit-on-error --single-transaction "$RESTORE_DUMP" || restore_ok=0
   if [ "$restore_ok" != "1" ]; then
     log "ERROR: database restore failed. Restarting original service with symlink unchanged at $before."
     original_started=1
