@@ -129,6 +129,13 @@ run() {
   "$@"
 }
 
+prepare_pnpm_toolchain() {
+  local staging_root="$1"
+  local install_dir="$staging_root/pnpm-bin"
+  mkdir -p "$install_dir"
+  run corepack enable pnpm --install-directory "$install_dir"
+}
+
 # ---------------------------------------------------------------------------
 # Guards
 # ---------------------------------------------------------------------------

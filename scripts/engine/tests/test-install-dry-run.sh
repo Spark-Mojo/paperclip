@@ -666,6 +666,30 @@ assert_true "unsupported option never invokes psql" test ! -e "$SECURE_MARKERS/p
 assert_true "failure output contains no password" bash -c '[[ "$1" != *super-secret* ]]' _ "$out16b"
 assert_true "credentials removed after URI validation failure" bash -c '[ -z "$(find "$1" -mindepth 1 -print -quit)" ]' _ "$SECURE_TMP"
 
+echo "== test 17: pnpm toolchain creates install directory before corepack =="
+COREPACK_BIN="$SANDBOX/corepack-bin"
+COREPACK_STAGE="$SANDBOX/corepack-stage"
+mkdir -p "$COREPACK_BIN"
+cat > "$COREPACK_BIN/corepack" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+[ "${1:-}" = enable ]
+[ "${2:-}" = pnpm ]
+[ "${3:-}" = --install-directory ]
+[ -d "${4:-}" ]
+printf '%s\n' "$4" > "$COREPACK_MARKER"
+EOF
+chmod +x "$COREPACK_BIN/corepack"
+capture out17 code17 env \
+  PATH="$COREPACK_BIN:$PATH" \
+  PAPERCLIP_ENGINE_DRY_RUN=0 \
+  COREPACK_MARKER="$SANDBOX/corepack-marker" \
+  COREPACK_STAGE="$COREPACK_STAGE" \
+  ENGINE_DIR_FOR_TEST="$ENGINE_DIR" \
+  bash -c '. "$ENGINE_DIR_FOR_TEST/lib.sh"; prepare_pnpm_toolchain "$COREPACK_STAGE"'
+assert_eq "pnpm toolchain helper exits 0" "0" "$code17"
+assert_eq "corepack observes existing pnpm-bin directory" "$COREPACK_STAGE/pnpm-bin" "$(cat "$SANDBOX/corepack-marker" 2>/dev/null || true)"
+
 echo
 echo "PASS=$PASS FAIL=$FAIL"
 [ "$FAIL" -eq 0 ]

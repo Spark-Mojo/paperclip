@@ -207,7 +207,7 @@ install_from_fork() {
 
   local build_env_path="$PATH"
   # Workspace build scripts invoke bare `pnpm`; corepack provisions it.
-  run corepack enable pnpm --install-directory "$staging_root/pnpm-bin"
+  prepare_pnpm_toolchain "$staging_root"
   export PATH="$staging_root/pnpm-bin:$build_env_path"
 
   (cd "$checkout" && run corepack pnpm install --frozen-lockfile)
