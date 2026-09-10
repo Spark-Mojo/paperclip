@@ -803,6 +803,46 @@ assert_contains "registry install uses npm global mode" "$(cat "$SANDBOX/global-
 assert_true "registry global-prefix package layout exists" test -f "$NPM_PAYLOAD/lib/node_modules/paperclipai/package.json"
 assert_true "registry global-prefix CLI shim is executable" test -x "$NPM_PAYLOAD/bin/paperclipai"
 
+echo "== test 21: compiled overlay targets nested runtime roots and receipts provenance =="
+OVERLAY_PREFIX="$SANDBOX/overlay-prefix"
+OVERLAY_BUILD="$SANDBOX/overlay-build"
+CLI_ROOT="$OVERLAY_PREFIX/lib/node_modules/paperclipai"
+mkdir -p "$CLI_ROOT" "$CLI_ROOT/node_modules/@paperclipai" \
+  "$OVERLAY_BUILD/packages/shared/dist" "$OVERLAY_BUILD/packages/db/dist/migrations" \
+  "$OVERLAY_BUILD/server/dist/vendor/paperclip-runner/bin" "$OVERLAY_BUILD/server/ui-dist" "$OVERLAY_BUILD/server/skills"
+printf '%s\n' '{"name":"paperclipai","version":"2026.831.1"}' > "$CLI_ROOT/package.json"
+for p in shared db server; do d="$CLI_ROOT/node_modules/@paperclipai/$p"; mkdir -p "$d"; printf '{"name":"@paperclipai/%s","version":"2026.831.1","main":"dist/index.js"}\n' "$p" > "$d/package.json"; mkdir -p "$d/dist"; printf 'old\n' > "$d/dist/index.js"; done
+printf 'new\n' > "$OVERLAY_BUILD/packages/shared/dist/index.js"
+printf 'new\n' > "$OVERLAY_BUILD/packages/db/dist/index.js"
+printf 'migration\n' > "$OVERLAY_BUILD/packages/db/dist/migrations/0001.sql"
+printf 'new\n' > "$OVERLAY_BUILD/server/dist/index.js"
+printf '%s\n' '{"commit":"0123456789012345678901234567890123456789"}' > "$OVERLAY_BUILD/server/dist/build-info.json"
+printf 'runner\n' > "$OVERLAY_BUILD/server/dist/vendor/paperclip-runner/bin/paperclip-runnerd"
+printf 'ui\n' > "$OVERLAY_BUILD/server/ui-dist/index.html"
+printf 'skill\n' > "$OVERLAY_BUILD/server/skills/catalog.json"
+capture out21 code21 node "$ENGINE_DIR/overlay-contract.mjs" "$OVERLAY_PREFIX" "$OVERLAY_BUILD" 0123456789012345678901234567890123456789 "$OVERLAY_PREFIX/receipt.json"
+assert_eq "overlay contract exits 0" "0" "$code21"
+assert_contains "overlay receipt records source provenance" "$(cat "$OVERLAY_PREFIX/receipt.json" 2>/dev/null || true)" "0123456789012345678901234567890123456789"
+assert_contains "official manifest remains unchanged" "$(cat "$CLI_ROOT/node_modules/@paperclipai/server/package.json")" '"version":"2026.831.1"'
+assert_eq "nested runtime server received overlay" "new" "$(cat "$CLI_ROOT/node_modules/@paperclipai/server/dist/index.js")"
+
+echo "== test 22: zero-pending gate compares full migration manifest and ledger =="
+LIVE_MIG="$SANDBOX/live-prefix/lib/node_modules/paperclipai/node_modules/@paperclipai/db/dist/migrations"
+CAND_MIG="$SANDBOX/candidate-prefix/lib/node_modules/paperclipai/node_modules/@paperclipai/db/dist/migrations"
+mkdir -p "$CAND_MIG/meta"
+node -e '
+ const fs=require("fs"),path=require("path"); const root=process.argv[1],entries=[];
+ for(let i=0;i<231;i++){const tag=String(i).padStart(4,"0")+"_fixture";fs.writeFileSync(path.join(root,tag+".sql"),`migration ${i}\n`);entries.push({idx:i,version:"7",when:1000+i,tag,breakpoints:true})}
+ fs.writeFileSync(path.join(root,"meta/_journal.json"),JSON.stringify({version:"7",dialect:"postgresql",entries}));
+' "$CAND_MIG"
+mkdir -p "$(dirname "$LIVE_MIG")"
+cp -a "$CAND_MIG" "$LIVE_MIG"
+capture out22 code22 env ENGINE_DIR_FOR_TEST="$ENGINE_DIR" CAND_PREFIX="$SANDBOX/candidate-prefix" LIVE_PREFIX="$SANDBOX/live-prefix" CAND_MIG="$CAND_MIG" bash -c '. "$ENGINE_DIR_FOR_TEST/lib.sh"; live_migration_ledger(){ node -e '\''const fs=require("fs"),path=require("path"),crypto=require("crypto"),r=process.argv[1],j=require(path.join(r,"meta/_journal.json"));for(const e of j.entries){const b=fs.readFileSync(path.join(r,e.tag+".sql"));console.log(`${e.when}|${crypto.createHash("sha256").update(b).digest("hex")}`)}console.log("1|old-a\n2|old-b\n3|old-c")'\'' "$CAND_MIG"; }; assert_overlay_zero_pending "$CAND_PREFIX" "$LIVE_PREFIX" ignored'
+assert_eq "exact migration manifest and ledger pass" "0" "$code22"
+printf 'changed\n' > "$CAND_MIG/0001.sql"
+capture out22b code22b env ENGINE_DIR_FOR_TEST="$ENGINE_DIR" CAND_PREFIX="$SANDBOX/candidate-prefix" LIVE_PREFIX="$SANDBOX/live-prefix" bash -c '. "$ENGINE_DIR_FOR_TEST/lib.sh"; assert_overlay_zero_pending "$CAND_PREFIX" "$LIVE_PREFIX" ignored'
+assert_eq "changed migration hash fails closed" "1" "$code22b"
+
 echo
 echo "PASS=$PASS FAIL=$FAIL"
 [ "$FAIL" -eq 0 ]
