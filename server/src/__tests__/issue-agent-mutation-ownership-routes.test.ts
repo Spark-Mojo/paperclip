@@ -2167,3 +2167,117 @@ describe("agent issue mutation checkout ownership", () => {
     });
   });
 });
+
+describe("SPA-5916 — terminal re-complete guard", () => {
+  beforeEach(() => {
+    vi.resetModules();
+    vi.doUnmock("@paperclipai/shared/telemetry");
+    vi.doUnmock("../telemetry.js");
+    vi.doUnmock("../services/access.js");
+    vi.doUnmock("../services/activity-log.js");
+    vi.doUnmock("../services/cross-issue-influence-limit.js");
+    vi.doUnmock("../services/agents.js");
+    vi.doUnmock("../services/documents.js");
+    vi.doUnmock("../services/external-objects.js");
+    vi.doUnmock("../services/index.js");
+    vi.doUnmock("../services/issues.js");
+    vi.doUnmock("../services/work-products.js");
+    vi.doUnmock("../routes/issues.js");
+    vi.doUnmock("../routes/authz.js");
+    vi.doUnmock("../middleware/index.js");
+    registerRouteMocks();
+    vi.clearAllMocks();
+    mockAccessService.decide.mockImplementation(async (input: { action: string }) => ({
+      allowed:
+        input.action === "tasks:assign" ||
+        input.action === "issue:comment" ||
+        input.action === "issue:read" ||
+        input.action === "issue:mutate" ||
+        input.action === "company_scope:read",
+      action: input.action,
+      reason: "allow_explicit_grant",
+      explanation: "Allowed by test default.",
+    }));
+    mockIssueService.getById.mockReset();
+    mockIssueService.getDependencyReadiness.mockResolvedValue({
+      blockerIssueIds: [],
+      isDependencyReady: false,
+      unresolvedBlockerCount: 0,
+    });
+    mockIssueService.getRelationSummaries.mockReset();
+    mockIssueService.getRelationSummaries.mockResolvedValue([]);
+    mockIssueService.listWakeableBlockedDependents.mockReset();
+    mockIssueService.listWakeableBlockedDependents.mockResolvedValue([]);
+    mockIssueService.addComment.mockReset();
+    mockIssueService.update.mockReset();
+  });
+
+  it.each([
+    ["done", "done"],
+    ["cancelled", "cancelled"],
+  ])(
+    "rejects %s -> %s as a routine PATCH (FINAL-SPEC §11.7)",
+    async (existingStatus, requestedStatus) => {
+      mockIssueService.getById.mockResolvedValue(makeIssue({ status: existingStatus }));
+
+      const res = await request(await createApp(peerActor()))
+        .patch(`/api/issues/${issueId}`)
+        .send({ status: requestedStatus });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(409);
+      expect(res.body.details?.code).toBe("issue_write_terminal_recomplete");
+      expect(res.body.details?.boundary).toBe("Terminal status");
+      expect(res.body.error).toContain(
+        existingStatus === "done" ? "already done" : "already cancelled",
+      );
+      expect(res.body.error).toContain("Who can act:");
+      expect(res.body.error).toContain("Try this:");
+      // The two side-effects the bug used to fire must NOT fire.
+      expect(mockIssueService.update).not.toHaveBeenCalled();
+      expect(mockIssueService.addComment).not.toHaveBeenCalled();
+    },
+  );
+
+  it("still allows legitimate todo -> done PATCH", async () => {
+    mockIssueService.getById.mockResolvedValue(makeIssue({ status: "todo" }));
+    mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+      ...makeIssue({ status: "todo" }),
+      ...patch,
+    }));
+    mockIssueService.listWakeableBlockedDependents.mockResolvedValue([]);
+
+    const res = await request(await createApp(ownerActor()))
+      .patch(`/api/issues/${issueId}`)
+      .send({ status: "done" });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(mockIssueService.update).toHaveBeenCalled();
+  });
+
+  it("allows non-status PATCH (title) on a done card — terminal guard is status-only", async () => {
+    mockIssueService.getById.mockResolvedValue(makeIssue({ status: "done" }));
+    mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+      ...makeIssue({ status: "done" }),
+      ...patch,
+    }));
+
+    const res = await request(await createApp(peerActor()))
+      .patch(`/api/issues/${issueId}`)
+      .send({ title: "Title edit on closed card" });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(mockIssueService.update).toHaveBeenCalled();
+  });
+
+  it("does not call addComment when a comment accompanies a same-terminal PATCH (no replay)", async () => {
+    mockIssueService.getById.mockResolvedValue(makeIssue({ status: "done" }));
+
+    const res = await request(await createApp(peerActor()))
+      .patch(`/api/issues/${issueId}`)
+      .send({ status: "done", comment: "sidecar comment that must NOT be replayed" });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(409);
+    expect(mockIssueService.addComment).not.toHaveBeenCalled();
+    expect(mockIssueService.update).not.toHaveBeenCalled();
+  });
+});
