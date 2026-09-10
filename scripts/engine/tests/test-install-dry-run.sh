@@ -280,6 +280,12 @@ cat > "$FAKE_BIN/pg_restore" <<'EOF'
 if [ "${1:-}" = "--list" ]; then
   exit 0
 fi
+case "$*" in
+  *postgres://*|*fake:fake*) exit 81 ;;
+esac
+[ "${PGSERVICE:-}" = paperclip_engine ]
+[ -f "${PGSERVICEFILE:-}" ]
+[ -f "${PGPASSFILE:-}" ]
 printf '%s\n' "$*" > "$RESTORE_MARKER"
 exit 99
 EOF
@@ -305,6 +311,7 @@ assert_contains "failed restore: uses exit-on-error" "$out9c" "--exit-on-error"
 assert_contains "failed restore: uses single transaction" "$out9c" "--single-transaction"
 assert_contains "failed restore: original service restart attempted" "$out9c" "systemctl --user start"
 assert_true "failed restore: fake restore command was invoked" test -s "$RESTORE_MARKER"
+assert_true "failed restore: output contains no database URI" bash -c '[[ "$1" != *postgres://* && "$1" != *fake:fake* ]]' _ "$out9c"
 
 echo "== test 10: fork server package verification accepts real nested npm layout =="
 SERVER_FIXTURE="$SANDBOX/server-fixture"
@@ -543,6 +550,121 @@ capture out15c code15c env \
   bash -c '. "$ENGINE_DIR_FOR_TEST/lib.sh"; resolve_migration_artifact "$MIGRATE_PREFIX"'
 assert_eq "ambiguous migration artifacts fail closed" "1" "$code15c"
 assert_contains "ambiguous migration artifacts explain failure" "$out15c" "ambiguous @paperclipai/db migration artifacts"
+
+echo "== test 16: database tools use temporary libpq credentials without URI argv leaks =="
+SECURE_BIN="$SANDBOX/secure-bin"
+SECURE_MARKERS="$SANDBOX/secure-markers"
+mkdir -p "$SECURE_BIN" "$SECURE_MARKERS"
+cat > "$SECURE_BIN/db-tool" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+tool="$(basename "$0")"
+if [ "$tool" = pg_restore ] && [ "${1:-}" = --list ]; then
+  grep -q VALID_DUMP "${2:-}" 2>/dev/null
+  exit $?
+fi
+case "$*" in
+  *super-secret*|*postgresql://*) exit 81 ;;
+esac
+[ "${PGSERVICE:-}" = paperclip_engine ]
+[ -f "${PGSERVICEFILE:-}" ]
+[ -f "${PGPASSFILE:-}" ]
+node -e '
+  const fs = require("fs");
+  for (const path of process.argv.slice(1)) {
+    if ((fs.statSync(path).mode & 0o777) !== 0o600) process.exit(1);
+    if ((fs.statSync(require("path").dirname(path)).mode & 0o777) !== 0o700) process.exit(1);
+  }
+' "$PGSERVICEFILE" "$PGPASSFILE"
+grep -Fxq 'sslmode=require' "$PGSERVICEFILE"
+grep -Fxq 'connect_timeout=7' "$PGSERVICEFILE"
+grep -Fq 'super-secret' "$PGPASSFILE"
+printf '%s\n' "$(dirname "$PGSERVICEFILE")" >> "$SECURE_MARKERS/credential-dirs"
+printf '%s\n' "$*" >> "$SECURE_MARKERS/$tool-argv"
+case "$tool" in
+  psql) printf '%s\n' 7 ;;
+  pg_dump)
+    out=""
+    while [ "$#" -gt 0 ]; do
+      if [ "$1" = -f ]; then shift; out="$1"; fi
+      shift
+    done
+    printf '%s\n' VALID_DUMP > "$out"
+    ;;
+  failing-tool) exit 42 ;;
+  signal-tool) kill -TERM "$PPID" ;;
+esac
+EOF
+chmod +x "$SECURE_BIN/db-tool"
+ln -s db-tool "$SECURE_BIN/psql"
+ln -s db-tool "$SECURE_BIN/pg_dump"
+ln -s db-tool "$SECURE_BIN/pg_restore"
+ln -s db-tool "$SECURE_BIN/failing-tool"
+ln -s db-tool "$SECURE_BIN/signal-tool"
+SECURE_URI='postgresql://paperclip:super-secret@127.0.0.1:5432/paperclip831?sslmode=require&connect_timeout=7'
+capture out16 code16 env \
+  PATH="$SECURE_BIN:$PATH" \
+  PAPERCLIP_ENGINE_DRY_RUN=0 \
+  BACKUP_DIR="$SANDBOX/secure-backups" \
+  SECURE_MARKERS="$SECURE_MARKERS" \
+  SECURE_URI="$SECURE_URI" \
+  ENGINE_DIR_FOR_TEST="$ENGINE_DIR" \
+  bash -c '
+    set -euo pipefail
+    . "$ENGINE_DIR_FOR_TEST/lib.sh"
+    database_reachable "$SECURE_URI"
+    migration_count "$SECURE_URI" >/dev/null
+    agents_paused_count "$SECURE_URI" >/dev/null
+    backup_database "$SECURE_URI" secure >/dev/null
+    secure_database_command "$SECURE_URI" pg_restore --exit-on-error fixture.dump
+  '
+assert_eq "secure DB commands exit 0" "0" "$code16"
+assert_true "secure DB command logs contain no password or URI" bash -c '[[ "$1" != *super-secret* && "$1" != *postgresql://* ]]' _ "$out16"
+assert_true "psql argv contains no URI or password" bash -c '! grep -Eq "super-secret|postgresql://" "$1"' _ "$SECURE_MARKERS/psql-argv"
+assert_true "pg_dump argv contains no URI or password" bash -c '! grep -Eq "super-secret|postgresql://" "$1"' _ "$SECURE_MARKERS/pg_dump-argv"
+assert_true "pg_restore argv contains no URI or password" bash -c '! grep -Eq "super-secret|postgresql://" "$1"' _ "$SECURE_MARKERS/pg_restore-argv"
+while IFS= read -r credential_dir; do
+  assert_true "temporary credential directory is removed" test ! -e "$credential_dir"
+done < "$SECURE_MARKERS/credential-dirs"
+
+capture out16f code16f env \
+  PATH="$SECURE_BIN:$PATH" \
+  PAPERCLIP_ENGINE_DRY_RUN=0 \
+  SECURE_MARKERS="$SECURE_MARKERS" \
+  SECURE_URI="$SECURE_URI" \
+  ENGINE_DIR_FOR_TEST="$ENGINE_DIR" \
+  bash -c '. "$ENGINE_DIR_FOR_TEST/lib.sh"; secure_database_command "$SECURE_URI" failing-tool'
+assert_eq "database command failure is preserved" "42" "$code16f"
+failed_credential_dir="$(tail -n 1 "$SECURE_MARKERS/credential-dirs")"
+assert_true "credentials removed after command failure" test ! -e "$failed_credential_dir"
+
+capture out16s code16s env \
+  PATH="$SECURE_BIN:$PATH" \
+  PAPERCLIP_ENGINE_DRY_RUN=0 \
+  SECURE_MARKERS="$SECURE_MARKERS" \
+  SECURE_URI="$SECURE_URI" \
+  ENGINE_DIR_FOR_TEST="$ENGINE_DIR" \
+  bash -c '. "$ENGINE_DIR_FOR_TEST/lib.sh"; secure_database_command "$SECURE_URI" signal-tool'
+assert_eq "signal terminates secure command" "143" "$code16s"
+signal_credential_dir="$(tail -n 1 "$SECURE_MARKERS/credential-dirs")"
+assert_true "credentials removed after signal" test ! -e "$signal_credential_dir"
+
+rm -f "$SECURE_MARKERS/psql-argv"
+SECURE_TMP="$SANDBOX/secure-tmp"
+mkdir -p "$SECURE_TMP"
+capture out16b code16b env \
+  PATH="$SECURE_BIN:$PATH" \
+  TMPDIR="$SECURE_TMP" \
+  PAPERCLIP_ENGINE_DRY_RUN=0 \
+  SECURE_MARKERS="$SECURE_MARKERS" \
+  SECURE_URI='postgresql://paperclip:super-secret@127.0.0.1:5432/paperclip831?unknown_option=bad' \
+  ENGINE_DIR_FOR_TEST="$ENGINE_DIR" \
+  bash -c '. "$ENGINE_DIR_FOR_TEST/lib.sh"; database_reachable "$SECURE_URI"'
+assert_eq "unsupported URI option fails closed" "1" "$code16b"
+assert_contains "unsupported option is named without secret" "$out16b" "Unsupported PostgreSQL connection option: unknown_option"
+assert_true "unsupported option never invokes psql" test ! -e "$SECURE_MARKERS/psql-argv"
+assert_true "failure output contains no password" bash -c '[[ "$1" != *super-secret* ]]' _ "$out16b"
+assert_true "credentials removed after URI validation failure" bash -c '[ -z "$(find "$1" -mindepth 1 -print -quit)" ]' _ "$SECURE_TMP"
 
 echo
 echo "PASS=$PASS FAIL=$FAIL"

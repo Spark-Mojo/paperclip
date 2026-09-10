@@ -113,7 +113,7 @@ preflight() {
     if connection_string="$(connection_string_from_config "$INSTANCE_CONFIG" 2>/dev/null)"; then
       log "Preflight: postgres reachability"
       if [ "$DRY_RUN" != "1" ]; then
-        if ! psql "$connection_string" -tAc 'select 1' >/dev/null 2>&1; then
+        if ! database_reachable "$connection_string" >/dev/null 2>&1; then
           die "Cannot reach postgres at the configured connectionString. Aborting before touching the running instance."
         fi
       fi

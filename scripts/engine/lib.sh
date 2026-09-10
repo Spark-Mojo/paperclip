@@ -194,6 +194,83 @@ connection_string_from_config() {
   ' "$config_path"
 }
 
+# Run a libpq client without placing the connection URI or password in its
+# argv, environment, or logs. Credentials live only in temporary mode-0600
+# libpq files inside a mode-0700 directory and are removed on every exit.
+secure_database_command() (
+  local connection_string="$1"
+  shift
+  local credential_dir service_file pass_file
+  credential_dir="$(mktemp -d "${TMPDIR:-/tmp}/paperclip-db.XXXXXX")"
+  chmod 0700 "$credential_dir"
+  service_file="$credential_dir/pg_service.conf"
+  pass_file="$credential_dir/pgpass"
+  trap 'rm -rf "$credential_dir"' EXIT
+  trap 'exit 129' HUP
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+
+  if ! printf '%s' "$connection_string" | node -e '
+    const fs = require("fs");
+    let raw = "";
+    process.stdin.on("data", chunk => raw += chunk);
+    process.stdin.on("end", () => {
+      try {
+        const uri = new URL(raw);
+        if (!['"'"'postgres:'"'"', '"'"'postgresql:'"'"'].includes(uri.protocol)) throw new Error();
+        if (!uri.hostname || !uri.pathname || uri.pathname === "/") throw new Error();
+        const allowed = new Set([
+          "application_name", "channel_binding", "connect_timeout", "gssencmode",
+          "keepalives", "keepalives_count", "keepalives_idle", "keepalives_interval",
+          "options", "sslcert", "sslcrl", "sslcrldir", "sslkey", "sslmode",
+          "sslrootcert", "target_session_attrs", "tcp_user_timeout"
+        ]);
+        const options = [];
+        for (const [key, value] of uri.searchParams) {
+          if (!allowed.has(key)) {
+            process.stderr.write(`Unsupported PostgreSQL connection option: ${key}\n`);
+            process.exit(2);
+          }
+          if (options.some(([seen]) => seen === key)) throw new Error();
+          options.push([key, value]);
+        }
+        const fields = {
+          host: uri.hostname,
+          port: uri.port || "5432",
+          dbname: decodeURIComponent(uri.pathname.slice(1)),
+          user: decodeURIComponent(uri.username)
+        };
+        for (const value of [...Object.values(fields), ...options.map(([, value]) => value)]) {
+          if (/[\r\n]/.test(value)) throw new Error();
+        }
+        const service = ["[paperclip_engine]", ...Object.entries(fields).map(([k, v]) => `${k}=${v}`), ...options.map(([k, v]) => `${k}=${v}`), ""].join("\n");
+        const pgpassEscape = value => value.replace(/\\/g, "\\\\").replace(/:/g, "\\:");
+        const password = decodeURIComponent(uri.password);
+        if (/[\r\n]/.test(password)) throw new Error();
+        const pass = [fields.host, fields.port, fields.dbname, fields.user, password].map(pgpassEscape).join(":") + "\n";
+        fs.writeFileSync(process.argv[1], service, { mode: 0o600 });
+        fs.writeFileSync(process.argv[2], pass, { mode: 0o600 });
+        fs.chmodSync(process.argv[1], 0o600);
+        fs.chmodSync(process.argv[2], 0o600);
+      } catch {
+        process.stderr.write("Invalid or unsupported PostgreSQL connection URI.\n");
+        process.exit(2);
+      }
+    });
+  ' "$service_file" "$pass_file"; then
+    die "Cannot create temporary libpq credentials from instance configuration."
+  fi
+
+  export PGSERVICE=paperclip_engine
+  export PGSERVICEFILE="$service_file"
+  export PGPASSFILE="$pass_file"
+  run "$@"
+)
+
+database_reachable() {
+  secure_database_command "$1" psql -tAc 'select 1'
+}
+
 server_port_from_config() {
   local config_path="$1"
   node -e '
@@ -505,7 +582,7 @@ migration_count() {
     echo "0"
     return 0
   fi
-  psql "$connection_string" -tAc 'select count(*) from "drizzle"."__drizzle_migrations"' 2>/dev/null | tr -d ' '
+  secure_database_command "$connection_string" psql -tAc 'select count(*) from "drizzle"."__drizzle_migrations"' 2>/dev/null | tr -d ' '
 }
 
 agents_paused_count() {
@@ -519,7 +596,7 @@ agents_paused_count() {
   # eq(agentsTable.status, "paused")) — not paused_at, which the schema
   # (packages/db/src/schema/agents.ts) only documents as "when", not as the
   # source of truth for whether an agent is currently paused.
-  psql "$connection_string" -tAc "select count(*) from agents where status = 'paused'" 2>/dev/null | tr -d ' '
+  secure_database_command "$connection_string" psql -tAc "select count(*) from agents where status = 'paused'" 2>/dev/null | tr -d ' '
 }
 
 backup_database() {
@@ -529,7 +606,7 @@ backup_database() {
   local ts
   ts="$(date -u +%Y%m%dT%H%M%SZ)"
   local dump_path="$BACKUP_DIR/${ts}-${label}.dump"
-  if ! run pg_dump -Fc "$connection_string" -f "$dump_path"; then
+  if ! secure_database_command "$connection_string" pg_dump -Fc -f "$dump_path"; then
     die "Database backup failed; refusing to build, migrate, or cut over."
   fi
   if [ "$DRY_RUN" != "1" ]; then
