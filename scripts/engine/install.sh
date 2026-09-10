@@ -202,6 +202,9 @@ install_from_fork() {
     return 0
   fi
 
+  local release_version="2026.831.1"
+  install_npm_payload "$payload" "$release_version"
+
   # ---- Faithfully mirrors installGitPayload() in cli/src/commands/install.ts ----
   log "Cloning fork ref '$ref' ($sha) into $checkout"
   run git clone --quiet "$(fork_source_repo)" "$checkout"
@@ -221,68 +224,7 @@ install_from_fork() {
   # whatever is on the npm registry.
   (cd "$checkout" && run corepack pnpm -r --filter '@paperclipai/server...' --if-present run build)
 
-  local cli_version
-  cli_version="$(node -e 'console.log(JSON.parse(require("fs").readFileSync(process.argv[1],"utf8")).version)' "$checkout/cli/package.json")"
-
-  # Resolve the exact set of workspace packages @paperclipai/server depends
-  # on, in dependency order — by calling the SAME function the CLI uses
-  # (resolveGitInstallWorkspacePackages), via tsx (already installed above),
-  # rather than re-deriving the graph by hand.
-  local packages_json
-  packages_json="$(cd "$checkout" && node cli/node_modules/tsx/dist/cli.mjs -e '
-    import { resolveGitInstallWorkspacePackages } from "./cli/src/commands/install.ts";
-    console.log(JSON.stringify(resolveGitInstallWorkspacePackages(process.cwd())));
-  ')"
-
-  # Pack each workspace package (bundleDependencies packages, e.g.
-  # @paperclipai/db, go through scripts/prepare-bundled-package.mjs first —
-  # same special case installGitPayload() handles).
-  echo "$packages_json" | node -e '
-    const packages = JSON.parse(require("fs").readFileSync(0, "utf8"));
-    for (const p of packages) process.stdout.write(p.dir + "\n");
-  ' > "$staging_root/workspace-dirs.txt"
-
-  while IFS= read -r wdir; do
-    [ -z "$wdir" ] && continue
-    local pkg_json="$checkout/$wdir/package.json"
-    local has_bundle
-    has_bundle="$(node -e '
-      const pkg = JSON.parse(require("fs").readFileSync(process.argv[1], "utf8"));
-      const deps = pkg.bundleDependencies || pkg.bundledDependencies || [];
-      console.log(deps.length > 0 ? "1" : "0");
-    ' "$pkg_json")"
-    if [ "$has_bundle" = "1" ]; then
-      local staged_dir="$staging_root/bundled-$(basename "$wdir")"
-      run node "$checkout/scripts/prepare-bundled-package.mjs" "$checkout/$wdir" "$staged_dir"
-      (cd "$checkout" && run npm pack "$staged_dir" --pack-destination "$staging_root")
-    else
-      (cd "$checkout" && PAPERCLIP_RELEASE_REUSE_UI_DIST=1 run corepack pnpm --dir "$wdir" pack --pack-destination "$staging_root")
-    fi
-  done < "$staging_root/workspace-dirs.txt"
-
-  (cd "$checkout/cli" && run npm pack --pack-destination "$staging_root")
-
-  local cli_tarball="$staging_root/paperclipai-$cli_version.tgz"
-  if [ ! -f "$cli_tarball" ]; then
-    die "Expected CLI tarball $cli_tarball was not produced by npm pack."
-  fi
-  local workspace_tarballs=()
-  local server_tarball=""
-  while IFS= read -r -d '' tgz; do
-    [ "$(basename "$tgz")" = "$(basename "$cli_tarball")" ] && continue
-    workspace_tarballs+=("$tgz")
-    if [ "$(package_name_from_tarball "$tgz" || true)" = "@paperclipai/server" ]; then
-      server_tarball="$tgz"
-    fi
-  done < <(find "$staging_root" -maxdepth 1 -name '*.tgz' -print0)
-
-  if [ -z "$server_tarball" ]; then
-    die "Required @paperclipai/server workspace tarball was not produced. Aborting before install, migrations, or cutover."
-  fi
-
-  install_fork_payload "$payload" "$cli_tarball" "${workspace_tarballs[@]}"
-
-  verify_fork_server_package "$payload" "$server_tarball"
+  node "$SCRIPT_DIR/overlay-contract.mjs" "$payload" "$checkout" "$sha" "$payload/.paperclip-engine-overlay.json"
 
   mv "$payload" "$prefix"
   rm -rf "$staging_root"
@@ -362,6 +304,9 @@ main() {
     install_from_fork "$GIT_REF"
   fi
 
+  if [ "$SOURCE_KIND" = "fork" ] && [ "$DRY_RUN" != "1" ] && [ -n "$previous_connection_string" ]; then
+    assert_overlay_zero_pending "$NEW_PREFIX" "$(current_target)" "$previous_connection_string"
+  fi
   run_migrations "$NEW_PREFIX"
 
   local previous

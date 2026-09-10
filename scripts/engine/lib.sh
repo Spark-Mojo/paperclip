@@ -712,3 +712,35 @@ resolve_migration_artifact() {
   fi
   printf '%s\n' "${matches[0]}"
 }
+
+assert_overlay_zero_pending() {
+  local candidate_prefix="$1" live_prefix="$2" connection_string="$3"
+  local candidate_dir="$candidate_prefix/lib/node_modules/paperclipai/node_modules/@paperclipai/db/dist/migrations"
+  local live_dir="$live_prefix/lib/node_modules/paperclipai/node_modules/@paperclipai/db/dist/migrations"
+  [ -d "$candidate_dir" ] && [ -d "$live_dir" ] || die "Cannot prove zero pending migrations: migration directory missing."
+  node -e '
+    const fs=require("fs"),path=require("path"),crypto=require("crypto");
+    function manifest(root){const out=[];function walk(d){for(const e of fs.readdirSync(d,{withFileTypes:true})){const p=path.join(d,e.name);if(e.isSymbolicLink())process.exit(4);if(e.isDirectory())walk(p);else if(e.isFile()){const b=fs.readFileSync(p);out.push([path.relative(root,p),b.length,crypto.createHash("sha256").update(b).digest("hex")]);}else process.exit(4)}}walk(root);return JSON.stringify(out.sort((a,b)=>a[0].localeCompare(b[0])))}
+    if(manifest(process.argv[1])!==manifest(process.argv[2])) process.exit(3);
+  ' "$candidate_dir" "$live_dir" || die "Candidate migration identity/hash manifest differs from live installed migrations; refusing cutover."
+  local scratch candidate_ledger live_ledger
+  scratch="$(mktemp -d "${TMPDIR:-/tmp}/paperclip-ledger.XXXXXX")"
+  candidate_ledger="$scratch/candidate"; live_ledger="$scratch/live"
+  trap 'rm -rf "$scratch"' RETURN
+  node -e '
+    const fs=require("fs"),path=require("path"),crypto=require("crypto");
+    const root=process.argv[1], journal=JSON.parse(fs.readFileSync(path.join(root,"meta/_journal.json")));
+    for(const e of journal.entries){const sql=fs.readFileSync(path.join(root,e.tag+".sql"));console.log(`${e.when}|${crypto.createHash("sha256").update(sql).digest("hex")}`)}
+  ' "$candidate_dir" | LC_ALL=C sort > "$candidate_ledger" || die "Cannot derive candidate migration journal/hash ledger."
+  live_migration_ledger "$connection_string" | LC_ALL=C sort > "$live_ledger" || die "Cannot read live migration ledger."
+  [ "$(wc -l < "$candidate_ledger")" -eq 231 ] || die "Candidate journal must contain exactly 231 entries."
+  [ "$(wc -l < "$live_ledger")" -eq 234 ] || die "Live migration ledger must contain exactly 234 rows."
+  [ "$(comm -23 "$candidate_ledger" "$live_ledger" | wc -l)" -eq 0 ] || die "Candidate has migration journal entries absent from live ledger; pending migrations are forbidden."
+  [ "$(comm -13 "$candidate_ledger" "$live_ledger" | wc -l)" -eq 3 ] || die "Live migration ledger must have exactly three historical surplus rows."
+  rm -rf "$scratch"; trap - RETURN
+  log "Verified zero pending migrations: exact 323-file tree, 231 mapped journal rows, and 3 historical live rows"
+}
+
+live_migration_ledger() {
+  secure_database_command "$1" psql -Atc "select created_at::text || '|' || hash from drizzle.__drizzle_migrations order by created_at, hash"
+}
