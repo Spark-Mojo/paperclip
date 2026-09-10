@@ -26,8 +26,8 @@ Usage: rollback.sh [prefix] [--restore <dump-file> --yes]
 With no [prefix], rolls back to the prefix recorded by the last install.sh
 run (scripts/engine/.paperclip-engine/previous-prefix under ENGINE_ROOT).
 
---restore <dump-file>   pg_restore the given dump into the instance database
-                         AFTER the symlink flip. Destructive; requires --yes.
+--restore <dump-file>   validate, then pg_restore the given dump into the
+                         instance database. Destructive; requires --yes.
 EOF
 }
 
@@ -80,6 +80,18 @@ fi
 
 assert_expected_database "$INSTANCE_CONFIG"
 
+if [ -n "$RESTORE_DUMP" ]; then
+  if [ ! -f "$RESTORE_DUMP" ]; then
+    die "Restore dump does not exist: $RESTORE_DUMP. Service and symlink left unchanged."
+  fi
+  if ! pg_restore --list "$RESTORE_DUMP" >/dev/null 2>&1; then
+    die "Restore dump is not a readable PostgreSQL archive: $RESTORE_DUMP. Service and symlink left unchanged."
+  fi
+  if [ ! -f "$INSTANCE_CONFIG" ]; then
+    die "No instance config at $INSTANCE_CONFIG — cannot resolve a connection string to restore into. Service and symlink left unchanged."
+  fi
+fi
+
 before="$(current_target)"
 log "Rolling back paperclip-current: $before -> $TARGET_PREFIX"
 
@@ -87,9 +99,6 @@ unit_stop
 flip_symlink "$TARGET_PREFIX"
 
 if [ -n "$RESTORE_DUMP" ]; then
-  if [ ! -f "$INSTANCE_CONFIG" ]; then
-    die "No instance config at $INSTANCE_CONFIG — cannot resolve a connection string to restore into."
-  fi
   connection_string="$(connection_string_from_config "$INSTANCE_CONFIG")"
   log "Restoring database from $RESTORE_DUMP (--yes confirmed)"
   run pg_restore --clean --if-exists -d "$connection_string" "$RESTORE_DUMP"

@@ -90,6 +90,9 @@ preflight() {
     die "Node $node_major found; Paperclip requires Node >= 20 (package.json engines.node)."
   fi
 
+  log "Preflight: systemd unit compatibility"
+  unit_assert_compatible "$SCRIPT_DIR/systemd/$UNIT_NAME"
+
   log "Preflight: disk space at $ENGINE_ROOT"
   mkdir -p "$ENGINE_ROOT"
   local free_kb
@@ -258,22 +261,22 @@ install_from_fork() {
     die "Expected CLI tarball $cli_tarball was not produced by npm pack."
   fi
   local workspace_tarballs=()
+  local server_tarball=""
   while IFS= read -r -d '' tgz; do
     [ "$(basename "$tgz")" = "$(basename "$cli_tarball")" ] && continue
     workspace_tarballs+=("$tgz")
+    if [ "$(package_name_from_tarball "$tgz" || true)" = "@paperclipai/server" ]; then
+      server_tarball="$tgz"
+    fi
   done < <(find "$staging_root" -maxdepth 1 -name '*.tgz' -print0)
+
+  if [ -z "$server_tarball" ]; then
+    die "Required @paperclipai/server workspace tarball was not produced. Aborting before install, migrations, or cutover."
+  fi
 
   run npm install --prefix "$payload" "$cli_tarball" "${workspace_tarballs[@]}" --no-audit --no-fund
 
-  # Read-back: confirm @paperclipai/server resolved to our packed tarball, not
-  # the npm registry, by checking it exists under the new prefix at all.
-  local server_pkg
-  server_pkg="$(prefix_server_package_path "$payload")"
-  if [ -z "$server_pkg" ]; then
-    log "WARNING: could not locate a packed @paperclipai/server/package.json under $payload — fork server changes may not be included. Investigate before trusting this install."
-  else
-    log "Fork server package present at: $server_pkg"
-  fi
+  verify_fork_server_package "$payload" "$server_tarball"
 
   mv "$payload" "$prefix"
   rm -rf "$staging_root"
