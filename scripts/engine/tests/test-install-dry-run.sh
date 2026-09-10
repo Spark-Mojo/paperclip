@@ -280,6 +280,12 @@ cat > "$FAKE_BIN/pg_restore" <<'EOF'
 if [ "${1:-}" = "--list" ]; then
   exit 0
 fi
+case "$*" in
+  *postgres://*|*fake:fake*) exit 81 ;;
+esac
+[ "${PGSERVICE:-}" = paperclip_engine ]
+[ -f "${PGSERVICEFILE:-}" ]
+[ -f "${PGPASSFILE:-}" ]
 printf '%s\n' "$*" > "$RESTORE_MARKER"
 exit 99
 EOF
@@ -305,6 +311,7 @@ assert_contains "failed restore: uses exit-on-error" "$out9c" "--exit-on-error"
 assert_contains "failed restore: uses single transaction" "$out9c" "--single-transaction"
 assert_contains "failed restore: original service restart attempted" "$out9c" "systemctl --user start"
 assert_true "failed restore: fake restore command was invoked" test -s "$RESTORE_MARKER"
+assert_true "failed restore: output contains no database URI" bash -c '[[ "$1" != *postgres://* && "$1" != *fake:fake* ]]' _ "$out9c"
 
 echo "== test 10: fork server package verification accepts real nested npm layout =="
 SERVER_FIXTURE="$SANDBOX/server-fixture"
@@ -312,6 +319,12 @@ SERVER_PAYLOAD="$SANDBOX/server-payload"
 mkdir -p "$SERVER_FIXTURE/package" "$SERVER_PAYLOAD/lib/node_modules/paperclipai/node_modules/@paperclipai/server"
 printf '%s\n' '{"name":"@paperclipai/server","version":"9.8.7","gitHead":"fixture-sha"}' > "$SERVER_FIXTURE/package/package.json"
 cp "$SERVER_FIXTURE/package/package.json" "$SERVER_PAYLOAD/lib/node_modules/paperclipai/node_modules/@paperclipai/server/package.json"
+PACKED_RUNNER="$SERVER_FIXTURE/package/dist/vendor/paperclip-runner/bin/paperclip-runnerd"
+INSTALLED_RUNNER="$SERVER_PAYLOAD/lib/node_modules/paperclipai/node_modules/@paperclipai/server/dist/vendor/paperclip-runner/bin/paperclip-runnerd"
+mkdir -p "$(dirname "$PACKED_RUNNER")" "$(dirname "$INSTALLED_RUNNER")"
+printf '%s\n' 'runner-binary-fixture' > "$PACKED_RUNNER"
+cp "$PACKED_RUNNER" "$INSTALLED_RUNNER"
+chmod 0644 "$PACKED_RUNNER" "$INSTALLED_RUNNER"
 tar -czf "$SANDBOX/paperclipai-server-9.8.7.tgz" -C "$SERVER_FIXTURE" package
 capture out10 code10 env ENGINE_DIR_FOR_TEST="$ENGINE_DIR" SERVER_PAYLOAD="$SERVER_PAYLOAD" SERVER_TARBALL="$SANDBOX/paperclipai-server-9.8.7.tgz" bash -c '
   set -euo pipefail
@@ -320,6 +333,17 @@ capture out10 code10 env ENGINE_DIR_FOR_TEST="$ENGINE_DIR" SERVER_PAYLOAD="$SERV
 '
 assert_eq "real nested layout: verification exits 0" "0" "$code10"
 assert_contains "real nested layout: reports verified source package" "$out10" "Verified fork server package"
+assert_true "npm-normalized runner mode is repaired to executable" test -x "$INSTALLED_RUNNER"
+
+printf '%s\n' 'tampered-runner' > "$INSTALLED_RUNNER"
+chmod 0755 "$INSTALLED_RUNNER"
+capture out10b code10b env ENGINE_DIR_FOR_TEST="$ENGINE_DIR" SERVER_PAYLOAD="$SERVER_PAYLOAD" SERVER_TARBALL="$SANDBOX/paperclipai-server-9.8.7.tgz" bash -c '
+  set -euo pipefail
+  . "$ENGINE_DIR_FOR_TEST/lib.sh"
+  verify_fork_server_package "$SERVER_PAYLOAD" "$SERVER_TARBALL"
+'
+assert_eq "runner hash mismatch fails closed" "1" "$code10b"
+assert_contains "runner hash mismatch explains failure" "$out10b" "runner binary hash mismatch"
 
 echo "== test 11: fork server package verification rejects missing installed server =="
 rm -rf "$SERVER_PAYLOAD/lib/node_modules/paperclipai/node_modules/@paperclipai/server"
@@ -330,6 +354,454 @@ capture out11 code11 env ENGINE_DIR_FOR_TEST="$ENGINE_DIR" SERVER_PAYLOAD="$SERV
 '
 assert_eq "missing server: verification exits non-zero" "1" "$code11"
 assert_contains "missing server: abort is explicit" "$out11" "Required fork server package"
+
+echo "== test 12: existing live topology is adopted before staging a replacement =="
+ADOPT_HOME="$SANDBOX/adopt-home"
+ADOPT_ROOT="$SANDBOX/adopt-root"
+ADOPT_PREFIX="$SANDBOX/usr"
+ADOPT_LINK="$ADOPT_ROOT/paperclip-current"
+ADOPT_STATE="$ADOPT_ROOT/.paperclip-engine"
+mkdir -p "$ADOPT_HOME/.config/systemd/user" "$ADOPT_PREFIX/lib/node_modules/paperclipai" "$ADOPT_PREFIX/bin"
+printf '%s\n' '[Service]' 'ExecStart=/usr/bin/node /usr/lib/node_modules/paperclipai/dist/index.js run' > "$ADOPT_HOME/.config/systemd/user/paperclip.service"
+mkdir -p "$ADOPT_HOME/.config/systemd/user/paperclip.service.d"
+printf '%s\n' '[Service]' 'Environment=KEEP_ME=1' > "$ADOPT_HOME/.config/systemd/user/paperclip.service.d/override-opencode.conf"
+printf '%s\n' '{"name":"paperclipai","version":"2026.831.1"}' > "$ADOPT_PREFIX/lib/node_modules/paperclipai/package.json"
+printf '%s\n' '#!/usr/bin/env bash' 'exit 0' > "$ADOPT_PREFIX/bin/paperclipai"
+chmod +x "$ADOPT_PREFIX/bin/paperclipai"
+capture out12 code12 env \
+  HOME="$ADOPT_HOME" \
+  ENGINE_ROOT="$ADOPT_ROOT" \
+  PAPERCLIP_HOME="$PAPERCLIP_HOME" \
+  CURRENT_LINK="$ADOPT_LINK" \
+  UNIT_NAME=paperclip.service \
+  STATE_DIR="$ADOPT_STATE" \
+  PAPERCLIP_ENGINE_ADOPT_EXISTING_PREFIX="$ADOPT_PREFIX" \
+  "$ENGINE_DIR/install.sh" npm:12.0.0
+echo "$out12" | sed 's/^/    /'
+assert_eq "adoption install exits 0" "0" "$code12"
+assert_eq "adoption records legacy prefix for rollback" "$ADOPT_PREFIX" "$(cat "$ADOPT_STATE/previous-prefix")"
+assert_eq "adoption cutover points at staged prefix" "$ADOPT_ROOT/paperclip-12.0.0" "$(readlink "$ADOPT_LINK")"
+adopt_log_pos="$(printf '%s\n' "$out12" | grep -n "Seeded current link from adopted prefix" | cut -d: -f1)"
+stage_log_pos="$(printf '%s\n' "$out12" | grep -n "Staged fake dry-run payload" | cut -d: -f1)"
+assert_true "legacy link is seeded before replacement staging" test "$adopt_log_pos" -lt "$stage_log_pos"
+assert_contains "adoption reports managed drop-in dry-run" "$out12" "would ensure adoption drop-in"
+
+echo "== test 12b: adoption is idempotent after managed cutover =="
+capture out12b code12b env \
+  HOME="$ADOPT_HOME" \
+  ENGINE_ROOT="$ADOPT_ROOT" \
+  PAPERCLIP_HOME="$PAPERCLIP_HOME" \
+  CURRENT_LINK="$ADOPT_LINK" \
+  UNIT_NAME=paperclip.service \
+  STATE_DIR="$ADOPT_STATE" \
+  PAPERCLIP_ENGINE_ADOPT_EXISTING_PREFIX="$ADOPT_PREFIX" \
+  "$ENGINE_DIR/install.sh" npm:12.0.0
+assert_eq "adoption re-install exits 0" "0" "$code12b"
+assert_contains "adoption re-install reuses staged prefix" "$out12b" "Reusing already-installed prefix"
+
+echo "== test 12c: adoption rejects an unknown current link before staging =="
+UNKNOWN_PREFIX="$SANDBOX/unknown-prefix"
+mkdir -p "$UNKNOWN_PREFIX"
+ln -sfn "$UNKNOWN_PREFIX" "$ADOPT_LINK"
+capture out12c code12c env \
+  HOME="$ADOPT_HOME" \
+  ENGINE_ROOT="$ADOPT_ROOT" \
+  PAPERCLIP_HOME="$PAPERCLIP_HOME" \
+  CURRENT_LINK="$ADOPT_LINK" \
+  UNIT_NAME=paperclip.service \
+  STATE_DIR="$ADOPT_STATE" \
+  PAPERCLIP_ENGINE_ADOPT_EXISTING_PREFIX="$ADOPT_PREFIX" \
+  "$ENGINE_DIR/install.sh" npm:13.0.0
+assert_eq "unknown adoption link exits non-zero" "1" "$code12c"
+assert_contains "unknown adoption link explains conflict" "$out12c" "points outside the adopted or managed prefixes"
+assert_true "unknown adoption link fails before staging" test ! -e "$ADOPT_ROOT/paperclip-13.0.0"
+
+echo "== test 13: real adoption writes only a managed ExecStart drop-in and verifies it =="
+FAKE_ADOPT_BIN="$SANDBOX/fake-adopt-bin"
+mkdir -p "$FAKE_ADOPT_BIN"
+cat > "$FAKE_ADOPT_BIN/systemctl" <<'EOF'
+#!/usr/bin/env bash
+if [ "${1:-}" = "--user" ] && [ "${2:-}" = "show" ]; then
+  printf '%s\n' "ExecStart={ path=${EXPECTED_CURRENT_LINK}/bin/paperclipai ; argv[]=${EXPECTED_CURRENT_LINK}/bin/paperclipai run --instance default ; }"
+fi
+exit 0
+EOF
+chmod +x "$FAKE_ADOPT_BIN/systemctl"
+rm -f "$ADOPT_LINK"
+capture out13 code13 env \
+  PATH="$FAKE_ADOPT_BIN:$PATH" \
+  HOME="$ADOPT_HOME" \
+  ENGINE_ROOT="$ADOPT_ROOT" \
+  PAPERCLIP_HOME="$PAPERCLIP_HOME" \
+  CURRENT_LINK="$ADOPT_LINK" \
+  UNIT_NAME=paperclip.service \
+  STATE_DIR="$ADOPT_STATE" \
+  PAPERCLIP_ENGINE_DRY_RUN=0 \
+  PAPERCLIP_ENGINE_ADOPT_EXISTING_PREFIX="$ADOPT_PREFIX" \
+  EXPECTED_CURRENT_LINK="$ADOPT_LINK" \
+  ENGINE_DIR_FOR_TEST="$ENGINE_DIR" \
+  bash -c '. "$ENGINE_DIR_FOR_TEST/lib.sh"; prepare_existing_prefix_adoption'
+echo "$out13" | sed 's/^/    /'
+assert_eq "real adoption helper exits 0" "0" "$code13"
+assert_eq "real adoption seeds legacy current link" "$ADOPT_PREFIX" "$(readlink "$ADOPT_LINK")"
+assert_true "managed drop-in sorts after existing overrides" test -f "$ADOPT_HOME/.config/systemd/user/paperclip.service.d/zzzz-paperclip-engine-current.conf"
+assert_contains "managed drop-in targets current link" "$(cat "$ADOPT_HOME/.config/systemd/user/paperclip.service.d/zzzz-paperclip-engine-current.conf")" "$ADOPT_LINK/bin/paperclipai"
+assert_eq "base unit remains unchanged" $'[Service]\nExecStart=/usr/bin/node /usr/lib/node_modules/paperclipai/dist/index.js run' "$(cat "$ADOPT_HOME/.config/systemd/user/paperclip.service")"
+assert_eq "existing drop-in remains unchanged" $'[Service]\nEnvironment=KEEP_ME=1' "$(cat "$ADOPT_HOME/.config/systemd/user/paperclip.service.d/override-opencode.conf")"
+assert_contains "effective ExecStart verification reported" "$out13" "Verified effective ExecStart"
+
+echo "== test 14: unusable backups stop install before build, migration, symlink, or service =="
+BACKUP_HOME="$SANDBOX/backup-home"
+BACKUP_ROOT="$SANDBOX/backup-root"
+BACKUP_INSTANCE="$SANDBOX/backup-paperclip/instances/default"
+BACKUP_LINK="$BACKUP_ROOT/paperclip-current"
+BACKUP_OLD="$BACKUP_ROOT/paperclip-old"
+BACKUP_BIN="$SANDBOX/backup-bin"
+BACKUP_MARKERS="$SANDBOX/backup-markers"
+mkdir -p "$BACKUP_HOME/.config/systemd/user" "$BACKUP_INSTANCE" "$BACKUP_OLD/lib/node_modules/paperclipai" "$BACKUP_OLD/bin" "$BACKUP_BIN" "$BACKUP_MARKERS"
+cp "$ENGINE_DIR/systemd/paperclip-831.service" "$BACKUP_HOME/.config/systemd/user/paperclip-831.service"
+printf '%s\n' '{"name":"paperclipai","version":"old"}' > "$BACKUP_OLD/lib/node_modules/paperclipai/package.json"
+printf '%s\n' '#!/usr/bin/env bash' 'exit 0' > "$BACKUP_OLD/bin/paperclipai"
+chmod +x "$BACKUP_OLD/bin/paperclipai"
+ln -s "$BACKUP_OLD" "$BACKUP_LINK"
+cat > "$BACKUP_INSTANCE/config.json" <<EOF
+{"server":{"host":"127.0.0.1","port":$HEALTH_PORT},"database":{"mode":"postgres","connectionString":"postgres://fake:fake@127.0.0.1:5432/paperclip831"}}
+EOF
+cat > "$BACKUP_BIN/psql" <<'EOF'
+#!/usr/bin/env bash
+exit 0
+EOF
+cat > "$BACKUP_BIN/systemctl" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$BACKUP_MARKERS/systemctl"
+exit 0
+EOF
+cat > "$BACKUP_BIN/npm" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$BACKUP_MARKERS/npm"
+exit 99
+EOF
+cat > "$BACKUP_BIN/pg_restore" <<'EOF'
+#!/usr/bin/env bash
+if [ "${1:-}" = "--list" ]; then
+  grep -q VALID_DUMP "${2:-}" 2>/dev/null
+  exit $?
+fi
+exit 0
+EOF
+chmod +x "$BACKUP_BIN"/*
+
+run_bad_backup_case() {
+  local mode="$1" version="$2"
+  rm -f "$BACKUP_MARKERS/systemctl" "$BACKUP_MARKERS/npm"
+  cat > "$BACKUP_BIN/pg_dump" <<EOF
+#!/usr/bin/env bash
+out=""
+while [ "\$#" -gt 0 ]; do
+  if [ "\$1" = "-f" ]; then shift; out="\$1"; fi
+  shift
+done
+case "$mode" in
+  exit23) exit 23 ;;
+  empty) : > "\$out" ;;
+  corrupt) printf '%s\\n' CORRUPT > "\$out" ;;
+esac
+EOF
+  chmod +x "$BACKUP_BIN/pg_dump"
+  capture bad_out bad_code env \
+    PATH="$BACKUP_BIN:$PATH" \
+    HOME="$BACKUP_HOME" \
+    PAPERCLIP_ENGINE_DRY_RUN=0 \
+    ENGINE_ROOT="$BACKUP_ROOT" \
+    PAPERCLIP_HOME="$SANDBOX/backup-paperclip" \
+    PAPERCLIP_INSTANCE_ID=default \
+    CURRENT_LINK="$BACKUP_LINK" \
+    UNIT_NAME=paperclip-831.service \
+    EXPECTED_DB=paperclip831 \
+    BACKUP_DIR="$BACKUP_ROOT/backups" \
+    STATE_DIR="$BACKUP_ROOT/state" \
+    MIN_FREE_KB=0 \
+    BACKUP_MARKERS="$BACKUP_MARKERS" \
+    "$ENGINE_DIR/install.sh" "npm:$version"
+  assert_true "$mode backup: install exits non-zero" test "$bad_code" -ne 0
+  assert_eq "$mode backup: current link unchanged" "$BACKUP_OLD" "$(readlink "$BACKUP_LINK")"
+  assert_true "$mode backup: no replacement prefix" test ! -e "$BACKUP_ROOT/paperclip-$version"
+  assert_true "$mode backup: npm build not reached" test ! -e "$BACKUP_MARKERS/npm"
+  assert_true "$mode backup: service not touched" test ! -e "$BACKUP_MARKERS/systemctl"
+}
+
+run_bad_backup_case exit23 14.0.1
+run_bad_backup_case empty 14.0.2
+run_bad_backup_case corrupt 14.0.3
+
+echo "== test 15: migration resolver supports nested package and fails closed =="
+MIGRATE_PREFIX="$SANDBOX/migrate-prefix"
+NESTED_MIGRATE="$MIGRATE_PREFIX/lib/node_modules/paperclipai/node_modules/@paperclipai/db/dist/migrate.js"
+mkdir -p "$(dirname "$NESTED_MIGRATE")"
+printf '%s\n' 'export {};' > "$NESTED_MIGRATE"
+capture out15 code15 env \
+  PAPERCLIP_ENGINE_DRY_RUN=0 \
+  ENGINE_DIR_FOR_TEST="$ENGINE_DIR" \
+  MIGRATE_PREFIX="$MIGRATE_PREFIX" \
+  bash -c '. "$ENGINE_DIR_FOR_TEST/lib.sh"; resolve_migration_artifact "$MIGRATE_PREFIX"'
+assert_eq "nested migration artifact resolves" "0" "$code15"
+assert_eq "nested migration artifact path is exact" "$NESTED_MIGRATE" "$out15"
+
+rm -f "$NESTED_MIGRATE"
+capture out15b code15b env \
+  PAPERCLIP_ENGINE_DRY_RUN=0 \
+  ENGINE_DIR_FOR_TEST="$ENGINE_DIR" \
+  MIGRATE_PREFIX="$MIGRATE_PREFIX" \
+  bash -c '. "$ENGINE_DIR_FOR_TEST/lib.sh"; resolve_migration_artifact "$MIGRATE_PREFIX"'
+assert_eq "missing migration artifact fails closed" "1" "$code15b"
+assert_contains "missing migration artifact explains failure" "$out15b" "no installed @paperclipai/db migration artifact"
+
+HOISTED_MIGRATE="$MIGRATE_PREFIX/lib/node_modules/@paperclipai/db/dist/migrate.js"
+mkdir -p "$(dirname "$HOISTED_MIGRATE")" "$(dirname "$NESTED_MIGRATE")"
+printf '%s\n' 'export {};' > "$HOISTED_MIGRATE"
+printf '%s\n' 'export {};' > "$NESTED_MIGRATE"
+capture out15c code15c env \
+  PAPERCLIP_ENGINE_DRY_RUN=0 \
+  ENGINE_DIR_FOR_TEST="$ENGINE_DIR" \
+  MIGRATE_PREFIX="$MIGRATE_PREFIX" \
+  bash -c '. "$ENGINE_DIR_FOR_TEST/lib.sh"; resolve_migration_artifact "$MIGRATE_PREFIX"'
+assert_eq "ambiguous migration artifacts fail closed" "1" "$code15c"
+assert_contains "ambiguous migration artifacts explain failure" "$out15c" "ambiguous @paperclipai/db migration artifacts"
+
+echo "== test 16: database tools use temporary libpq credentials without URI argv leaks =="
+SECURE_BIN="$SANDBOX/secure-bin"
+SECURE_MARKERS="$SANDBOX/secure-markers"
+mkdir -p "$SECURE_BIN" "$SECURE_MARKERS"
+cat > "$SECURE_BIN/db-tool" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+tool="$(basename "$0")"
+if [ "$tool" = pg_restore ] && [ "${1:-}" = --list ]; then
+  grep -q VALID_DUMP "${2:-}" 2>/dev/null
+  exit $?
+fi
+case "$*" in
+  *super-secret*|*postgresql://*) exit 81 ;;
+esac
+[ "${PGSERVICE:-}" = paperclip_engine ]
+[ -f "${PGSERVICEFILE:-}" ]
+[ -f "${PGPASSFILE:-}" ]
+node -e '
+  const fs = require("fs");
+  for (const path of process.argv.slice(1)) {
+    if ((fs.statSync(path).mode & 0o777) !== 0o600) process.exit(1);
+    if ((fs.statSync(require("path").dirname(path)).mode & 0o777) !== 0o700) process.exit(1);
+  }
+' "$PGSERVICEFILE" "$PGPASSFILE"
+grep -Fxq 'sslmode=require' "$PGSERVICEFILE"
+grep -Fxq 'connect_timeout=7' "$PGSERVICEFILE"
+grep -Fq 'super-secret' "$PGPASSFILE"
+printf '%s\n' "$(dirname "$PGSERVICEFILE")" >> "$SECURE_MARKERS/credential-dirs"
+printf '%s\n' "$*" >> "$SECURE_MARKERS/$tool-argv"
+case "$tool" in
+  psql) printf '%s\n' 7 ;;
+  pg_dump)
+    out=""
+    while [ "$#" -gt 0 ]; do
+      if [ "$1" = -f ]; then shift; out="$1"; fi
+      shift
+    done
+    printf '%s\n' VALID_DUMP > "$out"
+    ;;
+  failing-tool) exit 42 ;;
+  signal-tool) kill -TERM "$PPID" ;;
+esac
+EOF
+chmod +x "$SECURE_BIN/db-tool"
+ln -s db-tool "$SECURE_BIN/psql"
+ln -s db-tool "$SECURE_BIN/pg_dump"
+ln -s db-tool "$SECURE_BIN/pg_restore"
+ln -s db-tool "$SECURE_BIN/failing-tool"
+ln -s db-tool "$SECURE_BIN/signal-tool"
+SECURE_URI='postgresql://paperclip:super-secret@127.0.0.1:5432/paperclip831?sslmode=require&connect_timeout=7'
+capture out16 code16 env \
+  PATH="$SECURE_BIN:$PATH" \
+  PAPERCLIP_ENGINE_DRY_RUN=0 \
+  BACKUP_DIR="$SANDBOX/secure-backups" \
+  SECURE_MARKERS="$SECURE_MARKERS" \
+  SECURE_URI="$SECURE_URI" \
+  ENGINE_DIR_FOR_TEST="$ENGINE_DIR" \
+  bash -c '
+    set -euo pipefail
+    . "$ENGINE_DIR_FOR_TEST/lib.sh"
+    database_reachable "$SECURE_URI"
+    migration_count "$SECURE_URI" >/dev/null
+    agents_paused_count "$SECURE_URI" >/dev/null
+    backup_database "$SECURE_URI" secure >/dev/null
+    secure_database_command "$SECURE_URI" pg_restore --exit-on-error fixture.dump
+  '
+assert_eq "secure DB commands exit 0" "0" "$code16"
+assert_true "secure DB command logs contain no password or URI" bash -c '[[ "$1" != *super-secret* && "$1" != *postgresql://* ]]' _ "$out16"
+assert_true "psql argv contains no URI or password" bash -c '! grep -Eq "super-secret|postgresql://" "$1"' _ "$SECURE_MARKERS/psql-argv"
+assert_true "pg_dump argv contains no URI or password" bash -c '! grep -Eq "super-secret|postgresql://" "$1"' _ "$SECURE_MARKERS/pg_dump-argv"
+assert_true "pg_restore argv contains no URI or password" bash -c '! grep -Eq "super-secret|postgresql://" "$1"' _ "$SECURE_MARKERS/pg_restore-argv"
+while IFS= read -r credential_dir; do
+  assert_true "temporary credential directory is removed" test ! -e "$credential_dir"
+done < "$SECURE_MARKERS/credential-dirs"
+
+capture out16f code16f env \
+  PATH="$SECURE_BIN:$PATH" \
+  PAPERCLIP_ENGINE_DRY_RUN=0 \
+  SECURE_MARKERS="$SECURE_MARKERS" \
+  SECURE_URI="$SECURE_URI" \
+  ENGINE_DIR_FOR_TEST="$ENGINE_DIR" \
+  bash -c '. "$ENGINE_DIR_FOR_TEST/lib.sh"; secure_database_command "$SECURE_URI" failing-tool'
+assert_eq "database command failure is preserved" "42" "$code16f"
+failed_credential_dir="$(tail -n 1 "$SECURE_MARKERS/credential-dirs")"
+assert_true "credentials removed after command failure" test ! -e "$failed_credential_dir"
+
+capture out16s code16s env \
+  PATH="$SECURE_BIN:$PATH" \
+  PAPERCLIP_ENGINE_DRY_RUN=0 \
+  SECURE_MARKERS="$SECURE_MARKERS" \
+  SECURE_URI="$SECURE_URI" \
+  ENGINE_DIR_FOR_TEST="$ENGINE_DIR" \
+  bash -c '. "$ENGINE_DIR_FOR_TEST/lib.sh"; secure_database_command "$SECURE_URI" signal-tool'
+assert_eq "signal terminates secure command" "143" "$code16s"
+signal_credential_dir="$(tail -n 1 "$SECURE_MARKERS/credential-dirs")"
+assert_true "credentials removed after signal" test ! -e "$signal_credential_dir"
+
+rm -f "$SECURE_MARKERS/psql-argv"
+SECURE_TMP="$SANDBOX/secure-tmp"
+mkdir -p "$SECURE_TMP"
+capture out16b code16b env \
+  PATH="$SECURE_BIN:$PATH" \
+  TMPDIR="$SECURE_TMP" \
+  PAPERCLIP_ENGINE_DRY_RUN=0 \
+  SECURE_MARKERS="$SECURE_MARKERS" \
+  SECURE_URI='postgresql://paperclip:super-secret@127.0.0.1:5432/paperclip831?unknown_option=bad' \
+  ENGINE_DIR_FOR_TEST="$ENGINE_DIR" \
+  bash -c '. "$ENGINE_DIR_FOR_TEST/lib.sh"; database_reachable "$SECURE_URI"'
+assert_eq "unsupported URI option fails closed" "1" "$code16b"
+assert_contains "unsupported option is named without secret" "$out16b" "Unsupported PostgreSQL connection option: unknown_option"
+assert_true "unsupported option never invokes psql" test ! -e "$SECURE_MARKERS/psql-argv"
+assert_true "failure output contains no password" bash -c '[[ "$1" != *super-secret* ]]' _ "$out16b"
+assert_true "credentials removed after URI validation failure" bash -c '[ -z "$(find "$1" -mindepth 1 -print -quit)" ]' _ "$SECURE_TMP"
+
+echo "== test 17: pnpm toolchain creates install directory before corepack =="
+COREPACK_BIN="$SANDBOX/corepack-bin"
+COREPACK_STAGE="$SANDBOX/corepack-stage"
+mkdir -p "$COREPACK_BIN"
+cat > "$COREPACK_BIN/corepack" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+[ "${1:-}" = enable ]
+[ "${2:-}" = pnpm ]
+[ "${3:-}" = --install-directory ]
+[ -d "${4:-}" ]
+printf '%s\n' "$4" > "$COREPACK_MARKER"
+EOF
+chmod +x "$COREPACK_BIN/corepack"
+capture out17 code17 env \
+  PATH="$COREPACK_BIN:$PATH" \
+  PAPERCLIP_ENGINE_DRY_RUN=0 \
+  COREPACK_MARKER="$SANDBOX/corepack-marker" \
+  COREPACK_STAGE="$COREPACK_STAGE" \
+  ENGINE_DIR_FOR_TEST="$ENGINE_DIR" \
+  bash -c '. "$ENGINE_DIR_FOR_TEST/lib.sh"; prepare_pnpm_toolchain "$COREPACK_STAGE"'
+assert_eq "pnpm toolchain helper exits 0" "0" "$code17"
+assert_eq "corepack observes existing pnpm-bin directory" "$COREPACK_STAGE/pnpm-bin" "$(cat "$SANDBOX/corepack-marker" 2>/dev/null || true)"
+
+echo "== test 18: fork Rust preflight runs before topology adoption =="
+RUST_BIN="$SANDBOX/rust-bin"
+RUST_HOME="$SANDBOX/rust-home"
+RUST_ROOT="$SANDBOX/rust-root"
+RUST_PREFIX="$SANDBOX/rust-prefix"
+RUST_SOURCE="$SANDBOX/rust-source"
+mkdir -p "$RUST_BIN" "$RUST_HOME/.config/systemd/user" "$RUST_PREFIX/lib/node_modules/paperclipai" "$RUST_PREFIX/bin" "$RUST_SOURCE/packages/paperclip-runner"
+printf '%s\n' '[toolchain]' 'channel = "1.97.1"' > "$RUST_SOURCE/packages/paperclip-runner/rust-toolchain.toml"
+cat > "$RUST_BIN/cargo" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' 'cargo 1.96.0 (wrong)'
+EOF
+cat > "$RUST_BIN/rustc" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' 'rustc 1.96.0 (wrong)'
+EOF
+chmod +x "$RUST_BIN/cargo" "$RUST_BIN/rustc"
+printf '%s\n' '[Service]' 'ExecStart=/usr/bin/false' > "$RUST_HOME/.config/systemd/user/paperclip.service"
+printf '%s\n' '{"name":"paperclipai","version":"legacy"}' > "$RUST_PREFIX/lib/node_modules/paperclipai/package.json"
+printf '%s\n' '#!/usr/bin/env bash' 'exit 0' > "$RUST_PREFIX/bin/paperclipai"
+chmod +x "$RUST_PREFIX/bin/paperclipai"
+capture out18 code18 env \
+  PATH="$RUST_BIN:$PATH" \
+  HOME="$RUST_HOME" \
+  ENGINE_ROOT="$RUST_ROOT" \
+  CURRENT_LINK="$RUST_ROOT/paperclip-current" \
+  UNIT_NAME=paperclip.service \
+  PAPERCLIP_ENGINE_DRY_RUN=0 \
+  PAPERCLIP_ENGINE_ADOPT_EXISTING_PREFIX="$RUST_PREFIX" \
+  FORK_SOURCE_REPO="$RUST_SOURCE" \
+  "$ENGINE_DIR/install.sh" fork:HEAD
+assert_eq "wrong Rust toolchain aborts fork install" "1" "$code18"
+assert_contains "wrong Rust toolchain names pinned version" "$out18" "Rust 1.97.1"
+assert_true "Rust preflight fails before adoption symlink" test ! -e "$RUST_ROOT/paperclip-current"
+assert_true "Rust preflight fails before managed drop-in" test ! -e "$RUST_HOME/.config/systemd/user/paperclip.service.d"
+
+echo "== test 19: fork tarballs install into managed global-prefix layout =="
+GLOBAL_BIN="$SANDBOX/global-npm-bin"
+GLOBAL_PAYLOAD="$SANDBOX/global-payload"
+mkdir -p "$GLOBAL_BIN"
+cat > "$GLOBAL_BIN/npm" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\n' "$*" > "$NPM_ARGS_MARKER"
+prefix=""
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = "--prefix" ]; then
+    prefix="$2"
+    shift 2
+    continue
+  fi
+  shift
+done
+[ -n "$prefix" ]
+mkdir -p "$prefix/lib/node_modules/@paperclipai/server" "$prefix/lib/node_modules/paperclipai" "$prefix/bin"
+printf '%s\n' '{"name":"@paperclipai/server","version":"1.0.0"}' > "$prefix/lib/node_modules/@paperclipai/server/package.json"
+printf '%s\n' '{"name":"paperclipai","version":"1.0.0"}' > "$prefix/lib/node_modules/paperclipai/package.json"
+printf '%s\n' '#!/usr/bin/env bash' 'exit 0' > "$prefix/bin/paperclipai"
+chmod 0755 "$prefix/bin/paperclipai"
+EOF
+chmod +x "$GLOBAL_BIN/npm"
+capture out19 code19 env \
+  PATH="$GLOBAL_BIN:$PATH" \
+  NPM_ARGS_MARKER="$SANDBOX/global-npm-args" \
+  PAPERCLIP_ENGINE_DRY_RUN=0 \
+  ENGINE_DIR_FOR_TEST="$ENGINE_DIR" \
+  GLOBAL_PAYLOAD="$GLOBAL_PAYLOAD" \
+  bash -c '
+    set -euo pipefail
+    . "$ENGINE_DIR_FOR_TEST/lib.sh"
+    install_fork_payload "$GLOBAL_PAYLOAD" cli.tgz server.tgz
+  '
+assert_eq "global-prefix helper exits 0" "0" "$code19"
+assert_contains "fork install uses npm global mode" "$(cat "$SANDBOX/global-npm-args" 2>/dev/null || true)" "install --global --prefix $GLOBAL_PAYLOAD"
+assert_true "global-prefix server layout is discoverable" test -f "$GLOBAL_PAYLOAD/lib/node_modules/@paperclipai/server/package.json"
+assert_true "global-prefix CLI shim is executable" test -x "$GLOBAL_PAYLOAD/bin/paperclipai"
+
+echo "== test 20: registry package installs into managed global-prefix layout =="
+NPM_PAYLOAD="$SANDBOX/npm-payload"
+rm -f "$SANDBOX/global-npm-args"
+capture out20 code20 env \
+  PATH="$GLOBAL_BIN:$PATH" \
+  NPM_ARGS_MARKER="$SANDBOX/global-npm-args" \
+  PAPERCLIP_ENGINE_DRY_RUN=0 \
+  ENGINE_DIR_FOR_TEST="$ENGINE_DIR" \
+  NPM_PAYLOAD="$NPM_PAYLOAD" \
+  bash -c '
+    set -euo pipefail
+    . "$ENGINE_DIR_FOR_TEST/lib.sh"
+    install_npm_payload "$NPM_PAYLOAD" "4.5.6"
+  '
+assert_eq "registry global-prefix helper exits 0" "0" "$code20"
+assert_contains "registry install uses npm global mode" "$(cat "$SANDBOX/global-npm-args" 2>/dev/null || true)" "install --global --prefix $NPM_PAYLOAD paperclipai@4.5.6"
+assert_true "registry global-prefix package layout exists" test -f "$NPM_PAYLOAD/lib/node_modules/paperclipai/package.json"
+assert_true "registry global-prefix CLI shim is executable" test -x "$NPM_PAYLOAD/bin/paperclipai"
 
 echo
 echo "PASS=$PASS FAIL=$FAIL"
