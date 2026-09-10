@@ -860,7 +860,7 @@ REPORT_PROC="$SANDBOX/report-proc"; mkdir -p "$REPORT_PROC/4242"; ln -s "$(comma
 printf '%s\0%s\0%s\0' node "$OVERLAY_PREFIX-link/lib/node_modules/paperclipai/dist/index.js" run > "$REPORT_PROC/4242/cmdline"
 cat > "$REPORT_BIN/systemctl" <<EOF
 #!/usr/bin/env bash
-case "\$*" in *ActiveState*) echo active;; *MainPID*) echo 4242;; *ExecStart*) echo '$OVERLAY_PREFIX-link/bin/paperclipai run';; esac
+case "\$*" in *ActiveState*) echo active;; *MainPID*) echo 4242;; *ExecStart*) echo '{ path=$OVERLAY_PREFIX-link/bin/paperclipai ; argv[]=$OVERLAY_PREFIX-link/bin/paperclipai run --instance default ; ignore_errors=no ; }';; esac
 EOF
 chmod +x "$REPORT_BIN/systemctl"
 capture report_out report_code env PATH="$REPORT_BIN:$PATH" HOME="$REPORT_HOME" CURRENT_LINK="$OVERLAY_PREFIX-link" UNIT_NAME=paperclip.service PAPERCLIP_ENGINE_SCRIPT_DIR="$ENGINE_DIR" PAPERCLIP_PROC_ROOT="$REPORT_PROC" bash -c 'ln -s "$0" "$CURRENT_LINK"; exec "$1/whats-running.sh"' "$OVERLAY_PREFIX" "$ENGINE_DIR"
@@ -878,6 +878,16 @@ printf '%s\0%s\0%s\0' node /usr/lib/node_modules/paperclipai/dist/index.js "$OVE
 capture old_report_out old_report_code env PATH="$REPORT_BIN:$PATH" HOME="$REPORT_HOME" CURRENT_LINK="$OVERLAY_PREFIX-link" UNIT_NAME=paperclip.service PAPERCLIP_ENGINE_SCRIPT_DIR="$ENGINE_DIR" PAPERCLIP_PROC_ROOT="$REPORT_PROC" "$ENGINE_DIR/whats-running.sh"
 assert_eq "old /usr ExecStart is rejected" "1" "$old_report_code"
 assert_contains "old /usr runtime reports not running" "$old_report_out" "Engine running : NO"
+# Restore live argv, then prove a configured-argv substring spoof is rejected.
+printf '%s\0%s\0%s\0' node "$OVERLAY_PREFIX-link/lib/node_modules/paperclipai/dist/index.js" run > "$REPORT_PROC/4242/cmdline"
+sed -i 's|path='"$OVERLAY_PREFIX"'-link/bin/paperclipai|path=/tmp/spoof'"$OVERLAY_PREFIX"'-link/bin/paperclipai|' "$REPORT_BIN/systemctl"
+capture spoof_out spoof_code env PATH="$REPORT_BIN:$PATH" HOME="$REPORT_HOME" CURRENT_LINK="$OVERLAY_PREFIX-link" UNIT_NAME=paperclip.service PAPERCLIP_ENGINE_SCRIPT_DIR="$ENGINE_DIR" PAPERCLIP_PROC_ROOT="$REPORT_PROC" "$ENGINE_DIR/whats-running.sh"
+assert_eq "configured ExecStart substring spoof is rejected" "1" "$spoof_code"
+sed -i 's|path=/tmp/spoof'"$OVERLAY_PREFIX"'-link/bin/paperclipai|path='"$OVERLAY_PREFIX"'-link/bin/paperclipai|' "$REPORT_BIN/systemctl"
+mkdir -p "$SANDBOX/other-prefix"
+capture race_out race_code env PATH="$REPORT_BIN:$PATH" HOME="$REPORT_HOME" CURRENT_LINK="$OVERLAY_PREFIX-link" UNIT_NAME=paperclip.service PAPERCLIP_ENGINE_SCRIPT_DIR="$ENGINE_DIR" PAPERCLIP_PROC_ROOT="$REPORT_PROC" PAPERCLIP_ENGINE_TEST_FLIP_CURRENT_TO="$SANDBOX/other-prefix" "$ENGINE_DIR/whats-running.sh"
+assert_eq "current-link flip during report fails closed" "1" "$race_code"
+ln -sfn "$OVERLAY_PREFIX" "$OVERLAY_PREFIX-link"
 mkdir -p "$REPORT_HOME/bin" "$REPORT_HOME/old-bundle"; printf 'old\n' > "$REPORT_HOME/old-bundle/whats-running.sh"; ln -s "$REPORT_HOME/old-bundle/whats-running.sh" "$REPORT_HOME/bin/whats-running"
 capture fail_report_out fail_report_code env HOME="$REPORT_HOME" SCRIPT_DIR="$ENGINE_DIR" PAPERCLIP_WHATS_RUNNING_PATH="$REPORT_HOME/bin/whats-running" PAPERCLIP_ENGINE_TEST_FAIL_REPORT_INSTALL=1 bash -c '. "$SCRIPT_DIR/lib.sh"; install_whats_running'
 assert_eq "injected bundle failure exits nonzero" "1" "$fail_report_code"
@@ -886,6 +896,11 @@ capture install_report_out install_report_code env HOME="$REPORT_HOME" SCRIPT_DI
 assert_eq "managed report installer succeeds" "0" "$install_report_code"
 assert_true "installed report is mode 0755" test -x "$REPORT_HOME/bin/whats-running"
 assert_true "installed helper is mode 0755" test -x "$(dirname "$(readlink "$REPORT_HOME/bin/whats-running")")/overlay-contract.mjs"
+INSTALLED_BUNDLE="$(dirname "$(readlink "$REPORT_HOME/bin/whats-running")")"
+printf 'tamper\n' >> "$INSTALLED_BUNDLE/overlay-contract.mjs"
+capture bundle_tamper_out bundle_tamper_code env HOME="$REPORT_HOME" SCRIPT_DIR="$ENGINE_DIR" PAPERCLIP_WHATS_RUNNING_PATH="$REPORT_HOME/bin/whats-running" bash -c '. "$SCRIPT_DIR/lib.sh"; install_whats_running'
+assert_eq "tampered reused bundle fails closed" "1" "$bundle_tamper_code"
+assert_eq "tampered bundle failure preserves command link" "$INSTALLED_BUNDLE/whats-running.sh" "$(readlink "$REPORT_HOME/bin/whats-running")"
 printf 'tamper\n' >> "$CLI_ROOT/node_modules/@paperclipai/server/dist/index.js"
 capture out21t code21t node "$ENGINE_DIR/overlay-contract.mjs" --verify "$OVERLAY_PREFIX" 0123456789012345678901234567890123456789 "$OVERLAY_PREFIX/.paperclip-engine-overlay.json"
 assert_eq "tampered final inventory rejects reuse" "1" "$code21t"

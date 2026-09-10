@@ -147,7 +147,19 @@ install_whats_running() {
   bash -n "$staging/whats-running.sh"; node --check "$staging/overlay-contract.mjs"
   bundle_id="$(cat "$staging/whats-running.sh" "$staging/overlay-contract.mjs" | sha256sum | awk '{print $1}')"
   bundle="$bundle_root/$bundle_id"
-  if [ ! -d "$bundle" ]; then mv "$staging" "$bundle"; else rm -rf "$staging"; fi
+  if [ ! -d "$bundle" ]; then
+    mv "$staging" "$bundle"
+  else
+    if ! node -e '
+      const fs=require("fs"),path=require("path"),crypto=require("crypto");
+      const expected=["overlay-contract.mjs","whats-running.sh"];
+      function check(root){const names=fs.readdirSync(root).sort();if(JSON.stringify(names)!==JSON.stringify(expected))process.exit(1);return names.map(n=>{const p=path.join(root,n),s=fs.lstatSync(p);if(!s.isFile()||s.isSymbolicLink()||(s.mode&0o777)!==0o755)process.exit(1);return crypto.createHash("sha256").update(fs.readFileSync(p)).digest("hex")})}
+      if(JSON.stringify(check(process.argv[1]))!==JSON.stringify(check(process.argv[2])))process.exit(1);
+    ' "$staging" "$bundle"; then
+      die "Existing reporter bundle failed exact inventory verification."
+    fi
+    rm -rf "$staging"
+  fi
   if [ "${PAPERCLIP_ENGINE_TEST_FAIL_REPORT_INSTALL:-0}" = "1" ]; then die "Injected runtime report installation failure before atomic link flip."; fi
   link_tmp="$(dirname "$destination")/.whats-running.$$"
   ln -s "$bundle/whats-running.sh" "$link_tmp"
