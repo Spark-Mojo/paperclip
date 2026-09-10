@@ -280,6 +280,7 @@ cat > "$FAKE_BIN/pg_restore" <<'EOF'
 if [ "${1:-}" = "--list" ]; then
   exit 0
 fi
+printf '%s\n' "$*" > "$RESTORE_MARKER"
 exit 99
 EOF
 chmod +x "$FAKE_BIN/pg_restore"
@@ -289,14 +290,21 @@ printf 'fake systemctl %s\n' "$*" >&2
 exit 0
 EOF
 chmod +x "$FAKE_BIN/systemctl"
+cat > "$FAKE_BIN/uname" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' Linux
+EOF
+chmod +x "$FAKE_BIN/uname"
+RESTORE_MARKER="$SANDBOX/restore-invoked"
 before_link="$(readlink "$CURRENT_LINK")"
-capture out9c code9c env PATH="$FAKE_BIN:$PATH" PAPERCLIP_ENGINE_DRY_RUN=0 "$ENGINE_DIR/rollback.sh" "$ENGINE_ROOT/paperclip-2.0.0" --restore "$VALID_DUMP" --yes
+capture out9c code9c env PATH="$FAKE_BIN:$PATH" RESTORE_MARKER="$RESTORE_MARKER" PAPERCLIP_ENGINE_DRY_RUN=0 "$ENGINE_DIR/rollback.sh" "$ENGINE_ROOT/paperclip-2.0.0" --restore "$VALID_DUMP" --yes
 echo "$out9c" | sed 's/^/    /'
 assert_eq "failed restore: rollback exits non-zero" "1" "$code9c"
 assert_eq "failed restore: current symlink is unchanged" "$before_link" "$(readlink "$CURRENT_LINK")"
 assert_contains "failed restore: uses exit-on-error" "$out9c" "--exit-on-error"
 assert_contains "failed restore: uses single transaction" "$out9c" "--single-transaction"
 assert_contains "failed restore: original service restart attempted" "$out9c" "systemctl --user start"
+assert_true "failed restore: fake restore command was invoked" test -s "$RESTORE_MARKER"
 
 echo "== test 10: fork server package verification accepts real nested npm layout =="
 SERVER_FIXTURE="$SANDBOX/server-fixture"
