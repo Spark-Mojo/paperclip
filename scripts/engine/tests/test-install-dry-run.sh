@@ -143,6 +143,9 @@ assert_eq "re-install exits 0" "0" "$code1b"
 assert_contains "re-install logs reuse, not a fresh stage" "$out1b" "Reusing already-installed prefix"
 
 echo "== test 2: upgrade to npm:9.9.9 with health FAILING -> automatic rollback =="
+export PAPERCLIP_WHATS_RUNNING_PATH="$SANDBOX/bin/whats-running"
+mkdir -p "$(dirname "$PAPERCLIP_WHATS_RUNNING_PATH")"
+printf 'stale-report\n' > "$PAPERCLIP_WHATS_RUNNING_PATH"
 echo "fail" > "$MODE_FILE"
 capture out2 code2 "$ENGINE_DIR/install.sh" npm:9.9.9
 echo "$out2" | sed 's/^/    /'
@@ -150,6 +153,7 @@ assert_eq "failed install exits non-zero" "1" "$code2"
 assert_eq "current rolled back to paperclip-1.2.3" "$ENGINE_ROOT/paperclip-1.2.3" "$(readlink "$CURRENT_LINK")"
 assert_true "new (bad) prefix left on disk for investigation" test -d "$ENGINE_ROOT/paperclip-9.9.9"
 assert_contains "install.sh warns DB was not rolled back" "$out2" "DATABASE SCHEMA WAS NOT ROLLED BACK"
+assert_eq "failed install preserves existing runtime report" "stale-report" "$(cat "$PAPERCLIP_WHATS_RUNNING_PATH")"
 
 echo "== test 2b: upgrade to npm:8.8.8 where systemctl start itself fails (Type=notify timeout/crash) =="
 echo "ok" > "$MODE_FILE"
@@ -825,6 +829,11 @@ mkdir -p "$CLI_ROOT" "$CLI_ROOT/node_modules/@paperclipai" \
   "$OVERLAY_BUILD/packages/shared/dist" "$OVERLAY_BUILD/packages/db/dist/migrations" \
   "$OVERLAY_BUILD/server/dist/vendor/paperclip-runner/bin" "$OVERLAY_BUILD/server/ui-dist" "$OVERLAY_BUILD/server/skills"
 printf '%s\n' '{"name":"paperclipai","version":"2026.831.1"}' > "$CLI_ROOT/package.json"
+mkdir -p "$OVERLAY_PREFIX/bin" "$CLI_ROOT/dist" "$CLI_ROOT/node_modules/.bin" "$CLI_ROOT/node_modules/native/lib"
+printf 'cli\n' > "$CLI_ROOT/dist/index.js"; printf 'native\n' > "$CLI_ROOT/node_modules/native/lib/native.so"
+ln -s ../lib/node_modules/paperclipai/dist/index.js "$OVERLAY_PREFIX/bin/paperclipai"
+ln -s ../@paperclipai/server/dist/index.js "$CLI_ROOT/node_modules/.bin/paperclip-server"
+ln -s lib/native.so "$CLI_ROOT/node_modules/native/current.so"
 for p in shared db server; do d="$CLI_ROOT/node_modules/@paperclipai/$p"; mkdir -p "$d"; printf '{"name":"@paperclipai/%s","version":"2026.831.1","main":"dist/index.js"}\n' "$p" > "$d/package.json"; mkdir -p "$d/dist"; printf 'old\n' > "$d/dist/index.js"; done
 printf 'stale\n' > "$CLI_ROOT/node_modules/@paperclipai/server/dist/stale.js"
 printf 'new\n' > "$OVERLAY_BUILD/packages/shared/dist/index.js"
@@ -837,18 +846,38 @@ printf '%s\n' '{"commit":"0123456789012345678901234567890123456789"}' > "$OVERLA
 printf 'runner\n' > "$OVERLAY_BUILD/server/dist/vendor/paperclip-runner/bin/paperclip-runnerd"
 printf 'ui\n' > "$OVERLAY_BUILD/server/ui-dist/index.html"
 printf 'skill\n' > "$OVERLAY_BUILD/server/skills/catalog.json"
-capture out21 code21 node "$ENGINE_DIR/overlay-contract.mjs" "$OVERLAY_PREFIX" "$OVERLAY_BUILD" 0123456789012345678901234567890123456789 "$OVERLAY_PREFIX/receipt.json"
+capture out21 code21 node "$ENGINE_DIR/overlay-contract.mjs" "$OVERLAY_PREFIX" "$OVERLAY_BUILD" 0123456789012345678901234567890123456789 "$OVERLAY_PREFIX/.paperclip-engine-overlay.json"
 assert_eq "overlay contract exits 0" "0" "$code21"
-assert_contains "overlay receipt records source provenance" "$(cat "$OVERLAY_PREFIX/receipt.json" 2>/dev/null || true)" "0123456789012345678901234567890123456789"
+assert_contains "overlay receipt records source provenance" "$(cat "$OVERLAY_PREFIX/.paperclip-engine-overlay.json" 2>/dev/null || true)" "0123456789012345678901234567890123456789"
 assert_contains "official manifest remains unchanged" "$(cat "$CLI_ROOT/node_modules/@paperclipai/server/package.json")" '"version":"2026.831.1"'
 assert_eq "nested runtime server received overlay" "new" "$(cat "$CLI_ROOT/node_modules/@paperclipai/server/dist/index.js")"
 assert_true "exclusive replacement removes stale compiled files" test ! -e "$CLI_ROOT/node_modules/@paperclipai/server/dist/stale.js"
 assert_true "runner mode repaired to 0755" test -x "$CLI_ROOT/node_modules/@paperclipai/server/dist/vendor/paperclip-runner/bin/paperclip-runnerd"
-capture out21v code21v node "$ENGINE_DIR/overlay-contract.mjs" --verify "$OVERLAY_PREFIX" 0123456789012345678901234567890123456789 "$OVERLAY_PREFIX/receipt.json"
+capture out21v code21v node "$ENGINE_DIR/overlay-contract.mjs" --verify "$OVERLAY_PREFIX" 0123456789012345678901234567890123456789 "$OVERLAY_PREFIX/.paperclip-engine-overlay.json"
 assert_eq "matching receipt validates reuse" "0" "$code21v"
+REPORT_HOME="$SANDBOX/report-home"; REPORT_BIN="$SANDBOX/report-bin"; mkdir -p "$REPORT_HOME" "$REPORT_BIN"
+cat > "$REPORT_BIN/systemctl" <<EOF
+#!/usr/bin/env bash
+case "\$*" in *ActiveState*) echo active;; *MainPID*) echo 4242;; *ExecStart*) echo '$OVERLAY_PREFIX-link/bin/paperclipai run';; esac
+EOF
+chmod +x "$REPORT_BIN/systemctl"
+capture report_out report_code env PATH="$REPORT_BIN:$PATH" HOME="$REPORT_HOME" CURRENT_LINK="$OVERLAY_PREFIX-link" UNIT_NAME=paperclip.service PAPERCLIP_ENGINE_SCRIPT_DIR="$ENGINE_DIR" bash -c 'ln -s "$0" "$CURRENT_LINK"; exec "$1/whats-running.sh"' "$OVERLAY_PREFIX" "$ENGINE_DIR"
+echo "$report_out" | sed 's/^/    /'
+assert_eq "managed current-link process is recognized" "0" "$report_code"
+assert_contains "managed runtime report says running" "$report_out" "Engine running : YES"
+sed -i "s|$OVERLAY_PREFIX-link/bin/paperclipai|/usr/lib/node_modules/paperclipai/dist/index.js|" "$REPORT_BIN/systemctl"
+capture old_report_out old_report_code env PATH="$REPORT_BIN:$PATH" HOME="$REPORT_HOME" CURRENT_LINK="$OVERLAY_PREFIX-link" UNIT_NAME=paperclip.service PAPERCLIP_ENGINE_SCRIPT_DIR="$ENGINE_DIR" "$ENGINE_DIR/whats-running.sh"
+assert_eq "old /usr ExecStart is rejected" "1" "$old_report_code"
+assert_contains "old /usr runtime reports not running" "$old_report_out" "Engine running : NO"
+capture install_report_out install_report_code env HOME="$REPORT_HOME" SCRIPT_DIR="$ENGINE_DIR" PAPERCLIP_WHATS_RUNNING_PATH="$REPORT_HOME/bin/whats-running" bash -c '. "$SCRIPT_DIR/lib.sh"; install_whats_running'
+assert_eq "managed report installer succeeds" "0" "$install_report_code"
+assert_true "installed report is mode 0755" test -x "$REPORT_HOME/bin/whats-running"
 printf 'tamper\n' >> "$CLI_ROOT/node_modules/@paperclipai/server/dist/index.js"
-capture out21t code21t node "$ENGINE_DIR/overlay-contract.mjs" --verify "$OVERLAY_PREFIX" 0123456789012345678901234567890123456789 "$OVERLAY_PREFIX/receipt.json"
+capture out21t code21t node "$ENGINE_DIR/overlay-contract.mjs" --verify "$OVERLAY_PREFIX" 0123456789012345678901234567890123456789 "$OVERLAY_PREFIX/.paperclip-engine-overlay.json"
 assert_eq "tampered final inventory rejects reuse" "1" "$code21t"
+rm "$OVERLAY_PREFIX/bin/paperclipai"; ln -s /usr/lib/node_modules/paperclipai/dist/index.js "$OVERLAY_PREFIX/bin/paperclipai"
+capture out21l code21l node "$ENGINE_DIR/overlay-contract.mjs" --verify "$OVERLAY_PREFIX" 0123456789012345678901234567890123456789 "$OVERLAY_PREFIX/.paperclip-engine-overlay.json"
+assert_eq "absolute symlink target tamper fails closed" "1" "$code21l"
 
 echo "== test 22: zero-pending gate compares full migration manifest and ledger =="
 LIVE_MIG="$SANDBOX/live-prefix/lib/node_modules/paperclipai/node_modules/@paperclipai/db/dist/migrations"

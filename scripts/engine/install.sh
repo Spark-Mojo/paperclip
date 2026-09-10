@@ -347,6 +347,9 @@ main() {
     log "migrations before: $before_migrations"
     log "migrations after:  $after_migrations"
     log "health:            $body"
+    if [ "$DRY_RUN" != "1" ]; then
+      install_whats_running
+    fi
     exit 0
   fi
 
