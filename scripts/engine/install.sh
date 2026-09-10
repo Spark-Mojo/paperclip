@@ -321,16 +321,16 @@ EOF
 # NOT set that on the unit; migrations here are the only place they run.
 run_migrations() {
   local prefix="$1"
+  if [ ! -f "$INSTANCE_CONFIG" ]; then
+    log "No instance config at $INSTANCE_CONFIG; no existing database to migrate."
+    return 0
+  fi
   if [ "$DRY_RUN" = "1" ]; then
     log "+DRYRUN would run @paperclipai/db migrations from $prefix"
     return 0
   fi
   local migrate_js
-  migrate_js="$(find "$prefix/lib/node_modules" -maxdepth 5 -path '*/@paperclipai/db/dist/migrate.js' 2>/dev/null | head -1)"
-  if [ -z "$migrate_js" ]; then
-    log "WARNING: no @paperclipai/db/dist/migrate.js found under $prefix — skipping explicit migration run. The server will refuse to start if the schema is stale (see above); this is a fail-safe, not silent drift."
-    return 0
-  fi
+  migrate_js="$(resolve_migration_artifact "$prefix")"
   log "Running migrations via $migrate_js"
   PAPERCLIP_HOME="$PAPERCLIP_HOME" PAPERCLIP_INSTANCE_ID="$PAPERCLIP_INSTANCE_ID" PAPERCLIP_CONFIG="$INSTANCE_CONFIG" \
     run node "$migrate_js"

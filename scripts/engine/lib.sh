@@ -529,6 +529,31 @@ backup_database() {
   local ts
   ts="$(date -u +%Y%m%dT%H%M%SZ)"
   local dump_path="$BACKUP_DIR/${ts}-${label}.dump"
-  run pg_dump -Fc "$connection_string" -f "$dump_path"
+  if ! run pg_dump -Fc "$connection_string" -f "$dump_path"; then
+    die "Database backup failed; refusing to build, migrate, or cut over."
+  fi
+  if [ "$DRY_RUN" != "1" ]; then
+    [ -s "$dump_path" ] \
+      || die "Database backup is empty: $dump_path. Refusing to build, migrate, or cut over."
+    if ! pg_restore --list "$dump_path" >/dev/null 2>&1; then
+      die "Database backup is not a readable PostgreSQL archive: $dump_path. Refusing to build, migrate, or cut over."
+    fi
+  fi
   echo "$dump_path"
+}
+
+resolve_migration_artifact() {
+  local prefix="$1"
+  local hoisted="$prefix/lib/node_modules/@paperclipai/db/dist/migrate.js"
+  local nested="$prefix/lib/node_modules/paperclipai/node_modules/@paperclipai/db/dist/migrate.js"
+  local matches=()
+  [ -f "$hoisted" ] && matches+=("$hoisted")
+  [ -f "$nested" ] && matches+=("$nested")
+  if [ "${#matches[@]}" -eq 0 ]; then
+    die "Installed prefix $prefix has no installed @paperclipai/db migration artifact."
+  fi
+  if [ "${#matches[@]}" -ne 1 ]; then
+    die "Installed prefix $prefix has ambiguous @paperclipai/db migration artifacts: ${matches[*]}"
+  fi
+  printf '%s\n' "${matches[0]}"
 }

@@ -426,6 +426,124 @@ assert_eq "base unit remains unchanged" $'[Service]\nExecStart=/usr/bin/node /us
 assert_eq "existing drop-in remains unchanged" $'[Service]\nEnvironment=KEEP_ME=1' "$(cat "$ADOPT_HOME/.config/systemd/user/paperclip.service.d/override-opencode.conf")"
 assert_contains "effective ExecStart verification reported" "$out13" "Verified effective ExecStart"
 
+echo "== test 14: unusable backups stop install before build, migration, symlink, or service =="
+BACKUP_HOME="$SANDBOX/backup-home"
+BACKUP_ROOT="$SANDBOX/backup-root"
+BACKUP_INSTANCE="$SANDBOX/backup-paperclip/instances/default"
+BACKUP_LINK="$BACKUP_ROOT/paperclip-current"
+BACKUP_OLD="$BACKUP_ROOT/paperclip-old"
+BACKUP_BIN="$SANDBOX/backup-bin"
+BACKUP_MARKERS="$SANDBOX/backup-markers"
+mkdir -p "$BACKUP_HOME/.config/systemd/user" "$BACKUP_INSTANCE" "$BACKUP_OLD/lib/node_modules/paperclipai" "$BACKUP_OLD/bin" "$BACKUP_BIN" "$BACKUP_MARKERS"
+cp "$ENGINE_DIR/systemd/paperclip-831.service" "$BACKUP_HOME/.config/systemd/user/paperclip-831.service"
+printf '%s\n' '{"name":"paperclipai","version":"old"}' > "$BACKUP_OLD/lib/node_modules/paperclipai/package.json"
+printf '%s\n' '#!/usr/bin/env bash' 'exit 0' > "$BACKUP_OLD/bin/paperclipai"
+chmod +x "$BACKUP_OLD/bin/paperclipai"
+ln -s "$BACKUP_OLD" "$BACKUP_LINK"
+cat > "$BACKUP_INSTANCE/config.json" <<EOF
+{"server":{"host":"127.0.0.1","port":$HEALTH_PORT},"database":{"mode":"postgres","connectionString":"postgres://fake:fake@127.0.0.1:5432/paperclip831"}}
+EOF
+cat > "$BACKUP_BIN/psql" <<'EOF'
+#!/usr/bin/env bash
+exit 0
+EOF
+cat > "$BACKUP_BIN/systemctl" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$BACKUP_MARKERS/systemctl"
+exit 0
+EOF
+cat > "$BACKUP_BIN/npm" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$BACKUP_MARKERS/npm"
+exit 99
+EOF
+cat > "$BACKUP_BIN/pg_restore" <<'EOF'
+#!/usr/bin/env bash
+if [ "${1:-}" = "--list" ]; then
+  grep -q VALID_DUMP "${2:-}" 2>/dev/null
+  exit $?
+fi
+exit 0
+EOF
+chmod +x "$BACKUP_BIN"/*
+
+run_bad_backup_case() {
+  local mode="$1" version="$2"
+  rm -f "$BACKUP_MARKERS/systemctl" "$BACKUP_MARKERS/npm"
+  cat > "$BACKUP_BIN/pg_dump" <<EOF
+#!/usr/bin/env bash
+out=""
+while [ "\$#" -gt 0 ]; do
+  if [ "\$1" = "-f" ]; then shift; out="\$1"; fi
+  shift
+done
+case "$mode" in
+  exit23) exit 23 ;;
+  empty) : > "\$out" ;;
+  corrupt) printf '%s\\n' CORRUPT > "\$out" ;;
+esac
+EOF
+  chmod +x "$BACKUP_BIN/pg_dump"
+  capture bad_out bad_code env \
+    PATH="$BACKUP_BIN:$PATH" \
+    HOME="$BACKUP_HOME" \
+    PAPERCLIP_ENGINE_DRY_RUN=0 \
+    ENGINE_ROOT="$BACKUP_ROOT" \
+    PAPERCLIP_HOME="$SANDBOX/backup-paperclip" \
+    PAPERCLIP_INSTANCE_ID=default \
+    CURRENT_LINK="$BACKUP_LINK" \
+    UNIT_NAME=paperclip-831.service \
+    EXPECTED_DB=paperclip831 \
+    BACKUP_DIR="$BACKUP_ROOT/backups" \
+    STATE_DIR="$BACKUP_ROOT/state" \
+    MIN_FREE_KB=0 \
+    BACKUP_MARKERS="$BACKUP_MARKERS" \
+    "$ENGINE_DIR/install.sh" "npm:$version"
+  assert_true "$mode backup: install exits non-zero" test "$bad_code" -ne 0
+  assert_eq "$mode backup: current link unchanged" "$BACKUP_OLD" "$(readlink "$BACKUP_LINK")"
+  assert_true "$mode backup: no replacement prefix" test ! -e "$BACKUP_ROOT/paperclip-$version"
+  assert_true "$mode backup: npm build not reached" test ! -e "$BACKUP_MARKERS/npm"
+  assert_true "$mode backup: service not touched" test ! -e "$BACKUP_MARKERS/systemctl"
+}
+
+run_bad_backup_case exit23 14.0.1
+run_bad_backup_case empty 14.0.2
+run_bad_backup_case corrupt 14.0.3
+
+echo "== test 15: migration resolver supports nested package and fails closed =="
+MIGRATE_PREFIX="$SANDBOX/migrate-prefix"
+NESTED_MIGRATE="$MIGRATE_PREFIX/lib/node_modules/paperclipai/node_modules/@paperclipai/db/dist/migrate.js"
+mkdir -p "$(dirname "$NESTED_MIGRATE")"
+printf '%s\n' 'export {};' > "$NESTED_MIGRATE"
+capture out15 code15 env \
+  PAPERCLIP_ENGINE_DRY_RUN=0 \
+  ENGINE_DIR_FOR_TEST="$ENGINE_DIR" \
+  MIGRATE_PREFIX="$MIGRATE_PREFIX" \
+  bash -c '. "$ENGINE_DIR_FOR_TEST/lib.sh"; resolve_migration_artifact "$MIGRATE_PREFIX"'
+assert_eq "nested migration artifact resolves" "0" "$code15"
+assert_eq "nested migration artifact path is exact" "$NESTED_MIGRATE" "$out15"
+
+rm -f "$NESTED_MIGRATE"
+capture out15b code15b env \
+  PAPERCLIP_ENGINE_DRY_RUN=0 \
+  ENGINE_DIR_FOR_TEST="$ENGINE_DIR" \
+  MIGRATE_PREFIX="$MIGRATE_PREFIX" \
+  bash -c '. "$ENGINE_DIR_FOR_TEST/lib.sh"; resolve_migration_artifact "$MIGRATE_PREFIX"'
+assert_eq "missing migration artifact fails closed" "1" "$code15b"
+assert_contains "missing migration artifact explains failure" "$out15b" "no installed @paperclipai/db migration artifact"
+
+HOISTED_MIGRATE="$MIGRATE_PREFIX/lib/node_modules/@paperclipai/db/dist/migrate.js"
+mkdir -p "$(dirname "$HOISTED_MIGRATE")" "$(dirname "$NESTED_MIGRATE")"
+printf '%s\n' 'export {};' > "$HOISTED_MIGRATE"
+printf '%s\n' 'export {};' > "$NESTED_MIGRATE"
+capture out15c code15c env \
+  PAPERCLIP_ENGINE_DRY_RUN=0 \
+  ENGINE_DIR_FOR_TEST="$ENGINE_DIR" \
+  MIGRATE_PREFIX="$MIGRATE_PREFIX" \
+  bash -c '. "$ENGINE_DIR_FOR_TEST/lib.sh"; resolve_migration_artifact "$MIGRATE_PREFIX"'
+assert_eq "ambiguous migration artifacts fail closed" "1" "$code15c"
+assert_contains "ambiguous migration artifacts explain failure" "$out15c" "ambiguous @paperclipai/db migration artifacts"
+
 echo
 echo "PASS=$PASS FAIL=$FAIL"
 [ "$FAIL" -eq 0 ]
