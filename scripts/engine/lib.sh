@@ -738,7 +738,9 @@ assert_overlay_zero_pending() {
   [ "$(comm -23 "$candidate_ledger" "$live_ledger" | wc -l)" -eq 0 ] || die "Candidate has migration journal entries absent from live ledger; pending migrations are forbidden."
   [ "$(comm -13 "$candidate_ledger" "$live_ledger" | wc -l)" -eq 3 ] || die "Live migration ledger must have exactly three historical surplus rows."
   rm -rf "$scratch"; trap - RETURN
-  log "Verified zero pending migrations: exact 323-file tree, 231 mapped journal rows, and 3 historical live rows"
+  local migration_file_count
+  migration_file_count="$(find "$candidate_dir" -type f | wc -l)"
+  log "Verified zero pending migrations: exact ${migration_file_count}-file tree, 231 mapped journal rows, and 3 historical live rows"
 }
 
 live_migration_ledger() {
