@@ -143,6 +143,9 @@ assert_eq "re-install exits 0" "0" "$code1b"
 assert_contains "re-install logs reuse, not a fresh stage" "$out1b" "Reusing already-installed prefix"
 
 echo "== test 2: upgrade to npm:9.9.9 with health FAILING -> automatic rollback =="
+export PAPERCLIP_WHATS_RUNNING_PATH="$SANDBOX/bin/whats-running"
+mkdir -p "$(dirname "$PAPERCLIP_WHATS_RUNNING_PATH")"
+printf 'stale-report\n' > "$PAPERCLIP_WHATS_RUNNING_PATH"
 echo "fail" > "$MODE_FILE"
 capture out2 code2 "$ENGINE_DIR/install.sh" npm:9.9.9
 echo "$out2" | sed 's/^/    /'
@@ -150,6 +153,7 @@ assert_eq "failed install exits non-zero" "1" "$code2"
 assert_eq "current rolled back to paperclip-1.2.3" "$ENGINE_ROOT/paperclip-1.2.3" "$(readlink "$CURRENT_LINK")"
 assert_true "new (bad) prefix left on disk for investigation" test -d "$ENGINE_ROOT/paperclip-9.9.9"
 assert_contains "install.sh warns DB was not rolled back" "$out2" "DATABASE SCHEMA WAS NOT ROLLED BACK"
+assert_eq "failed install preserves existing runtime report" "stale-report" "$(cat "$PAPERCLIP_WHATS_RUNNING_PATH")"
 
 echo "== test 2b: upgrade to npm:8.8.8 where systemctl start itself fails (Type=notify timeout/crash) =="
 echo "ok" > "$MODE_FILE"
@@ -174,11 +178,16 @@ assert_eq "rollback.sh exits 0" "0" "$code3b"
 assert_eq "current rolled back to paperclip-1.2.3" "$ENGINE_ROOT/paperclip-1.2.3" "$(readlink "$CURRENT_LINK")"
 assert_eq "previous-prefix state file now records 2.0.0" "$ENGINE_ROOT/paperclip-2.0.0" "$(cat "$STATE_DIR/previous-prefix")"
 
-echo "== test 4: fork:<ref> source resolves to a paperclip-fork-<sha> prefix =="
+echo "== test 4: fork source uses distinct receipt-bound overlay prefix =="
+LEGACY_SHA="$(git -C "$ENGINE_DIR/../.." rev-parse HEAD | cut -c1-12)"
+LEGACY_PREFIX="$ENGINE_ROOT/paperclip-fork-$LEGACY_SHA"
+mkdir -p "$LEGACY_PREFIX/lib/node_modules/paperclipai"
+printf '%s\n' '{"name":"paperclipai","version":"legacy"}' > "$LEGACY_PREFIX/lib/node_modules/paperclipai/package.json"
 capture out4 code4 "$ENGINE_DIR/install.sh" fork:HEAD
 echo "$out4" | sed 's/^/    /'
 assert_eq "fork install exits 0" "0" "$code4"
-assert_true "current symlink now points at a paperclip-fork-* prefix" bash -c '[[ "$(readlink "'"$CURRENT_LINK"'")" == "'"$ENGINE_ROOT"'"/paperclip-fork-* ]]'
+assert_true "current symlink points at distinct overlay prefix" bash -c '[[ "$(readlink "'"$CURRENT_LINK"'")" == "'"$ENGINE_ROOT"'"/paperclip-overlay-2026.831.1-* ]]'
+assert_true "legacy same-source prefix was not reused" test "$(readlink "$CURRENT_LINK")" != "$LEGACY_PREFIX"
 
 echo "== test 5: status.sh runs cleanly against the sandbox =="
 capture status_out status_code "$ENGINE_DIR/status.sh"
@@ -344,6 +353,15 @@ capture out10b code10b env ENGINE_DIR_FOR_TEST="$ENGINE_DIR" SERVER_PAYLOAD="$SE
 '
 assert_eq "runner hash mismatch fails closed" "1" "$code10b"
 assert_contains "runner hash mismatch explains failure" "$out10b" "runner binary hash mismatch"
+
+: > "$INSTALLED_RUNNER"
+capture out10z code10z env ENGINE_DIR_FOR_TEST="$ENGINE_DIR" SERVER_PAYLOAD="$SERVER_PAYLOAD" SERVER_TARBALL="$SANDBOX/paperclipai-server-9.8.7.tgz" bash -c '
+  set -euo pipefail
+  . "$ENGINE_DIR_FOR_TEST/lib.sh"
+  verify_fork_server_package "$SERVER_PAYLOAD" "$SERVER_TARBALL"
+'
+assert_eq "zero-byte staged runner fails closed" "1" "$code10z"
+assert_contains "zero-byte runner explains failure" "$out10z" "missing or empty"
 
 echo "== test 11: fork server package verification rejects missing installed server =="
 rm -rf "$SERVER_PAYLOAD/lib/node_modules/paperclipai/node_modules/@paperclipai/server"
@@ -802,6 +820,114 @@ assert_eq "registry global-prefix helper exits 0" "0" "$code20"
 assert_contains "registry install uses npm global mode" "$(cat "$SANDBOX/global-npm-args" 2>/dev/null || true)" "install --global --prefix $NPM_PAYLOAD paperclipai@4.5.6"
 assert_true "registry global-prefix package layout exists" test -f "$NPM_PAYLOAD/lib/node_modules/paperclipai/package.json"
 assert_true "registry global-prefix CLI shim is executable" test -x "$NPM_PAYLOAD/bin/paperclipai"
+
+echo "== test 21: compiled overlay targets nested runtime roots and receipts provenance =="
+OVERLAY_PREFIX="$SANDBOX/overlay-prefix"
+OVERLAY_BUILD="$SANDBOX/overlay-build"
+CLI_ROOT="$OVERLAY_PREFIX/lib/node_modules/paperclipai"
+mkdir -p "$CLI_ROOT" "$CLI_ROOT/node_modules/@paperclipai" \
+  "$OVERLAY_BUILD/packages/shared/dist" "$OVERLAY_BUILD/packages/db/dist/migrations" \
+  "$OVERLAY_BUILD/server/dist/vendor/paperclip-runner/bin" "$OVERLAY_BUILD/server/ui-dist" "$OVERLAY_BUILD/server/skills"
+printf '%s\n' '{"name":"paperclipai","version":"2026.831.1"}' > "$CLI_ROOT/package.json"
+mkdir -p "$OVERLAY_PREFIX/bin" "$CLI_ROOT/dist" "$CLI_ROOT/node_modules/.bin" "$CLI_ROOT/node_modules/native/lib"
+printf 'cli\n' > "$CLI_ROOT/dist/index.js"; printf 'native\n' > "$CLI_ROOT/node_modules/native/lib/native.so"
+ln -s ../lib/node_modules/paperclipai/dist/index.js "$OVERLAY_PREFIX/bin/paperclipai"
+ln -s ../@paperclipai/server/dist/index.js "$CLI_ROOT/node_modules/.bin/paperclip-server"
+ln -s lib/native.so "$CLI_ROOT/node_modules/native/current.so"
+for p in shared db server; do d="$CLI_ROOT/node_modules/@paperclipai/$p"; mkdir -p "$d"; printf '{"name":"@paperclipai/%s","version":"2026.831.1","main":"dist/index.js"}\n' "$p" > "$d/package.json"; mkdir -p "$d/dist"; printf 'old\n' > "$d/dist/index.js"; done
+printf 'stale\n' > "$CLI_ROOT/node_modules/@paperclipai/server/dist/stale.js"
+printf 'new\n' > "$OVERLAY_BUILD/packages/shared/dist/index.js"
+printf 'new\n' > "$OVERLAY_BUILD/packages/db/dist/index.js"
+printf 'migration\n' > "$OVERLAY_BUILD/packages/db/dist/migrations/0001.sql"
+mkdir -p "$OVERLAY_BUILD/packages/db/dist/migrations/meta"
+printf '%s\n' '{"entries":[]}' > "$OVERLAY_BUILD/packages/db/dist/migrations/meta/_journal.json"
+printf 'new\n' > "$OVERLAY_BUILD/server/dist/index.js"
+printf '%s\n' '{"commit":"0123456789012345678901234567890123456789"}' > "$OVERLAY_BUILD/server/dist/build-info.json"
+printf 'runner\n' > "$OVERLAY_BUILD/server/dist/vendor/paperclip-runner/bin/paperclip-runnerd"
+printf 'ui\n' > "$OVERLAY_BUILD/server/ui-dist/index.html"
+printf 'skill\n' > "$OVERLAY_BUILD/server/skills/catalog.json"
+capture out21 code21 node "$ENGINE_DIR/overlay-contract.mjs" "$OVERLAY_PREFIX" "$OVERLAY_BUILD" 0123456789012345678901234567890123456789 "$OVERLAY_PREFIX/.paperclip-engine-overlay.json"
+assert_eq "overlay contract exits 0" "0" "$code21"
+assert_contains "overlay receipt records source provenance" "$(cat "$OVERLAY_PREFIX/.paperclip-engine-overlay.json" 2>/dev/null || true)" "0123456789012345678901234567890123456789"
+assert_contains "official manifest remains unchanged" "$(cat "$CLI_ROOT/node_modules/@paperclipai/server/package.json")" '"version":"2026.831.1"'
+assert_eq "nested runtime server received overlay" "new" "$(cat "$CLI_ROOT/node_modules/@paperclipai/server/dist/index.js")"
+assert_true "exclusive replacement removes stale compiled files" test ! -e "$CLI_ROOT/node_modules/@paperclipai/server/dist/stale.js"
+assert_true "runner mode repaired to 0755" test -x "$CLI_ROOT/node_modules/@paperclipai/server/dist/vendor/paperclip-runner/bin/paperclip-runnerd"
+capture out21v code21v node "$ENGINE_DIR/overlay-contract.mjs" --verify "$OVERLAY_PREFIX" 0123456789012345678901234567890123456789 "$OVERLAY_PREFIX/.paperclip-engine-overlay.json"
+assert_eq "matching receipt validates reuse" "0" "$code21v"
+REPORT_HOME="$SANDBOX/report-home"; REPORT_BIN="$SANDBOX/report-bin"; mkdir -p "$REPORT_HOME" "$REPORT_BIN"
+REPORT_PROC="$SANDBOX/report-proc"; mkdir -p "$REPORT_PROC/4242"; ln -s "$(command -v node)" "$REPORT_PROC/4242/exe"
+printf '%s\0%s\0%s\0' node "$OVERLAY_PREFIX-link/lib/node_modules/paperclipai/dist/index.js" run > "$REPORT_PROC/4242/cmdline"
+cat > "$REPORT_BIN/systemctl" <<EOF
+#!/usr/bin/env bash
+case "\$*" in *ActiveState*) echo active;; *MainPID*) echo 4242;; *ExecStart*) echo '{ path=$OVERLAY_PREFIX-link/bin/paperclipai ; argv[]=$OVERLAY_PREFIX-link/bin/paperclipai run --instance default ; ignore_errors=no ; }';; esac
+EOF
+chmod +x "$REPORT_BIN/systemctl"
+capture report_out report_code env PATH="$REPORT_BIN:$PATH" HOME="$REPORT_HOME" CURRENT_LINK="$OVERLAY_PREFIX-link" UNIT_NAME=paperclip.service PAPERCLIP_ENGINE_SCRIPT_DIR="$ENGINE_DIR" PAPERCLIP_PROC_ROOT="$REPORT_PROC" bash -c 'ln -s "$0" "$CURRENT_LINK"; exec "$1/whats-running.sh"' "$OVERLAY_PREFIX" "$ENGINE_DIR"
+echo "$report_out" | sed 's/^/    /'
+assert_eq "managed current-link process is recognized" "0" "$report_code"
+assert_contains "managed runtime report says running" "$report_out" "Engine running : YES"
+assert_contains "report lists changed path and final hash" "$report_out" "CHANGED lib/node_modules/paperclipai/node_modules/@paperclipai/server/dist/index.js sha256:"
+assert_contains "report lists deleted stale path" "$report_out" "DELETED lib/node_modules/paperclipai/node_modules/@paperclipai/server/dist/stale.js"
+cat > "$SANDBOX/change-receipt.json" <<'EOF'
+{"baselineInventory":[{"path":"z","type":"file","sha256":"oldz","size":1,"mode":420},{"path":"b","type":"file","sha256":"oldb","size":1,"mode":420}],"finalInventory":[{"path":"a","type":"symlink","target":"relative/target"},{"path":"b","type":"file","sha256":"newb","size":2,"mode":420}]}
+EOF
+capture changes_out changes_code node "$ENGINE_DIR/overlay-contract.mjs" --changes "$SANDBOX/change-receipt.json"
+assert_eq "deterministic added/changed/deleted/symlink output" $'ADDED a symlink:relative/target\nCHANGED b sha256:newb\nDELETED z sha256:oldz' "$changes_out"
+printf '%s\0%s\0%s\0' node /usr/lib/node_modules/paperclipai/dist/index.js "$OVERLAY_PREFIX-link/lib/node_modules/paperclipai/dist/index.js" > "$REPORT_PROC/4242/cmdline"
+capture old_report_out old_report_code env PATH="$REPORT_BIN:$PATH" HOME="$REPORT_HOME" CURRENT_LINK="$OVERLAY_PREFIX-link" UNIT_NAME=paperclip.service PAPERCLIP_ENGINE_SCRIPT_DIR="$ENGINE_DIR" PAPERCLIP_PROC_ROOT="$REPORT_PROC" "$ENGINE_DIR/whats-running.sh"
+assert_eq "old /usr ExecStart is rejected" "1" "$old_report_code"
+assert_contains "old /usr runtime reports not running" "$old_report_out" "Engine running : NO"
+# Restore live argv, then prove a configured-argv substring spoof is rejected.
+printf '%s\0%s\0%s\0' node "$OVERLAY_PREFIX-link/lib/node_modules/paperclipai/dist/index.js" run > "$REPORT_PROC/4242/cmdline"
+sed -i 's|path='"$OVERLAY_PREFIX"'-link/bin/paperclipai|path=/tmp/spoof'"$OVERLAY_PREFIX"'-link/bin/paperclipai|' "$REPORT_BIN/systemctl"
+capture spoof_out spoof_code env PATH="$REPORT_BIN:$PATH" HOME="$REPORT_HOME" CURRENT_LINK="$OVERLAY_PREFIX-link" UNIT_NAME=paperclip.service PAPERCLIP_ENGINE_SCRIPT_DIR="$ENGINE_DIR" PAPERCLIP_PROC_ROOT="$REPORT_PROC" "$ENGINE_DIR/whats-running.sh"
+assert_eq "configured ExecStart substring spoof is rejected" "1" "$spoof_code"
+sed -i 's|path=/tmp/spoof'"$OVERLAY_PREFIX"'-link/bin/paperclipai|path='"$OVERLAY_PREFIX"'-link/bin/paperclipai|' "$REPORT_BIN/systemctl"
+mkdir -p "$SANDBOX/other-prefix"
+capture race_out race_code env PATH="$REPORT_BIN:$PATH" HOME="$REPORT_HOME" CURRENT_LINK="$OVERLAY_PREFIX-link" UNIT_NAME=paperclip.service PAPERCLIP_ENGINE_SCRIPT_DIR="$ENGINE_DIR" PAPERCLIP_PROC_ROOT="$REPORT_PROC" PAPERCLIP_ENGINE_TEST_FLIP_CURRENT_TO="$SANDBOX/other-prefix" "$ENGINE_DIR/whats-running.sh"
+assert_eq "current-link flip during report fails closed" "1" "$race_code"
+ln -sfn "$OVERLAY_PREFIX" "$OVERLAY_PREFIX-link"
+ABA_PREFIX="$SANDBOX/aba-prefix"; cp -a "$OVERLAY_PREFIX" "$ABA_PREFIX"
+capture aba_out aba_code env PATH="$REPORT_BIN:$PATH" HOME="$REPORT_HOME" CURRENT_LINK="$OVERLAY_PREFIX-link" UNIT_NAME=paperclip.service PAPERCLIP_ENGINE_SCRIPT_DIR="$ENGINE_DIR" PAPERCLIP_PROC_ROOT="$REPORT_PROC" PAPERCLIP_ENGINE_TEST_PRE_PROCESS_LINK_TO="$ABA_PREFIX" PAPERCLIP_ENGINE_TEST_PRE_FINAL_LINK_TO="$OVERLAY_PREFIX" "$ENGINE_DIR/whats-running.sh"
+assert_eq "ABA current-link race stays bound to captured prefix" "1" "$aba_code"
+ln -sfn "$OVERLAY_PREFIX" "$OVERLAY_PREFIX-link"
+mkdir -p "$REPORT_HOME/bin" "$REPORT_HOME/old-bundle"; printf 'old\n' > "$REPORT_HOME/old-bundle/whats-running.sh"; ln -s "$REPORT_HOME/old-bundle/whats-running.sh" "$REPORT_HOME/bin/whats-running"
+capture fail_report_out fail_report_code env HOME="$REPORT_HOME" SCRIPT_DIR="$ENGINE_DIR" PAPERCLIP_WHATS_RUNNING_PATH="$REPORT_HOME/bin/whats-running" PAPERCLIP_ENGINE_TEST_FAIL_REPORT_INSTALL=1 bash -c '. "$SCRIPT_DIR/lib.sh"; install_whats_running'
+assert_eq "injected bundle failure exits nonzero" "1" "$fail_report_code"
+assert_eq "bundle failure preserves prior command" "$REPORT_HOME/old-bundle/whats-running.sh" "$(readlink "$REPORT_HOME/bin/whats-running")"
+capture install_report_out install_report_code env HOME="$REPORT_HOME" SCRIPT_DIR="$ENGINE_DIR" PAPERCLIP_WHATS_RUNNING_PATH="$REPORT_HOME/bin/whats-running" bash -c '. "$SCRIPT_DIR/lib.sh"; install_whats_running'
+assert_eq "managed report installer succeeds" "0" "$install_report_code"
+assert_true "installed report is mode 0755" test -x "$REPORT_HOME/bin/whats-running"
+assert_true "installed helper is mode 0755" test -x "$(dirname "$(readlink "$REPORT_HOME/bin/whats-running")")/overlay-contract.mjs"
+INSTALLED_BUNDLE="$(dirname "$(readlink "$REPORT_HOME/bin/whats-running")")"
+printf 'tamper\n' >> "$INSTALLED_BUNDLE/overlay-contract.mjs"
+capture bundle_tamper_out bundle_tamper_code env HOME="$REPORT_HOME" SCRIPT_DIR="$ENGINE_DIR" PAPERCLIP_WHATS_RUNNING_PATH="$REPORT_HOME/bin/whats-running" bash -c '. "$SCRIPT_DIR/lib.sh"; install_whats_running'
+assert_eq "tampered reused bundle fails closed" "1" "$bundle_tamper_code"
+assert_eq "tampered bundle failure preserves command link" "$INSTALLED_BUNDLE/whats-running.sh" "$(readlink "$REPORT_HOME/bin/whats-running")"
+printf 'tamper\n' >> "$CLI_ROOT/node_modules/@paperclipai/server/dist/index.js"
+capture out21t code21t node "$ENGINE_DIR/overlay-contract.mjs" --verify "$OVERLAY_PREFIX" 0123456789012345678901234567890123456789 "$OVERLAY_PREFIX/.paperclip-engine-overlay.json"
+assert_eq "tampered final inventory rejects reuse" "1" "$code21t"
+rm "$OVERLAY_PREFIX/bin/paperclipai"; ln -s /usr/lib/node_modules/paperclipai/dist/index.js "$OVERLAY_PREFIX/bin/paperclipai"
+capture out21l code21l node "$ENGINE_DIR/overlay-contract.mjs" --verify "$OVERLAY_PREFIX" 0123456789012345678901234567890123456789 "$OVERLAY_PREFIX/.paperclip-engine-overlay.json"
+assert_eq "absolute symlink target tamper fails closed" "1" "$code21l"
+
+echo "== test 22: zero-pending gate compares full migration manifest and ledger =="
+LIVE_MIG="$SANDBOX/live-prefix/lib/node_modules/paperclipai/node_modules/@paperclipai/db/dist/migrations"
+CAND_MIG="$SANDBOX/candidate-prefix/lib/node_modules/paperclipai/node_modules/@paperclipai/db/dist/migrations"
+mkdir -p "$CAND_MIG/meta"
+node -e '
+ const fs=require("fs"),path=require("path"); const root=process.argv[1],entries=[];
+ for(let i=0;i<231;i++){const tag=String(i).padStart(4,"0")+"_fixture";fs.writeFileSync(path.join(root,tag+".sql"),`migration ${i}\n`);entries.push({idx:i,version:"7",when:1000+i,tag,breakpoints:true})}
+ fs.writeFileSync(path.join(root,"meta/_journal.json"),JSON.stringify({version:"7",dialect:"postgresql",entries}));
+' "$CAND_MIG"
+mkdir -p "$(dirname "$LIVE_MIG")"
+cp -a "$CAND_MIG" "$LIVE_MIG"
+capture out22 code22 env ENGINE_DIR_FOR_TEST="$ENGINE_DIR" CAND_PREFIX="$SANDBOX/candidate-prefix" LIVE_PREFIX="$SANDBOX/live-prefix" CAND_MIG="$CAND_MIG" bash -c '. "$ENGINE_DIR_FOR_TEST/lib.sh"; live_migration_ledger(){ node -e '\''const fs=require("fs"),path=require("path"),crypto=require("crypto"),r=process.argv[1],j=require(path.join(r,"meta/_journal.json"));for(const e of j.entries){const b=fs.readFileSync(path.join(r,e.tag+".sql"));console.log(`${e.when}|${crypto.createHash("sha256").update(b).digest("hex")}`)}console.log("1|old-a\n2|old-b\n3|old-c")'\'' "$CAND_MIG"; }; assert_overlay_zero_pending "$CAND_PREFIX" "$LIVE_PREFIX" ignored'
+assert_eq "exact migration manifest and ledger pass" "0" "$code22"
+printf 'changed\n' > "$CAND_MIG/0001.sql"
+capture out22b code22b env ENGINE_DIR_FOR_TEST="$ENGINE_DIR" CAND_PREFIX="$SANDBOX/candidate-prefix" LIVE_PREFIX="$SANDBOX/live-prefix" bash -c '. "$ENGINE_DIR_FOR_TEST/lib.sh"; assert_overlay_zero_pending "$CAND_PREFIX" "$LIVE_PREFIX" ignored'
+assert_eq "changed migration hash fails closed" "1" "$code22b"
 
 echo
 echo "PASS=$PASS FAIL=$FAIL"

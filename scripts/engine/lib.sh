@@ -136,6 +136,38 @@ prepare_pnpm_toolchain() {
   run corepack enable pnpm --install-directory "$install_dir"
 }
 
+install_whats_running() {
+  local destination="${PAPERCLIP_WHATS_RUNNING_PATH:-$HOME/bin/whats-running}"
+  local bundle_root="$HOME/.local/lib/paperclip-engine-runtime" staging bundle_id bundle link_tmp
+  mkdir -p "$(dirname "$destination")" "$bundle_root"
+  staging="$(mktemp -d "$bundle_root/.staging.XXXXXX")"
+  trap 'rm -rf "$staging" "${link_tmp:-}"' RETURN
+  cp "$SCRIPT_DIR/whats-running.sh" "$SCRIPT_DIR/overlay-contract.mjs" "$staging/"
+  chmod 0755 "$staging/whats-running.sh" "$staging/overlay-contract.mjs"
+  bash -n "$staging/whats-running.sh"; node --check "$staging/overlay-contract.mjs"
+  bundle_id="$(cat "$staging/whats-running.sh" "$staging/overlay-contract.mjs" | sha256sum | awk '{print $1}')"
+  bundle="$bundle_root/$bundle_id"
+  if [ ! -d "$bundle" ]; then
+    mv "$staging" "$bundle"
+  else
+    if ! node -e '
+      const fs=require("fs"),path=require("path"),crypto=require("crypto");
+      const expected=["overlay-contract.mjs","whats-running.sh"];
+      function check(root){const names=fs.readdirSync(root).sort();if(JSON.stringify(names)!==JSON.stringify(expected))process.exit(1);return names.map(n=>{const p=path.join(root,n),s=fs.lstatSync(p);if(!s.isFile()||s.isSymbolicLink()||(s.mode&0o777)!==0o755)process.exit(1);return crypto.createHash("sha256").update(fs.readFileSync(p)).digest("hex")})}
+      if(JSON.stringify(check(process.argv[1]))!==JSON.stringify(check(process.argv[2])))process.exit(1);
+    ' "$staging" "$bundle"; then
+      die "Existing reporter bundle failed exact inventory verification."
+    fi
+    rm -rf "$staging"
+  fi
+  if [ "${PAPERCLIP_ENGINE_TEST_FAIL_REPORT_INSTALL:-0}" = "1" ]; then die "Injected runtime report installation failure before atomic link flip."; fi
+  link_tmp="$(dirname "$destination")/.whats-running.$$"
+  ln -s "$bundle/whats-running.sh" "$link_tmp"
+  mv -Tf "$link_tmp" "$destination"
+  trap - RETURN
+  log "Installed managed runtime report at $destination"
+}
+
 install_fork_payload() {
   local prefix="$1"
   shift
@@ -711,4 +743,38 @@ resolve_migration_artifact() {
     die "Installed prefix $prefix has ambiguous @paperclipai/db migration artifacts: ${matches[*]}"
   fi
   printf '%s\n' "${matches[0]}"
+}
+
+assert_overlay_zero_pending() {
+  local candidate_prefix="$1" live_prefix="$2" connection_string="$3"
+  local candidate_dir="$candidate_prefix/lib/node_modules/paperclipai/node_modules/@paperclipai/db/dist/migrations"
+  local live_dir="$live_prefix/lib/node_modules/paperclipai/node_modules/@paperclipai/db/dist/migrations"
+  [ -d "$candidate_dir" ] && [ -d "$live_dir" ] || die "Cannot prove zero pending migrations: migration directory missing."
+  node -e '
+    const fs=require("fs"),path=require("path"),crypto=require("crypto");
+    function manifest(root){const out=[];function walk(d){for(const e of fs.readdirSync(d,{withFileTypes:true})){const p=path.join(d,e.name);if(e.isSymbolicLink())process.exit(4);if(e.isDirectory())walk(p);else if(e.isFile()){const b=fs.readFileSync(p);out.push([path.relative(root,p),b.length,crypto.createHash("sha256").update(b).digest("hex")]);}else process.exit(4)}}walk(root);return JSON.stringify(out.sort((a,b)=>a[0].localeCompare(b[0])))}
+    if(manifest(process.argv[1])!==manifest(process.argv[2])) process.exit(3);
+  ' "$candidate_dir" "$live_dir" || die "Candidate migration identity/hash manifest differs from live installed migrations; refusing cutover."
+  local scratch candidate_ledger live_ledger
+  scratch="$(mktemp -d "${TMPDIR:-/tmp}/paperclip-ledger.XXXXXX")"
+  candidate_ledger="$scratch/candidate"; live_ledger="$scratch/live"
+  trap 'rm -rf "$scratch"' RETURN
+  node -e '
+    const fs=require("fs"),path=require("path"),crypto=require("crypto");
+    const root=process.argv[1], journal=JSON.parse(fs.readFileSync(path.join(root,"meta/_journal.json")));
+    for(const e of journal.entries){const sql=fs.readFileSync(path.join(root,e.tag+".sql"));console.log(`${e.when}|${crypto.createHash("sha256").update(sql).digest("hex")}`)}
+  ' "$candidate_dir" | LC_ALL=C sort > "$candidate_ledger" || die "Cannot derive candidate migration journal/hash ledger."
+  live_migration_ledger "$connection_string" | LC_ALL=C sort > "$live_ledger" || die "Cannot read live migration ledger."
+  [ "$(wc -l < "$candidate_ledger")" -eq 231 ] || die "Candidate journal must contain exactly 231 entries."
+  [ "$(wc -l < "$live_ledger")" -eq 234 ] || die "Live migration ledger must contain exactly 234 rows."
+  [ "$(comm -23 "$candidate_ledger" "$live_ledger" | wc -l)" -eq 0 ] || die "Candidate has migration journal entries absent from live ledger; pending migrations are forbidden."
+  [ "$(comm -13 "$candidate_ledger" "$live_ledger" | wc -l)" -eq 3 ] || die "Live migration ledger must have exactly three historical surplus rows."
+  rm -rf "$scratch"; trap - RETURN
+  local migration_file_count
+  migration_file_count="$(find "$candidate_dir" -type f | wc -l)"
+  log "Verified zero pending migrations: exact ${migration_file_count}-file tree, 231 mapped journal rows, and 3 historical live rows"
+}
+
+live_migration_ledger() {
+  secure_database_command "$1" psql -Atc "select created_at::text || '|' || hash from drizzle.__drizzle_migrations order by created_at, hash"
 }
