@@ -230,12 +230,55 @@ prefix_version() {
   node -e 'console.log(JSON.parse(require("fs").readFileSync(process.argv[1], "utf8")).version)' "$pkg"
 }
 
-# Best-effort: locate the packed @paperclipai/server inside a prefix, to
-# prove a fork install did not silently fall back to a registry server
-# package. Not fatal if not found (layout can vary with npm's hoisting).
+# Locate @paperclipai/server in npm layouts used by Paperclip installs.
 prefix_server_package_path() {
   local prefix="$1"
-  find "$prefix/lib/node_modules" -maxdepth 4 -path '*/@paperclipai/server/package.json' 2>/dev/null | head -1
+  local candidate
+  for candidate in \
+    "$prefix/lib/node_modules/@paperclipai/server/package.json" \
+    "$prefix/lib/node_modules/paperclipai/node_modules/@paperclipai/server/package.json"; do
+    if [ -f "$candidate" ]; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+  done
+  return 1
+}
+
+package_name_from_tarball() {
+  local tarball="$1"
+  tar -xOf "$tarball" package/package.json 2>/dev/null | node -e '
+    let input = "";
+    process.stdin.on("data", chunk => input += chunk);
+    process.stdin.on("end", () => {
+      try { process.stdout.write(JSON.parse(input).name || ""); }
+      catch { process.exit(1); }
+    });
+  '
+}
+
+verify_fork_server_package() {
+  local prefix="$1" server_tarball="$2"
+  local installed_pkg packed_json installed_json
+  installed_pkg="$(prefix_server_package_path "$prefix" || true)"
+  if [ -z "$installed_pkg" ]; then
+    die "Required fork server package @paperclipai/server is missing under $prefix. Aborting before migrations or cutover."
+  fi
+  if [ ! -f "$server_tarball" ]; then
+    die "Required packed fork server tarball is missing: $server_tarball"
+  fi
+  packed_json="$(tar -xOf "$server_tarball" package/package.json 2>/dev/null)" \
+    || die "Cannot read package/package.json from fork server tarball $server_tarball"
+  installed_json="$(cat "$installed_pkg")"
+  if ! node -e '
+    const packed = JSON.parse(process.argv[1]);
+    const installed = JSON.parse(process.argv[2]);
+    if (packed.name !== "@paperclipai/server" || installed.name !== packed.name || installed.version !== packed.version) process.exit(1);
+    if (JSON.stringify(installed) !== JSON.stringify(packed)) process.exit(1);
+  ' "$packed_json" "$installed_json"; then
+    die "Installed fork server package does not match produced workspace tarball $server_tarball. Aborting before migrations or cutover."
+  fi
+  log "Verified fork server package $installed_pkg matches produced workspace tarball $server_tarball"
 }
 
 current_target() {
@@ -304,6 +347,16 @@ unit_restart() {
   run systemctl --user restart "$UNIT_NAME"
 }
 
+unit_assert_compatible() {
+  local unit_path="$HOME/.config/systemd/user/$UNIT_NAME"
+  local template="$1"
+  if [ -f "$unit_path" ] && ! cmp -s "$template" "$unit_path" && [ "${PAPERCLIP_ENGINE_REPLACE_UNIT:-0}" != "1" ]; then
+    log "Existing unit file $unit_path differs from $template:"
+    diff -u "$unit_path" "$template" >&2 || true
+    die "Refusing to overwrite an existing, different unit file. Review the diff above; set PAPERCLIP_ENGINE_REPLACE_UNIT=1 to replace it deliberately."
+  fi
+}
+
 # Refuses to silently overwrite a unit file that already exists with
 # different content — another operator/script (e.g. leaf 2's own install)
 # may have put a different ExecStart there. Set
@@ -312,6 +365,7 @@ unit_restart() {
 unit_ensure_installed() {
   local unit_path="$HOME/.config/systemd/user/$UNIT_NAME"
   local template="$1"
+  unit_assert_compatible "$template"
   if [ "$DRY_RUN" = "1" ]; then
     log "+DRYRUN would ensure unit file at $unit_path from $template"
     return 0
@@ -324,11 +378,6 @@ unit_ensure_installed() {
     return 0
   fi
   if ! cmp -s "$template" "$unit_path"; then
-    if [ "${PAPERCLIP_ENGINE_REPLACE_UNIT:-0}" != "1" ]; then
-      log "Existing unit file $unit_path differs from $template:"
-      diff -u "$unit_path" "$template" >&2 || true
-      die "Refusing to overwrite an existing, different unit file. Review the diff above; set PAPERCLIP_ENGINE_REPLACE_UNIT=1 to replace it deliberately."
-    fi
     log "Replacing unit file $unit_path (PAPERCLIP_ENGINE_REPLACE_UNIT=1)"
     cp "$template" "$unit_path"
     run systemctl --user daemon-reload
