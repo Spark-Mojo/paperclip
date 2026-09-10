@@ -3067,6 +3067,9 @@ describe("IssueProperties", () => {
 
     expect(findApprovalsRow()?.textContent).toContain("Anyone else");
 
+    act(() => root.unmount());
+  });
+
   it("renders Approve stage-decision controls that disable until a comment is provided when commentRequired", async () => {
     const onUpdate = vi.fn();
     const targetIssue = createIssue({

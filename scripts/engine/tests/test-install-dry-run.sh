@@ -331,6 +331,101 @@ capture out11 code11 env ENGINE_DIR_FOR_TEST="$ENGINE_DIR" SERVER_PAYLOAD="$SERV
 assert_eq "missing server: verification exits non-zero" "1" "$code11"
 assert_contains "missing server: abort is explicit" "$out11" "Required fork server package"
 
+echo "== test 12: existing live topology is adopted before staging a replacement =="
+ADOPT_HOME="$SANDBOX/adopt-home"
+ADOPT_ROOT="$SANDBOX/adopt-root"
+ADOPT_PREFIX="$SANDBOX/usr"
+ADOPT_LINK="$ADOPT_ROOT/paperclip-current"
+ADOPT_STATE="$ADOPT_ROOT/.paperclip-engine"
+mkdir -p "$ADOPT_HOME/.config/systemd/user" "$ADOPT_PREFIX/lib/node_modules/paperclipai" "$ADOPT_PREFIX/bin"
+printf '%s\n' '[Service]' 'ExecStart=/usr/bin/node /usr/lib/node_modules/paperclipai/dist/index.js run' > "$ADOPT_HOME/.config/systemd/user/paperclip.service"
+mkdir -p "$ADOPT_HOME/.config/systemd/user/paperclip.service.d"
+printf '%s\n' '[Service]' 'Environment=KEEP_ME=1' > "$ADOPT_HOME/.config/systemd/user/paperclip.service.d/override-opencode.conf"
+printf '%s\n' '{"name":"paperclipai","version":"2026.831.1"}' > "$ADOPT_PREFIX/lib/node_modules/paperclipai/package.json"
+printf '%s\n' '#!/usr/bin/env bash' 'exit 0' > "$ADOPT_PREFIX/bin/paperclipai"
+chmod +x "$ADOPT_PREFIX/bin/paperclipai"
+capture out12 code12 env \
+  HOME="$ADOPT_HOME" \
+  ENGINE_ROOT="$ADOPT_ROOT" \
+  PAPERCLIP_HOME="$PAPERCLIP_HOME" \
+  CURRENT_LINK="$ADOPT_LINK" \
+  UNIT_NAME=paperclip.service \
+  STATE_DIR="$ADOPT_STATE" \
+  PAPERCLIP_ENGINE_ADOPT_EXISTING_PREFIX="$ADOPT_PREFIX" \
+  "$ENGINE_DIR/install.sh" npm:12.0.0
+echo "$out12" | sed 's/^/    /'
+assert_eq "adoption install exits 0" "0" "$code12"
+assert_eq "adoption records legacy prefix for rollback" "$ADOPT_PREFIX" "$(cat "$ADOPT_STATE/previous-prefix")"
+assert_eq "adoption cutover points at staged prefix" "$ADOPT_ROOT/paperclip-12.0.0" "$(readlink "$ADOPT_LINK")"
+adopt_log_pos="$(printf '%s\n' "$out12" | grep -n "Seeded current link from adopted prefix" | cut -d: -f1)"
+stage_log_pos="$(printf '%s\n' "$out12" | grep -n "Staged fake dry-run payload" | cut -d: -f1)"
+assert_true "legacy link is seeded before replacement staging" test "$adopt_log_pos" -lt "$stage_log_pos"
+assert_contains "adoption reports managed drop-in dry-run" "$out12" "would ensure adoption drop-in"
+
+echo "== test 12b: adoption is idempotent after managed cutover =="
+capture out12b code12b env \
+  HOME="$ADOPT_HOME" \
+  ENGINE_ROOT="$ADOPT_ROOT" \
+  PAPERCLIP_HOME="$PAPERCLIP_HOME" \
+  CURRENT_LINK="$ADOPT_LINK" \
+  UNIT_NAME=paperclip.service \
+  STATE_DIR="$ADOPT_STATE" \
+  PAPERCLIP_ENGINE_ADOPT_EXISTING_PREFIX="$ADOPT_PREFIX" \
+  "$ENGINE_DIR/install.sh" npm:12.0.0
+assert_eq "adoption re-install exits 0" "0" "$code12b"
+assert_contains "adoption re-install reuses staged prefix" "$out12b" "Reusing already-installed prefix"
+
+echo "== test 12c: adoption rejects an unknown current link before staging =="
+UNKNOWN_PREFIX="$SANDBOX/unknown-prefix"
+mkdir -p "$UNKNOWN_PREFIX"
+ln -sfn "$UNKNOWN_PREFIX" "$ADOPT_LINK"
+capture out12c code12c env \
+  HOME="$ADOPT_HOME" \
+  ENGINE_ROOT="$ADOPT_ROOT" \
+  PAPERCLIP_HOME="$PAPERCLIP_HOME" \
+  CURRENT_LINK="$ADOPT_LINK" \
+  UNIT_NAME=paperclip.service \
+  STATE_DIR="$ADOPT_STATE" \
+  PAPERCLIP_ENGINE_ADOPT_EXISTING_PREFIX="$ADOPT_PREFIX" \
+  "$ENGINE_DIR/install.sh" npm:13.0.0
+assert_eq "unknown adoption link exits non-zero" "1" "$code12c"
+assert_contains "unknown adoption link explains conflict" "$out12c" "points outside the adopted or managed prefixes"
+assert_true "unknown adoption link fails before staging" test ! -e "$ADOPT_ROOT/paperclip-13.0.0"
+
+echo "== test 13: real adoption writes only a managed ExecStart drop-in and verifies it =="
+FAKE_ADOPT_BIN="$SANDBOX/fake-adopt-bin"
+mkdir -p "$FAKE_ADOPT_BIN"
+cat > "$FAKE_ADOPT_BIN/systemctl" <<'EOF'
+#!/usr/bin/env bash
+if [ "${1:-}" = "--user" ] && [ "${2:-}" = "show" ]; then
+  printf '%s\n' "ExecStart={ path=${EXPECTED_CURRENT_LINK}/bin/paperclipai ; argv[]=${EXPECTED_CURRENT_LINK}/bin/paperclipai run --instance default ; }"
+fi
+exit 0
+EOF
+chmod +x "$FAKE_ADOPT_BIN/systemctl"
+rm -f "$ADOPT_LINK"
+capture out13 code13 env \
+  PATH="$FAKE_ADOPT_BIN:$PATH" \
+  HOME="$ADOPT_HOME" \
+  ENGINE_ROOT="$ADOPT_ROOT" \
+  PAPERCLIP_HOME="$PAPERCLIP_HOME" \
+  CURRENT_LINK="$ADOPT_LINK" \
+  UNIT_NAME=paperclip.service \
+  STATE_DIR="$ADOPT_STATE" \
+  PAPERCLIP_ENGINE_DRY_RUN=0 \
+  PAPERCLIP_ENGINE_ADOPT_EXISTING_PREFIX="$ADOPT_PREFIX" \
+  EXPECTED_CURRENT_LINK="$ADOPT_LINK" \
+  ENGINE_DIR_FOR_TEST="$ENGINE_DIR" \
+  bash -c '. "$ENGINE_DIR_FOR_TEST/lib.sh"; prepare_existing_prefix_adoption'
+echo "$out13" | sed 's/^/    /'
+assert_eq "real adoption helper exits 0" "0" "$code13"
+assert_eq "real adoption seeds legacy current link" "$ADOPT_PREFIX" "$(readlink "$ADOPT_LINK")"
+assert_true "managed drop-in sorts after existing overrides" test -f "$ADOPT_HOME/.config/systemd/user/paperclip.service.d/zzzz-paperclip-engine-current.conf"
+assert_contains "managed drop-in targets current link" "$(cat "$ADOPT_HOME/.config/systemd/user/paperclip.service.d/zzzz-paperclip-engine-current.conf")" "$ADOPT_LINK/bin/paperclipai"
+assert_eq "base unit remains unchanged" $'[Service]\nExecStart=/usr/bin/node /usr/lib/node_modules/paperclipai/dist/index.js run' "$(cat "$ADOPT_HOME/.config/systemd/user/paperclip.service")"
+assert_eq "existing drop-in remains unchanged" $'[Service]\nEnvironment=KEEP_ME=1' "$(cat "$ADOPT_HOME/.config/systemd/user/paperclip.service.d/override-opencode.conf")"
+assert_contains "effective ExecStart verification reported" "$out13" "Verified effective ExecStart"
+
 echo
 echo "PASS=$PASS FAIL=$FAIL"
 [ "$FAIL" -eq 0 ]

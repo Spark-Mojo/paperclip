@@ -36,6 +36,11 @@
 #   STATE_DIR               default: $ENGINE_ROOT/.paperclip-engine
 #   HEALTH_TIMEOUT_SECS      default: 90
 #   HEALTH_POLL_SECS         default: 2
+#   PAPERCLIP_ENGINE_ADOPT_EXISTING_PREFIX
+#                            opt-in absolute npm prefix already serving the
+#                            instance (for bigbox, /usr). Seeds CURRENT_LINK
+#                            to that prefix and redirects the existing unit
+#                            with one managed ExecStart-only drop-in.
 #
 # The systemd unit's ExecStart is
 #   "$CURRENT_LINK/bin/paperclipai" run --instance "$PAPERCLIP_INSTANCE_ID"
@@ -82,6 +87,8 @@ STATE_DIR="${STATE_DIR:-$ENGINE_ROOT/.paperclip-engine}"
 HEALTH_TIMEOUT_SECS="${HEALTH_TIMEOUT_SECS:-90}"
 HEALTH_POLL_SECS="${HEALTH_POLL_SECS:-2}"
 MIN_FREE_KB="${MIN_FREE_KB:-2097152}" # 2GiB
+PAPERCLIP_ENGINE_ADOPT_EXISTING_PREFIX="${PAPERCLIP_ENGINE_ADOPT_EXISTING_PREFIX:-}"
+ADOPTION_DROPIN_NAME="zzzz-paperclip-engine-current.conf"
 
 # Local git source used to resolve/clone a `fork:<ref>` install. Defaults to
 # the repo this script itself lives in. On bigbox, point this at whatever
@@ -357,6 +364,74 @@ unit_assert_compatible() {
   fi
 }
 
+valid_paperclip_prefix() {
+  local prefix="$1"
+  [ -f "$prefix/lib/node_modules/paperclipai/package.json" ] &&
+    [ -x "$prefix/bin/paperclipai" ]
+}
+
+prepare_existing_prefix_adoption() {
+  local adopted="$PAPERCLIP_ENGINE_ADOPT_EXISTING_PREFIX"
+  [ -n "$adopted" ] || return 0
+
+  case "$adopted" in
+    /*) ;;
+    *) die "PAPERCLIP_ENGINE_ADOPT_EXISTING_PREFIX must be an absolute npm prefix." ;;
+  esac
+  valid_paperclip_prefix "$adopted" \
+    || die "Adopted prefix $adopted is not valid: require package.json and executable bin/paperclipai."
+
+  local unit_path="$HOME/.config/systemd/user/$UNIT_NAME"
+  [ -f "$unit_path" ] || die "Adoption requires existing unit $unit_path; refusing to create a second unit."
+
+  if [ -L "$CURRENT_LINK" ]; then
+    local target
+    target="$(readlink "$CURRENT_LINK")"
+    case "$target" in
+      "$adopted"|"$ENGINE_ROOT"/paperclip-*) ;;
+      *) die "Current link $CURRENT_LINK points outside the adopted or managed prefixes: $target" ;;
+    esac
+    valid_paperclip_prefix "$target" \
+      || die "Current link target $target is not a valid Paperclip prefix."
+  elif [ -e "$CURRENT_LINK" ]; then
+    die "Current link path $CURRENT_LINK exists but is not a symlink."
+  else
+    mkdir -p "$(dirname "$CURRENT_LINK")"
+    flip_symlink "$adopted"
+    log "Seeded current link from adopted prefix: $CURRENT_LINK -> $adopted"
+  fi
+
+  local dropin_dir="$HOME/.config/systemd/user/$UNIT_NAME.d"
+  local dropin_path="$dropin_dir/$ADOPTION_DROPIN_NAME"
+  if [ "$DRY_RUN" = "1" ]; then
+    log "+DRYRUN would ensure adoption drop-in $dropin_path for $CURRENT_LINK/bin/paperclipai"
+    return 0
+  fi
+
+  mkdir -p "$dropin_dir"
+  local tmp
+  tmp="$(mktemp "$dropin_dir/.${ADOPTION_DROPIN_NAME}.XXXXXX")"
+  printf '%s\n' \
+    '[Service]' \
+    'ExecStart=' \
+    "ExecStart=\"$CURRENT_LINK/bin/paperclipai\" run --instance \"$PAPERCLIP_INSTANCE_ID\"" > "$tmp"
+  chmod 0644 "$tmp"
+  if [ -f "$dropin_path" ] && cmp -s "$tmp" "$dropin_path"; then
+    rm -f "$tmp"
+  else
+    mv "$tmp" "$dropin_path"
+  fi
+  run systemctl --user daemon-reload
+
+  local effective
+  effective="$(systemctl --user show "$UNIT_NAME" --property=ExecStart --value)"
+  case "$effective" in
+    *"$CURRENT_LINK/bin/paperclipai"*" run "*) ;;
+    *) die "Effective ExecStart for $UNIT_NAME does not use $CURRENT_LINK/bin/paperclipai run: $effective" ;;
+  esac
+  log "Verified effective ExecStart for $UNIT_NAME uses $CURRENT_LINK/bin/paperclipai"
+}
+
 # Refuses to silently overwrite a unit file that already exists with
 # different content — another operator/script (e.g. leaf 2's own install)
 # may have put a different ExecStart there. Set
@@ -365,6 +440,9 @@ unit_assert_compatible() {
 unit_ensure_installed() {
   local unit_path="$HOME/.config/systemd/user/$UNIT_NAME"
   local template="$1"
+  if [ -n "$PAPERCLIP_ENGINE_ADOPT_EXISTING_PREFIX" ]; then
+    return 0
+  fi
   unit_assert_compatible "$template"
   if [ "$DRY_RUN" = "1" ]; then
     log "+DRYRUN would ensure unit file at $unit_path from $template"

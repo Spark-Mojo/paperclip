@@ -28,6 +28,21 @@ echo "== previous prefix (rollback target) =="
 previous="$(read_previous_target)"
 echo "  ${previous:-<none recorded>}"
 
+echo "== existing-prefix adoption =="
+if [ -n "$PAPERCLIP_ENGINE_ADOPT_EXISTING_PREFIX" ]; then
+  echo "  mode: enabled"
+  echo "  adopted prefix: $PAPERCLIP_ENGINE_ADOPT_EXISTING_PREFIX"
+else
+  echo "  mode: disabled"
+fi
+dropin="$HOME/.config/systemd/user/$UNIT_NAME.d/$ADOPTION_DROPIN_NAME"
+echo "  managed drop-in: $dropin"
+if [ -f "$dropin" ]; then
+  echo "  drop-in state: present"
+else
+  echo "  drop-in state: absent"
+fi
+
 echo "== systemd --user units matching 'paperclip*' =="
 if [ "$DRY_RUN" = "1" ]; then
   echo "  (dry-run: would run: systemctl --user list-units --all 'paperclip*')"

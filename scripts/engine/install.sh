@@ -91,7 +91,11 @@ preflight() {
   fi
 
   log "Preflight: systemd unit compatibility"
-  unit_assert_compatible "$SCRIPT_DIR/systemd/$UNIT_NAME"
+  if [ -n "$PAPERCLIP_ENGINE_ADOPT_EXISTING_PREFIX" ]; then
+    prepare_existing_prefix_adoption
+  else
+    unit_assert_compatible "$SCRIPT_DIR/systemd/$UNIT_NAME"
+  fi
 
   log "Preflight: disk space at $ENGINE_ROOT"
   mkdir -p "$ENGINE_ROOT"
@@ -362,7 +366,9 @@ main() {
   previous="$(current_target)"
   record_previous_target "$previous"
 
-  unit_ensure_installed "$SCRIPT_DIR/systemd/$UNIT_NAME"
+  if [ -z "$PAPERCLIP_ENGINE_ADOPT_EXISTING_PREFIX" ]; then
+    unit_ensure_installed "$SCRIPT_DIR/systemd/$UNIT_NAME"
+  fi
   unit_stop
   flip_symlink "$NEW_PREFIX"
 

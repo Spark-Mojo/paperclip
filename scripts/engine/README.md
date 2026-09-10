@@ -73,6 +73,35 @@ top of `lib.sh` (`ENGINE_ROOT`, `PAPERCLIP_HOME`, `PAPERCLIP_INSTANCE_ID`,
 `CURRENT_LINK`, `UNIT_NAME`, `EXPECTED_DB`, `BACKUP_DIR`, `STATE_DIR`,
 `HEALTH_TIMEOUT_SECS`, `HEALTH_POLL_SECS`, `FORK_SOURCE_REPO`).
 
+### Adopt bigbox's existing `paperclip.service`
+
+Bigbox currently runs `paperclip.service` from the global npm prefix `/usr`
+and stores its instance under `/home/jamesilsley/.paperclip`. Use the explicit
+adoption mode for the first versioned install. It seeds `paperclip-current` to
+the working `/usr` prefix before adding one managed systemd drop-in that
+changes only `ExecStart`; the base unit and every existing drop-in remain
+untouched. A failure before cutover therefore leaves future restarts on the
+same legacy code, while a failure after cutover can flip the link back to it.
+
+`PAPERCLIP_ENGINE_ADOPT_EXISTING_PREFIX` is the npm prefix (`/usr`), whose
+package lives at `/usr/lib/node_modules/paperclipai`; it is not the package
+directory itself.
+
+```sh
+ENGINE_ROOT=/home/jamesilsley \
+PAPERCLIP_HOME=/home/jamesilsley/.paperclip \
+PAPERCLIP_INSTANCE_ID=default \
+CURRENT_LINK=/home/jamesilsley/paperclip-current \
+UNIT_NAME=paperclip.service \
+EXPECTED_DB=paperclip_spa_cutover_20260906 \
+PAPERCLIP_ENGINE_ADOPT_EXISTING_PREFIX=/usr \
+FORK_SOURCE_REPO=/home/jamesilsley/.paperclip/repair-builds/combined-20260910/repo \
+scripts/engine/install.sh fork:build/final-carried-set
+```
+
+This is one invocation and performs one fork build. Do not run a separate
+package build first.
+
 ## What `install.sh` actually does
 
 1. Preflight: Node >= 20, free disk on `$ENGINE_ROOT`, database identity
