@@ -136,6 +136,21 @@ prepare_pnpm_toolchain() {
   run corepack enable pnpm --install-directory "$install_dir"
 }
 
+install_whats_running() {
+  local destination="${PAPERCLIP_WHATS_RUNNING_PATH:-$HOME/bin/whats-running}"
+  local helper_dir="$HOME/.local/lib/paperclip-engine" tmp
+  mkdir -p "$(dirname "$destination")" "$helper_dir"
+  tmp="$destination.tmp.$$"
+  cp "$SCRIPT_DIR/whats-running.sh" "$tmp"
+  chmod 0755 "$tmp"
+  mv -f "$tmp" "$destination"
+  tmp="$helper_dir/overlay-contract.mjs.tmp.$$"
+  cp "$SCRIPT_DIR/overlay-contract.mjs" "$tmp"
+  chmod 0755 "$tmp"
+  mv -f "$tmp" "$helper_dir/overlay-contract.mjs"
+  log "Installed managed runtime report at $destination"
+}
+
 install_fork_payload() {
   local prefix="$1"
   shift
