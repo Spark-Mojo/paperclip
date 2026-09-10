@@ -319,6 +319,12 @@ SERVER_PAYLOAD="$SANDBOX/server-payload"
 mkdir -p "$SERVER_FIXTURE/package" "$SERVER_PAYLOAD/lib/node_modules/paperclipai/node_modules/@paperclipai/server"
 printf '%s\n' '{"name":"@paperclipai/server","version":"9.8.7","gitHead":"fixture-sha"}' > "$SERVER_FIXTURE/package/package.json"
 cp "$SERVER_FIXTURE/package/package.json" "$SERVER_PAYLOAD/lib/node_modules/paperclipai/node_modules/@paperclipai/server/package.json"
+PACKED_RUNNER="$SERVER_FIXTURE/package/dist/vendor/paperclip-runner/bin/paperclip-runnerd"
+INSTALLED_RUNNER="$SERVER_PAYLOAD/lib/node_modules/paperclipai/node_modules/@paperclipai/server/dist/vendor/paperclip-runner/bin/paperclip-runnerd"
+mkdir -p "$(dirname "$PACKED_RUNNER")" "$(dirname "$INSTALLED_RUNNER")"
+printf '%s\n' 'runner-binary-fixture' > "$PACKED_RUNNER"
+cp "$PACKED_RUNNER" "$INSTALLED_RUNNER"
+chmod 0755 "$PACKED_RUNNER" "$INSTALLED_RUNNER"
 tar -czf "$SANDBOX/paperclipai-server-9.8.7.tgz" -C "$SERVER_FIXTURE" package
 capture out10 code10 env ENGINE_DIR_FOR_TEST="$ENGINE_DIR" SERVER_PAYLOAD="$SERVER_PAYLOAD" SERVER_TARBALL="$SANDBOX/paperclipai-server-9.8.7.tgz" bash -c '
   set -euo pipefail
@@ -327,6 +333,26 @@ capture out10 code10 env ENGINE_DIR_FOR_TEST="$ENGINE_DIR" SERVER_PAYLOAD="$SERV
 '
 assert_eq "real nested layout: verification exits 0" "0" "$code10"
 assert_contains "real nested layout: reports verified source package" "$out10" "Verified fork server package"
+
+printf '%s\n' 'tampered-runner' > "$INSTALLED_RUNNER"
+chmod 0755 "$INSTALLED_RUNNER"
+capture out10b code10b env ENGINE_DIR_FOR_TEST="$ENGINE_DIR" SERVER_PAYLOAD="$SERVER_PAYLOAD" SERVER_TARBALL="$SANDBOX/paperclipai-server-9.8.7.tgz" bash -c '
+  set -euo pipefail
+  . "$ENGINE_DIR_FOR_TEST/lib.sh"
+  verify_fork_server_package "$SERVER_PAYLOAD" "$SERVER_TARBALL"
+'
+assert_eq "runner hash mismatch fails closed" "1" "$code10b"
+assert_contains "runner hash mismatch explains failure" "$out10b" "runner binary hash mismatch"
+
+cp "$PACKED_RUNNER" "$INSTALLED_RUNNER"
+chmod 0644 "$INSTALLED_RUNNER"
+capture out10c code10c env ENGINE_DIR_FOR_TEST="$ENGINE_DIR" SERVER_PAYLOAD="$SERVER_PAYLOAD" SERVER_TARBALL="$SANDBOX/paperclipai-server-9.8.7.tgz" bash -c '
+  set -euo pipefail
+  . "$ENGINE_DIR_FOR_TEST/lib.sh"
+  verify_fork_server_package "$SERVER_PAYLOAD" "$SERVER_TARBALL"
+'
+assert_eq "non-executable staged runner fails closed" "1" "$code10c"
+assert_contains "non-executable runner explains failure" "$out10c" "must have mode 0755"
 
 echo "== test 11: fork server package verification rejects missing installed server =="
 rm -rf "$SERVER_PAYLOAD/lib/node_modules/paperclipai/node_modules/@paperclipai/server"
@@ -689,6 +715,40 @@ capture out17 code17 env \
   bash -c '. "$ENGINE_DIR_FOR_TEST/lib.sh"; prepare_pnpm_toolchain "$COREPACK_STAGE"'
 assert_eq "pnpm toolchain helper exits 0" "0" "$code17"
 assert_eq "corepack observes existing pnpm-bin directory" "$COREPACK_STAGE/pnpm-bin" "$(cat "$SANDBOX/corepack-marker" 2>/dev/null || true)"
+
+echo "== test 18: fork Rust preflight runs before topology adoption =="
+RUST_BIN="$SANDBOX/rust-bin"
+RUST_HOME="$SANDBOX/rust-home"
+RUST_ROOT="$SANDBOX/rust-root"
+RUST_PREFIX="$SANDBOX/rust-prefix"
+mkdir -p "$RUST_BIN" "$RUST_HOME/.config/systemd/user" "$RUST_PREFIX/lib/node_modules/paperclipai" "$RUST_PREFIX/bin"
+cat > "$RUST_BIN/cargo" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' 'cargo 1.96.0 (wrong)'
+EOF
+cat > "$RUST_BIN/rustc" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' 'rustc 1.96.0 (wrong)'
+EOF
+chmod +x "$RUST_BIN/cargo" "$RUST_BIN/rustc"
+printf '%s\n' '[Service]' 'ExecStart=/usr/bin/false' > "$RUST_HOME/.config/systemd/user/paperclip.service"
+printf '%s\n' '{"name":"paperclipai","version":"legacy"}' > "$RUST_PREFIX/lib/node_modules/paperclipai/package.json"
+printf '%s\n' '#!/usr/bin/env bash' 'exit 0' > "$RUST_PREFIX/bin/paperclipai"
+chmod +x "$RUST_PREFIX/bin/paperclipai"
+capture out18 code18 env \
+  PATH="$RUST_BIN:$PATH" \
+  HOME="$RUST_HOME" \
+  ENGINE_ROOT="$RUST_ROOT" \
+  CURRENT_LINK="$RUST_ROOT/paperclip-current" \
+  UNIT_NAME=paperclip.service \
+  PAPERCLIP_ENGINE_DRY_RUN=0 \
+  PAPERCLIP_ENGINE_ADOPT_EXISTING_PREFIX="$RUST_PREFIX" \
+  FORK_SOURCE_REPO="$ENGINE_DIR/../.." \
+  "$ENGINE_DIR/install.sh" fork:HEAD
+assert_eq "wrong Rust toolchain aborts fork install" "1" "$code18"
+assert_contains "wrong Rust toolchain names pinned version" "$out18" "Rust 1.97.1"
+assert_true "Rust preflight fails before adoption symlink" test ! -e "$RUST_ROOT/paperclip-current"
+assert_true "Rust preflight fails before managed drop-in" test ! -e "$RUST_HOME/.config/systemd/user/paperclip.service.d"
 
 echo
 echo "PASS=$PASS FAIL=$FAIL"

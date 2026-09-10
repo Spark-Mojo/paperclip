@@ -136,6 +136,24 @@ prepare_pnpm_toolchain() {
   run corepack enable pnpm --install-directory "$install_dir"
 }
 
+assert_fork_rust_toolchain() {
+  local source_repo="$1"
+  local toolchain_dir="$source_repo/packages/paperclip-runner"
+  local toolchain_file="$toolchain_dir/rust-toolchain.toml"
+  [ -f "$toolchain_file" ] || die "Fork runner toolchain file is missing: $toolchain_file"
+  local required cargo_version rustc_version
+  required="$(sed -n 's/^[[:space:]]*channel[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' "$toolchain_file")"
+  [ -n "$required" ] || die "Cannot read pinned Rust version from $toolchain_file"
+  command -v cargo >/dev/null 2>&1 || die "Fork build requires Cargo from pinned Rust $required before topology adoption or backup."
+  command -v rustc >/dev/null 2>&1 || die "Fork build requires rustc from pinned Rust $required before topology adoption or backup."
+  cargo_version="$(cd "$toolchain_dir" && cargo --version 2>/dev/null | awk '{print $2}')" || true
+  rustc_version="$(cd "$toolchain_dir" && rustc --version 2>/dev/null | awk '{print $2}')" || true
+  if [ "$cargo_version" != "$required" ] || [ "$rustc_version" != "$required" ]; then
+    die "Fork build requires pinned Rust $required; found cargo ${cargo_version:-unavailable} and rustc ${rustc_version:-unavailable}."
+  fi
+  log "Preflight: pinned Rust $required available"
+}
+
 # ---------------------------------------------------------------------------
 # Guards
 # ---------------------------------------------------------------------------
@@ -369,8 +387,47 @@ verify_fork_server_package() {
   ' "$packed_json" "$installed_json"; then
     die "Installed fork server package does not match produced workspace tarball $server_tarball. Aborting before migrations or cutover."
   fi
+  verify_packed_runner_binary "$prefix" "$server_tarball" "$installed_pkg"
   log "Verified fork server package $installed_pkg matches produced workspace tarball $server_tarball"
 }
+
+file_sha256() {
+  node -e '
+    const fs = require("fs");
+    const crypto = require("crypto");
+    const hash = crypto.createHash("sha256");
+    hash.update(fs.readFileSync(process.argv[1]));
+    process.stdout.write(hash.digest("hex"));
+  ' "$1"
+}
+
+file_mode() {
+  node -e 'process.stdout.write((require("fs").statSync(process.argv[1]).mode & 0o777).toString(8))' "$1"
+}
+
+verify_packed_runner_binary() (
+  local prefix="$1" server_tarball="$2" installed_pkg="$3"
+  local scratch packed_runner installed_runner
+  scratch="$(mktemp -d "${TMPDIR:-/tmp}/paperclip-runner-verify.XXXXXX")"
+  trap 'rm -rf "$scratch"' EXIT
+  packed_runner="$scratch/package/dist/vendor/paperclip-runner/bin/paperclip-runnerd"
+  installed_runner="$(dirname "$installed_pkg")/dist/vendor/paperclip-runner/bin/paperclip-runnerd"
+  tar -xzf "$server_tarball" -C "$scratch" package/dist/vendor/paperclip-runner/bin/paperclip-runnerd 2>/dev/null \
+    || die "Packed fork server has no paperclip-runnerd binary. Aborting before migrations or cutover."
+  [ -s "$packed_runner" ] \
+    || die "Packed fork server paperclip-runnerd binary is empty. Aborting before migrations or cutover."
+  [ -s "$installed_runner" ] \
+    || die "Installed fork server paperclip-runnerd binary is missing or empty. Aborting before migrations or cutover."
+  [ "$(file_mode "$packed_runner")" = "755" ] \
+    || die "Packed fork server paperclip-runnerd must have mode 0755. Aborting before migrations or cutover."
+  [ "$(file_mode "$installed_runner")" = "755" ] \
+    || die "Installed fork server paperclip-runnerd must have mode 0755. Aborting before migrations or cutover."
+  [ -x "$installed_runner" ] \
+    || die "Installed fork server paperclip-runnerd is not executable. Aborting before migrations or cutover."
+  [ "$(file_sha256 "$packed_runner")" = "$(file_sha256 "$installed_runner")" ] \
+    || die "Installed fork server runner binary hash mismatch against packed artifact. Aborting before migrations or cutover."
+  log "Verified packed and installed paperclip-runnerd hashes and mode 0755"
+)
 
 current_target() {
   if [ -L "$CURRENT_LINK" ]; then

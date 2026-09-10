@@ -90,6 +90,11 @@ preflight() {
     die "Node $node_major found; Paperclip requires Node >= 20 (package.json engines.node)."
   fi
 
+  if [ "$SOURCE_KIND" = "fork" ] && [ "$DRY_RUN" != "1" ]; then
+    log "Preflight: fork Rust toolchain"
+    assert_fork_rust_toolchain "$(fork_source_repo)"
+  fi
+
   log "Preflight: systemd unit compatibility"
   if [ -n "$PAPERCLIP_ENGINE_ADOPT_EXISTING_PREFIX" ]; then
     prepare_existing_prefix_adoption
