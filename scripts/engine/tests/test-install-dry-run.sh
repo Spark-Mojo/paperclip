@@ -856,22 +856,36 @@ assert_true "runner mode repaired to 0755" test -x "$CLI_ROOT/node_modules/@pape
 capture out21v code21v node "$ENGINE_DIR/overlay-contract.mjs" --verify "$OVERLAY_PREFIX" 0123456789012345678901234567890123456789 "$OVERLAY_PREFIX/.paperclip-engine-overlay.json"
 assert_eq "matching receipt validates reuse" "0" "$code21v"
 REPORT_HOME="$SANDBOX/report-home"; REPORT_BIN="$SANDBOX/report-bin"; mkdir -p "$REPORT_HOME" "$REPORT_BIN"
+REPORT_PROC="$SANDBOX/report-proc"; mkdir -p "$REPORT_PROC/4242"; ln -s "$(command -v node)" "$REPORT_PROC/4242/exe"
+printf '%s\0%s\0%s\0' node "$OVERLAY_PREFIX-link/lib/node_modules/paperclipai/dist/index.js" run > "$REPORT_PROC/4242/cmdline"
 cat > "$REPORT_BIN/systemctl" <<EOF
 #!/usr/bin/env bash
 case "\$*" in *ActiveState*) echo active;; *MainPID*) echo 4242;; *ExecStart*) echo '$OVERLAY_PREFIX-link/bin/paperclipai run';; esac
 EOF
 chmod +x "$REPORT_BIN/systemctl"
-capture report_out report_code env PATH="$REPORT_BIN:$PATH" HOME="$REPORT_HOME" CURRENT_LINK="$OVERLAY_PREFIX-link" UNIT_NAME=paperclip.service PAPERCLIP_ENGINE_SCRIPT_DIR="$ENGINE_DIR" bash -c 'ln -s "$0" "$CURRENT_LINK"; exec "$1/whats-running.sh"' "$OVERLAY_PREFIX" "$ENGINE_DIR"
+capture report_out report_code env PATH="$REPORT_BIN:$PATH" HOME="$REPORT_HOME" CURRENT_LINK="$OVERLAY_PREFIX-link" UNIT_NAME=paperclip.service PAPERCLIP_ENGINE_SCRIPT_DIR="$ENGINE_DIR" PAPERCLIP_PROC_ROOT="$REPORT_PROC" bash -c 'ln -s "$0" "$CURRENT_LINK"; exec "$1/whats-running.sh"' "$OVERLAY_PREFIX" "$ENGINE_DIR"
 echo "$report_out" | sed 's/^/    /'
 assert_eq "managed current-link process is recognized" "0" "$report_code"
 assert_contains "managed runtime report says running" "$report_out" "Engine running : YES"
-sed -i "s|$OVERLAY_PREFIX-link/bin/paperclipai|/usr/lib/node_modules/paperclipai/dist/index.js|" "$REPORT_BIN/systemctl"
-capture old_report_out old_report_code env PATH="$REPORT_BIN:$PATH" HOME="$REPORT_HOME" CURRENT_LINK="$OVERLAY_PREFIX-link" UNIT_NAME=paperclip.service PAPERCLIP_ENGINE_SCRIPT_DIR="$ENGINE_DIR" "$ENGINE_DIR/whats-running.sh"
+assert_contains "report lists changed path and final hash" "$report_out" "CHANGED lib/node_modules/paperclipai/node_modules/@paperclipai/server/dist/index.js sha256:"
+assert_contains "report lists deleted stale path" "$report_out" "DELETED lib/node_modules/paperclipai/node_modules/@paperclipai/server/dist/stale.js"
+cat > "$SANDBOX/change-receipt.json" <<'EOF'
+{"baselineInventory":[{"path":"z","type":"file","sha256":"oldz","size":1,"mode":420},{"path":"b","type":"file","sha256":"oldb","size":1,"mode":420}],"finalInventory":[{"path":"a","type":"symlink","target":"relative/target"},{"path":"b","type":"file","sha256":"newb","size":2,"mode":420}]}
+EOF
+capture changes_out changes_code node "$ENGINE_DIR/overlay-contract.mjs" --changes "$SANDBOX/change-receipt.json"
+assert_eq "deterministic added/changed/deleted/symlink output" $'ADDED a symlink:relative/target\nCHANGED b sha256:newb\nDELETED z sha256:oldz' "$changes_out"
+printf '%s\0%s\0%s\0' node /usr/lib/node_modules/paperclipai/dist/index.js "$OVERLAY_PREFIX-link/lib/node_modules/paperclipai/dist/index.js" > "$REPORT_PROC/4242/cmdline"
+capture old_report_out old_report_code env PATH="$REPORT_BIN:$PATH" HOME="$REPORT_HOME" CURRENT_LINK="$OVERLAY_PREFIX-link" UNIT_NAME=paperclip.service PAPERCLIP_ENGINE_SCRIPT_DIR="$ENGINE_DIR" PAPERCLIP_PROC_ROOT="$REPORT_PROC" "$ENGINE_DIR/whats-running.sh"
 assert_eq "old /usr ExecStart is rejected" "1" "$old_report_code"
 assert_contains "old /usr runtime reports not running" "$old_report_out" "Engine running : NO"
+mkdir -p "$REPORT_HOME/bin" "$REPORT_HOME/old-bundle"; printf 'old\n' > "$REPORT_HOME/old-bundle/whats-running.sh"; ln -s "$REPORT_HOME/old-bundle/whats-running.sh" "$REPORT_HOME/bin/whats-running"
+capture fail_report_out fail_report_code env HOME="$REPORT_HOME" SCRIPT_DIR="$ENGINE_DIR" PAPERCLIP_WHATS_RUNNING_PATH="$REPORT_HOME/bin/whats-running" PAPERCLIP_ENGINE_TEST_FAIL_REPORT_INSTALL=1 bash -c '. "$SCRIPT_DIR/lib.sh"; install_whats_running'
+assert_eq "injected bundle failure exits nonzero" "1" "$fail_report_code"
+assert_eq "bundle failure preserves prior command" "$REPORT_HOME/old-bundle/whats-running.sh" "$(readlink "$REPORT_HOME/bin/whats-running")"
 capture install_report_out install_report_code env HOME="$REPORT_HOME" SCRIPT_DIR="$ENGINE_DIR" PAPERCLIP_WHATS_RUNNING_PATH="$REPORT_HOME/bin/whats-running" bash -c '. "$SCRIPT_DIR/lib.sh"; install_whats_running'
 assert_eq "managed report installer succeeds" "0" "$install_report_code"
 assert_true "installed report is mode 0755" test -x "$REPORT_HOME/bin/whats-running"
+assert_true "installed helper is mode 0755" test -x "$(dirname "$(readlink "$REPORT_HOME/bin/whats-running")")/overlay-contract.mjs"
 printf 'tamper\n' >> "$CLI_ROOT/node_modules/@paperclipai/server/dist/index.js"
 capture out21t code21t node "$ENGINE_DIR/overlay-contract.mjs" --verify "$OVERLAY_PREFIX" 0123456789012345678901234567890123456789 "$OVERLAY_PREFIX/.paperclip-engine-overlay.json"
 assert_eq "tampered final inventory rejects reuse" "1" "$code21t"

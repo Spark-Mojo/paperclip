@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import fs from "node:fs"; import path from "node:path"; import crypto from "node:crypto"; import {createRequire} from "node:module";
+if(process.argv[2]==="--changes"){const r=JSON.parse(fs.readFileSync(process.argv[3])),a=new Map(r.baselineInventory.map(x=>[x.path,x])),b=new Map(r.finalInventory.map(x=>[x.path,x])),render=x=>x.type==="symlink"?`symlink:${x.target}`:`sha256:${x.sha256}`;for(const p of [...new Set([...a.keys(),...b.keys()])].sort()){const x=a.get(p),y=b.get(p);if(!x)console.log(`ADDED ${p} ${render(y)}`);else if(!y)console.log(`DELETED ${p} ${render(x)}`);else if(JSON.stringify(x)!==JSON.stringify(y))console.log(`CHANGED ${p} ${render(y)}`)}process.exit(0)}
 const verify=process.argv[2]==="--verify", a=process.argv.slice(verify?3:2), [prefix,x,y,z]=a;
 const build=verify?null:x, source=verify?x:y, receipt=verify?y:z, version="2026.831.1";
 if(!prefix||!/^[0-9a-f]{40}$/.test(source||"")||!receipt||(!verify&&!build))throw Error("invalid overlay arguments");

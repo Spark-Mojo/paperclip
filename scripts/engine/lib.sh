@@ -138,16 +138,21 @@ prepare_pnpm_toolchain() {
 
 install_whats_running() {
   local destination="${PAPERCLIP_WHATS_RUNNING_PATH:-$HOME/bin/whats-running}"
-  local helper_dir="$HOME/.local/lib/paperclip-engine" tmp
-  mkdir -p "$(dirname "$destination")" "$helper_dir"
-  tmp="$destination.tmp.$$"
-  cp "$SCRIPT_DIR/whats-running.sh" "$tmp"
-  chmod 0755 "$tmp"
-  mv -f "$tmp" "$destination"
-  tmp="$helper_dir/overlay-contract.mjs.tmp.$$"
-  cp "$SCRIPT_DIR/overlay-contract.mjs" "$tmp"
-  chmod 0755 "$tmp"
-  mv -f "$tmp" "$helper_dir/overlay-contract.mjs"
+  local bundle_root="$HOME/.local/lib/paperclip-engine-runtime" staging bundle_id bundle link_tmp
+  mkdir -p "$(dirname "$destination")" "$bundle_root"
+  staging="$(mktemp -d "$bundle_root/.staging.XXXXXX")"
+  trap 'rm -rf "$staging" "${link_tmp:-}"' RETURN
+  cp "$SCRIPT_DIR/whats-running.sh" "$SCRIPT_DIR/overlay-contract.mjs" "$staging/"
+  chmod 0755 "$staging/whats-running.sh" "$staging/overlay-contract.mjs"
+  bash -n "$staging/whats-running.sh"; node --check "$staging/overlay-contract.mjs"
+  bundle_id="$(cat "$staging/whats-running.sh" "$staging/overlay-contract.mjs" | sha256sum | awk '{print $1}')"
+  bundle="$bundle_root/$bundle_id"
+  if [ ! -d "$bundle" ]; then mv "$staging" "$bundle"; else rm -rf "$staging"; fi
+  if [ "${PAPERCLIP_ENGINE_TEST_FAIL_REPORT_INSTALL:-0}" = "1" ]; then die "Injected runtime report installation failure before atomic link flip."; fi
+  link_tmp="$(dirname "$destination")/.whats-running.$$"
+  ln -s "$bundle/whats-running.sh" "$link_tmp"
+  mv -Tf "$link_tmp" "$destination"
+  trap - RETURN
   log "Installed managed runtime report at $destination"
 }
 
