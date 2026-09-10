@@ -48,6 +48,14 @@ export const agentWakeupRequests = pgTable(
     )
       .on(table.companyId, table.idempotencyKey)
       .where(sql`${table.idempotencyKey} LIKE 'question-response:%' AND ${table.status} NOT IN ('skipped', 'failed', 'cancelled')`),
+    handoffBoundedContinuationIdempotencyUq:
+      uniqueIndex("agent_wakeup_requests_handoff_bounded_continuation_uq")
+        .on(table.companyId, table.agentId, table.idempotencyKey)
+        .where(sql`${table.idempotencyKey} LIKE 'handoff_bounded_continuation:%' AND ${table.status} <> 'skipped'`),
+    handoffBoundedContinuationEscalationIdempotencyUq:
+      uniqueIndex("agent_wakeup_requests_handoff_bounded_escalation_uq")
+        .on(table.companyId, table.idempotencyKey)
+        .where(sql`${table.idempotencyKey} LIKE 'handoff_bounded_continuation_escalation:%'`),
     companyPayloadIssueIdx: index("agent_wakeup_requests_company_payload_issue_idx").on(
       table.companyId,
       sql`(${table.payload} ->> 'issueId')`,

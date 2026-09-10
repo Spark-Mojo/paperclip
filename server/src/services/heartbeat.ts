@@ -5925,6 +5925,25 @@ export async function buildPaperclipWakePayload(input: {
       ? input.contextSnapshot.childIssueSummaries
       : [],
     childIssueSummaryTruncated: input.contextSnapshot.childIssueSummaryTruncated === true,
+    // A corrective "successful run, no disposition" handoff keeps its remediation
+    // text under handoffReason/instruction, not under recoveryActionId or
+    // recoveryCause, so the recovery block above does not see it. Only
+    // handoffRequired and handoffReason mark this wake: review-path recovery also
+    // writes a bare instruction and sourceRunId, and must not match here.
+    successfulRunHandoff: input.contextSnapshot.handoffRequired === true ||
+      readNonEmptyString(input.contextSnapshot.handoffReason)
+      ? {
+          attempt: input.contextSnapshot.handoffAttempt,
+          maxAttempts: input.contextSnapshot.maxHandoffAttempts,
+          sourceRunId: readNonEmptyString(input.contextSnapshot.sourceRunId),
+          reason: readNonEmptyString(input.contextSnapshot.handoffReason),
+          missingDisposition: readNonEmptyString(input.contextSnapshot.missingDisposition),
+          validDispositionOptions: Array.isArray(input.contextSnapshot.validDispositionOptions)
+            ? input.contextSnapshot.validDispositionOptions
+            : [],
+          instruction: readNonEmptyString(input.contextSnapshot.instruction),
+        }
+      : null,
     livenessContinuation: readNonEmptyString(input.contextSnapshot.livenessContinuationState) ||
       readNonEmptyString(input.contextSnapshot.livenessContinuationInstruction) ||
       readNonEmptyString(input.contextSnapshot.livenessContinuationSourceRunId) ||
@@ -18188,6 +18207,21 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         await tx.execute(
           sql`select id from issues where id = ${issueId} and company_id = ${agent.companyId} for update`,
         );
+
+        if (opts.idempotencyKey?.startsWith("handoff_bounded_continuation:")) {
+          const existing = await tx.select({ id: agentWakeupRequests.id })
+            .from(agentWakeupRequests)
+            .where(and(
+              eq(agentWakeupRequests.companyId, agent.companyId),
+              eq(agentWakeupRequests.agentId, agentId),
+              eq(agentWakeupRequests.idempotencyKey, opts.idempotencyKey),
+              ne(agentWakeupRequests.status, "skipped"),
+            ))
+            .limit(1);
+          // Terminal queue rows also consume C1. Returning no run prevents a
+          // stale recovery worker from counting or executing the winner again.
+          if (existing.length > 0) return { kind: "skipped" as const };
+        }
 
         const issue = await tx
           .select({
