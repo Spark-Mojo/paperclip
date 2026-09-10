@@ -180,12 +180,20 @@ install_from_fork() {
   local sha short_sha prefix
   sha="$(resolve_fork_sha "$ref")"
   short_sha="$(echo "$sha" | cut -c1-12)"
-  VERSION_LABEL="fork-$short_sha"
+  local release_version="2026.831.1"
+  VERSION_LABEL="overlay-$release_version-$short_sha"
   prefix="$ENGINE_ROOT/paperclip-$VERSION_LABEL"
   NEW_PREFIX="$prefix"
 
   if [ -f "$prefix/lib/node_modules/paperclipai/package.json" ]; then
-    log "Reusing already-installed fork prefix $prefix (idempotent)."
+    local receipt="$prefix/.paperclip-engine-overlay.json"
+    [ -f "$receipt" ] || die "Refusing to reuse overlay prefix without receipt: $prefix"
+    if [ "$DRY_RUN" = "1" ]; then
+      node -e 'const r=require(process.argv[1]);if(r.sourceSha!==process.argv[2])process.exit(1)' "$receipt" "$sha" || die "Overlay receipt does not match source $sha"
+    else
+      node "$SCRIPT_DIR/overlay-contract.mjs" --verify "$prefix" "$sha" "$receipt"
+    fi
+    log "Reusing verified overlay prefix $prefix (idempotent)."
     return 0
   fi
 
@@ -197,12 +205,12 @@ install_from_fork() {
 
   if [ "$DRY_RUN" = "1" ]; then
     stage_fake_payload "$payload" "0.0.0-$short_sha"
+    printf '{"schema":2,"sourceSha":"%s"}\n' "$sha" > "$payload/.paperclip-engine-overlay.json"
     mv "$payload" "$prefix"
     rm -rf "$staging_root"
     return 0
   fi
 
-  local release_version="2026.831.1"
   install_npm_payload "$payload" "$release_version"
 
   # ---- Faithfully mirrors installGitPayload() in cli/src/commands/install.ts ----

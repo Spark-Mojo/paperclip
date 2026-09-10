@@ -1,64 +1,14 @@
 #!/usr/bin/env node
-import fs from "node:fs";
-import path from "node:path";
-import crypto from "node:crypto";
-import { createRequire } from "node:module";
-
-const [prefix, buildRoot, sourceSha, receiptPath] = process.argv.slice(2);
-if (!prefix || !buildRoot || !/^[0-9a-f]{40}$/.test(sourceSha || "") || !receiptPath) throw new Error("usage: overlay-contract.mjs PREFIX BUILD_ROOT SOURCE_SHA RECEIPT");
-const version = "2026.831.1";
-const cliRoot = path.join(prefix, "lib/node_modules/paperclipai");
-const cliManifest = JSON.parse(fs.readFileSync(path.join(cliRoot, "package.json")));
-if (cliManifest.version !== version) throw new Error(`official CLI baseline version ${cliManifest.version} != ${version}`);
-const req = createRequire(path.join(cliRoot, "package.json"));
-const specs = [
-  { name: "@paperclipai/shared", source: "packages/shared", dirs: ["dist"] },
-  { name: "@paperclipai/db", source: "packages/db", dirs: ["dist"] },
-  { name: "@paperclipai/server", source: "server", dirs: ["dist", "ui-dist", "skills"] },
-];
-const sha = p => crypto.createHash("sha256").update(fs.readFileSync(p)).digest("hex");
-function packageRoot(name) {
-  let p = req.resolve(name);
-  while (p !== path.dirname(p)) {
-    const manifest = path.join(p, "package.json");
-    if (fs.existsSync(manifest) && JSON.parse(fs.readFileSync(manifest)).name === name) return p;
-    p = path.dirname(p);
-  }
-  throw new Error(`cannot resolve ${name} from official CLI`);
-}
-function files(root) {
-  const out=[];
-  function walk(dir) { for (const ent of fs.readdirSync(dir,{withFileTypes:true})) { const p=path.join(dir,ent.name); if(ent.isSymbolicLink()) throw new Error(`symlink forbidden: ${p}`); if(ent.isDirectory()) walk(p); else if(ent.isFile()) out.push(p); else throw new Error(`unsupported entry: ${p}`); } }
-  walk(root); return out.sort();
-}
-const receipt={schema:1,sourceSha,baselineVersion:version,files:[]};
-for (const spec of specs) {
-  const target=packageRoot(spec.name);
-  const manifest=path.join(target,"package.json");
-  const before=fs.readFileSync(manifest);
-  const pkg=JSON.parse(before);
-  if(pkg.version!==version) throw new Error(`${spec.name} baseline version ${pkg.version} != ${version}`);
-  for (const section of ["dependencies","optionalDependencies","peerDependencies"]) for (const [name,value] of Object.entries(pkg[section]||{})) {
-    if (specs.some(x=>x.name===name) && value!==version) throw new Error(`${spec.name} dependency edge ${name}=${value} != ${version}`);
-  }
-  const expectedNested=path.join(cliRoot,"node_modules",...spec.name.split("/"));
-  if(fs.realpathSync(target)!==fs.realpathSync(expectedNested)) throw new Error(`${spec.name} runtime root is not intended nested root`);
-  for(const dir of spec.dirs) {
-    const src=path.join(buildRoot,spec.source,dir);
-    if(!fs.statSync(src).isDirectory()) throw new Error(`missing overlay directory: ${src}`);
-    for(const file of files(src)) {
-      const rel=path.relative(path.join(buildRoot,spec.source),file);
-      if(rel.startsWith("..")||path.isAbsolute(rel)) throw new Error(`path traversal: ${file}`);
-      const dest=path.join(target,rel); const old=fs.existsSync(dest)?{sha256:sha(dest),size:fs.statSync(dest).size,mode:fs.statSync(dest).mode&0o777}:null;
-      fs.mkdirSync(path.dirname(dest),{recursive:true}); fs.copyFileSync(file,dest); fs.chmodSync(dest,fs.statSync(file).mode&0o777);
-      receipt.files.push({package:spec.name,path:rel,old,new:{sha256:sha(dest),size:fs.statSync(dest).size,mode:fs.statSync(dest).mode&0o777}});
-    }
-  }
-  if(!before.equals(fs.readFileSync(manifest))) throw new Error(`${spec.name} package manifest changed`);
-}
-const stamp=JSON.parse(fs.readFileSync(path.join(buildRoot,"server/dist/build-info.json")));
-if(stamp.commit!==sourceSha) throw new Error(`server build provenance ${stamp.commit} != ${sourceSha}`);
-if(!receipt.files.some(x=>x.package==="@paperclipai/server"&&x.path==="dist/vendor/paperclip-runner/bin/paperclip-runnerd")) throw new Error("runner missing from overlay");
-if(!receipt.files.some(x=>x.package==="@paperclipai/server"&&x.path.startsWith("ui-dist/"))) throw new Error("UI missing from overlay");
-if(!receipt.files.some(x=>x.package==="@paperclipai/db"&&x.path.startsWith("dist/migrations/"))) throw new Error("migrations missing from overlay");
-fs.writeFileSync(receiptPath,JSON.stringify(receipt,null,2)+"\n",{mode:0o600});
+import fs from "node:fs"; import path from "node:path"; import crypto from "node:crypto"; import {createRequire} from "node:module";
+const verify=process.argv[2]==="--verify", a=process.argv.slice(verify?3:2), [prefix,x,y,z]=a;
+const build=verify?null:x, source=verify?x:y, receipt=verify?y:z, version="2026.831.1";
+if(!prefix||!/^[0-9a-f]{40}$/.test(source||"")||!receipt||(!verify&&!build))throw Error("invalid overlay arguments");
+const cli=path.join(prefix,"lib/node_modules/paperclipai"), specs=[{name:"@paperclipai/shared",src:"packages/shared",dirs:["dist"]},{name:"@paperclipai/db",src:"packages/db",dirs:["dist"]},{name:"@paperclipai/server",src:"server",dirs:["dist","ui-dist","skills"]}], digest=b=>crypto.createHash("sha256").update(b).digest("hex");
+function inventory(root,skipReceipt=false){const out=[];function walk(d){for(const e of fs.readdirSync(d,{withFileTypes:true}).sort((a,b)=>a.name.localeCompare(b.name))){const p=path.join(d,e.name),rel=path.relative(root,p);if(skipReceipt&&path.resolve(p)===path.resolve(receipt))continue;if(e.isSymbolicLink())throw Error(`symlink forbidden: ${rel}`);if(e.isDirectory())walk(p);else if(e.isFile()){const b=fs.readFileSync(p),s=fs.statSync(p);out.push({path:rel,sha256:digest(b),size:b.length,mode:s.mode&511})}else throw Error(`unsupported entry: ${rel}`)}}walk(root);return out}
+function packageRoots(){const cp=JSON.parse(fs.readFileSync(path.join(cli,"package.json")));if(cp.name!=="paperclipai"||cp.version!==version)throw Error("official CLI identity mismatch");const req=createRequire(path.join(cli,"package.json")), out=new Map;for(const s of specs){let p=req.resolve(s.name);while(p!==path.dirname(p)){const f=path.join(p,"package.json");if(fs.existsSync(f)&&JSON.parse(fs.readFileSync(f)).name===s.name)break;p=path.dirname(p)}const expected=path.join(cli,"node_modules",...s.name.split("/"));if(fs.realpathSync(p)!==fs.realpathSync(expected))throw Error(`${s.name} runtime root mismatch`);const pkg=JSON.parse(fs.readFileSync(path.join(p,"package.json")));if(pkg.version!==version)throw Error(`${s.name} identity mismatch`);for(const sec of ["dependencies","optionalDependencies","peerDependencies"])for(const [n,v] of Object.entries(pkg[sec]||{}))if(specs.some(q=>q.name===n)&&v!==version)throw Error(`${s.name} edge ${n} mismatch`);out.set(s.name,p)}return out}
+function runner(root,src){const dst=path.join(root,"dist/vendor/paperclip-runner/bin/paperclip-runnerd");for(const p of [src,dst])if(!fs.existsSync(p)||fs.lstatSync(p).isSymbolicLink()||!fs.statSync(p).isFile()||!fs.statSync(p).size)throw Error("runner must be regular and nonempty");fs.chmodSync(dst,0o755);if((fs.statSync(dst).mode&511)!==493)throw Error("runner mode mismatch");if(digest(fs.readFileSync(dst))!==digest(fs.readFileSync(src)))throw Error("runner hash mismatch")}
+const roots=packageRoots();
+if(verify){const r=JSON.parse(fs.readFileSync(receipt));if(r.schema!==2||r.sourceSha!==source||r.baselineVersion!==version)throw Error("receipt identity mismatch");if(JSON.stringify(inventory(prefix,true))!==JSON.stringify(r.finalInventory))throw Error("final inventory differs from receipt");const sr=roots.get("@paperclipai/server"), rp=path.join(sr,"dist/vendor/paperclip-runner/bin/paperclip-runnerd");runner(sr,rp);process.exit(0)}
+const r={schema:2,sourceSha:source,baselineVersion:version,baselineInventory:inventory(prefix),overlays:[]};
+for(const s of specs){const target=roots.get(s.name),manifest=fs.readFileSync(path.join(target,"package.json"));for(const d of s.dirs){const src=path.join(build,s.src,d);if(!fs.existsSync(src)||!fs.statSync(src).isDirectory())throw Error(`missing overlay directory: ${src}`);const tmp=path.join(target,`.${d}.overlay.${process.pid}`),old=path.join(target,`.${d}.baseline.${process.pid}`);fs.rmSync(tmp,{recursive:true,force:true});fs.cpSync(src,tmp,{recursive:true});const si=inventory(src),ti=inventory(tmp);if(JSON.stringify(si.map(({path,sha256,size})=>({path,sha256,size})))!==JSON.stringify(ti.map(({path,sha256,size})=>({path,sha256,size}))))throw Error("copy mismatch");if(fs.existsSync(path.join(target,d)))fs.renameSync(path.join(target,d),old);fs.renameSync(tmp,path.join(target,d));fs.rmSync(old,{recursive:true,force:true});r.overlays.push({package:s.name,dir:d,sourceInventory:si,resultInventory:inventory(path.join(target,d))})}if(!manifest.equals(fs.readFileSync(path.join(target,"package.json"))))throw Error(`${s.name} manifest changed`)}
+const sr=roots.get("@paperclipai/server"), sourceRunner=path.join(build,"server/dist/vendor/paperclip-runner/bin/paperclip-runnerd");runner(sr,sourceRunner);if(JSON.parse(fs.readFileSync(path.join(sr,"dist/build-info.json"))).commit!==source)throw Error("build provenance mismatch");if(!fs.existsSync(path.join(sr,"ui-dist/index.html")))throw Error("UI missing");if(!fs.existsSync(path.join(roots.get("@paperclipai/db"),"dist/migrations/meta/_journal.json")))throw Error("migrations missing");r.finalInventory=inventory(prefix,true);fs.writeFileSync(receipt,JSON.stringify(r,null,2)+"\n",{mode:0o600});

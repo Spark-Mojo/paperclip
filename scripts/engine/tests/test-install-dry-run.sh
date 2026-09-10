@@ -174,11 +174,16 @@ assert_eq "rollback.sh exits 0" "0" "$code3b"
 assert_eq "current rolled back to paperclip-1.2.3" "$ENGINE_ROOT/paperclip-1.2.3" "$(readlink "$CURRENT_LINK")"
 assert_eq "previous-prefix state file now records 2.0.0" "$ENGINE_ROOT/paperclip-2.0.0" "$(cat "$STATE_DIR/previous-prefix")"
 
-echo "== test 4: fork:<ref> source resolves to a paperclip-fork-<sha> prefix =="
+echo "== test 4: fork source uses distinct receipt-bound overlay prefix =="
+LEGACY_SHA="$(git -C "$ENGINE_DIR/../.." rev-parse HEAD | cut -c1-12)"
+LEGACY_PREFIX="$ENGINE_ROOT/paperclip-fork-$LEGACY_SHA"
+mkdir -p "$LEGACY_PREFIX/lib/node_modules/paperclipai"
+printf '%s\n' '{"name":"paperclipai","version":"legacy"}' > "$LEGACY_PREFIX/lib/node_modules/paperclipai/package.json"
 capture out4 code4 "$ENGINE_DIR/install.sh" fork:HEAD
 echo "$out4" | sed 's/^/    /'
 assert_eq "fork install exits 0" "0" "$code4"
-assert_true "current symlink now points at a paperclip-fork-* prefix" bash -c '[[ "$(readlink "'"$CURRENT_LINK"'")" == "'"$ENGINE_ROOT"'"/paperclip-fork-* ]]'
+assert_true "current symlink points at distinct overlay prefix" bash -c '[[ "$(readlink "'"$CURRENT_LINK"'")" == "'"$ENGINE_ROOT"'"/paperclip-overlay-2026.831.1-* ]]'
+assert_true "legacy same-source prefix was not reused" test "$(readlink "$CURRENT_LINK")" != "$LEGACY_PREFIX"
 
 echo "== test 5: status.sh runs cleanly against the sandbox =="
 capture status_out status_code "$ENGINE_DIR/status.sh"
@@ -344,6 +349,15 @@ capture out10b code10b env ENGINE_DIR_FOR_TEST="$ENGINE_DIR" SERVER_PAYLOAD="$SE
 '
 assert_eq "runner hash mismatch fails closed" "1" "$code10b"
 assert_contains "runner hash mismatch explains failure" "$out10b" "runner binary hash mismatch"
+
+: > "$INSTALLED_RUNNER"
+capture out10z code10z env ENGINE_DIR_FOR_TEST="$ENGINE_DIR" SERVER_PAYLOAD="$SERVER_PAYLOAD" SERVER_TARBALL="$SANDBOX/paperclipai-server-9.8.7.tgz" bash -c '
+  set -euo pipefail
+  . "$ENGINE_DIR_FOR_TEST/lib.sh"
+  verify_fork_server_package "$SERVER_PAYLOAD" "$SERVER_TARBALL"
+'
+assert_eq "zero-byte staged runner fails closed" "1" "$code10z"
+assert_contains "zero-byte runner explains failure" "$out10z" "missing or empty"
 
 echo "== test 11: fork server package verification rejects missing installed server =="
 rm -rf "$SERVER_PAYLOAD/lib/node_modules/paperclipai/node_modules/@paperclipai/server"
@@ -812,9 +826,12 @@ mkdir -p "$CLI_ROOT" "$CLI_ROOT/node_modules/@paperclipai" \
   "$OVERLAY_BUILD/server/dist/vendor/paperclip-runner/bin" "$OVERLAY_BUILD/server/ui-dist" "$OVERLAY_BUILD/server/skills"
 printf '%s\n' '{"name":"paperclipai","version":"2026.831.1"}' > "$CLI_ROOT/package.json"
 for p in shared db server; do d="$CLI_ROOT/node_modules/@paperclipai/$p"; mkdir -p "$d"; printf '{"name":"@paperclipai/%s","version":"2026.831.1","main":"dist/index.js"}\n' "$p" > "$d/package.json"; mkdir -p "$d/dist"; printf 'old\n' > "$d/dist/index.js"; done
+printf 'stale\n' > "$CLI_ROOT/node_modules/@paperclipai/server/dist/stale.js"
 printf 'new\n' > "$OVERLAY_BUILD/packages/shared/dist/index.js"
 printf 'new\n' > "$OVERLAY_BUILD/packages/db/dist/index.js"
 printf 'migration\n' > "$OVERLAY_BUILD/packages/db/dist/migrations/0001.sql"
+mkdir -p "$OVERLAY_BUILD/packages/db/dist/migrations/meta"
+printf '%s\n' '{"entries":[]}' > "$OVERLAY_BUILD/packages/db/dist/migrations/meta/_journal.json"
 printf 'new\n' > "$OVERLAY_BUILD/server/dist/index.js"
 printf '%s\n' '{"commit":"0123456789012345678901234567890123456789"}' > "$OVERLAY_BUILD/server/dist/build-info.json"
 printf 'runner\n' > "$OVERLAY_BUILD/server/dist/vendor/paperclip-runner/bin/paperclip-runnerd"
@@ -825,6 +842,13 @@ assert_eq "overlay contract exits 0" "0" "$code21"
 assert_contains "overlay receipt records source provenance" "$(cat "$OVERLAY_PREFIX/receipt.json" 2>/dev/null || true)" "0123456789012345678901234567890123456789"
 assert_contains "official manifest remains unchanged" "$(cat "$CLI_ROOT/node_modules/@paperclipai/server/package.json")" '"version":"2026.831.1"'
 assert_eq "nested runtime server received overlay" "new" "$(cat "$CLI_ROOT/node_modules/@paperclipai/server/dist/index.js")"
+assert_true "exclusive replacement removes stale compiled files" test ! -e "$CLI_ROOT/node_modules/@paperclipai/server/dist/stale.js"
+assert_true "runner mode repaired to 0755" test -x "$CLI_ROOT/node_modules/@paperclipai/server/dist/vendor/paperclip-runner/bin/paperclip-runnerd"
+capture out21v code21v node "$ENGINE_DIR/overlay-contract.mjs" --verify "$OVERLAY_PREFIX" 0123456789012345678901234567890123456789 "$OVERLAY_PREFIX/receipt.json"
+assert_eq "matching receipt validates reuse" "0" "$code21v"
+printf 'tamper\n' >> "$CLI_ROOT/node_modules/@paperclipai/server/dist/index.js"
+capture out21t code21t node "$ENGINE_DIR/overlay-contract.mjs" --verify "$OVERLAY_PREFIX" 0123456789012345678901234567890123456789 "$OVERLAY_PREFIX/receipt.json"
+assert_eq "tampered final inventory rejects reuse" "1" "$code21t"
 
 echo "== test 22: zero-pending gate compares full migration manifest and ledger =="
 LIVE_MIG="$SANDBOX/live-prefix/lib/node_modules/paperclipai/node_modules/@paperclipai/db/dist/migrations"
