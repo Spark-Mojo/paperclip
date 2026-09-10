@@ -192,7 +192,16 @@ echo "$out6a" | sed 's/^/    /'
 assert_eq "no --yes: rollback.sh exits non-zero" "1" "$code6a"
 assert_contains "no --yes: rollback.sh refuses the restore" "$out6a" "requires --yes"
 
-capture out6b code6b "$ENGINE_DIR/rollback.sh" "$ENGINE_ROOT/paperclip-1.2.3" --restore /tmp/does-not-matter.dump --yes
+FAKE_BIN="$SANDBOX/fake-bin"
+mkdir -p "$FAKE_BIN"
+cat > "$FAKE_BIN/pg_restore" <<'EOF'
+#!/usr/bin/env bash
+exit 0
+EOF
+chmod +x "$FAKE_BIN/pg_restore"
+VALID_DUMP="$SANDBOX/valid.dump"
+echo "fixture" > "$VALID_DUMP"
+capture out6b code6b env PATH="$FAKE_BIN:$PATH" "$ENGINE_DIR/rollback.sh" "$ENGINE_ROOT/paperclip-1.2.3" --restore "$VALID_DUMP" --yes
 echo "$out6b" | sed 's/^/    /'
 assert_eq "with --yes: rollback.sh exits 0" "0" "$code6b"
 assert_contains "with --yes: rollback.sh logs the (dry-run) pg_restore invocation" "$out6b" "pg_restore --clean --if-exists"
@@ -229,6 +238,66 @@ echo "$out7" | sed 's/^/    /'
 assert_eq "differing unit file: refuses and exits non-zero" "1" "$code7"
 assert_contains "differing unit file: names the escape hatch" "$out7" "PAPERCLIP_ENGINE_REPLACE_UNIT"
 assert_eq "differing unit file: left untouched on disk" "# a unit file installed by someone else (e.g. leaf 2)" "$(cat "$FAKE_UNIT_DIR/$UNIT_NAME")"
+
+echo "== test 8: install rejects a conflicting unit before any install mutation =="
+before_link="$(readlink "$CURRENT_LINK")"
+capture out8 code8 env HOME="$SANDBOX/fake-home" "$ENGINE_DIR/install.sh" npm:7.7.7
+echo "$out8" | sed 's/^/    /'
+assert_eq "conflicting unit: install exits non-zero" "1" "$code8"
+assert_contains "conflicting unit: refusal happens in preflight" "$out8" "Preflight: systemd unit compatibility"
+assert_eq "conflicting unit: current symlink is unchanged" "$before_link" "$(readlink "$CURRENT_LINK")"
+assert_true "conflicting unit: no new prefix was staged" test ! -e "$ENGINE_ROOT/paperclip-7.7.7"
+
+echo "== test 9: corrupt restore dump is rejected before service or symlink mutation =="
+cat > "$FAKE_BIN/pg_restore" <<'EOF'
+#!/usr/bin/env bash
+if [ "${1:-}" = "--list" ]; then
+  exit 1
+fi
+exit 99
+EOF
+chmod +x "$FAKE_BIN/pg_restore"
+CORRUPT_DUMP="$SANDBOX/corrupt.dump"
+echo "not a postgres archive" > "$CORRUPT_DUMP"
+before_link="$(readlink "$CURRENT_LINK")"
+capture out9 code9 env PATH="$FAKE_BIN:$PATH" "$ENGINE_DIR/rollback.sh" "$ENGINE_ROOT/paperclip-2.0.0" --restore "$CORRUPT_DUMP" --yes
+echo "$out9" | sed 's/^/    /'
+assert_eq "corrupt dump: rollback exits non-zero" "1" "$code9"
+assert_contains "corrupt dump: validation explains failure" "$out9" "not a readable PostgreSQL archive"
+assert_eq "corrupt dump: current symlink is unchanged" "$before_link" "$(readlink "$CURRENT_LINK")"
+assert_true "corrupt dump: unit stop was never attempted" bash -c '[[ "$1" != *"systemctl --user stop"* ]]' _ "$out9"
+
+echo "== test 9b: missing restore dump is rejected before service or symlink mutation =="
+before_link="$(readlink "$CURRENT_LINK")"
+capture out9b code9b env PATH="$FAKE_BIN:$PATH" "$ENGINE_DIR/rollback.sh" "$ENGINE_ROOT/paperclip-2.0.0" --restore "$SANDBOX/missing.dump" --yes
+assert_eq "missing dump: rollback exits non-zero" "1" "$code9b"
+assert_contains "missing dump: validation explains failure" "$out9b" "Restore dump does not exist"
+assert_eq "missing dump: current symlink is unchanged" "$before_link" "$(readlink "$CURRENT_LINK")"
+
+echo "== test 10: fork server package verification accepts real nested npm layout =="
+SERVER_FIXTURE="$SANDBOX/server-fixture"
+SERVER_PAYLOAD="$SANDBOX/server-payload"
+mkdir -p "$SERVER_FIXTURE/package" "$SERVER_PAYLOAD/lib/node_modules/paperclipai/node_modules/@paperclipai/server"
+printf '%s\n' '{"name":"@paperclipai/server","version":"9.8.7","gitHead":"fixture-sha"}' > "$SERVER_FIXTURE/package/package.json"
+cp "$SERVER_FIXTURE/package/package.json" "$SERVER_PAYLOAD/lib/node_modules/paperclipai/node_modules/@paperclipai/server/package.json"
+tar -czf "$SANDBOX/paperclipai-server-9.8.7.tgz" -C "$SERVER_FIXTURE" package
+capture out10 code10 env ENGINE_DIR_FOR_TEST="$ENGINE_DIR" SERVER_PAYLOAD="$SERVER_PAYLOAD" SERVER_TARBALL="$SANDBOX/paperclipai-server-9.8.7.tgz" bash -c '
+  set -euo pipefail
+  . "$ENGINE_DIR_FOR_TEST/lib.sh"
+  verify_fork_server_package "$SERVER_PAYLOAD" "$SERVER_TARBALL"
+'
+assert_eq "real nested layout: verification exits 0" "0" "$code10"
+assert_contains "real nested layout: reports verified source package" "$out10" "Verified fork server package"
+
+echo "== test 11: fork server package verification rejects missing installed server =="
+rm -rf "$SERVER_PAYLOAD/lib/node_modules/paperclipai/node_modules/@paperclipai/server"
+capture out11 code11 env ENGINE_DIR_FOR_TEST="$ENGINE_DIR" SERVER_PAYLOAD="$SERVER_PAYLOAD" SERVER_TARBALL="$SANDBOX/paperclipai-server-9.8.7.tgz" bash -c '
+  set -euo pipefail
+  . "$ENGINE_DIR_FOR_TEST/lib.sh"
+  verify_fork_server_package "$SERVER_PAYLOAD" "$SERVER_TARBALL"
+'
+assert_eq "missing server: verification exits non-zero" "1" "$code11"
+assert_contains "missing server: abort is explicit" "$out11" "Required fork server package"
 
 echo
 echo "PASS=$PASS FAIL=$FAIL"
