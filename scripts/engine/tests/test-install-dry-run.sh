@@ -274,6 +274,30 @@ assert_eq "missing dump: rollback exits non-zero" "1" "$code9b"
 assert_contains "missing dump: validation explains failure" "$out9b" "Restore dump does not exist"
 assert_eq "missing dump: current symlink is unchanged" "$before_link" "$(readlink "$CURRENT_LINK")"
 
+echo "== test 9c: failed restore restarts original service without flipping symlink =="
+cat > "$FAKE_BIN/pg_restore" <<'EOF'
+#!/usr/bin/env bash
+if [ "${1:-}" = "--list" ]; then
+  exit 0
+fi
+exit 99
+EOF
+chmod +x "$FAKE_BIN/pg_restore"
+cat > "$FAKE_BIN/systemctl" <<'EOF'
+#!/usr/bin/env bash
+printf 'fake systemctl %s\n' "$*" >&2
+exit 0
+EOF
+chmod +x "$FAKE_BIN/systemctl"
+before_link="$(readlink "$CURRENT_LINK")"
+capture out9c code9c env PATH="$FAKE_BIN:$PATH" PAPERCLIP_ENGINE_DRY_RUN=0 "$ENGINE_DIR/rollback.sh" "$ENGINE_ROOT/paperclip-2.0.0" --restore "$VALID_DUMP" --yes
+echo "$out9c" | sed 's/^/    /'
+assert_eq "failed restore: rollback exits non-zero" "1" "$code9c"
+assert_eq "failed restore: current symlink is unchanged" "$before_link" "$(readlink "$CURRENT_LINK")"
+assert_contains "failed restore: uses exit-on-error" "$out9c" "--exit-on-error"
+assert_contains "failed restore: uses single transaction" "$out9c" "--single-transaction"
+assert_contains "failed restore: original service restart attempted" "$out9c" "systemctl --user start"
+
 echo "== test 10: fork server package verification accepts real nested npm layout =="
 SERVER_FIXTURE="$SANDBOX/server-fixture"
 SERVER_PAYLOAD="$SANDBOX/server-payload"

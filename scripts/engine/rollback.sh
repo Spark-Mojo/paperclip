@@ -96,13 +96,27 @@ before="$(current_target)"
 log "Rolling back paperclip-current: $before -> $TARGET_PREFIX"
 
 unit_stop
-flip_symlink "$TARGET_PREFIX"
 
 if [ -n "$RESTORE_DUMP" ]; then
   connection_string="$(connection_string_from_config "$INSTANCE_CONFIG")"
   log "Restoring database from $RESTORE_DUMP (--yes confirmed)"
-  run pg_restore --clean --if-exists -d "$connection_string" "$RESTORE_DUMP"
+  restore_ok=1
+  run pg_restore --clean --if-exists --exit-on-error --single-transaction -d "$connection_string" "$RESTORE_DUMP" || restore_ok=0
+  if [ "$restore_ok" != "1" ]; then
+    log "ERROR: database restore failed. Restarting original service with symlink unchanged at $before."
+    original_started=1
+    unit_start || original_started=0
+    original_url="$(health_url "$INSTANCE_CONFIG")"
+    if [ "$original_started" = "1" ] && original_body="$(wait_for_health "$original_url")"; then
+      log "Original service recovered after failed restore: $original_body"
+    else
+      log "ERROR: original service did not recover after failed restore. Manual intervention required."
+    fi
+    exit 1
+  fi
 fi
+
+flip_symlink "$TARGET_PREFIX"
 
 # See install.sh for why this can't be a bare `unit_start` under `set -e`.
 started=1
