@@ -938,6 +938,21 @@ printf 'changed\n' > "$CAND_MIG/0001.sql"
 capture out22b code22b env ENGINE_DIR_FOR_TEST="$ENGINE_DIR" CAND_PREFIX="$SANDBOX/candidate-prefix" LIVE_PREFIX="$SANDBOX/live-prefix" bash -c '. "$ENGINE_DIR_FOR_TEST/lib.sh"; assert_overlay_zero_pending "$CAND_PREFIX" "$LIVE_PREFIX" ignored'
 assert_eq "changed migration hash fails closed" "1" "$code22b"
 
+echo "== test 23: fork build prepares and verifies self-contained server UI =="
+capture out23 code23 node -e '
+  const fs=require("fs"); const s=fs.readFileSync(process.argv[1],"utf8");
+  const q=String.fromCharCode(39);
+  const build=s.indexOf("--filter "+q+"@paperclipai/server..."+q+" --if-present run build");
+  const stamp=s.indexOf("exact.startsWith(stamp.commit)");
+  const ui=s.indexOf("--filter "+q+"@paperclipai/server"+q+" run prepare:ui-dist");
+  const indexGate=s.indexOf("server/ui-dist/index.html");
+  const featureGate=s.indexOf("stage-decision-actions");
+  const skills=s.indexOf("cp -r \"$checkout/skills\" \"$checkout/server/skills\"");
+  const overlay=s.indexOf("overlay-contract.mjs",featureGate);
+  if(!(build>=0 && stamp>build && ui>stamp && indexGate>ui && featureGate>indexGate && skills>featureGate && overlay>skills)) process.exit(1);
+' "$ENGINE_DIR/install.sh"
+assert_eq "UI preparation and feature gates precede overlay" "0" "$code23"
+
 echo
 echo "PASS=$PASS FAIL=$FAIL"
 [ "$FAIL" -eq 0 ]
