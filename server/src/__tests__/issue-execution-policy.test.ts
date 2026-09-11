@@ -1835,6 +1835,139 @@ describe("issue execution policy transitions", () => {
         }),
       ).toThrow("Monitor bounds are already exhausted");
     });
+
+    it("SPA-7105: a rejected non-explicit status write never clears an armed monitor", () => {
+      // Reproduces SPA-5921 (2026-09-10 15:14:43Z + 15:41:53Z):
+      // recovery.reconcile_stranded_assigned_issue moved in_progress→blocked
+      // with empty blockers, and the invalid transition executed AND cleared
+      // the armed monitor (executionState.monitor.status=cleared,
+      // clearReason=invalid_status, nextCheckAt=null). The write is now
+      // rejected and the armed monitor survives with nextCheckAt intact.
+      const policy = normalizeIssueExecutionPolicy({
+        stages: [],
+        monitor: {
+          nextCheckAt: "2099-04-11T12:30:00.000Z",
+          notes: "upstream-pr-watch",
+          scheduledBy: "assignee",
+          kind: "external_service",
+          serviceName: "upstream-pr-watch",
+        },
+      })!;
+      const armedState = {
+        status: "idle",
+        currentStageId: null,
+        currentStageIndex: null,
+        currentStageType: null,
+        currentParticipant: null,
+        returnAssignee: null,
+        completedStageIds: [],
+        lastDecisionId: null,
+        lastDecisionOutcome: null,
+        monitor: {
+          status: "scheduled",
+          nextCheckAt: "2099-04-11T12:30:00.000Z",
+          lastTriggeredAt: null,
+          attemptCount: 0,
+          notes: "upstream-pr-watch",
+          scheduledBy: "assignee",
+          kind: "external_service",
+          serviceName: "upstream-pr-watch",
+          clearedAt: null,
+          clearReason: null,
+        },
+      };
+
+      expect(() =>
+        applyIssueExecutionPolicyTransition({
+          issue: {
+            status: "in_progress",
+            assigneeAgentId: coderAgentId,
+            assigneeUserId: null,
+            executionPolicy: policy,
+            executionState: armedState,
+            monitorAttemptCount: 0,
+            monitorNextCheckAt: new Date("2099-04-11T12:30:00.000Z"),
+            monitorLastTriggeredAt: null,
+            monitorNotes: "upstream-pr-watch",
+            monitorScheduledBy: "assignee",
+          },
+          policy,
+          previousPolicy: policy,
+          requestedStatus: "blocked",
+          requestedAssigneePatch: {},
+          actor: { agentId: null },
+        }),
+      ).toThrow("Monitor can only be scheduled");
+    });
+
+    it("SPA-7105: a monitor-eligible implicit policy removal preserves the armed monitor", () => {
+      // The SPA-5921 shape can also arrive as a policy payload without the
+      // monitor key (a write that drops executionPolicy.monitor). When the
+      // target stays monitor-eligible, the armed monitor is preserved with
+      // nextCheckAt intact instead of cleared.
+      const policy = normalizeIssueExecutionPolicy({
+        stages: [],
+        monitor: {
+          nextCheckAt: "2099-04-11T12:30:00.000Z",
+          notes: "upstream-pr-watch",
+          scheduledBy: "assignee",
+          kind: "external_service",
+          serviceName: "upstream-pr-watch",
+        },
+      })!;
+      const strippedPolicy = normalizeIssueExecutionPolicy({ stages: [] });
+      const armedState = {
+        status: "idle",
+        currentStageId: null,
+        currentStageIndex: null,
+        currentStageType: null,
+        currentParticipant: null,
+        returnAssignee: null,
+        completedStageIds: [],
+        lastDecisionId: null,
+        lastDecisionOutcome: null,
+        monitor: {
+          status: "scheduled",
+          nextCheckAt: "2099-04-11T12:30:00.000Z",
+          lastTriggeredAt: null,
+          attemptCount: 0,
+          notes: "upstream-pr-watch",
+          scheduledBy: "assignee",
+          kind: "external_service",
+          serviceName: "upstream-pr-watch",
+          clearedAt: null,
+          clearReason: null,
+        },
+      };
+
+      const result = applyIssueExecutionPolicyTransition({
+        issue: {
+          status: "in_progress",
+          assigneeAgentId: coderAgentId,
+          assigneeUserId: null,
+          executionPolicy: policy,
+          executionState: armedState,
+          monitorAttemptCount: 0,
+          monitorNextCheckAt: new Date("2099-04-11T12:30:00.000Z"),
+          monitorLastTriggeredAt: null,
+          monitorNotes: "upstream-pr-watch",
+          monitorScheduledBy: "assignee",
+        },
+        policy: strippedPolicy,
+        previousPolicy: policy,
+        requestedStatus: "in_progress",
+        requestedAssigneePatch: {},
+        actor: { agentId: null },
+      });
+
+      expect(result.patch.monitorNextCheckAt).toEqual(new Date("2099-04-11T12:30:00.000Z"));
+      expect(result.patch.executionPolicy).toMatchObject({
+        monitor: { serviceName: "upstream-pr-watch" },
+      });
+      expect(result.patch.executionState).toMatchObject({
+        monitor: { status: "scheduled", nextCheckAt: "2099-04-11T12:30:00.000Z" },
+      });
+    });
   });
 });
 
