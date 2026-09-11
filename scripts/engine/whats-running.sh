@@ -1,7 +1,39 @@
 #!/usr/bin/env bash
 set -euo pipefail
 CURRENT_LINK="${CURRENT_LINK:-$HOME/paperclip-current}"; UNIT_NAME="${UNIT_NAME:-paperclip.service}"
-ENGINE_SCRIPT_DIR="${PAPERCLIP_ENGINE_SCRIPT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}"; PROC_ROOT="${PAPERCLIP_PROC_ROOT:-/proc}"
+resolve_engine_script_dir() {
+  local source="${BASH_SOURCE[0]}" dir target followed=0 hops=0
+  declare -A seen=()
+  [[ "$source" = /* ]] || source="$PWD/$source"
+  while [ -L "$source" ]; do
+    followed=1; hops=$((hops + 1)); [ "$hops" -le 40 ] || return 1
+    dir="$(cd -P "$(dirname "$source")" 2>/dev/null && pwd)" || return 1
+    source="$dir/$(basename "$source")"
+    [ -z "${seen[$source]:-}" ] || return 1; seen[$source]=1
+    target="$(readlink "$source")" || return 1
+    if [[ "$target" = /* ]]; then source="$target"; else source="$dir/$target"; fi
+  done
+  dir="$(cd -P "$(dirname "$source")" 2>/dev/null && pwd)" || return 1
+  source="$dir/$(basename "$source")"
+  [ -f "$source" ] && [ ! -L "$source" ] || return 1
+  if [ "$followed" = 1 ]; then
+    local bundle_root="$HOME/.local/lib/paperclip-engine-runtime"
+    case "$dir/" in "$bundle_root"/*/) ;; *) return 1 ;; esac
+    node -e '
+      const fs=require("fs"),path=require("path"),root=process.argv[1],want=["overlay-contract.mjs","whats-running.sh"];
+      if(JSON.stringify(fs.readdirSync(root).sort())!==JSON.stringify(want))process.exit(1);
+      for(const name of want){const s=fs.lstatSync(path.join(root,name));if(!s.isFile()||s.isSymbolicLink()||(s.mode&0o777)!==0o755)process.exit(1)}
+    ' "$dir" || return 1
+  fi
+  printf '%s\n' "$dir"
+}
+if [ -n "${PAPERCLIP_ENGINE_SCRIPT_DIR:-}" ]; then
+  ENGINE_SCRIPT_DIR="$(cd -P "$PAPERCLIP_ENGINE_SCRIPT_DIR" 2>/dev/null && pwd)" || { echo "ERROR: invalid engine script directory" >&2; exit 1; }
+else
+  ENGINE_SCRIPT_DIR="$(resolve_engine_script_dir)" || { echo "ERROR: unsafe or broken reporter bundle link" >&2; exit 1; }
+fi
+[ -f "$ENGINE_SCRIPT_DIR/overlay-contract.mjs" ] && [ ! -L "$ENGINE_SCRIPT_DIR/overlay-contract.mjs" ] || { echo "ERROR: reporter helper missing or unsafe" >&2; exit 1; }
+PROC_ROOT="${PAPERCLIP_PROC_ROOT:-/proc}"
 [ -L "$CURRENT_LINK" ] || { echo "ERROR: managed current link missing" >&2; exit 1; }
 prefix="$(readlink -f "$CURRENT_LINK")"; receipt="$prefix/.paperclip-engine-overlay.json"
 [ -f "$receipt" ] || { echo "ERROR: managed overlay receipt missing" >&2; exit 1; }
