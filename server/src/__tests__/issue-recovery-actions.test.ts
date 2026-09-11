@@ -314,9 +314,17 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     });
 
     const [updatedIssue] = await db.select().from(issues).where(eq(issues.id, sourceIssue.id));
+    // SPA-7105 broad fix: with no unresolved blocker edge (and no armed
+    // monitor) the blocked-empty parking write is skipped — the card keeps
+    // in_progress and the skip note names the preserved path.
     expect(updatedIssue).toMatchObject({
-      status: "blocked",
+      status: "in_progress",
     });
+    const skipNotes = await db
+      .select({ body: issueComments.body })
+      .from(issueComments)
+      .where(eq(issueComments.issueId, sourceIssue.id));
+    expect(skipNotes.filter((row) => (row.body ?? "").includes("Recovery skipped the parking write"))).toHaveLength(1);
     const recoveryIssues = await db
       .select()
       .from(issues)
@@ -879,10 +887,20 @@ describeEmbeddedPostgres("issue recovery actions", () => {
 
     expect(result).toMatchObject({ escalated: 1, reviewParticipantRequeued: 0 });
     const [updatedIssue] = await db.select().from(issues).where(eq(issues.id, sourceIssueId));
+    // SPA-7105 broad fix: the escalation source-scoped action is recorded,
+    // but the status write is skipped — blocking an in_review card holding a
+    // live review stage would destroy the review continuation path, and the
+    // assignee stays the original reviewer's fallback instead of being moved.
     expect(updatedIssue).toMatchObject({
-      status: "blocked",
-      assigneeAgentId: managerId,
+      status: "in_review",
+      assigneeAgentId: coderId,
     });
+    const reviewSkipNotes = await db
+      .select({ body: issueComments.body })
+      .from(issueComments)
+      .where(eq(issueComments.issueId, sourceIssueId));
+    expect(reviewSkipNotes.filter((row) => (row.body ?? "").includes("Recovery skipped the parking write")))
+      .toHaveLength(1);
     const [updatedRun] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
     expect(updatedRun?.errorCode).toBe("configuration_incomplete");
     const [action] = await db.select().from(issueRecoveryActions);
@@ -946,7 +964,16 @@ describeEmbeddedPostgres("issue recovery actions", () => {
 
     expect(result).toMatchObject({ escalated: 1, skipped: 0 });
     const [updatedIssue] = await db.select().from(issues).where(eq(issues.id, sourceIssueId));
-    expect(updatedIssue?.status).toBe("blocked");
+    // SPA-7105 broad fix: the classification still lands, but the blocked
+    // parking write is skipped — the card keeps its status and the skip note
+    // records the preserved continuation path.
+    expect(updatedIssue?.status).toBe("in_progress");
+    const modelSkipNotes = await db
+      .select({ body: issueComments.body })
+      .from(issueComments)
+      .where(eq(issueComments.issueId, sourceIssueId));
+    expect(modelSkipNotes.filter((row) => (row.body ?? "").includes("Recovery skipped the parking write")))
+      .toHaveLength(1);
     const [updatedRun] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
     expect(updatedRun?.errorCode).toBe("configuration_incomplete");
     const [action] = await db.select().from(issueRecoveryActions);
@@ -1147,7 +1174,7 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     expect(comments[0]?.presentation).toMatchObject({
       kind: "system_notice",
       tone: "warning",
-      title: "Recovery: workspace validation failed — moved to blocked (owner: CTO)",
+      title: "Recovery: parking write skipped — blocked-empty write is not legal",
       density: "compact",
     });
     expect(comments[0]?.metadata).toMatchObject({
@@ -1198,7 +1225,11 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     });
 
     const [afterFirst] = await db.select().from(issues).where(eq(issues.id, sourceIssue.id));
-    expect(afterFirst?.status).toBe("blocked");
+    // SPA-7105 broad fix: no parking write lands on a blocked-empty card, so
+    // a synchronously claimed wakeup cannot clobber an escalation write —
+    // there is none. The card stays in_progress; the source-scoped action and
+    // the deduped skip note carry the escalation.
+    expect(afterFirst?.status).toBe("in_progress");
     expect(afterFirst?.assigneeAgentId).toBe(coderId);
 
     const secondLatestRun = {
@@ -1227,11 +1258,11 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       attemptCount: 2,
     });
     const [afterSecond] = await db.select().from(issues).where(eq(issues.id, sourceIssue.id));
-    expect(afterSecond?.status).toBe("blocked");
+    expect(afterSecond?.status).toBe("in_progress");
 
     const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, sourceIssue.id));
     expect(comments).toHaveLength(1);
-    expect(comments[0]?.body).toContain("Recovery action:");
+    expect(comments[0]?.body).toContain("Recovery skipped the parking write");
   });
 
   it("does not create nested recovery artifacts when issue-backed fallback work itself fails", async () => {
