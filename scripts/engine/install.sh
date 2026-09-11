@@ -352,24 +352,32 @@ main() {
   unit_start || started=0
 
   url="$(health_url "$INSTANCE_CONFIG")"
+  local report_failed=0
   if [ "$started" = "1" ] && body="$(wait_for_health "$url")"; then
     local after_migrations="unknown"
     if [ -n "$previous_connection_string" ]; then
       after_migrations="$(migration_count "$previous_connection_string" || echo unknown)"
     fi
-    log "=== INSTALL OK ==="
-    log "prefix:            $NEW_PREFIX"
-    log "version:           $(prefix_version "$NEW_PREFIX")"
-    log "migrations before: $before_migrations"
-    log "migrations after:  $after_migrations"
-    log "health:            $body"
     if [ "$DRY_RUN" != "1" ]; then
-      install_whats_running
+      local report_path="${PAPERCLIP_WHATS_RUNNING_PATH:-$HOME/bin/whats-running}"
+      if ! ( install_whats_running ) || ! "$report_path"; then report_failed=1; fi
+    elif [ "${PAPERCLIP_ENGINE_TEST_FAIL_REPORT_READBACK:-0}" = "1" ] || [ "${PAPERCLIP_ENGINE_TEST_FAIL_REPORT_INSTALL:-0}" = "1" ]; then
+      report_failed=1
     fi
-    exit 0
+    if [ "$report_failed" = "0" ]; then
+      log "=== INSTALL OK ==="
+      log "prefix:            $NEW_PREFIX"
+      log "version:           $(prefix_version "$NEW_PREFIX")"
+      log "migrations before: $before_migrations"
+      log "migrations after:  $after_migrations"
+      log "health:            $body"
+      exit 0
+    fi
   fi
 
-  if [ "$started" = "1" ]; then
+  if [ "$report_failed" = "1" ]; then
+    log "=== installed runtime report FAILED — rolling back symlink to previous prefix ==="
+  elif [ "$started" = "1" ]; then
     log "=== HEALTH CHECK FAILED after ${HEALTH_TIMEOUT_SECS}s — rolling back symlink to previous prefix ==="
   else
     log "=== systemctl start FAILED — rolling back symlink to previous prefix ==="
