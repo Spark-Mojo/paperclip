@@ -533,7 +533,28 @@ export function productivityReviewService(db: Db, deps?: { enqueueWakeup?: Enque
       : null;
 
     const noComment = noCommentStreak >= thresholds.noCommentStreakRuns;
-    const longActive = elapsedMs !== null && elapsedMs >= thresholds.longActiveMs;
+    // SPA-7111: wall-clock since episode start keeps ticking while completed work waits for
+    // close-out (review backpressure). An episode whose sampled runs are all terminal, with no
+    // queued/running runs and no run starts in the last hour, is idle — not actively long.
+    // Suppress long_active_duration for that idle-episode signature; the other triggers are
+    // unaffected because they measure run/comment activity, not episode wall-clock.
+    const idleEpisode =
+      activeRunCount === 0 &&
+      runCountLastHour === 0 &&
+      latestRuns.length > 0 &&
+      terminalRuns.length === latestRuns.length;
+    if (idleEpisode && elapsedMs !== null && elapsedMs >= thresholds.longActiveMs) {
+      logger.debug(
+        {
+          companyId: sourceIssue.companyId,
+          issueId: sourceIssue.id,
+          elapsedMs,
+          totalRunCount: latestRuns.length,
+        },
+        "productivity review long_active_duration suppressed for idle episode",
+      );
+    }
+    const longActive = !idleEpisode && elapsedMs !== null && elapsedMs >= thresholds.longActiveMs;
     const highChurn =
       runCountLastHour >= thresholds.highChurnHourly ||
       assigneeRunCommentCountLastHour >= thresholds.highChurnHourly ||
