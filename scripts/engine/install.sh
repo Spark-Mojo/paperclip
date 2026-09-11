@@ -231,6 +231,22 @@ install_from_fork() {
   # changes (e.g. SPA-6057's recovery service) are what gets packed, not
   # whatever is on the npm registry.
   (cd "$checkout" && run corepack pnpm -r --filter '@paperclipai/server...' --if-present run build)
+  # Upstream records `git rev-parse --short HEAD`; first bind that stamp to the
+  # frozen commit, then expand it to the exact SHA consumed by overlay proof.
+  validate_and_expand_build_stamp "$checkout" "$checkout/server/dist/build-info.json" "$sha"
+  # server's regular build excludes its static UI. Use the package's official
+  # preparation command so the overlay contains the same self-contained UI as
+  # the published server package.
+  (cd "$checkout" && run corepack pnpm --filter '@paperclipai/server' run prepare:ui-dist)
+  [ -f "$checkout/server/ui-dist/index.html" ] \
+    || die "Fork build did not produce server/ui-dist/index.html."
+  grep -RIl --include='*.js' 'stage-decision-actions' "$checkout/server/ui-dist" >/dev/null \
+    || die "Fork UI build does not contain compiled StageDecisionActions (stage-decision-actions)."
+  # Match release.sh Step 2: server's published artifact carries root skills.
+  rm -rf "$checkout/server/skills"
+  cp -r "$checkout/skills" "$checkout/server/skills"
+  [ -f "$checkout/server/skills/paperclip/SKILL.md" ] \
+    || die "Fork build did not stage the official server skills inventory."
 
   node "$SCRIPT_DIR/overlay-contract.mjs" "$payload" "$checkout" "$sha" "$payload/.paperclip-engine-overlay.json"
 

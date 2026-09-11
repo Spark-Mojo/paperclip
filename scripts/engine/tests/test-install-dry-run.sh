@@ -938,6 +938,49 @@ printf 'changed\n' > "$CAND_MIG/0001.sql"
 capture out22b code22b env ENGINE_DIR_FOR_TEST="$ENGINE_DIR" CAND_PREFIX="$SANDBOX/candidate-prefix" LIVE_PREFIX="$SANDBOX/live-prefix" bash -c '. "$ENGINE_DIR_FOR_TEST/lib.sh"; assert_overlay_zero_pending "$CAND_PREFIX" "$LIVE_PREFIX" ignored'
 assert_eq "changed migration hash fails closed" "1" "$code22b"
 
+echo "== test 23: fork build prepares and verifies self-contained server UI =="
+capture out23 code23 node -e '
+  const fs=require("fs"); const s=fs.readFileSync(process.argv[1],"utf8");
+  const q=String.fromCharCode(39);
+  const build=s.indexOf("--filter "+q+"@paperclipai/server..."+q+" --if-present run build");
+  const stamp=s.indexOf("validate_and_expand_build_stamp");
+  const ui=s.indexOf("--filter "+q+"@paperclipai/server"+q+" run prepare:ui-dist");
+  const indexGate=s.indexOf("server/ui-dist/index.html");
+  const featureGate=s.indexOf("stage-decision-actions");
+  const skills=s.indexOf("cp -r \"$checkout/skills\" \"$checkout/server/skills\"");
+  const overlay=s.indexOf("overlay-contract.mjs",featureGate);
+  if(!(build>=0 && stamp>build && ui>stamp && indexGate>ui && featureGate>indexGate && skills>featureGate && overlay>skills)) process.exit(1);
+' "$ENGINE_DIR/install.sh"
+assert_eq "UI preparation and feature gates precede overlay" "0" "$code23"
+
+
+echo "== test 24: build stamp binds to actual checkout HEAD =="
+STAMP_REPO="$SANDBOX/stamp-repo"
+STAMP_FILE="$SANDBOX/build-info.json"
+mkdir -p "$STAMP_REPO"
+git -C "$STAMP_REPO" init -q
+git -C "$STAMP_REPO" config user.email test@example.invalid
+git -C "$STAMP_REPO" config user.name Test
+printf 'fixture\n' > "$STAMP_REPO/file"
+git -C "$STAMP_REPO" add file
+git -C "$STAMP_REPO" commit -qm fixture
+STAMP_FULL="$(git -C "$STAMP_REPO" rev-parse HEAD)"
+STAMP_SHORT="$(git -C "$STAMP_REPO" rev-parse --short HEAD)"
+for stamp_case in empty one unrelated; do
+  case "$stamp_case" in
+    empty) stamp_value="" ;;
+    one) stamp_value="${STAMP_SHORT:0:1}" ;;
+    unrelated) stamp_value="deadbeef" ;;
+  esac
+  printf '{"commit":"%s"}\n' "$stamp_value" > "$STAMP_FILE"
+  capture stamp_out stamp_code env ENGINE_DIR_FOR_TEST="$ENGINE_DIR" STAMP_REPO="$STAMP_REPO" STAMP_FILE="$STAMP_FILE" STAMP_FULL="$STAMP_FULL" bash -c '. "$ENGINE_DIR_FOR_TEST/lib.sh"; validate_and_expand_build_stamp "$STAMP_REPO" "$STAMP_FILE" "$STAMP_FULL"'
+  assert_true "$stamp_case build stamp rejected" test "$stamp_code" -ne 0
+done
+printf '{"commit":"%s"}\n' "$STAMP_SHORT" > "$STAMP_FILE"
+capture stamp_out stamp_code env ENGINE_DIR_FOR_TEST="$ENGINE_DIR" STAMP_REPO="$STAMP_REPO" STAMP_FILE="$STAMP_FILE" STAMP_FULL="$STAMP_FULL" bash -c '. "$ENGINE_DIR_FOR_TEST/lib.sh"; validate_and_expand_build_stamp "$STAMP_REPO" "$STAMP_FILE" "$STAMP_FULL"'
+assert_eq "actual short build stamp accepted" "0" "$stamp_code"
+assert_contains "accepted stamp expands to frozen SHA" "$(cat "$STAMP_FILE")" "$STAMP_FULL"
+
 echo
 echo "PASS=$PASS FAIL=$FAIL"
 [ "$FAIL" -eq 0 ]
