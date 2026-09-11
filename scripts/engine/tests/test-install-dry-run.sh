@@ -129,7 +129,9 @@ capture() {
 
 echo "== test 1: first install (npm:1.2.3), health ok =="
 echo "ok" > "$MODE_FILE"
+export PAPERCLIP_ENGINE_TEST_FAIL_REPORT_READBACK=1
 capture out1 code1 "$ENGINE_DIR/install.sh" npm:1.2.3
+unset PAPERCLIP_ENGINE_TEST_FAIL_REPORT_READBACK
 echo "$out1" | sed 's/^/    /'
 assert_eq "install exits 0" "0" "$code1"
 assert_true "current symlink exists" test -L "$CURRENT_LINK"
@@ -164,6 +166,21 @@ echo "$out2b" | sed 's/^/    /'
 assert_eq "start-failure install exits non-zero" "1" "$code2b"
 assert_eq "current rolled back to paperclip-1.2.3 (not left on the broken prefix)" "$ENGINE_ROOT/paperclip-1.2.3" "$(readlink "$CURRENT_LINK")"
 assert_contains "install.sh reports the systemctl start failure, not a silent set -e death" "$out2b" "systemctl start FAILED"
+
+echo "== test 2c: reporter readback failure triggers automatic rollback =="
+export PAPERCLIP_ENGINE_TEST_FAIL_REPORT_READBACK=1
+capture out2c code2c "$ENGINE_DIR/install.sh" fork:HEAD
+unset PAPERCLIP_ENGINE_TEST_FAIL_REPORT_READBACK
+assert_eq "reporter failure install exits non-zero" "1" "$code2c"
+assert_eq "reporter failure rolls back current prefix" "$ENGINE_ROOT/paperclip-1.2.3" "$(readlink "$CURRENT_LINK")"
+assert_contains "reporter failure is identified" "$out2c" "runtime report FAILED"
+
+echo "== test 2d: reporter installation failure triggers automatic rollback =="
+export PAPERCLIP_ENGINE_TEST_FAIL_REPORT_INSTALL=1
+capture out2d code2d "$ENGINE_DIR/install.sh" fork:HEAD
+unset PAPERCLIP_ENGINE_TEST_FAIL_REPORT_INSTALL
+assert_eq "reporter install failure exits non-zero" "1" "$code2d"
+assert_eq "reporter install failure rolls back current prefix" "$ENGINE_ROOT/paperclip-1.2.3" "$(readlink "$CURRENT_LINK")"
 
 echo "== test 3: healthy upgrade to npm:2.0.0, then explicit rollback.sh with no args =="
 echo "ok" > "$MODE_FILE"
@@ -919,6 +936,19 @@ capture install_report_out install_report_code env HOME="$REPORT_HOME" SCRIPT_DI
 assert_eq "managed report installer succeeds" "0" "$install_report_code"
 assert_true "installed report is mode 0755" test -x "$REPORT_HOME/bin/whats-running"
 assert_true "installed helper is mode 0755" test -x "$(dirname "$(readlink "$REPORT_HOME/bin/whats-running")")/overlay-contract.mjs"
+capture installed_report_out installed_report_code env PATH="$REPORT_BIN:$PATH" HOME="$REPORT_HOME" CURRENT_LINK="$OVERLAY_PREFIX-link" UNIT_NAME=paperclip.service PAPERCLIP_PROC_ROOT="$REPORT_PROC" "$REPORT_HOME/bin/whats-running"
+assert_eq "installed reporter symlink resolves bundled helper" "0" "$installed_report_code"
+capture direct_report_out direct_report_code env PATH="$REPORT_BIN:$PATH" HOME="$REPORT_HOME" CURRENT_LINK="$OVERLAY_PREFIX-link" UNIT_NAME=paperclip.service PAPERCLIP_PROC_ROOT="$REPORT_PROC" "$ENGINE_DIR/whats-running.sh"
+assert_eq "direct reporter invocation still works" "0" "$direct_report_code"
+ln -s "$REPORT_HOME/missing/whats-running.sh" "$REPORT_HOME/bin/broken-report"
+capture broken_report_out broken_report_code env HOME="$REPORT_HOME" "$REPORT_HOME/bin/broken-report"
+assert_true "broken reporter symlink fails closed" test "$broken_report_code" -ne 0
+ln -s cycle-b "$REPORT_HOME/bin/cycle-a"; ln -s cycle-a "$REPORT_HOME/bin/cycle-b"
+capture cycle_report_out cycle_report_code env HOME="$REPORT_HOME" "$REPORT_HOME/bin/cycle-a"
+assert_true "cyclic reporter symlink fails closed" test "$cycle_report_code" -ne 0
+ln -s "$ENGINE_DIR/whats-running.sh" "$REPORT_HOME/bin/outside-bundle-report"
+capture outside_report_out outside_report_code env HOME="$REPORT_HOME" "$REPORT_HOME/bin/outside-bundle-report"
+assert_eq "reporter symlink escaping managed bundle fails closed" "1" "$outside_report_code"
 INSTALLED_BUNDLE="$(dirname "$(readlink "$REPORT_HOME/bin/whats-running")")"
 printf 'tamper\n' >> "$INSTALLED_BUNDLE/overlay-contract.mjs"
 capture bundle_tamper_out bundle_tamper_code env HOME="$REPORT_HOME" SCRIPT_DIR="$ENGINE_DIR" PAPERCLIP_WHATS_RUNNING_PATH="$REPORT_HOME/bin/whats-running" bash -c '. "$SCRIPT_DIR/lib.sh"; install_whats_running'
