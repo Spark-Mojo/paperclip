@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { applyIssueExecutionPolicyTransition, normalizeIssueExecutionPolicy, parseIssueExecutionState } from "../services/issue-execution-policy.ts";
+import { applyIssueExecutionPolicyTransition, assertDecisionTransitionCoherent, normalizeIssueExecutionPolicy, parseIssueExecutionState, REVIEW_DECISION_INCOHERENT_TRANSITION } from "../services/issue-execution-policy.ts";
 import type { IssueExecutionPolicy, IssueExecutionState } from "@paperclipai/shared";
 
 const coderAgentId = "11111111-1111-4111-8111-111111111111";
@@ -1875,7 +1875,7 @@ describe("review round circuit breaker", () => {
     });
   });
 
-  it("escalates the pending stage to the responsible human at the round cap", () => {
+  it("records the round-cap changes_requested and bounces coherently without transferring the stage", () => {
     const result = applyIssueExecutionPolicyTransition({
       issue: reviewPendingIssue({}, { changesRequestedCount: 2 }),
       policy,
@@ -1885,18 +1885,35 @@ describe("review round circuit breaker", () => {
       commentBody: "Round three feedback — still not converging",
     });
 
-    // The decision is still recorded, but the stage stays pending with the
-    // responsible human as participant instead of bouncing to the executor.
+    // The decision is recorded, but the cap never transfers the card to the
+    // responsible human (SPA-7138): the transition bounces per standard
+    // changes_requested semantics, leaving a wakeable agent holder.
     expect(result.decision).toMatchObject({ outcome: "changes_requested" });
-    expect(result.patch.status).toBe("in_review");
-    expect(result.patch.assigneeAgentId).toBeNull();
-    expect(result.patch.assigneeUserId).toBe(boardUserId);
+    expect(result.patch.status).toBe("in_progress");
+    expect(result.patch.assigneeAgentId).toBe(coderAgentId);
+    expect(result.patch.assigneeUserId).toBeNull();
     expect(result.patch.executionState).toMatchObject({
-      status: "pending",
+      status: "changes_requested",
       currentStageId: reviewStageId,
-      currentParticipant: { type: "user", userId: boardUserId },
+      currentParticipant: { type: "agent", agentId: qaAgentId },
       changesRequestedCount: 3,
     });
+  });
+
+  it("refuses the capped decision when no return assignee exists (no partial bounce)", () => {
+    expect(() =>
+      applyIssueExecutionPolicyTransition({
+        issue: reviewPendingIssue(
+          {},
+          { returnAssignee: null, changesRequestedCount: 2 },
+        ),
+        policy,
+        requestedStatus: "in_progress",
+        requestedAssigneePatch: {},
+        actor: { agentId: qaAgentId },
+        commentBody: "Round three feedback with nowhere to bounce",
+      }),
+    ).toThrow("no return assignee");
   });
 
   it("keeps the escalated hold sticky across unrelated transitions", () => {
@@ -2044,7 +2061,7 @@ describe("review round circuit breaker", () => {
     });
   });
 
-  it("honors a policy maxReviewRounds override", () => {
+  it("honors a policy maxReviewRounds override with the same coherent bounce", () => {
     const strictPolicy = normalizeIssueExecutionPolicy({
       stages: [{ type: "review", participants: [{ type: "agent", agentId: qaAgentId }] }],
       maxReviewRounds: 1,
@@ -2077,11 +2094,282 @@ describe("review round circuit breaker", () => {
       commentBody: "First and only agent round",
     });
 
-    expect(result.patch.assigneeUserId).toBe(boardUserId);
+    expect(result.decision).toMatchObject({ outcome: "changes_requested" });
+    expect(result.patch.status).toBe("in_progress");
+    expect(result.patch.assigneeAgentId).toBe(coderAgentId);
+    expect(result.patch.assigneeUserId).toBeNull();
     expect(result.patch.executionState).toMatchObject({
-      status: "pending",
-      currentParticipant: { type: "user", userId: boardUserId },
+      status: "changes_requested",
+      currentParticipant: { type: "agent", agentId: qaAgentId },
       changesRequestedCount: 1,
     });
+  });
+
+  it("keeps the armed monitor and the agent participant when the round cap records changes_requested (SPA-7095 shape)", () => {
+    // Exact replay of the SPA-7095 wedge: a review-stage agent participant
+    // PATCHes changes_requested (third round) on an in_review card with an
+    // armed external_service monitor. The end state must need no operator
+    // repair: decision recorded, card bounced to the return assignee,
+    // participant still the reviewer, monitor still scheduled.
+    const monitoredPolicy = normalizeIssueExecutionPolicy({
+      stages: [{ type: "review", participants: [{ type: "agent", agentId: qaAgentId }] }],
+      monitor: {
+        nextCheckAt: "2026-09-11T07:00:00.000Z",
+        scheduledBy: "assignee",
+        kind: "external_service",
+        serviceName: "patti",
+        maxAttempts: 5,
+      },
+    })!;
+    const stageId = monitoredPolicy.stages[0].id;
+
+    const result = applyIssueExecutionPolicyTransition({
+      issue: {
+        status: "in_review",
+        assigneeAgentId: qaAgentId,
+        assigneeUserId: null,
+        responsibleUserId: boardUserId,
+        executionPolicy: monitoredPolicy,
+        monitorNextCheckAt: new Date("2026-09-11T06:30:00.000Z"),
+        monitorLastTriggeredAt: new Date("2026-09-11T06:00:00.000Z"),
+        monitorAttemptCount: 2,
+        monitorNotes: null,
+        monitorScheduledBy: "assignee",
+        executionState: {
+          status: "pending",
+          currentStageId: stageId,
+          currentStageIndex: 0,
+          currentStageType: "review",
+          currentParticipant: { type: "agent", agentId: qaAgentId },
+          returnAssignee: { type: "agent", agentId: coderAgentId },
+          completedStageIds: [],
+          lastDecisionId: null,
+          lastDecisionOutcome: null,
+          monitor: {
+            status: "scheduled",
+            nextCheckAt: "2026-09-11T06:30:00.000Z",
+            lastTriggeredAt: "2026-09-11T06:00:00.000Z",
+            attemptCount: 2,
+            notes: null,
+            scheduledBy: "assignee",
+            kind: "external_service",
+            serviceName: "patti",
+            externalRef: null,
+            timeoutAt: null,
+            maxAttempts: 5,
+            recoveryPolicy: null,
+            clearedAt: null,
+            clearReason: null,
+          },
+          changesRequestedCount: 2,
+        },
+      },
+      policy: monitoredPolicy,
+      requestedStatus: "in_progress",
+      requestedAssigneePatch: {},
+      actor: { agentId: qaAgentId },
+      commentBody: "Pass three: still changes requested",
+    });
+
+    expect(result.decision).toMatchObject({ outcome: "changes_requested" });
+    expect(result.patch.status).toBe("in_progress");
+    expect(result.patch.assigneeAgentId).toBe(coderAgentId);
+    expect(result.patch.assigneeUserId).toBeNull();
+    const state = result.patch.executionState as IssueExecutionState;
+    expect(state.status).toBe("changes_requested");
+    expect(state.currentParticipant).toEqual({ type: "agent", agentId: qaAgentId });
+    expect(state.changesRequestedCount).toBe(3);
+    // The armed monitor is kept per its own policy — rescheduled, never
+    // cleared with invalid_assignee as a side effect of the decision.
+    expect(state.monitor).toMatchObject({
+      status: "scheduled",
+      attemptCount: 2,
+      clearedAt: null,
+      clearReason: null,
+    });
+    expect(result.patch.monitorNextCheckAt).toEqual(new Date("2026-09-11T07:00:00.000Z"));
+    expect(result.patch.executionPolicy).toBeUndefined();
+  });
+});
+
+describe("decision transition coherence guard (SPA-7138 R2)", () => {
+  const policy = reviewOnlyPolicy();
+  const reviewStageId = policy.stages[0].id;
+
+  function baseDecision(): NonNullable<ReturnType<typeof applyIssueExecutionPolicyTransition>["decision"]> {
+    return {
+      stageId: reviewStageId,
+      stageType: "review",
+      outcome: "changes_requested",
+      body: "recorded decision",
+    };
+  }
+
+  function baseIssue() {
+    return {
+      status: "in_review",
+      assigneeAgentId: qaAgentId,
+      assigneeUserId: null,
+      responsibleUserId: boardUserId,
+      executionPolicy: policy,
+      executionState: {
+        status: "pending",
+        currentStageId: reviewStageId,
+        currentStageIndex: 0,
+        currentStageType: "review",
+        currentParticipant: { type: "agent", agentId: qaAgentId },
+        returnAssignee: { type: "agent", agentId: coderAgentId },
+        completedStageIds: [],
+        lastDecisionId: null,
+        lastDecisionOutcome: null,
+      },
+    };
+  }
+
+  it("refuses a decision patch that leaves the issue in_review with no agent assignee and an unconfigured user participant", () => {
+    // The SPA-7095 orphan shape as a computed patch: in_review held by a user
+    // who is not a stage participant. The guard must refuse it whole, with a
+    // machine-readable code the caller can act on.
+    let refused: unknown = null;
+    try {
+      assertDecisionTransitionCoherent(
+        { issue: baseIssue(), policy, requestedAssigneePatch: {}, actor: { agentId: qaAgentId } },
+        {
+          patch: {
+            status: "in_review",
+            assigneeAgentId: null,
+            assigneeUserId: boardUserId,
+            executionState: {
+              status: "pending",
+              currentStageId: reviewStageId,
+              currentStageIndex: 0,
+              currentStageType: "review",
+              currentParticipant: { type: "user", userId: boardUserId },
+              returnAssignee: { type: "agent", agentId: coderAgentId },
+              completedStageIds: [],
+              lastDecisionId: null,
+              lastDecisionOutcome: null,
+              changesRequestedCount: 3,
+            },
+          },
+          decision: baseDecision(),
+        },
+      );
+    } catch (error) {
+      refused = error;
+    }
+    expect((refused as { message?: string } | null)?.message).toMatch(/without a wakeable agent assignee/);
+    expect((refused as { details?: { code?: string } } | null)?.details?.code).toBe(
+      REVIEW_DECISION_INCOHERENT_TRANSITION,
+    );
+  });
+
+  it("refuses a decision patch that leaves a pending stage without a current participant", () => {
+    expect(() =>
+      assertDecisionTransitionCoherent(
+        { issue: baseIssue(), policy, requestedAssigneePatch: {}, actor: { agentId: qaAgentId } },
+        {
+          patch: {
+            status: "in_review",
+            assigneeAgentId: null,
+            assigneeUserId: boardUserId,
+            executionState: {
+              status: "pending",
+              currentStageId: reviewStageId,
+              currentStageIndex: 0,
+              currentStageType: "review",
+              currentParticipant: null,
+              returnAssignee: { type: "agent", agentId: coderAgentId },
+              completedStageIds: [],
+              lastDecisionId: null,
+              lastDecisionOutcome: null,
+              changesRequestedCount: 3,
+            },
+          },
+          decision: baseDecision(),
+        },
+      ),
+    ).toThrow(/without a current participant/);
+  });
+
+  it("allows the coherent agent bounce (the SPA-7095 end state)", () => {
+    expect(() =>
+      assertDecisionTransitionCoherent(
+        { issue: baseIssue(), policy, requestedAssigneePatch: {}, actor: { agentId: qaAgentId } },
+        {
+          patch: {
+            status: "in_progress",
+            assigneeAgentId: coderAgentId,
+            assigneeUserId: null,
+            executionState: {
+              status: "changes_requested",
+              currentStageId: reviewStageId,
+              currentStageIndex: 0,
+              currentStageType: "review",
+              currentParticipant: { type: "agent", agentId: qaAgentId },
+              returnAssignee: { type: "agent", agentId: coderAgentId },
+              completedStageIds: [],
+              lastDecisionId: null,
+              lastDecisionOutcome: "changes_requested",
+              changesRequestedCount: 3,
+            },
+          },
+          decision: baseDecision(),
+        },
+      ),
+    ).not.toThrow();
+  });
+
+  it("allows the deliberate handoff to a user who the policy configures as stage participant", () => {
+    const userReviewPolicy = makePolicy([
+      { type: "review", participants: [{ type: "user", userId: ctoUserId }] },
+    ]);
+    const userReviewStageId = userReviewPolicy.stages[0].id;
+
+    expect(() =>
+      assertDecisionTransitionCoherent(
+        {
+          issue: baseIssue(),
+          policy: userReviewPolicy,
+          requestedAssigneePatch: {},
+          actor: { agentId: qaAgentId },
+        },
+        {
+          patch: {
+            status: "in_review",
+            assigneeAgentId: null,
+            assigneeUserId: ctoUserId,
+            executionState: {
+              status: "pending",
+              currentStageId: userReviewStageId,
+              currentStageIndex: 0,
+              currentStageType: "review",
+              currentParticipant: { type: "user", userId: ctoUserId },
+              returnAssignee: { type: "agent", agentId: coderAgentId },
+              completedStageIds: [],
+              lastDecisionId: null,
+              lastDecisionOutcome: null,
+            },
+          },
+          decision: baseDecision(),
+        },
+      ),
+    ).not.toThrow();
+  });
+
+  it("ignores non-decision transitions", () => {
+    expect(() =>
+      assertDecisionTransitionCoherent(
+        { issue: baseIssue(), policy, requestedAssigneePatch: {}, actor: { agentId: qaAgentId } },
+        {
+          patch: {
+            status: "in_review",
+            assigneeAgentId: null,
+            assigneeUserId: boardUserId,
+            executionState: null,
+          },
+        },
+      ),
+    ).not.toThrow();
   });
 });

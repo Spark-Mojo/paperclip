@@ -689,9 +689,12 @@ export interface IssueExecutionPolicy {
   reviewPreset?: LowTrustReviewPresetPolicy;
   authorizationPolicy?: TrustAuthorizationPolicy;
   /**
-   * Maximum consecutive agent-initiated changes-requested rounds before the
-   * pending stage escalates to the responsible human. Null uses the server
-   * default. Human decisions reset the round counter.
+   * Maximum consecutive agent-initiated changes-requested rounds counted on
+   * the pending stage. Null uses the server default. Human decisions reset
+   * the round counter. The cap is a counter for consumers (bridge escalation,
+   * monitor bounds) — recording the capped decision still bounces the stage
+   * to the return assignee; the server never transfers the card to a user as
+   * a side effect of the decision (SPA-7138).
    */
   maxReviewRounds?: number | null;
 }

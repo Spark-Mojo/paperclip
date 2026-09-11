@@ -62,11 +62,21 @@ type TransitionResult = {
 };
 
 /**
- * Consecutive agent-initiated changes-requested rounds tolerated on one stage
- * before the pending review escalates to the responsible human. Policies can
+ * Consecutive agent-initiated changes-requested rounds counted on one stage
+ * before consumers should escalate to the responsible human. Policies can
  * override via `maxReviewRounds`; human decisions always reset the counter.
+ * The cap is a counter, not a server-side transfer: recording the capped
+ * decision must keep the transition coherent (see the round-cap comment in
+ * `applyIssueExecutionStageTransition` and the fail-closed guard in
+ * `applyIssueExecutionPolicyTransition`).
  */
 export const DEFAULT_MAX_REVIEW_ROUNDS = 3;
+
+/**
+ * Machine-readable `details.code` carried by the fail-closed refusal raised
+ * when recording a review decision would orphan the card (SPA-7138).
+ */
+export const REVIEW_DECISION_INCOHERENT_TRANSITION = "review_decision_transition_incoherent";
 
 const COMPLETED_STATUS: IssueExecutionState["status"] = "completed";
 const PENDING_STATUS: IssueExecutionState["status"] = "pending";
@@ -446,19 +456,6 @@ function principalsEqual(a: IssueExecutionStagePrincipal | null, b: IssueExecuti
 function resolveMaxReviewRounds(policy: IssueExecutionPolicy | null): number {
   const configured = policy?.maxReviewRounds;
   return typeof configured === "number" && configured > 0 ? configured : DEFAULT_MAX_REVIEW_ROUNDS;
-}
-
-/**
- * The human a review stage escalates to when agents exhaust their
- * changes-requested rounds. Without one the loop keeps handing back to the
- * return assignee (pre-existing behavior) rather than stalling the stage.
- */
-function reviewEscalationUserId(issue: IssueLike): string | null {
-  const responsible = issue.responsibleUserId?.trim();
-  if (responsible) return responsible;
-  const creator = issue.createdByUserId?.trim();
-  if (creator) return creator;
-  return null;
 }
 
 function findStageById(policy: IssueExecutionPolicy, stageId: string | null | undefined) {
@@ -865,31 +862,19 @@ function applyIssueExecutionStageTransition(input: TransitionInput): TransitionR
         // unattended agent↔agent ping-pong, not to limit human review.
         const actorIsHuman = actor?.type === "user";
         const nextRounds = actorIsHuman ? 0 : (existingState.changesRequestedCount ?? 0) + 1;
-        if (!actorIsHuman && nextRounds >= resolveMaxReviewRounds(input.policy)) {
-          const escalationUserId = reviewEscalationUserId(input.issue);
-          if (escalationUserId) {
-            // Rounds exhausted: keep the stage pending but hand it to the
-            // responsible human instead of bouncing back to the implementer.
-            // The recorded changes-requested decision carries the reviewer's
-            // reasoning; the human approves, requests changes (resetting the
-            // counter), or re-scopes.
-            buildPendingStagePatch({
-              patch,
-              previous: existingState,
-              policy: input.policy,
-              stage: activeStage,
-              participant: { type: "user", agentId: null, userId: escalationUserId },
-              returnAssignee: existingState.returnAssignee,
-              reviewRequest: effectiveReviewRequest,
-              changesRequestedCount: nextRounds,
-            });
-            return {
-              patch,
-              decision,
-              workflowControlledAssignment: true,
-            };
-          }
-        }
+        // The round cap is a counter, not a transfer. An earlier revision
+        // re-pended the stage to the responsible human at the cap, but that
+        // compound transition orphaned the card (SPA-7095 / SPA-7134): the
+        // issue stayed in_review with a user assignee (no wakeable agent
+        // holder), the armed monitor was cleared with
+        // clearReason=invalid_assignee as a side effect, and the stage-advance
+        // guard then refused the reviewer's own follow-up PATCHes. Recording
+        // the decision and bouncing to the return assignee keeps every
+        // decision transition coherent. Ping-pong beyond the cap is bounded
+        // by the bridge-side escalation after repeated hold cycles and the
+        // monitor's own maxAttempts bounds; a user participant placed on an
+        // exhausted stage by that escalation (or by an operator) is held
+        // sticky by the escalated-hold branch above.
         patch.status = "in_progress";
         Object.assign(patch, patchForPrincipal(existingState.returnAssignee));
         patch.executionState = buildChangesRequestedState(existingState, activeStage, nextRounds);
@@ -1214,10 +1199,76 @@ export function buildIssueMonitorClearedPatch(input: {
   };
 }
 
+/**
+ * Fail-closed invariant for decision-recording transitions (SPA-7138, R2).
+ *
+ * A decision PATCH is only coherent if it leaves the card actionable:
+ * a pending stage must always name a current participant (the SPA-4763
+ * "participant None — handoff held" shape), and an issue left in_review must
+ * keep a wakeable agent assignee unless the transition deliberately handed
+ * the stage to a user who the policy itself configures as the stage's
+ * participant (a legitimate user-held review or approval). Anything else is
+ * the orphan shape — in_review, no agent assignee, monitor subsequently
+ * cleared invalid_assignee, nobody left to act — and MUST refuse the whole
+ * PATCH instead of persisting it. The guard runs on the final composed patch
+ * (stage transition + monitor transition) and throws before the route writes
+ * anything, so a refusal leaves participant, monitor, and assignee untouched.
+ */
+export function assertDecisionTransitionCoherent(
+  input: TransitionInput,
+  result: TransitionResult,
+): void {
+  if (!result.decision) return;
+  const patch = result.patch;
+  const existingState = parseIssueExecutionState(input.issue.executionState);
+  const nextState = patch.executionState !== undefined
+    ? parseIssueExecutionState(patch.executionState)
+    : existingState;
+  // Status composition mirrors applyMonitorTransition: the route merges the
+  // requested status into the final patch, so a decision patch that relies on
+  // that merge (approve → "done") carries no status of its own.
+  const nextStatus = typeof patch.status === "string"
+    ? (patch.status as string)
+    : input.requestedStatus ?? input.issue.status;
+  const nextAssigneeAgentId = patch.assigneeAgentId !== undefined
+    ? (patch.assigneeAgentId as string | null)
+    : input.issue.assigneeAgentId ?? null;
+  const nextAssigneeUserId = patch.assigneeUserId !== undefined
+    ? (patch.assigneeUserId as string | null)
+    : input.issue.assigneeUserId ?? null;
+  const nextParticipant = nextState?.currentParticipant ?? null;
+
+  if (nextState?.status === PENDING_STATUS && !nextParticipant) {
+    throw unprocessable(
+      "Recording this decision would leave the pending stage without a current participant",
+      { code: REVIEW_DECISION_INCOHERENT_TRANSITION },
+    );
+  }
+
+  if (nextStatus === "in_review" && !nextAssigneeAgentId) {
+    const stage = input.policy && nextState?.currentStageId
+      ? findStageById(input.policy, nextState.currentStageId)
+      : null;
+    const participantIsConfiguredUser =
+      nextParticipant?.type === "user" &&
+      nextAssigneeUserId != null &&
+      nextParticipant.userId === nextAssigneeUserId &&
+      stage != null &&
+      stageHasParticipant(stage, nextParticipant);
+    if (!participantIsConfiguredUser) {
+      throw unprocessable(
+        "Recording this decision would leave the issue in review without a wakeable agent assignee",
+        { code: REVIEW_DECISION_INCOHERENT_TRANSITION },
+      );
+    }
+  }
+}
+
 export function applyIssueExecutionPolicyTransition(input: TransitionInput): TransitionResult {
   const stageResult = applyIssueExecutionStageTransition(input);
   const monitorPatch = applyMonitorTransition(input, stageResult.patch);
   Object.assign(stageResult.patch, monitorPatch);
+  assertDecisionTransitionCoherent(input, stageResult);
   return stageResult;
 }
 
