@@ -849,12 +849,22 @@ printf 'skill\n' > "$OVERLAY_BUILD/server/skills/catalog.json"
 capture out21 code21 node "$ENGINE_DIR/overlay-contract.mjs" "$OVERLAY_PREFIX" "$OVERLAY_BUILD" 0123456789012345678901234567890123456789 "$OVERLAY_PREFIX/.paperclip-engine-overlay.json"
 assert_eq "overlay contract exits 0" "0" "$code21"
 assert_contains "overlay receipt records source provenance" "$(cat "$OVERLAY_PREFIX/.paperclip-engine-overlay.json" 2>/dev/null || true)" "0123456789012345678901234567890123456789"
+assert_contains "overlay receipt uses schema 2" "$(cat "$OVERLAY_PREFIX/.paperclip-engine-overlay.json" 2>/dev/null || true)" '"schema": 2'
 assert_contains "official manifest remains unchanged" "$(cat "$CLI_ROOT/node_modules/@paperclipai/server/package.json")" '"version":"2026.831.1"'
 assert_eq "nested runtime server received overlay" "new" "$(cat "$CLI_ROOT/node_modules/@paperclipai/server/dist/index.js")"
 assert_true "exclusive replacement removes stale compiled files" test ! -e "$CLI_ROOT/node_modules/@paperclipai/server/dist/stale.js"
 assert_true "runner mode repaired to 0755" test -x "$CLI_ROOT/node_modules/@paperclipai/server/dist/vendor/paperclip-runner/bin/paperclip-runnerd"
 capture out21v code21v node "$ENGINE_DIR/overlay-contract.mjs" --verify "$OVERLAY_PREFIX" 0123456789012345678901234567890123456789 "$OVERLAY_PREFIX/.paperclip-engine-overlay.json"
 assert_eq "matching receipt validates reuse" "0" "$code21v"
+capture reuse_shape_out reuse_shape_code node -e '
+  const fs=require("fs"),s=fs.readFileSync(process.argv[1],"utf8");
+  const existing=s.indexOf("if [ -f \"$prefix/lib/node_modules/paperclipai/package.json\" ]");
+  const verify=s.indexOf("overlay-contract.mjs\" --verify",existing);
+  const done=s.indexOf("return 0",verify);
+  const staging=s.indexOf("local staging_root=",existing);
+  if(!(existing>=0&&verify>existing&&done>verify&&staging>done))process.exit(1);
+' "$ENGINE_DIR/install.sh"
+assert_eq "verified existing overlay returns before staging or rebuild" "0" "$reuse_shape_code"
 MISSING_PREFIX="$SANDBOX/missing-root-prefix"; cp -a "$OVERLAY_PREFIX" "$MISSING_PREFIX"; rm -rf "$MISSING_PREFIX/lib/node_modules/paperclipai/node_modules/@paperclipai/shared"
 capture missing_root_out missing_root_code node "$ENGINE_DIR/overlay-contract.mjs" "$MISSING_PREFIX" "$OVERLAY_BUILD" 0123456789012345678901234567890123456789 "$MISSING_PREFIX/.paperclip-engine-overlay.json"
 assert_eq "missing public package root fails closed" "1" "$missing_root_code"
@@ -932,8 +942,10 @@ node -e '
 ' "$CAND_MIG"
 mkdir -p "$(dirname "$LIVE_MIG")"
 cp -a "$CAND_MIG" "$LIVE_MIG"
-capture out22 code22 env ENGINE_DIR_FOR_TEST="$ENGINE_DIR" CAND_PREFIX="$SANDBOX/candidate-prefix" LIVE_PREFIX="$SANDBOX/live-prefix" CAND_MIG="$CAND_MIG" bash -c '. "$ENGINE_DIR_FOR_TEST/lib.sh"; live_migration_ledger(){ node -e '\''const fs=require("fs"),path=require("path"),crypto=require("crypto"),r=process.argv[1],j=require(path.join(r,"meta/_journal.json"));for(const e of j.entries){const b=fs.readFileSync(path.join(r,e.tag+".sql"));console.log(`${e.when}|${crypto.createHash("sha256").update(b).digest("hex")}`)}console.log("1|old-a\n2|old-b\n3|old-c")'\'' "$CAND_MIG"; }; assert_overlay_zero_pending "$CAND_PREFIX" "$LIVE_PREFIX" ignored'
-assert_eq "exact migration manifest and ledger pass" "0" "$code22"
+capture out22 code22 env ENGINE_DIR_FOR_TEST="$ENGINE_DIR" CAND_PREFIX="$SANDBOX/candidate-prefix" LIVE_PREFIX="$SANDBOX/live-prefix" CAND_MIG="$CAND_MIG" bash -c '. "$ENGINE_DIR_FOR_TEST/lib.sh"; live_migration_ledger(){ node -e '\''const fs=require("fs"),path=require("path"),crypto=require("crypto"),r=process.argv[1],j=require(path.join(r,"meta/_journal.json"));for(let i=0;i<j.entries.length;i++){const e=j.entries[i],b=fs.readFileSync(path.join(r,e.tag+".sql"));console.log(`${e.when+(i<25?i+1:0)}|${crypto.createHash("sha256").update(b).digest("hex")}`)}console.log("1|94a8ea6a4f0a4f3b90c41fab39cc0d9ce9dde2b0fc6f59718db9a631fd479c99\n2|976ebe46ccd0fe5745f994a8b1a4f276801b4069c5b6b13dc04a43377303c373\n3|d3bc57340786db91c06a42ee290549b521ac165fe26410d344a8c9adac7cbeef")'\'' "$CAND_MIG"; }; assert_overlay_zero_pending "$CAND_PREFIX" "$LIVE_PREFIX" ignored'
+assert_eq "live-shaped timestamp drift with exact hash coverage passes" "0" "$code22"
+capture out22m code22m env ENGINE_DIR_FOR_TEST="$ENGINE_DIR" CAND_PREFIX="$SANDBOX/candidate-prefix" LIVE_PREFIX="$SANDBOX/live-prefix" CAND_MIG="$CAND_MIG" bash -c '. "$ENGINE_DIR_FOR_TEST/lib.sh"; live_migration_ledger(){ node -e '\''const fs=require("fs"),path=require("path"),crypto=require("crypto"),r=process.argv[1],j=require(path.join(r,"meta/_journal.json"));for(let i=1;i<j.entries.length;i++){const e=j.entries[i],b=fs.readFileSync(path.join(r,e.tag+".sql"));console.log(`${e.when}|${crypto.createHash("sha256").update(b).digest("hex")}`)}console.log("1|94a8ea6a4f0a4f3b90c41fab39cc0d9ce9dde2b0fc6f59718db9a631fd479c99\n2|976ebe46ccd0fe5745f994a8b1a4f276801b4069c5b6b13dc04a43377303c373\n3|d3bc57340786db91c06a42ee290549b521ac165fe26410d344a8c9adac7cbeef\n4|aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")'\'' "$CAND_MIG"; }; assert_overlay_zero_pending "$CAND_PREFIX" "$LIVE_PREFIX" ignored'
+assert_true "missing candidate SQL hash fails closed" test "$code22m" -ne 0
 printf 'changed\n' > "$CAND_MIG/0001.sql"
 capture out22b code22b env ENGINE_DIR_FOR_TEST="$ENGINE_DIR" CAND_PREFIX="$SANDBOX/candidate-prefix" LIVE_PREFIX="$SANDBOX/live-prefix" bash -c '. "$ENGINE_DIR_FOR_TEST/lib.sh"; assert_overlay_zero_pending "$CAND_PREFIX" "$LIVE_PREFIX" ignored'
 assert_eq "changed migration hash fails closed" "1" "$code22b"
