@@ -330,12 +330,11 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       .from(issues)
       .where(and(eq(issues.companyId, companyId), eq(issues.originKind, "stranded_issue_recovery")));
     expect(recoveryIssues).toHaveLength(0);
-    expect(enqueueWakeup).toHaveBeenCalledTimes(2);
-    expect(enqueueWakeup.mock.calls[0]?.[1]?.payload).toMatchObject({
-      issueId: sourceIssue.id,
-      sourceIssueId: sourceIssue.id,
-      recoveryCause: "stranded_assigned_issue",
-    });
+    // SPA-7105 + SPA-7132 ruling (Steve, Option 2 — contract amendment): the
+    // skip path is a silent park. No recovery wake fires from a skip-path
+    // escalation, even across repeated reconcile passes; the source-scoped
+    // action row IS the durable escalation (SPA-7133 covers dormant wakes).
+    expect(enqueueWakeup).not.toHaveBeenCalled();
   });
 
   it.each([
@@ -378,15 +377,10 @@ describeEmbeddedPostgres("issue recovery actions", () => {
         .from(issueRecoveryActions)
         .where(eq(issueRecoveryActions.sourceIssueId, sourceIssue.id));
       expect(action?.ownerAgentId).toBe(expectedOwnerId);
-      expect(enqueueWakeup).toHaveBeenCalledWith(
-        expectedOwnerId,
-        expect.objectContaining({
-          reason: "source_scoped_recovery_action",
-          payload: expect.objectContaining({
-            recoveryCause: explicitCause ?? (errorCode === "adapter_failed" ? "stranded_assigned_issue" : errorCode),
-          }),
-        }),
-      );
+      // SPA-7105 + SPA-7132 ruling (Steve, Option 2 — contract amendment):
+      // the cause-keyed playbook still routes ownership, but the skip path
+      // (blocked-empty is never a legal write) fires no wake.
+      expect(enqueueWakeup).not.toHaveBeenCalled();
     },
   );
 
@@ -1063,13 +1057,9 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       attemptCount: 2,
     });
     expect(actionRows[0]?.evidence).toMatchObject({ latestRunId: secondLatestRun.id });
-    expect(enqueueWakeup).toHaveBeenCalledTimes(2);
-    expect(enqueueWakeup.mock.calls[1]?.[1]?.payload).toMatchObject({
-      issueId: sourceIssue.id,
-      sourceIssueId: sourceIssue.id,
-      strandedRunId: secondLatestRun.id,
-      recoveryCause: "stranded_assigned_issue",
-    });
+    // SPA-7105 + SPA-7132 ruling (Steve, Option 2 — contract amendment): the
+    // skip path is a silent park — no wake across repeated escalations.
+    expect(enqueueWakeup).not.toHaveBeenCalled();
   });
 
   it("deduplicates workspace-incoherence recovery actions by the typed workspace fingerprint", async () => {
@@ -1186,17 +1176,10 @@ describeEmbeddedPostgres("issue recovery actions", () => {
         ]),
       })],
     });
-    expect(enqueueWakeup).toHaveBeenCalledTimes(2);
-    expect(enqueueWakeup).toHaveBeenCalledWith(
-      expect.any(String),
-      expect.objectContaining({
-        reason: "source_scoped_recovery_action",
-        payload: expect.objectContaining({ recoveryCause: "workspace_validation_failed" }),
-      }),
-    );
+    expect(enqueueWakeup).not.toHaveBeenCalled();
   });
 
-  it("keeps the source issue blocked when source-scoped wakeup is claimed synchronously", async () => {
+  it("keeps the source issue in_progress across repeated escalations with no wake (SPA-7132 ruling)", async () => {
     const { companyId, managerId, coderId, sourceIssue } = await seedCompany();
     await db.update(agents).set({ status: "paused" }).where(eq(agents.id, managerId));
     const enqueueWakeup = vi.fn(async () => {

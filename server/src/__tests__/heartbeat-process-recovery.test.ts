@@ -1629,6 +1629,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       finalStatus: "in_progress",
       retryReason: "issue_continuation_needed",
       cause: "process_lost",
+      expectRecoveryWakeup: false,
     });
   });
 
@@ -3933,6 +3934,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       retryReason: null,
       cause: SUCCESSFUL_RUN_MISSING_STATE_REASON,
       kind: "missing_disposition",
+      expectRecoveryWakeup: false,
     });
     expect(recoveryAction.evidence).toMatchObject({
       sourceRunId,
@@ -4137,6 +4139,10 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       cause: SUCCESSFUL_RUN_MISSING_STATE_REASON,
       kind: "missing_disposition",
       expectRecoveryRun: false,
+      // SPA-7105 broad fix + SPA-7132 ruling (Option 2): the escalation is
+      // recorded but the blocked-empty parking write is skipped (no unresolved
+      // blocker edge) and the skip path is a silent park — no wakeup.
+      expectRecoveryWakeup: false,
     });
 
     expect(recoveryAction).toBeDefined();
@@ -4225,9 +4231,9 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(actions[0]).toMatchObject({ cause: SUCCESSFUL_RUN_MISSING_STATE_REASON, kind: "missing_disposition" });
     const wakes = await db.select().from(agentWakeupRequests)
       .where(eq(agentWakeupRequests.companyId, companyId));
-    // SPA-7105 broad fix: the skip path still enqueues the durable recovery
-    // wake (the continuation path is preserved, not destroyed).
-    expect(wakes.filter((wake) => wake.reason === "source_scoped_recovery_action")).toHaveLength(1);
+    // SPA-7105 broad fix + SPA-7132 ruling (Option 2): the skip path is a
+    // silent park — no source-scoped wake fires from a skip-path escalation.
+    expect(wakes.filter((wake) => wake.reason === "source_scoped_recovery_action")).toHaveLength(0);
     expect(wakes.filter((wake) => wake.reason === "issue_continuation_needed" || wake.reason === "provider_quota_recovery")).toHaveLength(0);
     const runs = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, companyId));
     expect(runs).toHaveLength(3);
@@ -4557,12 +4563,10 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
         eq(agentWakeupRequests.companyId, companyId),
         eq(agentWakeupRequests.idempotencyKey, idempotencyKey),
       ));
-    // SPA-7105 broad fix: the skip path still enqueues the durable bounded
-    // escalation wake — it is the card's continuation path. The bounded
-    // idempotency key (no attempt component) plus the unique constraint keep
-    // it at exactly one row across both racing workers and the replay.
-    expect(wakes).toHaveLength(1);
-    expect(wakes[0]?.agentId).toBe(issueAfterRace?.assigneeAgentId ?? null);
+    // SPA-7105 broad fix + SPA-7132 ruling (Option 2): the skip path is a
+    // silent park — the durable escalation is the source-scoped action row,
+    // not a wake, so no bounded continuation wake is enqueued.
+    expect(wakes).toHaveLength(0);
     const actions = await db
       .select()
       .from(issueRecoveryActions)
@@ -5656,6 +5660,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       cause: "execution_review_participant_recovery",
       previousOwnerAgentId: sourceAssigneeAgentId,
       returnOwnerAgentId: sourceAssigneeAgentId,
+      expectRecoveryWakeup: false,
     });
     expect(recoveryAction.evidence).toMatchObject({
       latestRunId: runId,
@@ -6371,6 +6376,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       finalStatus: "todo",
       retryReason: "assignment_recovery",
       cause: "process_lost",
+      expectRecoveryWakeup: false,
     });
     expect(JSON.stringify(recoveryAction.evidence)).not.toContain("sk-test-recovery-secret");
 
@@ -6792,6 +6798,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       finalStatus: "in_progress",
       retryReason: "issue_continuation_needed",
       cause: "process_lost",
+      expectRecoveryWakeup: false,
     });
 
     const skipNote = await expectBlockedEmptySkipNote({
@@ -6822,6 +6829,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       previousStatus: "in_progress",
       finalStatus: "in_progress",
       retryReason: "issue_continuation_needed",
+      expectRecoveryWakeup: false,
     });
     expect(recoveryAction.evidence).toMatchObject({
       latestRunErrorCode: "adapter_exit_code",
@@ -6924,6 +6932,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       previousStatus: "in_progress",
       finalStatus: "in_progress",
       retryReason: "issue_continuation_needed",
+      expectRecoveryWakeup: false,
     });
     expect(recoveryAction.evidence).toMatchObject({
       latestRunErrorCode: "adapter_failed",
@@ -7066,6 +7075,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       previousStatus: "in_progress",
       finalStatus: "in_progress",
       retryReason: null,
+      expectRecoveryWakeup: false,
     });
 
     const skipNote = await expectBlockedEmptySkipNote({
@@ -7455,6 +7465,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       previousStatus: "in_progress",
       finalStatus: "in_progress",
       retryReason: "issue_continuation_needed",
+      expectRecoveryWakeup: false,
     });
 
     await expectBlockedEmptySkipNote({
@@ -7462,10 +7473,11 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       previousStatus: "in_progress",
     });
 
-    // SPA-7105: the skip path still enqueues the durable recovery wake, whose
-    // persisted wake run joins the seeded run — no continuation retry exists.
+    // SPA-7105 + SPA-7132 ruling (Option 2): the skip path enqueues no
+    // recovery wake, so no second run exists — the escalation is recorded as
+    // action + skip note only.
     const followupRuns = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, agentId));
-    expect(followupRuns).toHaveLength(2);
+    expect(followupRuns).toHaveLength(1);
     expect(followupRuns.find((run) => run.id === runId)).toBeDefined();
   });
 
@@ -7636,9 +7648,9 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, issueId));
     expect(comments.some((row) => (row.body ?? "").includes("skipped the parking write"))).toBe(true);
     const runs = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, agentId));
-    // SPA-7105: the skip path still enqueues the durable recovery wake, whose
-    // persisted wake run joins the seeded failed run.
-    expect(runs).toHaveLength(2);
+    // SPA-7105 + SPA-7132 ruling (Option 2): the skip path is a silent park —
+    // no wake, no extra run.
+    expect(runs).toHaveLength(1);
   });
 
   it("preserves a delegated blocker edge as the durable external-wait path", async () => {
@@ -7710,6 +7722,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       previousStatus: "in_progress",
       finalStatus: "in_progress",
       retryReason: "issue_continuation_needed",
+      expectRecoveryWakeup: false,
     });
 
     const skipNote = await expectBlockedEmptySkipNote({
