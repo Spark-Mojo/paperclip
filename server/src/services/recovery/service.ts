@@ -3684,18 +3684,12 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
           blockerIssueIds: blockerIds,
         },
       });
-      // SPA-7105: the wake IS a continuation path, not a destructive write —
-      // skipping the parking write must not strand the card. The wake still
-      // fires (provider_quota/configuration_incomplete carve-outs stay inside
-      // the helper), so the recovery owner owns a live follow-up even though
-      // the status write never landed.
-      await enqueueSourceScopedStrandedRecoveryWake({
-        action: recoveryAction,
-        issue: input.issue,
-        latestRun: input.latestRun,
-        recoveryCause,
-        boundedHandoffContinuationRunId: input.boundedHandoffContinuationRunId,
-      });
+      // SPA-7105 (SPA-7132 ruling, request 6f2c1b90 — Steve, Option 2): the
+      // skip path is a silent park — no source_scoped wake fires on a
+      // skip-path escalation, even when the card holds an invokable owner.
+      // The source-scoped action record IS the durable escalation; the
+      // provider_quota wait-monitor path above still arms its own monitor.
+      // Dormant-wake follow-up: SPA-7133 (backlog, non-blocking).
       return input.issue;
     }
     const updated = await issuesSvc.update(input.issue.id, {
