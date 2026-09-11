@@ -778,3 +778,27 @@ assert_overlay_zero_pending() {
 live_migration_ledger() {
   secure_database_command "$1" psql -Atc "select created_at::text || '|' || hash from drizzle.__drizzle_migrations order by created_at, hash"
 }
+
+validate_and_expand_build_stamp() {
+  local checkout="$1" stamp_file="$2" frozen_sha="$3"
+  local actual_full actual_short
+  actual_full="$(git -C "$checkout" rev-parse HEAD 2>/dev/null)" \
+    || die "Cannot resolve fork checkout HEAD for build provenance."
+  actual_short="$(git -C "$checkout" rev-parse --short HEAD 2>/dev/null)" \
+    || die "Cannot resolve fork checkout short HEAD for build provenance."
+  [[ "$frozen_sha" =~ ^[0-9a-f]{40}$ ]] \
+    || die "Frozen fork SHA is not a canonical lowercase commit ID."
+  [ "$actual_full" = "$frozen_sha" ] \
+    || die "Fork checkout HEAD does not match frozen source."
+  [[ "$actual_short" =~ ^[0-9a-f]{7,40}$ ]] \
+    || die "Fork checkout short HEAD is not a valid lowercase commit ID."
+  [ -f "$stamp_file" ] && [ ! -L "$stamp_file" ] \
+    || die "Server build stamp is not a regular file."
+  node -e '
+    const fs=require("fs"), file=process.argv[1], expected=process.argv[2], exact=process.argv[3];
+    const stamp=JSON.parse(fs.readFileSync(file));
+    if(typeof stamp.commit!=="string" || !/^[0-9a-f]{7,40}$/.test(stamp.commit) || stamp.commit!==expected) process.exit(1);
+    fs.writeFileSync(file, JSON.stringify({commit: exact}, null, 2)+"\n");
+  ' "$stamp_file" "$actual_short" "$frozen_sha" \
+    || die "Server build stamp does not match actual fork checkout HEAD."
+}
