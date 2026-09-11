@@ -767,8 +767,7 @@ assert_overlay_zero_pending() {
   live_migration_ledger "$connection_string" | LC_ALL=C sort > "$live_ledger" || die "Cannot read live migration ledger."
   [ "$(wc -l < "$candidate_ledger")" -eq 231 ] || die "Candidate journal must contain exactly 231 entries."
   [ "$(wc -l < "$live_ledger")" -eq 234 ] || die "Live migration ledger must contain exactly 234 rows."
-  [ "$(comm -23 "$candidate_ledger" "$live_ledger" | wc -l)" -eq 0 ] || die "Candidate has migration journal entries absent from live ledger; pending migrations are forbidden."
-  [ "$(comm -13 "$candidate_ledger" "$live_ledger" | wc -l)" -eq 3 ] || die "Live migration ledger must have exactly three historical surplus rows."
+  assert_migration_ledger_equivalence "$candidate_ledger" "$live_ledger"
   rm -rf "$scratch"; trap - RETURN
   local migration_file_count
   migration_file_count="$(find "$candidate_dir" -type f | wc -l)"
@@ -777,6 +776,28 @@ assert_overlay_zero_pending() {
 
 live_migration_ledger() {
   secure_database_command "$1" psql -Atc "select created_at::text || '|' || hash from drizzle.__drizzle_migrations order by created_at, hash"
+}
+
+assert_migration_ledger_equivalence() {
+  local candidate_ledger="$1" live_ledger="$2"
+  if ! node - "$candidate_ledger" "$live_ledger" <<'NODE'
+const fs=require("fs");
+const allowed=new Set([
+  "94a8ea6a4f0a4f3b90c41fab39cc0d9ce9dde2b0fc6f59718db9a631fd479c99",
+  "976ebe46ccd0fe5745f994a8b1a4f276801b4069c5b6b13dc04a43377303c373",
+  "d3bc57340786db91c06a42ee290549b521ac165fe26410d344a8c9adac7cbeef",
+]);
+function rows(file){return fs.readFileSync(file,"utf8").trim().split("\n").filter(Boolean).map(line=>{const p=line.split("|");if(p.length!==2||!/^[0-9]+$/.test(p[0])||!/^[0-9a-f]{64}$/.test(p[1]))process.exit(2);return p[1]})}
+const candidate=rows(process.argv[2]), live=rows(process.argv[3]);
+if(candidate.length!==231||live.length!==234||new Set(candidate).size!==231||new Set(live).size!==234)process.exit(3);
+const candidateSet=new Set(candidate), liveSet=new Set(live);
+if(candidate.some(hash=>!liveSet.has(hash)))process.exit(4);
+const surplus=live.filter(hash=>!candidateSet.has(hash));
+if(surplus.length!==allowed.size||surplus.some(hash=>!allowed.has(hash)))process.exit(5);
+NODE
+  then
+    die "Migration ledger hashes differ from candidate journal or approved historical surplus; pending migrations are forbidden."
+  fi
 }
 
 validate_and_expand_build_stamp() {
