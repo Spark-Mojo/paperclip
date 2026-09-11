@@ -130,6 +130,16 @@ export async function prepareOpenCodeRuntimeConfig(input: {
   }
 
   const sourceConfigDir = path.join(resolveXdgConfigHome(input.env), "opencode");
+  // SPA-7079: the sandbox XDG_CONFIG_HOME below hides the host gh CLI auth
+  // (gh resolves hosts.yml under XDG_CONFIG_HOME/gh, so the empty temp dir
+  // reads as "not logged in" and git falls back to `could not read
+  // Username`). gh honours GH_CONFIG_DIR over XDG_CONFIG_HOME, so remember
+  // the host gh dir resolved BEFORE the override. An explicit GH_CONFIG_DIR
+  // in the caller env is respected untouched below and never deleted.
+  const hostGhConfigDir = path.join(resolveXdgConfigHome(input.env), "gh");
+  const callerGhConfigDir =
+    (typeof input.env.GH_CONFIG_DIR === "string" && input.env.GH_CONFIG_DIR.trim()) ||
+    (typeof process.env.GH_CONFIG_DIR === "string" && process.env.GH_CONFIG_DIR.trim());
   const runtimeConfigHome = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-opencode-config-"));
   const runtimeConfigDir = path.join(runtimeConfigHome, "opencode");
   const runtimeConfigPath = path.join(runtimeConfigDir, "opencode.json");
@@ -229,11 +239,27 @@ export async function prepareOpenCodeRuntimeConfig(input: {
   }
   await fs.writeFile(runtimeConfigPath, `${JSON.stringify(nextConfig, null, 2)}\n`, "utf8");
 
+  // Inject-only: respect an explicit caller GH_CONFIG_DIR untouched; only add
+  // one when absent AND the host actually has gh auth (hosts.yml). Never
+  // delete what the caller supplied — a dead explicit dir is the caller's
+  // statement, not ours to strip. When the host has no auth, degrade to
+  // today's behavior (no GH_CONFIG_DIR) so gh uses default resolution.
+  const nextEnv: Record<string, string> = {
+    ...input.env,
+    XDG_CONFIG_HOME: runtimeConfigHome,
+  };
+  if (!callerGhConfigDir) {
+    try {
+      await fs.access(path.join(hostGhConfigDir, "hosts.yml"));
+      nextEnv.GH_CONFIG_DIR = hostGhConfigDir;
+      notes.push(`Passed host gh auth through via GH_CONFIG_DIR=${hostGhConfigDir}.`);
+    } catch {
+      // No host gh auth to pass through.
+    }
+  }
+
   return {
-    env: {
-      ...input.env,
-      XDG_CONFIG_HOME: runtimeConfigHome,
-    },
+    env: nextEnv,
     notes,
     cleanup: async () => {
       await fs.rm(runtimeConfigHome, { recursive: true, force: true });
