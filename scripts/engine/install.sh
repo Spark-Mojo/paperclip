@@ -358,10 +358,10 @@ main() {
     if [ -n "$previous_connection_string" ]; then
       after_migrations="$(migration_count "$previous_connection_string" || echo unknown)"
     fi
-    if [ "$DRY_RUN" != "1" ]; then
+    if [ "$SOURCE_KIND" = "fork" ] && [ "$DRY_RUN" != "1" ]; then
       local report_path="${PAPERCLIP_WHATS_RUNNING_PATH:-$HOME/bin/whats-running}"
       if ! ( install_whats_running ) || ! "$report_path"; then report_failed=1; fi
-    elif [ "${PAPERCLIP_ENGINE_TEST_FAIL_REPORT_READBACK:-0}" = "1" ] || [ "${PAPERCLIP_ENGINE_TEST_FAIL_REPORT_INSTALL:-0}" = "1" ]; then
+    elif [ "$SOURCE_KIND" = "fork" ] && { [ "${PAPERCLIP_ENGINE_TEST_FAIL_REPORT_READBACK:-0}" = "1" ] || [ "${PAPERCLIP_ENGINE_TEST_FAIL_REPORT_INSTALL:-0}" = "1" ]; }; then
       report_failed=1
     fi
     if [ "$report_failed" = "0" ]; then

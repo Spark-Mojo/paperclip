@@ -129,7 +129,9 @@ capture() {
 
 echo "== test 1: first install (npm:1.2.3), health ok =="
 echo "ok" > "$MODE_FILE"
+export PAPERCLIP_ENGINE_TEST_FAIL_REPORT_READBACK=1
 capture out1 code1 "$ENGINE_DIR/install.sh" npm:1.2.3
+unset PAPERCLIP_ENGINE_TEST_FAIL_REPORT_READBACK
 echo "$out1" | sed 's/^/    /'
 assert_eq "install exits 0" "0" "$code1"
 assert_true "current symlink exists" test -L "$CURRENT_LINK"
@@ -167,7 +169,7 @@ assert_contains "install.sh reports the systemctl start failure, not a silent se
 
 echo "== test 2c: reporter readback failure triggers automatic rollback =="
 export PAPERCLIP_ENGINE_TEST_FAIL_REPORT_READBACK=1
-capture out2c code2c "$ENGINE_DIR/install.sh" npm:6.6.6
+capture out2c code2c "$ENGINE_DIR/install.sh" fork:HEAD
 unset PAPERCLIP_ENGINE_TEST_FAIL_REPORT_READBACK
 assert_eq "reporter failure install exits non-zero" "1" "$code2c"
 assert_eq "reporter failure rolls back current prefix" "$ENGINE_ROOT/paperclip-1.2.3" "$(readlink "$CURRENT_LINK")"
@@ -175,7 +177,7 @@ assert_contains "reporter failure is identified" "$out2c" "runtime report FAILED
 
 echo "== test 2d: reporter installation failure triggers automatic rollback =="
 export PAPERCLIP_ENGINE_TEST_FAIL_REPORT_INSTALL=1
-capture out2d code2d "$ENGINE_DIR/install.sh" npm:5.5.5
+capture out2d code2d "$ENGINE_DIR/install.sh" fork:HEAD
 unset PAPERCLIP_ENGINE_TEST_FAIL_REPORT_INSTALL
 assert_eq "reporter install failure exits non-zero" "1" "$code2d"
 assert_eq "reporter install failure rolls back current prefix" "$ENGINE_ROOT/paperclip-1.2.3" "$(readlink "$CURRENT_LINK")"
