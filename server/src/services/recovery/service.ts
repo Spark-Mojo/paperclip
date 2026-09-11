@@ -3612,24 +3612,32 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         : `no unresolved blocker edge exists for this card, and blocked-empty is never a legal recovery write. ` +
           `The card keeps its current status${monitorContext.nextCheckAt ? " and its armed monitor schedule" : ""}. `;
       // SPA-7105: the skip path can be re-entered on every reconcile pass
-      // (attemptCount grows each time), so gate the note on a stable marker —
-      // one note per issue, never a per-tick comment stream.
-      const [existingSkipNote] = await db
-        .select({ id: issueComments.id })
+      // (attemptCount grows each time), so gate the note on the structured
+      // recovery-action reference — one note per recovery action, never a
+      // per-tick comment stream, and dedupe survives comment-body rewrites.
+      const recentSystemComments = await db
+        .select({ id: issueComments.id, body: issueComments.body, metadata: issueComments.metadata })
         .from(issueComments)
         .where(
           and(
             eq(issueComments.issueId, input.issue.id),
-            sql`${issueComments.body} LIKE '%Recovery skipped the parking write%'`,
+            eq(issueComments.authorType, "system"),
           ),
         )
-        .limit(1);
-      if (!existingSkipNote) await issuesSvc.addComment(input.issue.id,
+        .orderBy(desc(issueComments.createdAt))
+        .limit(50);
+      const hasSkipNote = recentSystemComments.some((row) =>
+        noticeMetadataReferencesRecoveryAction(row.metadata, recoveryAction.id) ||
+        (row.body ?? "").includes("Recovery skipped the parking write"),
+      );
+      if (!hasSkipNote) await issuesSvc.addComment(input.issue.id,
         `Recovery skipped the parking write to \`blocked\` because ${skipReason}` +
         `(Recovery cause: ${recoveryCause}; skipped write: status=blocked.)`, {}, {
           authorType: "system",
           presentation: compactRecoveryPresentation(
-            "Recovery: parking write skipped — live armed monitor preserved",
+            armedMonitor
+              ? "Recovery: parking write skipped — live armed monitor preserved"
+              : "Recovery: parking write skipped — blocked-empty write is not legal",
           ),
           metadata: {
             version: 1,
@@ -3637,6 +3645,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
             sections: [{
               title: "Recovery",
               rows: [
+                { type: "key_value", label: "Recovery action", value: recoveryAction.id },
                 { type: "key_value", label: "Cause", value: recoveryCause },
                 { type: "key_value", label: "Previous status", value: input.previousStatus },
                 { type: "key_value", label: "Skipped write", value: "status=blocked" },
@@ -3674,6 +3683,18 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
           returnOwnerAgentId: recoveryAction.returnOwnerAgentId,
           blockerIssueIds: blockerIds,
         },
+      });
+      // SPA-7105: the wake IS a continuation path, not a destructive write —
+      // skipping the parking write must not strand the card. The wake still
+      // fires (provider_quota/configuration_incomplete carve-outs stay inside
+      // the helper), so the recovery owner owns a live follow-up even though
+      // the status write never landed.
+      await enqueueSourceScopedStrandedRecoveryWake({
+        action: recoveryAction,
+        issue: input.issue,
+        latestRun: input.latestRun,
+        recoveryCause,
+        boundedHandoffContinuationRunId: input.boundedHandoffContinuationRunId,
       });
       return input.issue;
     }
