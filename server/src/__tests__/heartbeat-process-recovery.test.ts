@@ -318,7 +318,10 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       createdAt: now,
       updatedAt: now,
     });
-  }, 20_000);
+    // SPA-7177: embedded-Postgres boot + migrations cross 20s under a loaded
+    // runner (same flake class the vitest.config hookTimeout headroom covers);
+    // a genuinely hung hook is still caught, just later.
+  }, 120_000);
 
   afterEach(async () => {
     vi.clearAllMocks();
@@ -3934,6 +3937,103 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     if (retryRun) {
       await waitForRunToSettle(heartbeat, retryRun.id);
     }
+  });
+
+  // SPA-7177: a standing wake channel's steady state is open, assigned, and
+  // in_progress forever (SPA-7170 shape). A productive successful run is the
+  // card working as designed, so the productive-terminal continuation requeue
+  // must be suppressed instead of ping-ponging no-content wake cycles.
+  it("suppresses the productive-terminal continuation requeue for a standing wake channel", async () => {
+    const { agentId, runId, issueId } = await seedStrandedIssueFixture({
+      status: "in_progress",
+      runStatus: "succeeded",
+      livenessState: "advanced",
+    });
+    await db
+      .update(issues)
+      .set({
+        description: [
+          "node05 memory tripwire — standing wake channel.",
+          "",
+          "DO NOT CLOSE: this open, assigned card is the wake channel.",
+          "standing-wake-channel: node05-memory-pressure-tripwire",
+        ].join("\n"),
+      })
+      .where(eq(issues.id, issueId));
+    const recovery = recoveryServiceForTest({ persistWakeup: true });
+
+    const result = await recovery.reconcileStrandedAssignedIssues();
+    expect(result.continuationRequeued).toBe(0);
+    expect(result.standingChannelSuppressed).toBe(1);
+    expect(result.escalated).toBe(0);
+    expect(result.successfulRunHandoffEscalated).toBe(0);
+    expect(result.issueIds).toEqual([]);
+
+    const wakeups = await db
+      .select()
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.agentId, agentId));
+    expect(wakeups).toHaveLength(1);
+
+    const runs = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.agentId, agentId));
+    expect(runs).toHaveLength(1);
+    expect(runs[0]?.id).toBe(runId);
+  });
+
+  // SPA-7177 negative control: without the marker, the productive-terminal
+  // continuation requeue behaves exactly as before.
+  it("still requeues the productive-terminal continuation for a card without the marker", async () => {
+    const { agentId, issueId } = await seedStrandedIssueFixture({
+      status: "in_progress",
+      runStatus: "succeeded",
+      livenessState: "advanced",
+    });
+    await db
+      .update(issues)
+      .set({
+        description: "DO NOT CLOSE: this open, assigned card is the wake channel (no marker line).",
+      })
+      .where(eq(issues.id, issueId));
+    const recovery = recoveryServiceForTest({ persistWakeup: true });
+
+    const result = await recovery.reconcileStrandedAssignedIssues();
+    // persistWakeup enqueues by writing the row and returns null, so the
+    // requeue shows up in the wake table, not in result.continuationRequeued.
+    const wakeups = await db
+      .select()
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.agentId, agentId));
+    expect(wakeups.some((row) => row.reason === "issue_continuation_needed")).toBe(true);
+  });
+
+  // SPA-7177: the marker suppresses engine-inferred nudges on the success
+  // path only — failure recovery (a dead probe) stays active.
+  it("still requeues continuation recovery for a standing wake channel after a failed run", async () => {
+    const { agentId, issueId } = await seedStrandedIssueFixture({
+      status: "in_progress",
+      runStatus: "failed",
+      runErrorCode: "process_lost",
+    });
+    await db
+      .update(issues)
+      .set({
+        description: "standing-wake-channel: node05-memory-pressure-tripwire",
+      })
+      .where(eq(issues.id, issueId));
+    const recovery = recoveryServiceForTest({ persistWakeup: true });
+
+    const result = await recovery.reconcileStrandedAssignedIssues();
+    expect(result.standingChannelSuppressed).toBe(0);
+    // persistWakeup enqueues by writing the row and returns null, so the
+    // requeue shows up in the wake table, not in result.continuationRequeued.
+    const wakeups = await db
+      .select()
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.agentId, agentId));
+    expect(wakeups.some((row) => row.reason === "issue_continuation_needed")).toBe(true);
   });
 
   // SPA-6335 P1 regression: the repeat of a handoff-derived bounded

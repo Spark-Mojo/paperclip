@@ -112,6 +112,39 @@ describe("successful run handoff decision", () => {
     expect(decision.instruction).toContain("you are on your normal model and allowed to work in this wake");
   });
 
+  // SPA-7177: standing wake channels stay open and assigned forever by design;
+  // a productive successful run on such a card must not enqueue a handoff.
+  it("skips the handoff for a standing wake channel card and classifies the skip as a valid path", () => {
+    const decision = decide({
+      issue: {
+        ...issue,
+        description: [
+          "node05 memory tripwire — standing wake channel.",
+          "DO NOT CLOSE: this open, assigned card is the wake channel.",
+          "standing-wake-channel: node05-memory-pressure-tripwire",
+        ].join("\n"),
+      },
+    });
+
+    expect(decision).toEqual({
+      kind: "skip",
+      reason: "standing wake channel is comment-driven; handoff suppressed",
+    });
+    expect(isSuccessfulRunHandoffValidPathSkip(decision)).toBe(true);
+  });
+
+  it("still queues the handoff for an ordinary card that only mentions the marker token in prose", () => {
+    const decision = decide({
+      issue: {
+        ...issue,
+        description: "Document probe cards with the standing-wake-channel marker convention.",
+      },
+    });
+
+    expect(decision.kind).toBe("enqueue");
+    expect(isSuccessfulRunHandoffValidPathSkip(decision)).toBe(false);
+  });
+
   it.each([
     "**Blocked** — The benchmark target is not mounted…",
     "coqc … is not installed, so local compilation could not run",

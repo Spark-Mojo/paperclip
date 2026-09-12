@@ -63,3 +63,7 @@ export type {
   SuccessfulRunHandoffNotice,
   SuccessfulRunHandoffDecision,
 } from "./successful-run-handoff.js";
+export {
+  isStandingWakeChannelDescription,
+  isStandingWakeChannelIssue,
+} from "./standing-wake-channel.js";

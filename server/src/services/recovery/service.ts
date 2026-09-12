@@ -61,6 +61,7 @@ import {
   noticeMetadataReferencesRecoveryAction,
   type SuccessfulRunHandoffNotice,
 } from "./successful-run-handoff.js";
+import { isStandingWakeChannelIssue } from "./standing-wake-channel.js";
 import {
   RECOVERY_ORIGIN_KINDS,
   buildIssueGraphLivenessLeafKey,
@@ -3847,6 +3848,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       assignmentDispatched: 0,
       dispatchRequeued: 0,
       continuationRequeued: 0,
+      standingChannelSuppressed: 0,
       productiveContinuationObserved: 0,
       successfulContinuationObserved: 0,
       orphanBlockersAssigned: 0,
@@ -3926,7 +3928,11 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         }
         // Validate handoff provenance against durable run rows before any handoff
         // classification. Context JSON is agent-authored evidence, not authority.
-        const handoffCandidate = issue.status === "in_progress" ? isExhaustedSuccessfulRunHandoff(latestRun) : null;
+        // SPA-7177: standing wake channels have no handoff-relevant progress by
+        // contract — skip handoff classification entirely.
+        const handoffCandidate = issue.status === "in_progress" && !isStandingWakeChannelIssue(issue)
+          ? isExhaustedSuccessfulRunHandoff(latestRun)
+          : null;
         const handoffEvidence = handoffCandidate
           ? await getVerifiedSuccessfulRunHandoffEvidence({ issue, agentId, latestRun })
           : null;
@@ -4404,6 +4410,17 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
 
           if (!isProductiveContinuationRun(successfulRun)) {
             result.successfulContinuationObserved += 1;
+            result.skipped += 1;
+            continue;
+          }
+
+          // SPA-7177: a standing wake channel's steady state is open, assigned,
+          // and in_progress forever. A productive successful run on such a card
+          // is the card working as designed — requeueing a continuation nudge
+          // ping-pongs the assignee into no-content wake cycles. Comment wakes,
+          // accepted interactions, and failure recovery still apply.
+          if (isStandingWakeChannelIssue(issue)) {
+            result.standingChannelSuppressed += 1;
             result.skipped += 1;
             continue;
           }
