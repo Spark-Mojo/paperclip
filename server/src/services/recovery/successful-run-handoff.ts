@@ -3,6 +3,7 @@ import type { Db } from "@paperclipai/db";
 import { agentWakeupRequests, agents, heartbeatRuns, issues } from "@paperclipai/db";
 import type { IssueCommentMetadata, IssueCommentPresentation, RunLivenessState } from "@paperclipai/shared";
 import { withRecoveryModelProfileHint } from "./model-profile-hint.js";
+import { isStandingWakeChannelIssue } from "./standing-wake-channel.js";
 
 export const FINISH_SUCCESSFUL_RUN_HANDOFF_REASON = "finish_successful_run_handoff";
 export const SUCCESSFUL_RUN_MISSING_STATE_REASON = "successful_run_missing_state";
@@ -107,6 +108,7 @@ const SUCCESSFUL_RUN_HANDOFF_VALID_PATH_SKIP_REASONS = new Set([
   "open recovery issue owns the ambiguity",
   "issue is under an active pause hold",
   "corrective handoff wake already exists for this source run",
+  "standing wake channel is comment-driven; handoff suppressed",
 ]);
 
 export function isSuccessfulRunHandoffValidPathSkip(
@@ -483,6 +485,9 @@ export function decideSuccessfulRunHandoff(input: {
   }
   if (issue.assigneeUserId) return { kind: "skip", reason: "issue is human-owned" };
   if (issue.status !== "in_progress") return { kind: "skip", reason: `issue status ${issue.status} is a valid disposition` };
+  if (isStandingWakeChannelIssue(issue)) {
+    return { kind: "skip", reason: "standing wake channel is comment-driven; handoff suppressed" };
+  }
   if (issue.executionState) return { kind: "skip", reason: "issue has execution policy state" };
   if (agent.status === "paused" || agent.status === "terminated" || agent.status === "pending_approval") {
     return { kind: "skip", reason: `agent status ${agent.status} is not invokable` };
