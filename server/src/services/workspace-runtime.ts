@@ -1071,8 +1071,6 @@ async function inspectGitWorktreeBranchIncoherence(input: {
     cleanliness === "clean" &&
     expectedBranchExists &&
     input.actualBranchName === null &&
-    ancestryVerdict === "ancestor" &&
-    !sameHead &&
     registeredBranchMatchesHead;
   const eligible =
     canCheckoutRecordedBranch || canAdoptForwardActualBranch || canAttachRecordedBranchToDetachedHead;
@@ -1081,7 +1079,7 @@ async function inspectGitWorktreeBranchIncoherence(input: {
       ? "clean worktree and expected branch points at the current HEAD"
       : canAdoptForwardActualBranch
         ? "clean worktree and checked-out branch is forward of the recorded branch"
-        : "clean detached worktree HEAD is forward of the recorded branch"
+        : "clean detached worktree HEAD will be reattached to the recorded branch (cleanliness-only gate; forward containment not proven — see SPA-6039 tech debt 2026-09-03)"
     : cleanliness !== "clean"
       ? inProgressOperation
         ? `worktree is not clean and a git ${GIT_IN_PROGRESS_OPERATION_LABELS[inProgressOperation]} is in progress`
@@ -1112,6 +1110,7 @@ async function inspectGitWorktreeBranchIncoherence(input: {
     worktreePath: input.worktreePath,
     actualBranchName: input.actualBranchName,
   });
+  const incoherenceClass = input.actualBranchName === null ? "detached_head" as const : null;
 
   return {
     reason: GIT_WORKTREE_BRANCH_INCOHERENCE_REASON,
@@ -1124,6 +1123,7 @@ async function inspectGitWorktreeBranchIncoherence(input: {
     expectedBranch: input.expectedBranchName,
     actualBranch: input.actualBranchName,
     cleanliness,
+    incoherenceClass,
     inProgressOperation,
     statusEntryCount: statusLines?.length ?? null,
     dirtyPathSample,
@@ -1152,8 +1152,9 @@ async function inspectGitWorktreeBranchIncoherence(input: {
 }
 
 function branchIncoherenceValidationFailure(evidence: GitWorktreeBranchIncoherenceEvidence) {
+  const classLabel = evidence.incoherenceClass ? ` class (${evidence.incoherenceClass})` : "";
   return new WorkspaceRuntimeValidationFailure(
-    `Execution workspace git worktree expected branch "${evidence.expectedBranch}" but found "${formatBranchForMessage(evidence.actualBranch)}" at "${evidence.worktreePath}". Safe repair ${evidence.safeRepair.succeeded ? "succeeded" : "was not completed"}: ${evidence.safeRepair.reason}.`,
+    `Execution workspace git worktree expected branch "${evidence.expectedBranch}" but found "${formatBranchForMessage(evidence.actualBranch)}"${classLabel} at "${evidence.worktreePath}". Safe repair ${evidence.safeRepair.succeeded ? "succeeded" : "was not completed"}: ${evidence.safeRepair.reason}.`,
     {
       workspaceValidation: evidence,
     },
@@ -1924,11 +1925,23 @@ export async function ensureGitWorktreeBranchCoherent(input: {
     };
   }
 
+  // Detached-HEAD repair: reattach the recorded branch to HEAD when safe.
+  // SPA-5250 rebased in the worktree and left HEAD detached (ancestryVerdict
+  // === "diverged"), so the prior ancestor-gated reattach stayed inert and
+  // the card bounced. Per SPA-6039 spec: when the worktree is clean and HEAD
+  // is detached, reattach via `git checkout -B <expectedBranch> HEAD` and
+  // warn; dirty or not-on-remote keeps failing with class detached_head.
+  // 2026-09-03: gate is intentionally cleanliness-only. SPA-5250's rebase left
+  // HEAD diverged (amended commit, ancestryVerdict diverged) so an
+  // ancestor/origin containment gate would re-break the SPA-5250 fix. Rewind
+  // risk (clean detached HEAD behind recorded tip would move refs/heads
+  // backward via checkout -B) is accepted as low-likelihood tech debt for
+  // this scope; follow-up can add a 'not-behind' ancestry check when needed.
+  // Dirty/unknown still reject with class detached_head.
   if (
     currentBranch === null &&
-    evidence.provenance.ancestryVerdict === "ancestor" &&
-    !evidence.provenance.sameHead &&
-    evidence.provenance.actualHeadSha
+    evidence.provenance.actualHeadSha &&
+    evidence.cleanliness === "clean"
   ) {
     try {
       await recordGitOperation(input.recorder, {
@@ -1969,7 +1982,7 @@ export async function ensureGitWorktreeBranchCoherent(input: {
       branchName: expectedBranchName,
       reconciledForward: false,
       warnings: [
-        `${warningPrefix} The detached HEAD contained the recorded branch plus newer commits, so Paperclip moved the recorded branch to that HEAD.`,
+        `${warningPrefix} Paperclip moved the recorded branch to that HEAD (detached HEAD was clean; forward containment not proven).`,
       ],
     };
   }

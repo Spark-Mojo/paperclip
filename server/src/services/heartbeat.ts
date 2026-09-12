@@ -1764,6 +1764,33 @@ function readWorkspaceValidationPayloadFromRun(
   return parseObject(parseObject(run?.resultJson).workspaceValidation);
 }
 
+export function buildWorkspaceValidationRecoveryCommentText(
+  latestRun:
+    | Pick<typeof heartbeatRuns.$inferSelect, "error" | "errorCode" | "resultJson">
+    | null
+    | undefined,
+): string {
+  const failureSummary = summarizeRunFailureForIssueComment(latestRun);
+  const payload = readWorkspaceValidationPayloadFromRun(latestRun);
+  const validationReason = readNonEmptyString(payload.reason);
+  const incoherenceClass = readNonEmptyString((payload as Record<string, unknown>).incoherenceClass);
+  const classSuffix = incoherenceClass ? ` (failure class ${incoherenceClass})` : "";
+  if (validationReason === "git_worktree_base_materialization_failed") {
+    return (
+      "Paperclip stopped before launching the local adapter because the project workspace checkout could not be prepared " +
+      `(for example the repository clone failed).${failureSummary ?? ""} ` +
+      "Moving it to `blocked` with a source-scoped recovery action so the repository URL, clone access, or configured local cwd can be repaired before resuming."
+    );
+  }
+  return (
+    "Paperclip stopped before launching the local adapter because the issue workspace failed validation" +
+    classSuffix +
+    ". " +
+    `This prevents git-sensitive adapters from running in an unrelated fallback cwd.${failureSummary ?? ""} ` +
+    "Moving it to `blocked` with a source-scoped recovery action so the workspace link, cwd, or git checkout can be repaired before resuming."
+  );
+}
+
 function stableStringifyForFingerprint(value: unknown): string {
   if (Array.isArray(value)) {
     return `[${value.map((entry) => stableStringifyForFingerprint(entry)).join(",")}]`;
@@ -16371,22 +16398,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       | null
       | undefined;
   }) {
-    const failureSummary = summarizeRunFailureForIssueComment(input.latestRun);
-    const validationReason = readNonEmptyString(
-      readWorkspaceValidationPayloadFromRun(input.latestRun).reason,
-    );
-    if (validationReason === "git_worktree_base_materialization_failed") {
-      return (
-        "Paperclip stopped before launching the local adapter because the project workspace checkout could not be prepared " +
-        `(for example the repository clone failed).${failureSummary ?? ""} ` +
-        "Moving it to `blocked` with a source-scoped recovery action so the repository URL, clone access, or configured local cwd can be repaired before resuming."
-      );
-    }
-    return (
-      "Paperclip stopped before launching the local adapter because the issue workspace failed validation. " +
-      `This prevents git-sensitive adapters from running in an unrelated fallback cwd.${failureSummary ?? ""} ` +
-      "Moving it to `blocked` with a source-scoped recovery action so the workspace link, cwd, or git checkout can be repaired before resuming."
-    );
+    return buildWorkspaceValidationRecoveryCommentText(input.latestRun);
   }
 
   function buildConfigurationIncompleteRecoveryComment(input: {

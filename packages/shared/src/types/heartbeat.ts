@@ -12,6 +12,8 @@ export type GitWorktreeBranchAncestryVerdict = "ancestor" | "diverged" | "unknow
 
 export type GitWorktreeInProgressOperation = "rebase" | "merge" | "cherry_pick" | "revert" | "bisect";
 
+export type GitWorktreeIncoherenceClass = "detached_head";
+
 export interface GitWorktreeBranchIncoherenceEvidence {
   reason: "git_worktree_branch_incoherence";
   fingerprint: string;
@@ -23,6 +25,7 @@ export interface GitWorktreeBranchIncoherenceEvidence {
   expectedBranch: string;
   actualBranch: string | null;
   cleanliness: "clean" | "dirty" | "unknown";
+  incoherenceClass?: GitWorktreeIncoherenceClass | null;
   /**
    * Interrupted git operation (rebase/merge/cherry-pick/revert/bisect) whose
    * state directory is still present in the worktree. Optional so previously

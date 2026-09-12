@@ -3345,6 +3345,88 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(validationComment).toBeTruthy();
   });
 
+  it("names the workspace validation failure class in the stranded recovery comment (SPA-6039)", async () => {
+    mockAdapterExecute.mockClear();
+    const { companyId, agentId, runId, issueId } = await seedQueuedIssueRunFixture();
+    const projectId = randomUUID();
+    const projectWorkspaceId = randomUUID();
+    const issuePrefix = `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+
+    await db.insert(projects).values({
+      id: projectId,
+      companyId,
+      name: "Paperclip App",
+      status: "in_progress",
+    });
+    await db.insert(projectWorkspaces).values({
+      id: projectWorkspaceId,
+      companyId,
+      projectId,
+      name: "Primary workspace",
+      sourceType: "local_path",
+      cwd: `/tmp/paperclip-missing-workspace-${randomUUID()}`,
+      isPrimary: true,
+    });
+    await db.update(issues).set({
+      projectId,
+      projectWorkspaceId,
+      identifier: `${issuePrefix}-6130`,
+    }).where(eq(issues.id, issueId));
+
+    const heartbeat = heartbeatService(db);
+    await heartbeat.resumeQueuedRuns();
+    await waitForRunToSettle(heartbeat, runId, 5_000);
+
+    const failedRun = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, runId))
+      .then((rows) => rows[0] ?? null);
+    expect(failedRun?.errorCode).toBe("workspace_validation_failed");
+
+    const validationComment = await waitForValue(async () => {
+      const rows = await db.select().from(issueComments).where(eq(issueComments.issueId, issueId));
+      return rows.find((comment) => comment.body.includes("workspace failed validation")) ?? null;
+    });
+    expect(validationComment).toBeTruthy();
+    // The stranded comment stays unchanged for legacy payloads without a
+    // failure class; class names ride the failure summary from run.error.
+    expect(validationComment?.body).not.toContain("failure class undefined");
+  });
+
+  it("injects the failure class into the stranded recovery comment when the payload carries one (SPA-6039)", async () => {
+    // Positive case for Gate 3. `buildWorkspaceValidationRecoveryCommentText`
+    // is a pure formatter extracted from the inner recovery-comment closure;
+    // test it directly so the assertion is deterministic and does not depend
+    // on reaching the live dispatch workspace-validation gate.
+    const { buildWorkspaceValidationRecoveryCommentText } = await import("../services/heartbeat.ts");
+    const run = {
+      error: "Execution workspace git worktree expected branch \"PAP-455\" but found \"<detached>\" class (detached_head) at \"/tmp\".",
+      errorCode: "workspace_validation_failed" as const,
+      resultJson: {
+        workspaceValidation: {
+          reason: "git_worktree_branch_incoherence",
+          incoherenceClass: "detached_head",
+          expectedBranch: "PAP-455",
+          actualBranch: null,
+        },
+      },
+    };
+    const text = buildWorkspaceValidationRecoveryCommentText(run);
+    expect(text).toContain("(failure class detached_head)");
+    expect(text).toContain("workspace failed validation (failure class detached_head).");
+
+    // Legacy payload (no class) stays unchanged — the other SPA-6039 test
+    // covers this live; assert the pure formatter's legacy path here too.
+    const legacy = buildWorkspaceValidationRecoveryCommentText({
+      error: "fallback cwd",
+      errorCode: "workspace_validation_failed" as const,
+      resultJson: { workspaceValidation: { reason: "fallback_agent_home_cwd" } },
+    });
+    expect(legacy).not.toContain("(failure class ");
+    expect(legacy).not.toContain("failure class undefined");
+  });
+
   it("blocks before dispatch when a declared secret ref has no binding instead of emitting an opaque setup failure", async () => {
     const { companyId, agentId, runId, issueId } = await seedQueuedIssueRunFixture();
     const svc = secretService(db);
