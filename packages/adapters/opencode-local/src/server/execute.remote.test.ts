@@ -376,4 +376,134 @@ describe("opencode remote execution", () => {
     expect(call?.[2]).toContain("--session");
     expect(call?.[2]).toContain("session-123");
   });
+
+  it("retries with backoff when OpenCode dies on the shared-DB SQLite lock at startup (SPA-7226)", async () => {
+    const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-opencode-remote-db-lock-"));
+    cleanupDirs.push(rootDir);
+    const workspaceDir = path.join(rootDir, "workspace");
+    const managedRemoteWorkspace = "/remote/workspace/.paperclip-runtime/runs/run-ssh-db-lock/workspace";
+    await mkdir(workspaceDir, { recursive: true });
+
+    const failureStdout = [
+      JSON.stringify({
+        type: "error",
+        error: {
+          message: 'Failed query: insert into "project" ... (cause: SQLiteError: database is locked)',
+        },
+      }),
+      JSON.stringify({ type: "error", error: { message: "SQLiteError: database is locked" } }),
+    ].join("\n");
+    const successStdout = [
+      JSON.stringify({ type: "step_start", sessionID: "session_db_lock" }),
+      JSON.stringify({ type: "text", sessionID: "session_db_lock", part: { text: "hello after retry" } }),
+      JSON.stringify({
+        type: "step_finish",
+        sessionID: "session_db_lock",
+        part: { cost: 0.001, tokens: { input: 1, output: 1, reasoning: 0, cache: { read: 0, write: 0 } } },
+      }),
+    ].join("\n");
+
+    // Sequence: (1..n) `models` probes succeed, (2) first `run` dies on the
+    // shared-DB lock, (3) the retried `run` succeeds.
+    const defaultImpl = runChildProcess.getMockImplementation();
+    let runCallCount = 0;
+    runChildProcess.mockImplementation(async (_runId: string, _command: string, args: string[]) => {
+      if (args.includes("models")) {
+        return {
+          exitCode: 0,
+          signal: null,
+          timedOut: false,
+          stdout: "opencode/gpt-5-nano\n",
+          stderr: "",
+          pid: 9000,
+          startedAt: new Date().toISOString(),
+        };
+      }
+      runCallCount += 1;
+      if (runCallCount === 1) {
+        return {
+          exitCode: 1,
+          signal: null,
+          timedOut: false,
+          stdout: failureStdout,
+          stderr: "",
+          pid: 9001,
+          startedAt: new Date().toISOString(),
+        };
+      }
+      return {
+        exitCode: 0,
+        signal: null,
+        timedOut: false,
+        stdout: successStdout,
+        stderr: "",
+        pid: 9002,
+        startedAt: new Date().toISOString(),
+      };
+    });
+
+    const result = await execute({
+      runId: "run-ssh-db-lock",
+      agent: {
+        id: "agent-1",
+        companyId: "company-1",
+        name: "OpenCode Builder",
+        adapterType: "opencode_local",
+        adapterConfig: {},
+      },
+      runtime: {
+        sessionId: "session-db-lock",
+        sessionParams: {
+          sessionId: "session-db-lock",
+          cwd: managedRemoteWorkspace,
+          remoteExecution: {
+            transport: "ssh",
+            host: "127.0.0.1",
+            port: 2222,
+            username: "fixture",
+            remoteCwd: managedRemoteWorkspace,
+          },
+        },
+        sessionDisplayId: "session-db-lock",
+        taskKey: null,
+      },
+      config: {
+        command: "opencode",
+        model: "opencode/gpt-5-nano",
+      },
+      context: {
+        paperclipWorkspace: {
+          cwd: workspaceDir,
+          source: "project_primary",
+        },
+      },
+      executionTransport: {
+        remoteExecution: {
+          host: "127.0.0.1",
+          port: 2222,
+          username: "fixture",
+          remoteWorkspacePath: "/remote/workspace",
+          remoteCwd: "/remote/workspace",
+          privateKey: "PRIVATE KEY",
+          knownHosts: "[127.0.0.1]:2222 ssh-ed25519 AAAA",
+          strictHostKeyChecking: true,
+        },
+      },
+      onLog: async () => {},
+    });
+
+    if (defaultImpl) {
+      runChildProcess.mockImplementation(defaultImpl);
+    }
+    expect(result.errorMessage).toBeNull();
+    expect(result.sessionId).toBe("session_db_lock");
+    const runCalls = runChildProcess.mock.calls.filter(
+      (entry) => Array.isArray(entry[2]) && (entry[2] as string[]).includes("run"),
+    );
+    expect(runCalls).toHaveLength(2);
+    expect(runCalls[0]?.[2]).toContain("--session");
+    expect(runCalls[0]?.[2]).toContain("session-db-lock");
+    expect(runCalls[1]?.[2]).toContain("--session");
+    expect(runCalls[1]?.[2]).toContain("session-db-lock");
+  });
 });
