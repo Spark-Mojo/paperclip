@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { parseOpenCodeJsonl, isOpenCodeUnknownSessionError } from "./parse.js";
+import { parseOpenCodeJsonl, isOpenCodeUnknownSessionError, isOpenCodeTransientDbLockError } from "./parse.js";
 
 describe("parseOpenCodeJsonl", () => {
   it("parses assistant text, usage, cost, and errors", () => {
@@ -73,5 +73,16 @@ describe("parseOpenCodeJsonl", () => {
     expect(isOpenCodeUnknownSessionError("Session not found: s_123", "")).toBe(true);
     expect(isOpenCodeUnknownSessionError("", "unknown session id")).toBe(true);
     expect(isOpenCodeUnknownSessionError("all good", "")).toBe(false);
+  });
+
+  it("detects transient shared-DB SQLite lock errors (SPA-7226)", () => {
+    expect(
+      isOpenCodeTransientDbLockError(
+        'Failed query: insert into "project" on conflict do update',
+        "SQLiteError: database is locked (LockTimeoutError)",
+      ),
+    ).toBe(true);
+    expect(isOpenCodeTransientDbLockError(JSON.stringify({ type: "error", error: { message: "SQLiteError: database is locked" } }), "")).toBe(true);
+    expect(isOpenCodeTransientDbLockError("regular failure", "exit code 1")).toBe(false);
   });
 });
