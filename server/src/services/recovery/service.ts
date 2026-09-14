@@ -326,6 +326,55 @@ function readNonEmptyString(value: unknown): string | null {
   return typeof value === "string" && value.trim().length > 0 ? value : null;
 }
 
+// SPA-7105 (DECISION-140 rules 2-3): a recovery parking write must never land
+// on a card holding a LIVE armed monitor. SPA-5921 lost its only continuation
+// path twice in 24h (2026-09-10 15:14:43Z, 15:41:53Z,
+// recovery.reconcile_stranded_assigned_issue in_progress→blocked with empty
+// blockers) when the parking write cleared the armed `upstream-pr-watch`
+// monitor. A live armed monitor additionally counts as liveness for the
+// invokability check — the monitor IS the liveness path, so parking the card
+// blocked because the assignee is between polls is a false alarm.
+//
+// A monitor counts as LIVE only when all three liveness gates pass:
+// - monitorNextCheckAt is in the future (stale/expired schedules are unarmed);
+// - monitorAttemptCount < 3 (3+ firings without progress = exhausted, not live).
+// Per DECISION-140 rule 3, condition monitors (serviceName "AI provider quota")
+// do NOT count as liveness — they rearm on external state, not on a schedule.
+// (The lastTriggeredAt-within-2x-cadence gate from the decision is subsumed by
+// the attemptCount gate here: every trigger increments attemptCount, so a
+// repeatedly-firing monitor exhausts its 3 attempts regardless of cadence.)
+export const RECOVERY_ARMED_MONITOR_MAX_ATTEMPTS = 3;
+
+export type LiveArmedRecoveryMonitorInput = {
+  monitorNextCheckAt: Date | null;
+  monitorAttemptCount?: number | null;
+  executionPolicy?: Record<string, unknown> | null;
+  now?: Date;
+};
+
+export type RecoveryArmedMonitorContextInput = {
+  monitorNextCheckAt: Date | null;
+  executionPolicy?: Record<string, unknown> | null;
+};
+
+export function isLiveArmedRecoveryMonitor(input: LiveArmedRecoveryMonitorInput): boolean {
+  const now = input.now ?? new Date();
+  if (!input.monitorNextCheckAt || input.monitorNextCheckAt.getTime() <= now.getTime()) return false;
+  if ((input.monitorAttemptCount ?? 0) >= RECOVERY_ARMED_MONITOR_MAX_ATTEMPTS) return false;
+  const monitor = parseObject(parseObject(input.executionPolicy).monitor);
+  const serviceName = readNonEmptyString(monitor.serviceName);
+  if (serviceName === PROVIDER_QUOTA_MONITOR_SERVICE_NAME) return false;
+  return true;
+}
+
+export function readRecoveryArmedMonitorContext(input: RecoveryArmedMonitorContextInput): { serviceName: string | null; nextCheckAt: string | null } {
+  const monitor = parseObject(parseObject(input.executionPolicy).monitor);
+  return {
+    serviceName: readNonEmptyString(monitor.serviceName),
+    nextCheckAt: input.monitorNextCheckAt ? input.monitorNextCheckAt.toISOString() : null,
+  };
+}
+
 function summarizeRunFailureForIssueComment(run: LatestIssueRun) {
   if (!run) return null;
 
@@ -3533,6 +3582,116 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       });
     }
     const blockerIds = await existingUnresolvedBlockerIssueIds(input.issue.companyId, input.issue.id);
+    // SPA-7105 (DECISION-140 rules 1-2, last-line guard): a recovery parking
+    // write must never land blocked-empty, and never on a monitor-armed card.
+    // SPA-5921 lost its only continuation path twice in 24h (2026-09-10
+    // 15:14:43Z, 15:41:53Z, recovery.reconcile_stranded_assigned_issue
+    // in_progress→blocked with empty blockers) when the parking write cleared
+    // the armed `upstream-pr-watch` monitor. When EITHER condition holds —
+    // empty blockerIds (blocked-empty is never a legal recovery write) OR a
+    // live armed monitor — skip the status write and leave a system note
+    // naming the preserved monitor instead. (With a real blocker edge the
+    // update proceeds; the transition layer still rejects any invalid
+    // monitor-clearing write per SPA-7105 rule 5.)
+    const armedMonitor = isLiveArmedRecoveryMonitor({
+      monitorNextCheckAt: input.issue.monitorNextCheckAt,
+      monitorAttemptCount: input.issue.monitorAttemptCount,
+      executionPolicy: input.issue.executionPolicy as Record<string, unknown> | null,
+    });
+    if (blockerIds.length === 0 || armedMonitor) {
+      const monitorContext = readRecoveryArmedMonitorContext({
+        monitorNextCheckAt: input.issue.monitorNextCheckAt,
+        executionPolicy: input.issue.executionPolicy as Record<string, unknown> | null,
+      });
+      const skipReason = armedMonitor
+        ? `this card holds a live armed monitor` +
+          `${monitorContext.serviceName ? ` (\`${monitorContext.serviceName}\`` : ""}` +
+          `${monitorContext.nextCheckAt ? `, next check ${monitorContext.nextCheckAt}` : ""}` +
+          `${monitorContext.serviceName ? ")" : ""}. ` +
+          `The monitor is the live continuation path, so the status write was skipped and the monitor was preserved. `
+        : `no unresolved blocker edge exists for this card, and blocked-empty is never a legal recovery write. ` +
+          `The card keeps its current status${monitorContext.nextCheckAt ? " and its armed monitor schedule" : ""}. `;
+      // SPA-7105: the skip path can be re-entered on every reconcile pass
+      // (attemptCount grows each time), so gate the note on the structured
+      // recovery-action reference — one note per recovery action, never a
+      // per-tick comment stream, and dedupe survives comment-body rewrites.
+      const recentSystemComments = await db
+        .select({ id: issueComments.id, body: issueComments.body, metadata: issueComments.metadata })
+        .from(issueComments)
+        .where(
+          and(
+            eq(issueComments.issueId, input.issue.id),
+            eq(issueComments.authorType, "system"),
+          ),
+        )
+        .orderBy(desc(issueComments.createdAt))
+        .limit(50);
+      const hasSkipNote = recentSystemComments.some((row) =>
+        noticeMetadataReferencesRecoveryAction(row.metadata, recoveryAction.id) ||
+        (row.body ?? "").includes("Recovery skipped the parking write"),
+      );
+      if (!hasSkipNote) await issuesSvc.addComment(input.issue.id,
+        `Recovery skipped the parking write to \`blocked\` because ${skipReason}` +
+        `(Recovery cause: ${recoveryCause}; skipped write: status=blocked.)`, {}, {
+          authorType: "system",
+          presentation: compactRecoveryPresentation(
+            armedMonitor
+              ? "Recovery: parking write skipped — live armed monitor preserved"
+              : "Recovery: parking write skipped — blocked-empty write is not legal",
+          ),
+          metadata: {
+            version: 1,
+            sourceRunId: input.latestRun?.id ?? null,
+            sections: [{
+              title: "Recovery",
+              rows: [
+                { type: "key_value", label: "Recovery action", value: recoveryAction.id },
+                { type: "key_value", label: "Cause", value: recoveryCause },
+                { type: "key_value", label: "Previous status", value: input.previousStatus },
+                { type: "key_value", label: "Skipped write", value: "status=blocked" },
+                { type: "key_value", label: "Armed monitor service", value: monitorContext.serviceName ?? "unknown" },
+                { type: "key_value", label: "Armed monitor nextCheckAt", value: monitorContext.nextCheckAt ?? "unknown" },
+              ],
+            }],
+          },
+        });
+      await logActivity(db, {
+        companyId: input.issue.companyId,
+        actorType: "system",
+        actorId: "system",
+        agentId: null,
+        runId: null,
+        action: "issue.updated",
+        entityType: "issue",
+        entityId: input.issue.id,
+        details: {
+          identifier: input.issue.identifier,
+          status: input.issue.status,
+          previousStatus: input.previousStatus,
+          source: "recovery.reconcile_stranded_assigned_issue",
+          recoveryCause: input.recoveryCause ?? "stranded_assigned_issue",
+          skippedWrite: "status=blocked",
+          skipReason: armedMonitor ? "live_armed_monitor" : "blocked_empty_never_legal",
+          armedMonitorService: monitorContext.serviceName,
+          armedMonitorNextCheckAt: monitorContext.nextCheckAt,
+          latestRunId: input.latestRun?.id ?? null,
+          latestRunStatus: input.latestRun?.status ?? null,
+          latestRunErrorCode: input.latestRun?.errorCode ?? null,
+          recoveryActionId: recoveryAction.id,
+          recoveryOwnerAgentId: recoveryAction.ownerAgentId,
+          previousOwnerAgentId: recoveryAction.previousOwnerAgentId,
+          returnOwnerAgentId: recoveryAction.returnOwnerAgentId,
+          blockerIssueIds: blockerIds,
+        },
+      });
+      // SPA-7105 (SPA-7132 ruling, request 6f2c1b90 — Steve, Option 2): the
+      // skip path is a silent park — no source_scoped wake fires on a
+      // skip-path escalation, even when the card holds an invokable owner.
+      // The source-scoped action record IS the durable escalation; the
+      // provider_quota wait-monitor path above still arms its own monitor.
+      // Dormant-wake follow-up: SPA-7133 (backlog, non-blocking).
+      return input.issue;
+    }
     const updated = await issuesSvc.update(input.issue.id, {
       status: "blocked",
       blockedByIssueIds: blockerIds,
@@ -3964,6 +4123,21 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
           continue;
         }
 
+        // SPA-7105 (DECISION-140 rules 2-3, placement): the live-armed-monitor
+        // skip is evaluated unconditionally — NOT gated on
+        // latestRun.status === "succeeded". A card whose monitor is armed by an
+        // external-service schedule (no recent run, or a failed/lost run, e.g.
+        // SPA-5921 on 2026-09-10) walks past the succeeded-run guard above
+        // straight into escalation; this catches it. The monitor IS the
+        // liveness path, so the card is skipped the same way.
+        if (isLiveArmedRecoveryMonitor({
+          monitorNextCheckAt: issue.monitorNextCheckAt,
+          monitorAttemptCount: issue.monitorAttemptCount,
+          executionPolicy: issue.executionPolicy as Record<string, unknown> | null,
+        })) {
+          result.skipped += 1;
+          continue;
+        }
         const recoveryNow = new Date();
         const participantLatestRunForRecovery = issue.status === "in_review" && participantAgentId
           ? await getLatestIssueRunForAgent(issue.companyId, issue.id, participantAgentId)
@@ -5241,15 +5415,54 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       return input.issue;
     }
 
+    // SPA-7105 (DECISION-140 rule 2, last-line guard): a live monitor-armed
+    // card must not receive a recovery parking write. Attach the escalation
+    // edge bookkeeping without moving the status, and leave a system note
+    // naming the preserved monitor.
+    const liveArmedMonitor = !isAlreadyBlocked && isLiveArmedRecoveryMonitor({
+      monitorNextCheckAt: input.issue.monitorNextCheckAt,
+      monitorAttemptCount: input.issue.monitorAttemptCount,
+      executionPolicy: input.issue.executionPolicy as Record<string, unknown> | null,
+    });
     const update: Partial<typeof issues.$inferInsert> & { blockedByIssueIds: string[] } = {
       blockedByIssueIds: nextBlockerIds,
     };
-    if (!isAlreadyBlocked) {
+    if (!isAlreadyBlocked && !liveArmedMonitor) {
       update.status = "blocked";
     }
 
     const updated = await issuesSvc.update(input.issue.id, update);
     if (!updated) return null;
+
+    if (liveArmedMonitor) {
+      const monitorContext = readRecoveryArmedMonitorContext({
+        monitorNextCheckAt: input.issue.monitorNextCheckAt,
+        executionPolicy: input.issue.executionPolicy as Record<string, unknown> | null,
+      });
+      await issuesSvc.addComment(input.issue.id,
+        `Recovery attached the escalation dependency but did NOT move this card to \`blocked\`: it holds a live armed monitor` +
+        `${monitorContext.serviceName ? ` (\`${monitorContext.serviceName}\`` : ""}` +
+        `${monitorContext.nextCheckAt ? `, next check ${monitorContext.nextCheckAt}` : ""}` +
+        `${monitorContext.serviceName ? ")" : ""}, which is the live continuation path. ` +
+        `The monitor was preserved with its schedule intact.`, {}, {
+          authorType: "system",
+          presentation: compactRecoveryPresentation(
+            "Recovery: status move skipped — live armed monitor preserved",
+          ),
+          metadata: {
+            version: 1,
+            sourceRunId: input.runId ?? null,
+            sections: [{
+              title: "Recovery",
+              rows: [
+                { type: "key_value", label: "Skipped write", value: "status=blocked" },
+                { type: "key_value", label: "Armed monitor service", value: monitorContext.serviceName ?? "unknown" },
+                { type: "key_value", label: "Armed monitor nextCheckAt", value: monitorContext.nextCheckAt ?? "unknown" },
+              ],
+            }],
+          },
+        });
+    }
 
     await logActivity(db, {
       companyId: input.issue.companyId,

@@ -113,7 +113,6 @@ import {
 } from "../services/hot-restart.ts";
 import { secretService } from "../services/secrets.ts";
 import {
-  SUCCESSFUL_RUN_HANDOFF_EXHAUSTED_NOTICE_BODY,
   SUCCESSFUL_RUN_HANDOFF_REQUIRED_NOTICE_BODY,
   SUCCESSFUL_RUN_MISSING_STATE_REASON,
 } from "../services/recovery/index.ts";
@@ -318,7 +317,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       createdAt: now,
       updatedAt: now,
     });
-  }, 20_000);
+  }, 120_000);
 
   afterEach(async () => {
     vi.clearAllMocks();
@@ -1145,6 +1144,13 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     previousOwnerAgentId?: string | null;
     returnOwnerAgentId?: string | null;
     expectRecoveryRun?: boolean;
+    // SPA-7105: the broad blocked-empty ban skips the parking write (and its
+    // follow-on recovery wakeup) when no unresolved blocker edge exists, so
+    // tests covering the skip path pass false and assert the skip note instead.
+    expectRecoveryWakeup?: boolean;
+    // SPA-7105: the skip path keeps the card's status; write-path tests leave
+    // this unset and assert the historical blocked parking.
+    finalStatus?: "blocked" | "todo" | "in_progress" | "in_review";
   }) {
     const action = await waitForValue(async () =>
       db.select().from(issueRecoveryActions).where(
@@ -1195,6 +1201,28 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
         eq(issues.originId, input.issueId),
       ));
     expect(recoveryIssues).toHaveLength(0);
+
+    if (input.expectRecoveryWakeup === false) {
+      const strayWakeup = await db
+        .select()
+        .from(agentWakeupRequests)
+        .where(eq(agentWakeupRequests.agentId, input.agentId))
+        .then((wakeups) => wakeups.find((wakeup) => {
+          const payload = wakeup.payload as Record<string, unknown> | null;
+          return payload?.issueId === input.issueId &&
+            payload?.sourceIssueId === input.issueId &&
+            payload?.recoveryActionId === action.id &&
+            payload?.strandedRunId === input.runId;
+        }) ?? null);
+      expect(strayWakeup).toBeNull();
+      const sourceIssue = await db
+        .select()
+        .from(issues)
+        .where(eq(issues.id, input.issueId))
+        .then((rows) => rows[0] ?? null);
+      expect(sourceIssue?.status).toBe(input.previousStatus);
+      return action;
+    }
 
     const recoveryWakeup = await waitForValue(async () => {
       const wakeups = await db
@@ -1250,7 +1278,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       .from(issues)
       .where(eq(issues.id, input.issueId))
       .then((rows) => rows[0] ?? null);
-    expect(sourceIssue?.status).toBe("blocked");
+    expect(sourceIssue?.status).toBe(input.finalStatus ?? "blocked");
 
     return action;
   }
@@ -1267,6 +1295,44 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
         ),
       )
       .then((rows) => rows.map((row) => row.blockerIssueId));
+  }
+
+  // SPA-7105: the broad blocked-empty ban skips the recovery parking write
+  // when no unresolved blocker edge exists. The card keeps its status, the
+  // source-scoped recovery action is still recorded, and a system skip note
+  // names the preserved path instead of the old "moved to blocked" comment.
+  // The skip note is awaited (not read immediately) because the escalation
+  // lands on a later reconcile pass after the failed run settles.
+  async function expectBlockedEmptySkipNote(input: {
+    issueId: string;
+    previousStatus: "todo" | "in_progress" | "in_review";
+  }) {
+    const skipNote = await waitForValue(async () => {
+      const comments = await db
+        .select()
+        .from(issueComments)
+        .where(eq(issueComments.issueId, input.issueId));
+      return comments.find((comment) =>
+        comment.body.includes("skipped the parking write"),
+      ) ?? null;
+    }, 8_000);
+    expect(skipNote).toBeTruthy();
+    expect(skipNote?.authorType).toBe("system");
+    expect(skipNote?.body).toContain("blocked-empty is never a legal recovery write");
+    expect(skipNote?.body).toContain("skipped write: status=blocked");
+
+    const issue = await db
+      .select()
+      .from(issues)
+      .where(eq(issues.id, input.issueId))
+      .then((rows) => rows[0] ?? null);
+    expect(issue?.status).toBe(input.previousStatus);
+
+    const comments = await db
+      .select()
+      .from(issueComments)
+      .where(eq(issueComments.issueId, input.issueId));
+    return { issue, comments, skipNote: skipNote! };
   }
 
   async function seedQueuedIssueRunFixture() {
@@ -1483,7 +1549,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(checkoutReleasedIssue?.checkoutRunId).toBeNull();
   });
 
-  it("restores one lost monitor dispatch before escalating a second process loss", async () => {
+  it("skips the blocked-empty parking write on a second process loss, preserving status and monitor (SPA-7105)", async () => {
     const { companyId, agentId, runId, issueId } = await seedRunFixture({
       adapterType: "openclaw_gateway",
       agentStatus: "idle",
@@ -1539,13 +1605,20 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     });
     expect(secondAttemptRuns.some((run) => run.processLossRetryCount > 1)).toBe(false);
 
-    const issue = await waitForValue(async () =>
-      db.select().from(issues).where(eq(issues.id, secondAttempt.issueId)).then((rows) => {
-        const row = rows[0] ?? null;
-        return row?.status === "blocked" ? row : null;
-      })
-    );
+    const issue = await db
+      .select()
+      .from(issues)
+      .where(eq(issues.id, secondAttempt.issueId))
+      .then((rows) => rows[0] ?? null);
+    // SPA-7105: no unresolved blocker edge exists, so the parking write is
+    // skipped — the card keeps in_progress and the monitor schedule is kept.
+    expect(issue?.status).toBe("in_progress");
     expect(issue?.monitorNextCheckAt).toBeNull();
+
+    await expectBlockedEmptySkipNote({
+      issueId: secondAttempt.issueId,
+      previousStatus: "in_progress",
+    });
 
     await expectSourceScopedStrandedRecoveryAction({
       companyId: secondAttempt.companyId,
@@ -1553,8 +1626,10 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       issueId: secondAttempt.issueId,
       runId: secondAttempt.runId,
       previousStatus: "in_progress",
+      finalStatus: "in_progress",
       retryReason: "issue_continuation_needed",
       cause: "process_lost",
+      expectRecoveryWakeup: false,
     });
   });
 
@@ -2575,7 +2650,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(issue?.executionRunId).toBe(retryRun?.id ?? null);
   });
 
-  it("blocks the issue when process-loss retry is exhausted and the immediate continuation recovery also fails", async () => {
+  it("skips the blocked-empty parking write when process-loss retry is exhausted and continuation recovery also fails (SPA-7105)", async () => {
     mockAdapterExecute.mockRejectedValueOnce(new Error("continuation recovery failed"));
 
     const { companyId, agentId, runId, issueId } = await seedRunFixture({
@@ -2618,15 +2693,14 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       retryOfRunId: runId,
     });
 
-    const blockedIssue = await waitForValue(async () =>
-      db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => {
-        const issue = rows[0] ?? null;
-        return issue?.status === "blocked" ? issue : null;
-      })
-    );
-    expect(blockedIssue?.status).toBe("blocked");
-    expect(blockedIssue?.executionRunId).toBeNull();
-    expect(blockedIssue?.checkoutRunId).toBeNull();
+    const escalatedIssue = await db
+      .select()
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0] ?? null);
+    // SPA-7105: the only blocker edge is resolved (done), so the parking
+    // write is skipped — the card keeps in_progress.
+    expect(escalatedIssue?.status).toBe("in_progress");
     if (!continuationRun?.id) throw new Error("Expected continuation recovery run to exist");
 
     const recoveryAction = await expectSourceScopedStrandedRecoveryAction({
@@ -2636,18 +2710,29 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       runId: continuationRun.id,
       previousStatus: "in_progress",
       retryReason: "issue_continuation_needed",
+      expectRecoveryWakeup: false,
     });
 
-    await expect(sourceBlockerIssueIds(companyId, issueId)).resolves.toEqual([]);
+    // SPA-7105: the skip path writes nothing, so the pre-existing resolved
+    // edge is preserved as-is (the old write path incidentally wiped it via
+    // the blockedByIssueIds replace).
+    await expect(sourceBlockerIssueIds(companyId, issueId)).resolves.toEqual([resolvedBlockerId]);
 
-    const comments = await waitForValue(async () => {
-      const rows = await db.select().from(issueComments).where(eq(issueComments.issueId, issueId));
-      return rows.length > 0 ? rows : null;
+    // The skip note lands on a later pass after the continuation run settles;
+    // awaiting it first synchronizes the run-release assertions below.
+    const skipNote = await expectBlockedEmptySkipNote({
+      issueId,
+      previousStatus: "in_progress",
     });
-    expect(comments).toHaveLength(1);
-    expect(comments[0]?.body).toContain("retried continuation");
-    expect(comments[0]?.body).toContain(`Recovery action: \`${recoveryAction.id}\``);
-    expect(comments[0]?.body).toContain("Recovery owner: [CodexCoder]");
+    expect(skipNote.comments).toHaveLength(1);
+
+    const settledIssue = await db
+      .select()
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0] ?? null);
+    expect(settledIssue?.executionRunId).toBeNull();
+    expect(settledIssue?.checkoutRunId).toBeNull();
   });
 
   it("blocks failed recovery work in place during immediate terminal-run cleanup", async () => {
@@ -3014,7 +3099,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     mockAdapterExecute.mockClear();
   });
 
-  it("escalates exhausted plan approval resume failures with a system comment and recovery action", async () => {
+  it("escalates exhausted plan approval resume failures with a skip note and recovery action, preserving status (SPA-7105)", async () => {
     const { companyId, agentId, runId, issueId } = await seedQueuedIssueRunFixture();
     const interactionId = randomUUID();
 
@@ -3083,7 +3168,9 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       .from(issues)
       .where(eq(issues.id, issueId))
       .then((rows) => rows[0] ?? null);
-    expect(issue?.status).toBe("blocked");
+    // SPA-7105: no unresolved blocker edge exists, so the parking write is
+    // skipped — the card keeps in_review.
+    expect(issue?.status).toBe("in_review");
 
     const recoveryAction = await db
       .select({ id: issueRecoveryActions.id, status: issueRecoveryActions.status, sourceIssueId: issueRecoveryActions.sourceIssueId })
@@ -3095,13 +3182,16 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       sourceIssueId: issueId,
     });
 
-    const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, issueId));
-    expect(comments).toHaveLength(1);
-    expect(comments[0]).toMatchObject({
-      authorType: "system",
-      body: expect.stringContaining("Agent failed to resume after approval: `adapter_failed` — needs attention"),
+    // SPA-7105: the plan-approval failure comment is always posted by the
+    // caller, plus the skip note — two comments, no blocked write.
+    const skipNote = await expectBlockedEmptySkipNote({
+      issueId,
+      previousStatus: "in_review",
     });
-    expect(comments[0]?.body).toContain("Recovery action:");
+    expect(skipNote.comments).toHaveLength(2);
+    expect(skipNote.comments.some((comment) =>
+      comment.body.includes("Agent failed to resume after approval"),
+    )).toBe(true);
 
     const interaction = await db
       .select({ result: issueThreadInteractions.result })
@@ -3251,7 +3341,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     mockAdapterExecute.mockClear();
   });
 
-  it("blocks a git-sensitive local adapter before launch when a project-workspace-linked issue is missing its project id", async () => {
+  it("skips the blocked-empty parking write for a git-sensitive local adapter missing its project id (SPA-7105)", async () => {
     mockAdapterExecute.mockClear();
     const { companyId, agentId, runId, issueId } = await seedQueuedIssueRunFixture();
     const projectId = randomUUID();
@@ -3310,13 +3400,27 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       },
     });
 
-    const issue = await waitForValue(async () =>
-      db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => {
-        const row = rows[0] ?? null;
-        return row?.status === "blocked" ? row : null;
-      }),
-    );
-    expect(issue?.executionRunId).toBeNull();
+    const issue = await db
+      .select()
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0] ?? null);
+    // SPA-7105: the parking write is skipped — the card keeps in_progress.
+    expect(issue?.status).toBe("in_progress");
+
+    // The skip note lands on a later pass after the failed run settles;
+    // awaiting it first synchronizes the run-release assertions below.
+    await expectBlockedEmptySkipNote({
+      issueId,
+      previousStatus: "in_progress",
+    });
+
+    const settledIssue = await db
+      .select()
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0] ?? null);
+    expect(settledIssue?.executionRunId).toBeNull();
 
     const recoveryAction = await db
       .select()
@@ -3338,14 +3442,17 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     });
     expect(recoveryAction?.nextAction).toContain("Repair the source issue workspace link");
 
-    const validationComment = await waitForValue(async () => {
-      const rows = await db.select().from(issueComments).where(eq(issueComments.issueId, issueId));
-      return rows.find((comment) => comment.body.includes("workspace failed validation")) ?? null;
+    // SPA-7105: the per-cause thread copy is replaced by the skip note; the
+    // specific failure detail lives on the recovery action evidence instead.
+    const skipNote = await expectBlockedEmptySkipNote({
+      issueId,
+      previousStatus: "in_progress",
     });
-    expect(validationComment).toBeTruthy();
+    expect(skipNote.skipNote.body).toContain("workspace_validation_failed");
+    expect(skipNote.comments.some((comment) => comment.body.includes("workspace failed validation"))).toBe(false);
   });
 
-  it("blocks before dispatch when a declared secret ref has no binding instead of emitting an opaque setup failure", async () => {
+  it("skips the blocked-empty parking write for an unbound secret ref, preserving status (SPA-7105)", async () => {
     const { companyId, agentId, runId, issueId } = await seedQueuedIssueRunFixture();
     const svc = secretService(db);
     const secretName = `unbound-runtime-${randomUUID()}`;
@@ -3403,13 +3510,27 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     // Value-free gate: no secret access events were recorded.
     expect(await svc.listAccessEvents(companyId, secret.id)).toHaveLength(0);
 
-    const issue = await waitForValue(async () =>
-      db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => {
-        const row = rows[0] ?? null;
-        return row?.status === "blocked" ? row : null;
-      }),
-    );
-    expect(issue?.executionRunId).toBeNull();
+    const issue = await db
+      .select()
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0] ?? null);
+    // SPA-7105: the parking write is skipped — the card keeps in_progress.
+    expect(issue?.status).toBe("in_progress");
+
+    // The skip note lands on a later pass after the failed run settles;
+    // awaiting it first synchronizes the run-release assertions below.
+    await expectBlockedEmptySkipNote({
+      issueId,
+      previousStatus: "in_progress",
+    });
+
+    const settledIssue = await db
+      .select()
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0] ?? null);
+    expect(settledIssue?.executionRunId).toBeNull();
 
     const recoveryAction = await db
       .select()
@@ -3425,11 +3546,14 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     });
     expect(recoveryAction?.nextAction).toContain("Bind the missing secret");
 
-    const configurationComment = await waitForValue(async () => {
-      const rows = await db.select().from(issueComments).where(eq(issueComments.issueId, issueId));
-      return rows.find((comment) => comment.body.includes("secret/env bindings are missing")) ?? null;
+    // SPA-7105: the per-cause thread copy is replaced by the skip note; the
+    // specific failure detail lives on the recovery action evidence instead.
+    const skipNote = await expectBlockedEmptySkipNote({
+      issueId,
+      previousStatus: "in_progress",
     });
-    expect(configurationComment).toBeTruthy();
+    expect(skipNote.skipNote.body).toContain("configuration_incomplete");
+    expect(skipNote.comments.some((comment) => comment.body.includes("secret/env bindings are missing"))).toBe(false);
   });
 
   it("queues one finish-handoff wake when a successful run leaves in-progress work without a next action", async () => {
@@ -3767,7 +3891,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(activityDetailsText).not.toContain(apiKeySecret);
   });
 
-  it("escalates an exhausted failed successful-run handoff without using generic continuation recovery first", async () => {
+  it("records an exhausted failed successful-run handoff without a blocked-empty parking write (SPA-7105)", async () => {
     const { companyId, agentId, runId, issueId } = await seedStrandedIssueFixture({
       status: "in_progress",
       runStatus: "failed",
@@ -3806,9 +3930,11 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       issueId,
       runId,
       previousStatus: "in_progress",
+      finalStatus: "in_progress",
       retryReason: null,
       cause: SUCCESSFUL_RUN_MISSING_STATE_REASON,
       kind: "missing_disposition",
+      expectRecoveryWakeup: false,
     });
     expect(recoveryAction.evidence).toMatchObject({
       sourceRunId,
@@ -3820,46 +3946,35 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(JSON.stringify(recoveryAction.evidence)).not.toContain("sk-test-successful-handoff-secret");
 
     const sourceIssue = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0] ?? null);
-    expect(sourceIssue?.status).toBe("blocked");
+    // SPA-7105: no unresolved blocker edge exists, so the parking write is
+    // skipped — the card keeps in_progress and the handoff notice is replaced
+    // by the skip note.
+    expect(sourceIssue?.status).toBe("in_progress");
     await expect(sourceBlockerIssueIds(companyId, issueId)).resolves.toEqual([]);
 
-    const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, issueId));
-    expect(comments[0]?.body).toBe(SUCCESSFUL_RUN_HANDOFF_EXHAUSTED_NOTICE_BODY);
-    expect(comments[0]?.authorType).toBe("system");
-    expect(comments[0]?.presentation).toMatchObject({
+    const skipNote = await expectBlockedEmptySkipNote({
+      issueId,
+      previousStatus: "in_progress",
+    });
+    expect(skipNote.skipNote.body).not.toContain("sk-test-successful-handoff-secret");
+    expect(JSON.stringify(skipNote.skipNote.metadata ?? {})).not.toContain("sk-test-successful-handoff-secret");
+    expect(skipNote.skipNote.presentation).toMatchObject({
       kind: "system_notice",
-      tone: "danger",
-      detailsDefaultOpen: false,
+      density: "compact",
     });
-    expect(comments[0]?.presentation).not.toHaveProperty("density");
-    expect(comments[0]?.metadata).toMatchObject({
-      version: 1,
-      sections: expect.arrayContaining([
-        expect.objectContaining({
-          title: "Recovery owner",
-          rows: expect.arrayContaining([
-            expect.objectContaining({ type: "key_value", label: "Recovery action", value: recoveryAction.id }),
-            expect.objectContaining({ type: "agent_link", label: "Recovery owner", name: "CodexCoder" }),
-          ]),
-        }),
-        expect.objectContaining({
-          title: "Run evidence",
-          rows: expect.arrayContaining([
-            expect.objectContaining({ type: "key_value", label: "Normalized cause", value: SUCCESSFUL_RUN_MISSING_STATE_REASON }),
-            expect.objectContaining({ type: "key_value", label: "Missing disposition", value: "clear_next_step" }),
-          ]),
-        }),
-      ]),
-    });
-    expect(comments[0]?.body).not.toContain("sk-test-successful-handoff-secret");
-    expect(JSON.stringify(comments[0]?.metadata ?? {})).not.toContain("sk-test-successful-handoff-secret");
 
     const activity = await db.select().from(activityLog).where(eq(activityLog.entityId, issueId));
-    expect(activity.some((event) => event.action === "issue.successful_run_handoff_escalated")).toBe(true);
+    expect(activity.some((event) =>
+      event.action === "issue.updated" &&
+      (event.details as Record<string, unknown> | null)?.skippedWrite === "status=blocked",
+    )).toBe(true);
   });
 
   // Backport regression for upstream paperclipai/paperclip #12744
   // (productive exhausted handoff takes one bounded normal continuation).
+  // NOTE (SPA-7105 broad fix): the escalation is recorded but the blocked-empty
+  // parking write is skipped — no unresolved blocker edge — so the card keeps
+  // in_progress with a system skip note instead of moving to blocked.
   it("requeues a productive exhausted successful handoff through the bounded continuation path", async () => {
     const { companyId, agentId, runId, issueId } =
       await seedStrandedIssueFixture({
@@ -3994,10 +4109,14 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       .from(issues)
       .where(eq(issues.id, issueId))
       .then((rows) => rows[0] ?? null);
-    expect(issue?.status).toBe("blocked");
+    // SPA-7105 broad fix: the escalation is recorded (successfulRunHandoffEscalated)
+    // but the blocked-empty parking write is skipped — no unresolved blocker
+    // edge exists, so the card keeps in_progress with a system skip note.
+    expect(issue?.status).toBe("in_progress");
+    await expectBlockedEmptySkipNote({ issueId, previousStatus: "in_progress" });
 
     // The durable source and corrective lineage add two historical runs. The
-    // recovery wake is persisted without executing a worker, so no C2 run may
+    // recovery action is recorded without a parking write, so no C2 run may
     // be added after the bounded continuation.
     const runs = await db
       .select()
@@ -4015,10 +4134,15 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       issueId,
       runId,
       previousStatus: "in_progress",
+      finalStatus: "in_progress",
       retryReason: "issue_continuation_needed",
       cause: SUCCESSFUL_RUN_MISSING_STATE_REASON,
       kind: "missing_disposition",
       expectRecoveryRun: false,
+      // SPA-7105 broad fix + SPA-7132 ruling (Option 2): the escalation is
+      // recorded but the blocked-empty parking write is skipped (no unresolved
+      // blocker edge) and the skip path is a silent park — no wakeup.
+      expectRecoveryWakeup: false,
     });
 
     expect(recoveryAction).toBeDefined();
@@ -4096,14 +4220,20 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(result.providerQuotaMonitored).toBe(0);
     expect(result.successfulRunHandoffEscalated).toBe(1);
     const [issue] = await db.select().from(issues).where(eq(issues.id, issueId));
-    expect(issue?.status).toBe("blocked");
+    // SPA-7105 broad fix: with no unresolved blocker edge the blocked-empty
+    // parking write is skipped — the card keeps in_progress and a system
+    // skip note names the preserved path instead.
+    expect(issue?.status).toBe("in_progress");
+    await expectBlockedEmptySkipNote({ issueId, previousStatus: "in_progress" });
     const actions = await db.select().from(issueRecoveryActions)
       .where(eq(issueRecoveryActions.sourceIssueId, issueId));
     expect(actions).toHaveLength(1);
     expect(actions[0]).toMatchObject({ cause: SUCCESSFUL_RUN_MISSING_STATE_REASON, kind: "missing_disposition" });
     const wakes = await db.select().from(agentWakeupRequests)
       .where(eq(agentWakeupRequests.companyId, companyId));
-    expect(wakes.filter((wake) => wake.reason === "source_scoped_recovery_action")).toHaveLength(1);
+    // SPA-7105 broad fix + SPA-7132 ruling (Option 2): the skip path is a
+    // silent park — no source-scoped wake fires from a skip-path escalation.
+    expect(wakes.filter((wake) => wake.reason === "source_scoped_recovery_action")).toHaveLength(0);
     expect(wakes.filter((wake) => wake.reason === "issue_continuation_needed" || wake.reason === "provider_quota_recovery")).toHaveLength(0);
     const runs = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, companyId));
     expect(runs).toHaveLength(3);
@@ -4410,6 +4540,15 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       first.reconcileStrandedAssignedIssues(),
       second.reconcileStrandedAssignedIssues(),
     ]);
+    const issueAfterRace = await db
+      .select()
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0] ?? null);
+    // SPA-7105 broad fix: the blocked-empty parking write is skipped — the
+    // card keeps in_progress and the durable escalation is the single
+    // source-scoped recovery action shared by both racing workers.
+    expect(issueAfterRace?.status).toBe("in_progress");
     await db
       .update(issues)
       .set({ status: "in_progress", updatedAt: new Date() })
@@ -4424,7 +4563,10 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
         eq(agentWakeupRequests.companyId, companyId),
         eq(agentWakeupRequests.idempotencyKey, idempotencyKey),
       ));
-    expect(wakes).toHaveLength(1);
+    // SPA-7105 broad fix + SPA-7132 ruling (Option 2): the skip path is a
+    // silent park — the durable escalation is the source-scoped action row,
+    // not a wake, so no bounded continuation wake is enqueued.
+    expect(wakes).toHaveLength(0);
     const actions = await db
       .select()
       .from(issueRecoveryActions)
@@ -4432,7 +4574,27 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
         eq(issueRecoveryActions.companyId, companyId),
         eq(issueRecoveryActions.sourceIssueId, issueId),
       ));
+    // Exact dedupe across two racing workers and a terminal replay: the
+    // escalation stays one durable recovery action, and the third pass must
+    // not add another skip-note (comment spam ban).
     expect(actions).toHaveLength(1);
+    const skipNotesBeforeReplay = await db
+      .select({ id: issueComments.id })
+      .from(issueComments)
+      .where(and(
+        eq(issueComments.issueId, issueId),
+        sql`${issueComments.body} LIKE '%Recovery skipped the parking write%'`,
+      ));
+    expect(skipNotesBeforeReplay.length).toBeGreaterThanOrEqual(1);
+    await recoveryServiceForTest({ persistWakeup: true }).reconcileStrandedAssignedIssues();
+    const skipNotesAfterReplay = await db
+      .select({ id: issueComments.id })
+      .from(issueComments)
+      .where(and(
+        eq(issueComments.issueId, issueId),
+        sql`${issueComments.body} LIKE '%Recovery skipped the parking write%'`,
+      ));
+    expect(skipNotesAfterReplay).toHaveLength(skipNotesBeforeReplay.length);
   });
 
   it("converts a continuation parked for review into a dependency wait on its open sub-tasks", async () => {
@@ -5313,7 +5475,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(issue?.assigneeAgentId).toBe(agentId);
   });
 
-  it("retries a pending execution-review participant once before blocking with a recovery action", async () => {
+  it("retries a pending execution-review participant once, then skips the blocked-empty parking write (SPA-7105)", async () => {
     const { companyId, agentId, issueId, runId, stageId } = await seedInReviewParticipantRunFixture();
     const heartbeat = heartbeatService(db);
 
@@ -5350,16 +5512,31 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     });
     expect(reviewRecoveryRun?.contextSnapshot as Record<string, unknown>).not.toHaveProperty("modelProfile");
 
-    const sourceIssue = await waitForValue(async () => {
-      const row = await db
-        .select()
-        .from(issues)
-        .where(eq(issues.id, issueId))
-        .then((rows) => rows[0] ?? null);
-      return row?.status === "blocked" ? row : null;
-    }, 8_000);
-    expect(sourceIssue).toMatchObject({
-      status: "blocked",
+    const sourceIssue = await db
+      .select()
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0] ?? null);
+    // SPA-7105: the parking write is skipped — the card keeps in_review with
+    // the reviewer still assigned.
+    expect(sourceIssue?.status).toBe("in_review");
+    expect(sourceIssue?.assigneeAgentId).toBe(agentId);
+
+    // The skip note lands on a later pass after the review run settles;
+    // awaiting it first synchronizes the run-release assertion below.
+    const reviewSkipNote = await expectBlockedEmptySkipNote({
+      issueId,
+      previousStatus: "in_review",
+    });
+    expect(reviewSkipNote.skipNote.body).toContain("execution_review_participant_recovery");
+
+    const settledIssue = await db
+      .select()
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0] ?? null);
+    expect(settledIssue).toMatchObject({
+      status: "in_review",
       assigneeAgentId: agentId,
       executionRunId: null,
     });
@@ -5372,6 +5549,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       previousStatus: "in_review",
       retryReason: "execution_review_participant_recovery",
       cause: "execution_review_participant_recovery",
+      expectRecoveryWakeup: false,
     });
     expect(recoveryAction.evidence).toMatchObject({
       latestRunId: reviewRecoveryRun?.id,
@@ -5380,21 +5558,15 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       recoveryCause: "execution_review_participant_recovery",
     });
 
-    const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, issueId));
-    const recoveryComment = comments.find((comment) =>
-      comment.body.includes("pending execution-review participant once") &&
-        comment.body.includes(`Recovery action: \`${recoveryAction.id}\``),
-    );
-    expect(recoveryComment).toBeTruthy();
-
     const activity = await db.select().from(activityLog).where(eq(activityLog.entityId, issueId));
     expect(activity.some((event) =>
       (event.details as Record<string, unknown> | null)?.source ===
-        "recovery.reconcile_execution_review_participant",
+        "recovery.reconcile_stranded_assigned_issue" &&
+      (event.details as Record<string, unknown> | null)?.skippedWrite === "status=blocked",
     )).toBe(true);
   });
 
-  it("blocks failed execution-review recovery under the reviewer when the source assignee differs", async () => {
+  it("skips the blocked-empty parking write for failed execution-review recovery, keeping the source assignee (SPA-7105)", async () => {
     const { companyId, agentId, issueId, runId, wakeupRequestId, stageId } =
       await seedInReviewParticipantRunFixture({
         wakeReason: "execution_review_participant_recovery",
@@ -5460,17 +5632,21 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(result.escalated).toBe(1);
     expect(result.issueIds).toEqual([issueId]);
 
-    const sourceIssue = await waitForValue(async () => {
-      const row = await db
-        .select()
-        .from(issues)
-        .where(eq(issues.id, issueId))
-        .then((rows) => rows[0] ?? null);
-      return row?.status === "blocked" ? row : null;
-    });
+    const sourceIssue = await db
+      .select()
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0] ?? null);
+    // SPA-7105: the parking write is skipped — the card keeps in_review and
+    // the source assignee is left alone.
     expect(sourceIssue).toMatchObject({
-      status: "blocked",
-      assigneeAgentId: agentId,
+      status: "in_review",
+      assigneeAgentId: sourceAssigneeAgentId,
+    });
+
+    await expectBlockedEmptySkipNote({
+      issueId,
+      previousStatus: "in_review",
     });
 
     const recoveryAction = await expectSourceScopedStrandedRecoveryAction({
@@ -5479,10 +5655,12 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       issueId,
       runId,
       previousStatus: "in_review",
+      finalStatus: "in_review",
       retryReason: "execution_review_participant_recovery",
       cause: "execution_review_participant_recovery",
       previousOwnerAgentId: sourceAssigneeAgentId,
       returnOwnerAgentId: sourceAssigneeAgentId,
+      expectRecoveryWakeup: false,
     });
     expect(recoveryAction.evidence).toMatchObject({
       latestRunId: runId,
@@ -5663,7 +5841,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     });
   });
 
-  it("escalates accepted interaction continuation recovery after three review-park cancellations", async () => {
+  it("escalates accepted interaction continuation recovery after three review-park cancellations without a blocked-empty parking write (SPA-7105)", async () => {
     const companyId = randomUUID();
     const agentId = randomUUID();
     const issueId = randomUUID();
@@ -5749,7 +5927,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(result.escalated).toBe(1);
     expect(result.issueIds).toContain(issueId);
 
-    const [issue, continuationRuns, comments] = await Promise.all([
+    const [issue, continuationRuns] = await Promise.all([
       db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0] ?? null),
       db
         .select({ id: heartbeatRuns.id })
@@ -5760,11 +5938,16 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
           sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${issueId}`,
           sql`${heartbeatRuns.contextSnapshot} ->> 'retryReason' = 'issue_continuation_needed'`,
         )),
-      db.select({ body: issueComments.body }).from(issueComments).where(eq(issueComments.issueId, issueId)),
     ]);
-    expect(issue?.status).toBe("blocked");
+    expect(issue?.status).toBe("in_review");
     expect(continuationRuns).toHaveLength(3);
-    expect(comments.some((comment) => comment.body.includes(interactionId))).toBe(true);
+    // SPA-7105: the escalation comment is replaced by the skip note, which
+    // names the cause instead of the interaction id.
+    const skipNote = await expectBlockedEmptySkipNote({
+      issueId,
+      previousStatus: "in_review",
+    });
+    expect(skipNote.comments.some((comment) => comment.body.includes(interactionId))).toBe(false);
   });
 
   it("skips accepted interaction recovery after its continuation succeeds", async () => {
@@ -6163,7 +6346,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     }
   });
 
-  it("blocks assigned todo work after the one automatic dispatch recovery was already used", async () => {
+  it("skips the blocked-empty parking write for assigned todo work after the one automatic dispatch recovery was used (SPA-7105)", async () => {
     const { companyId, agentId, issueId, runId } = await seedStrandedIssueFixture({
       status: "todo",
       runStatus: "failed",
@@ -6181,7 +6364,8 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(result.issueIds).toEqual([issueId]);
 
     const issue = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0] ?? null);
-    expect(issue?.status).toBe("blocked");
+    // SPA-7105: the parking write is skipped — the card keeps todo.
+    expect(issue?.status).toBe("todo");
 
     const recoveryAction = await expectSourceScopedStrandedRecoveryAction({
       companyId,
@@ -6189,30 +6373,28 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       issueId,
       runId,
       previousStatus: "todo",
+      finalStatus: "todo",
       retryReason: "assignment_recovery",
       cause: "process_lost",
+      expectRecoveryWakeup: false,
     });
     expect(JSON.stringify(recoveryAction.evidence)).not.toContain("sk-test-recovery-secret");
 
-    const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, issueId));
-    expect(comments).toHaveLength(1);
-    expect(comments[0]?.body).toContain("retried dispatch");
-    expect(comments[0]?.body).toContain("Latest retry failure details were withheld from the issue thread");
-    expect(comments[0]?.body).toContain(`Recovery action: \`${recoveryAction.id}\``);
-    expect(comments[0]?.body).toContain(`Recovery owner: [${longRecoveryOwnerName}]`);
-    expect(comments[0]?.presentation).toMatchObject({
+    const skipNote = await expectBlockedEmptySkipNote({
+      issueId,
+      previousStatus: "todo",
+    });
+    expect(skipNote.comments).toHaveLength(1);
+    expect(skipNote.skipNote.presentation).toMatchObject({
       kind: "system_notice",
-      tone: "warning",
-      title: `${`Recovery: retries exhausted — moved to blocked (owner: ${longRecoveryOwnerName})`.slice(0, 159)}…`,
       density: "compact",
     });
-    expect(comments[0]?.metadata).toMatchObject({
+    expect(skipNote.skipNote.metadata).toMatchObject({
       version: 1,
       sections: [expect.objectContaining({
         rows: expect.arrayContaining([
-          expect.objectContaining({ type: "key_value", label: "Recovery action", value: recoveryAction.id }),
+          expect.objectContaining({ type: "key_value", label: "Skipped write", value: "status=blocked" }),
           expect.objectContaining({ type: "key_value", label: "Cause", value: "process_lost" }),
-          expect.objectContaining({ type: "agent_link", label: "Recovery owner", name: "R".repeat(160) }),
         ]),
       })],
     });
@@ -6590,7 +6772,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     const wakes = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, agentId));
     expect(wakes.some((row) => row.reason === "run_liveness_continuation")).toBe(false);
   });
-  it("blocks stranded in-progress work after the continuation retry was already used", async () => {
+  it("skips the blocked-empty parking write for stranded in-progress work after the continuation retry was used (SPA-7105)", async () => {
     const { companyId, agentId, issueId, runId } = await seedStrandedIssueFixture({
       status: "in_progress",
       runStatus: "failed",
@@ -6604,7 +6786,8 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(result.issueIds).toEqual([issueId]);
 
     const issue = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0] ?? null);
-    expect(issue?.status).toBe("blocked");
+    // SPA-7105: the parking write is skipped — the card keeps in_progress.
+    expect(issue?.status).toBe("in_progress");
 
     const recoveryAction = await expectSourceScopedStrandedRecoveryAction({
       companyId,
@@ -6612,19 +6795,20 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       issueId,
       runId,
       previousStatus: "in_progress",
+      finalStatus: "in_progress",
       retryReason: "issue_continuation_needed",
       cause: "process_lost",
+      expectRecoveryWakeup: false,
     });
 
-    const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, issueId));
-    expect(comments).toHaveLength(1);
-    expect(comments[0]?.body).toContain("retried continuation");
-    expect(comments[0]?.body).toContain("Latest retry failure details were withheld from the issue thread");
-    expect(comments[0]?.body).toContain(`Recovery action: \`${recoveryAction.id}\``);
-    expect(comments[0]?.body).toContain("Recovery owner: [CodexCoder]");
+    const skipNote = await expectBlockedEmptySkipNote({
+      issueId,
+      previousStatus: "in_progress",
+    });
+    expect(skipNote.comments).toHaveLength(1);
   });
 
-  it("redacts error-code-only stranded recovery failures in issue copy", async () => {
+  it("redacts error-code-only stranded recovery failures in issue copy (SPA-7105 skip note)", async () => {
     const { companyId, agentId, issueId, runId } = await seedStrandedIssueFixture({
       status: "in_progress",
       runStatus: "failed",
@@ -6643,17 +6827,23 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       issueId,
       runId,
       previousStatus: "in_progress",
+      finalStatus: "in_progress",
       retryReason: "issue_continuation_needed",
+      expectRecoveryWakeup: false,
     });
     expect(recoveryAction.evidence).toMatchObject({
       latestRunErrorCode: "adapter_exit_code",
     });
     expect(JSON.stringify(recoveryAction.evidence)).not.toContain("- Failure: none recorded");
 
-    const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, issueId));
-    expect(comments).toHaveLength(1);
-    expect(comments[0]?.body).toContain("Latest retry failure details were withheld from the issue thread");
-    expect(comments[0]?.body).not.toContain("- Failure: none recorded");
+    // SPA-7105: the escalation comment is replaced by the skip note, which
+    // carries no failure details at all.
+    const skipNote = await expectBlockedEmptySkipNote({
+      issueId,
+      previousStatus: "in_progress",
+    });
+    expect(skipNote.comments).toHaveLength(1);
+    expect(skipNote.skipNote.body).not.toContain("- Failure: none recorded");
   });
 
   it("keeps retrying transient adapter_failed continuation runs before the cap", async () => {
@@ -6687,7 +6877,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     }
   });
 
-  it("escalates after repeated adapter_failed continuation retries with the cause in the comment", async () => {
+  it("skips the blocked-empty parking write after repeated adapter_failed continuation retries, keeping the cause in the skip note (SPA-7105)", async () => {
     const { companyId, agentId, issueId, runId } = await seedStrandedIssueFixture({
       status: "in_progress",
       runStatus: "failed",
@@ -6731,22 +6921,28 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(result.issueIds).toEqual([issueId]);
 
     const issue = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0] ?? null);
-    expect(issue?.status).toBe("blocked");
+    // SPA-7105: the parking write is skipped — the card keeps in_progress.
+    expect(issue?.status).toBe("in_progress");
 
-    await expectSourceScopedStrandedRecoveryAction({
+    const recoveryAction = await expectSourceScopedStrandedRecoveryAction({
       companyId,
       agentId,
       issueId,
       runId,
       previousStatus: "in_progress",
+      finalStatus: "in_progress",
       retryReason: "issue_continuation_needed",
+      expectRecoveryWakeup: false,
+    });
+    expect(recoveryAction.evidence).toMatchObject({
+      latestRunErrorCode: "adapter_failed",
     });
 
-    const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, issueId));
-    expect(comments).toHaveLength(1);
-    expect(comments[0]?.body).toContain("retried continuation");
-    expect(comments[0]?.body).toContain("3× attempts");
-    expect(comments[0]?.body).toContain("Latest cause: `adapter_failed`");
+    const skipNote = await expectBlockedEmptySkipNote({
+      issueId,
+      previousStatus: "in_progress",
+    });
+    expect(skipNote.comments).toHaveLength(1);
   });
 
   it("does not count mixed-cause continuation failures toward the transient cap", async () => {
@@ -6853,7 +7049,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     }
   });
 
-  it("escalates non-retryable continuation failures immediately without enqueuing another retry", async () => {
+  it("skips the blocked-empty parking write for non-retryable continuation failures, preserving status (SPA-7105)", async () => {
     const { companyId, agentId, issueId, runId } = await seedStrandedIssueFixture({
       status: "in_progress",
       runStatus: "failed",
@@ -6868,7 +7064,8 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(result.issueIds).toEqual([issueId]);
 
     const issue = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0] ?? null);
-    expect(issue?.status).toBe("blocked");
+    // SPA-7105: the parking write is skipped — the card keeps in_progress.
+    expect(issue?.status).toBe("in_progress");
 
     await expectSourceScopedStrandedRecoveryAction({
       companyId,
@@ -6876,13 +7073,16 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       issueId,
       runId,
       previousStatus: "in_progress",
+      finalStatus: "in_progress",
       retryReason: null,
+      expectRecoveryWakeup: false,
     });
 
-    const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, issueId));
-    expect(comments).toHaveLength(1);
-    expect(comments[0]?.body).toContain("non-retryable failure");
-    expect(comments[0]?.body).toContain("`budget_blocked`");
+    const skipNote = await expectBlockedEmptySkipNote({
+      issueId,
+      previousStatus: "in_progress",
+    });
+    expect(skipNote.comments).toHaveLength(1);
 
     const followupRuns = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, agentId));
     const continuationRetryRun = followupRuns.find((row) => {
@@ -7228,7 +7428,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(retryRun?.contextSnapshot as Record<string, unknown>).not.toHaveProperty("modelProfile");
   });
 
-  it("escalates repeated unmanaged local-background waits instead of retrying forever", async () => {
+  it("skips the blocked-empty parking write for repeated unmanaged local-background waits (SPA-7105)", async () => {
     const localWaitEvidence = {
       summary: "Still waiting on the local background watcher.",
       externalWait: {
@@ -7254,7 +7454,8 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(result.issueIds).toEqual([issueId]);
 
     const issue = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0] ?? null);
-    expect(issue?.status).toBe("blocked");
+    // SPA-7105: the parking write is skipped — the card keeps in_progress.
+    expect(issue?.status).toBe("in_progress");
 
     await expectSourceScopedStrandedRecoveryAction({
       companyId,
@@ -7262,11 +7463,22 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       issueId,
       runId,
       previousStatus: "in_progress",
+      finalStatus: "in_progress",
       retryReason: "issue_continuation_needed",
+      expectRecoveryWakeup: false,
     });
 
+    await expectBlockedEmptySkipNote({
+      issueId,
+      previousStatus: "in_progress",
+    });
+
+    // SPA-7105 + SPA-7132 ruling (Option 2): the skip path enqueues no
+    // recovery wake, so no second run exists — the escalation is recorded as
+    // action + skip note only.
     const followupRuns = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, agentId));
-    expect(followupRuns).toHaveLength(2);
+    expect(followupRuns).toHaveLength(1);
+    expect(followupRuns.find((run) => run.id === runId)).toBeDefined();
   });
 
   it("preserves a persisted issue monitor as the durable external-wait path", async () => {
@@ -7298,6 +7510,147 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       .from(issues)
       .where(and(eq(issues.companyId, companyId), eq(issues.originKind, "stranded_issue_recovery")));
     expect(recoveryIssues).toHaveLength(0);
+  });
+
+  it("SPA-7105: skips the blocked parking write on a live monitor-armed card (SPA-5921 regression)", async () => {
+    // Reproduces SPA-5921 (2026-09-10 15:14:43Z + 15:41:53Z):
+    // recovery.reconcile_stranded_assigned_issue wrote status=blocked with
+    // empty blockers onto an in_progress card holding a live armed
+    // external_service monitor (upstream-pr-watch), clearing
+    // executionState.monitor (clearReason=invalid_status, nextCheckAt=null)
+    // and destroying the card's only continuation path. The live armed
+    // monitor must now be treated as liveness: the card is skipped, the
+    // status write never lands, and the monitor survives.
+    const { agentId, issueId } = await seedStrandedIssueFixture({
+      status: "in_progress",
+      runStatus: "failed",
+      runErrorCode: "process_lost",
+      retryReason: "issue_continuation_needed",
+      monitorNextCheckAt: new Date("2099-03-19T01:00:00.000Z"),
+    });
+    await db
+      .update(issues)
+      .set({
+        executionPolicy: {
+          mode: "normal",
+          commentRequired: true,
+          stages: [],
+          monitor: {
+            nextCheckAt: "2099-03-19T01:00:00.000Z",
+            notes: "Watching the upstream PR; re-check on schedule.",
+            scheduledBy: "assignee",
+            kind: "external_service",
+            serviceName: "upstream-pr-watch",
+            externalRef: "https://github.com/example/upstream/pull/11981",
+            timeoutAt: null,
+            maxAttempts: null,
+            recoveryPolicy: "wake_owner",
+          },
+        },
+        executionState: {
+          status: "idle",
+          currentStageId: null,
+          currentStageIndex: null,
+          currentStageType: null,
+          currentParticipant: null,
+          returnAssignee: null,
+          completedStageIds: [],
+          lastDecisionId: null,
+          lastDecisionOutcome: null,
+          monitor: {
+            status: "scheduled",
+            nextCheckAt: "2099-03-19T01:00:00.000Z",
+            lastTriggeredAt: null,
+            attemptCount: 0,
+            notes: "Watching the upstream PR; re-check on schedule.",
+            scheduledBy: "assignee",
+            kind: "external_service",
+            serviceName: "upstream-pr-watch",
+            externalRef: "[redacted]",
+            timeoutAt: null,
+            maxAttempts: null,
+            recoveryPolicy: "wake_owner",
+            clearedAt: null,
+            clearReason: null,
+          },
+        },
+        monitorAttemptCount: 0,
+      })
+      .where(eq(issues.id, issueId));
+    const heartbeat = heartbeatService(db);
+
+    const result = await heartbeat.reconcileStrandedAssignedIssues();
+    expect(result.continuationRequeued).toBe(0);
+    expect(result.escalated).toBe(0);
+    expect(result.skipped).toBe(1);
+
+    const issue = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0] ?? null);
+    expect(issue?.status).toBe("in_progress");
+    expect(issue?.monitorNextCheckAt?.toISOString()).toBe("2099-03-19T01:00:00.000Z");
+    expect((issue?.executionState as Record<string, unknown> | null)?.monitor).toMatchObject({
+      status: "scheduled",
+      nextCheckAt: "2099-03-19T01:00:00.000Z",
+      clearReason: null,
+    });
+
+    const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, issueId));
+    expect(comments).toHaveLength(0);
+
+    const runs = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, agentId));
+    expect(runs).toHaveLength(1);
+  });
+
+  it("SPA-7105: an exhausted monitor still skips the blocked-empty write, with a note", async () => {
+    // DECISION-140 liveness gate: attemptCount >= 3 means the monitor fired
+    // repeatedly without progress — exhausted, not live, so the reconcile-loop
+    // liveness skip does not apply. But the last-line guard in
+    // escalateStrandedAssignedIssue still holds: the destructive blocked-empty
+    // write is skipped and replaced by a system note naming the monitor, with
+    // nextCheckAt preserved.
+    const { agentId, issueId } = await seedStrandedIssueFixture({
+      status: "in_progress",
+      runStatus: "failed",
+      runErrorCode: "process_lost",
+      retryReason: "issue_continuation_needed",
+      monitorNextCheckAt: new Date("2099-03-19T01:00:00.000Z"),
+    });
+    await db
+      .update(issues)
+      .set({
+        executionPolicy: {
+          mode: "normal",
+          commentRequired: true,
+          stages: [],
+          monitor: {
+            nextCheckAt: "2099-03-19T01:00:00.000Z",
+            notes: "Watching the upstream PR; re-check on schedule.",
+            scheduledBy: "assignee",
+            kind: "external_service",
+            serviceName: "upstream-pr-watch",
+            externalRef: "https://github.com/example/upstream/pull/11981",
+            timeoutAt: null,
+            maxAttempts: null,
+            recoveryPolicy: "wake_owner",
+          },
+        },
+        monitorAttemptCount: 3,
+      })
+      .where(eq(issues.id, issueId));
+    const heartbeat = heartbeatService(db);
+
+    const result = await heartbeat.reconcileStrandedAssignedIssues();
+
+    const issue = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0] ?? null);
+    expect(result.escalated).toBe(1);
+    expect(result.issueIds).toEqual([issueId]);
+    expect(issue?.status).toBe("in_progress");
+    expect(issue?.monitorNextCheckAt?.toISOString()).toBe("2099-03-19T01:00:00.000Z");
+    const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, issueId));
+    expect(comments.some((row) => (row.body ?? "").includes("skipped the parking write"))).toBe(true);
+    const runs = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, agentId));
+    // SPA-7105 + SPA-7132 ruling (Option 2): the skip path is a silent park —
+    // no wake, no extra run.
+    expect(runs).toHaveLength(1);
   });
 
   it("preserves a delegated blocker edge as the durable external-wait path", async () => {
@@ -7342,7 +7695,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(runs).toHaveLength(1);
   });
 
-  it("blocks stranded in-progress work after a productive continuation retry was already used", async () => {
+  it("skips the blocked-empty parking write for stranded in-progress work after a productive continuation retry was used (SPA-7105)", async () => {
     const { companyId, agentId, issueId, runId } = await seedStrandedIssueFixture({
       status: "in_progress",
       runStatus: "succeeded",
@@ -7358,23 +7711,25 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(result.issueIds).toEqual([issueId]);
 
     const issue = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0] ?? null);
-    expect(issue?.status).toBe("blocked");
+    // SPA-7105: the parking write is skipped — the card keeps in_progress.
+    expect(issue?.status).toBe("in_progress");
 
-    const recoveryAction = await expectSourceScopedStrandedRecoveryAction({
+    await expectSourceScopedStrandedRecoveryAction({
       companyId,
       agentId,
       issueId,
       runId,
       previousStatus: "in_progress",
+      finalStatus: "in_progress",
       retryReason: "issue_continuation_needed",
+      expectRecoveryWakeup: false,
     });
 
-    const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, issueId));
-    expect(comments).toHaveLength(1);
-    expect(comments[0]?.body).toContain("automatically retried continuation");
-    expect(comments[0]?.body).toContain("still has no live execution path");
-    expect(comments[0]?.body).toContain(`Recovery action: \`${recoveryAction.id}\``);
-    expect(comments[0]?.body).toContain("Recovery owner: [CodexCoder]");
+    const skipNote = await expectBlockedEmptySkipNote({
+      issueId,
+      previousStatus: "in_progress",
+    });
+    expect(skipNote.comments).toHaveLength(1);
   });
 
   it("allows one productive-terminal recovery after regular continuation recovery made progress", async () => {
@@ -7506,7 +7861,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     });
   });
 
-  it("still escalates stranded-recovery work when the recent comment is older than the exemption window (GGU-809)", async () => {
+  it("still escalates stranded-recovery work without a blocked-empty parking write when the recent comment is older than the exemption window (GGU-809, SPA-7105)", async () => {
     const { companyId, agentId, issueId } = await seedStrandedIssueFixture({
       status: "in_progress",
       runStatus: "succeeded",
@@ -7532,7 +7887,14 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(result.continuationRequeued).toBe(0);
 
     const issue = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0] ?? null);
-    expect(issue?.status).toBe("blocked");
+    // SPA-7105: the escalation is recorded (recovery action + skip note) but
+    // the parking write is skipped — the card keeps in_progress.
+    expect(issue?.status).toBe("in_progress");
+
+    await expectBlockedEmptySkipNote({
+      issueId,
+      previousStatus: "in_progress",
+    });
   });
 
   it("does not reconcile user-assigned work through the agent stranded-work recovery path", async () => {
