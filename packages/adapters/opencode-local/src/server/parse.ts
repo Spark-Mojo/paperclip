@@ -107,8 +107,10 @@ export function isOpenCodeUnknownSessionError(stdout: string, stderr: string): b
 // produces any output. That failure is transient — a few seconds of backoff
 // is enough for the burst to drain — so the adapter retries instead of
 // failing the whole run.
+// detects the shared-DB lock error class only (not other SQLite errors) —
+// opencode's own internal failures on a plain I/O error should not be retried.
 export function isOpenCodeTransientDbLockError(stdout: string, stderr: string): boolean {
   const haystack = `${stdout}\n${stderr}`;
-  return /database\s+is\s+locked|SQLiteError|LockTimeoutError|SQLITE_BUSY/i.test(haystack);
+  return /database\s+is\s+locked|LockTimeoutError|SQLITE_BUSY/i.test(haystack);
 }
 
