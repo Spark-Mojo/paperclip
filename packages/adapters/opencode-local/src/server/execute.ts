@@ -720,7 +720,12 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       // any output. That is transient contention — wait a few seconds and retry
       // the same session instead of failing the whole run.
       if (initialFailed && isOpenCodeTransientDbLockError(initial.proc.stdout, initial.rawStderr)) {
-        const lockRetryDelaysMs = [2_000, 6_000];
+        // Base delays get ±25% jitter: fleet wakes are correlated (board dispatch
+        // storms), and colliding processes re-collide at identical offsets.
+        const lockRetryDelaysMs = [2_000, 6_000].map((baseMs) => {
+          const jitterFactor = 1 + (Math.random() * 0.5 - 0.25);
+          return Math.round(baseMs * jitterFactor);
+        });
         let lockRetryAttempt = initial;
         for (let attemptIndex = 0; attemptIndex < lockRetryDelaysMs.length; attemptIndex++) {
           const delayMs = lockRetryDelaysMs[attemptIndex];
