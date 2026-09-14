@@ -603,7 +603,7 @@ describeEmbeddedPostgres("stalled review decision routes", () => {
     });
     const stageId = randomUUID();
     const approvalStageId = randomUUID();
-    await db.update(agents).set({ status: "paused" }).where(eq(agents.id, reviewerAgentId));
+    await db.update(agents).set({ status: "paused", pausedAt: new Date("2026-09-14T00:00:00Z") }).where(eq(agents.id, reviewerAgentId));
     await db.update(issues).set({
       executionPolicy: {
         mode: "normal",
@@ -679,7 +679,7 @@ describeEmbeddedPostgres("stalled review decision routes", () => {
       reviewPolicy: "not_creator",
     });
     const stageId = randomUUID();
-    await db.update(agents).set({ status: "paused" }).where(eq(agents.id, reviewerAgentId));
+    await db.update(agents).set({ status: "paused", pausedAt: new Date("2026-09-14T00:00:00Z") }).where(eq(agents.id, reviewerAgentId));
     await db.insert(activityLog).values({
       companyId: seeded.companyId,
       actorType: "user",
@@ -764,7 +764,7 @@ describeEmbeddedPostgres("stalled review decision routes", () => {
     // execution path, i.e. `covered`). This matches SPA-6171, where Argus
     // owned the stage but nothing could wake them. The route admits the
     // reviewer on stage configuration alone, not invokability.
-    await db.update(agents).set({ status: "paused" }).where(eq(agents.id, reviewerAgentId));
+    await db.update(agents).set({ status: "paused", pausedAt: new Date("2026-09-14T00:00:00Z") }).where(eq(agents.id, reviewerAgentId));
     await db.update(issues).set({
       executionPolicy: {
         mode: "normal",
@@ -856,7 +856,7 @@ describeEmbeddedPostgres("stalled review decision routes", () => {
       identifier: "NPA-1",
     });
     const stageId = randomUUID();
-    await db.update(agents).set({ status: "paused" }).where(eq(agents.id, reviewerAgentId));
+    await db.update(agents).set({ status: "paused", pausedAt: new Date("2026-09-14T00:00:00Z") }).where(eq(agents.id, reviewerAgentId));
     await db.update(issues).set({
       executionPolicy: {
         mode: "normal",
@@ -916,6 +916,7 @@ describeEmbeddedPostgres("stalled review decision routes", () => {
     const stageId = randomUUID();
     await db.update(agents).set({
       status: "paused",
+      pausedAt: new Date("2026-09-14T00:00:00Z"),
       permissions: {
         trustPreset: LOW_TRUST_REVIEW_PRESET,
         authorizationPolicy: {
@@ -985,7 +986,7 @@ describeEmbeddedPostgres("stalled review decision routes", () => {
       status: "todo",
     });
     const stageId = randomUUID();
-    await db.update(agents).set({ status: "paused" }).where(eq(agents.id, reviewerAgentId));
+    await db.update(agents).set({ status: "paused", pausedAt: new Date("2026-09-14T00:00:00Z") }).where(eq(agents.id, reviewerAgentId));
     await db.update(issues).set({
       executionPolicy: {
         mode: "normal",
@@ -1058,7 +1059,7 @@ describeEmbeddedPostgres("stalled review decision routes", () => {
     });
     const reviewStageId = randomUUID();
     const approvalStageId = randomUUID();
-    await db.update(agents).set({ status: "paused" }).where(eq(agents.id, reviewerAgentId));
+    await db.update(agents).set({ status: "paused", pausedAt: new Date("2026-09-14T00:00:00Z") }).where(eq(agents.id, reviewerAgentId));
     await db.update(issues).set({
       executionPolicy: {
         mode: "normal",
@@ -1166,7 +1167,7 @@ describeEmbeddedPostgres("stalled review decision routes", () => {
       identifier: "RTN-1",
     });
     const stageId = randomUUID();
-    await db.update(agents).set({ status: "paused" }).where(eq(agents.id, reviewerAgentId));
+    await db.update(agents).set({ status: "paused", pausedAt: new Date("2026-09-14T00:00:00Z") }).where(eq(agents.id, reviewerAgentId));
     await db.update(issues).set({
       executionPolicy: {
         mode: "normal",
@@ -1227,7 +1228,7 @@ describeEmbeddedPostgres("stalled review decision routes", () => {
     const reviewerAgentId = seeded.assigneeAgentId;
     // Pause the reviewer so each review reads `stalled` despite the live run
     // (an invokable currentParticipant is a maintained, i.e. `covered`, path).
-    await db.update(agents).set({ status: "paused" }).where(eq(agents.id, reviewerAgentId));
+    await db.update(agents).set({ status: "paused", pausedAt: new Date("2026-09-14T00:00:00Z") }).where(eq(agents.id, reviewerAgentId));
     const stageId = randomUUID();
     const makeIssue = async (identifier: string) => {
       const issueId = await seedReview({

@@ -82,6 +82,7 @@ describeEmbeddedPostgres("issue blocker attention", () => {
         name: `${prefix} Paused`,
         role: "engineer",
         status: "paused",
+        pausedAt: new Date("2026-09-14T00:00:00Z"),
       },
     ]);
     return { companyId, agentId, pausedAgentId };
