@@ -1414,4 +1414,473 @@ describeEmbeddedPostgres("heartbeat issue graph liveness escalation", () => {
 
     expect(result.findings).toBe(0);
   });
+
+  async function seedCancelledBlockerChain(opts: { blockerStatus?: string } = {}) {
+    const companyId = randomUUID();
+    const managerId = randomUUID();
+    const coderId = randomUUID();
+    const blockedIssueId = randomUUID();
+    const blockerIssueId = randomUUID();
+    const ownerUserId = randomUUID();
+    const issuePrefix = `X${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(companyMemberships).values({
+      companyId,
+      principalType: "user",
+      principalId: ownerUserId,
+      membershipRole: "owner",
+      status: "active",
+    });
+    await db.insert(agents).values([
+      {
+        id: managerId,
+        companyId,
+        name: "CTO",
+        role: "cto",
+        status: "idle",
+        adapterType: "test_adapter",
+        adapterConfig: {},
+        runtimeConfig: { heartbeat: { wakeOnDemand: true, maxConcurrentRuns: 1 } },
+        permissions: {},
+      },
+      {
+        id: coderId,
+        companyId,
+        name: "Coder",
+        role: "engineer",
+        status: "idle",
+        reportsTo: managerId,
+        adapterType: "test_adapter",
+        adapterConfig: {},
+        runtimeConfig: { heartbeat: { wakeOnDemand: true, maxConcurrentRuns: 1 } },
+        permissions: {},
+      },
+    ]);
+    await db.insert(issues).values([
+      {
+        id: blockedIssueId,
+        companyId,
+        title: "Blocked parent",
+        status: "blocked",
+        priority: "medium",
+        assigneeAgentId: coderId,
+        issueNumber: 1,
+        identifier: `${issuePrefix}-1`,
+      },
+      {
+        id: blockerIssueId,
+        companyId,
+        title: "Cancelled blocker",
+        status: opts.blockerStatus ?? "cancelled",
+        priority: "medium",
+        assigneeAgentId: coderId,
+        issueNumber: 2,
+        identifier: `${issuePrefix}-2`,
+      },
+    ]);
+    await db.insert(issueRelations).values({
+      companyId,
+      issueId: blockerIssueId,
+      relatedIssueId: blockedIssueId,
+      type: "blocks",
+    });
+    return { companyId, managerId, coderId, blockedIssueId, blockerIssueId };
+  }
+
+  it("auto-drops a cancelled blocker edge before minting and never escalates", async () => {
+    await enableAutoRecovery();
+    const { companyId, blockedIssueId, blockerIssueId, coderId } = await seedCancelledBlockerChain();
+    const heartbeat = heartbeatService(db);
+    const runId = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: runId,
+      companyId,
+      agentId: coderId,
+    });
+
+    const first = await heartbeat.reconcileIssueGraphLiveness({ runId });
+
+    expect(first.findings).toBe(0);
+    expect(first.cancelledBlockerEdgesDropped).toBe(1);
+    expect(first.escalationsCreated).toBe(0);
+    expect(first.existingEscalations).toBe(0);
+
+    const relations = await db
+      .select({ blockerIssueId: issueRelations.issueId })
+      .from(issueRelations)
+      .where(eq(issueRelations.relatedIssueId, blockedIssueId));
+    expect(relations).toHaveLength(0);
+
+    const dropEvents = await db
+      .select({ entityId: activityLog.entityId, details: activityLog.details })
+      .from(activityLog)
+      .where(and(
+        eq(activityLog.companyId, companyId),
+        eq(activityLog.action, "issue.blockers.auto_dropped_cancelled"),
+      ));
+    expect(dropEvents).toHaveLength(1);
+    expect(dropEvents[0]).toMatchObject({
+      entityId: blockedIssueId,
+      details: expect.objectContaining({
+        source: "recovery.reconcile_issue_graph_liveness",
+        sourceIssueId: blockedIssueId,
+        blockerIssueId,
+        previousBlockerIds: [blockerIssueId],
+        nextBlockerIds: [],
+        findingState: "blocked_by_cancelled_issue",
+        runId,
+      }),
+    });
+
+    // Card leaves blocked through existing resolution semantics: the dependency
+    // wake backstop reads the healed edge set and enqueues the blockers-resolved wake.
+    const wake = await db
+      .select({ reason: agentWakeupRequests.reason, idempotencyKey: agentWakeupRequests.idempotencyKey })
+      .from(agentWakeupRequests)
+      .where(and(
+        eq(agentWakeupRequests.companyId, companyId),
+        eq(agentWakeupRequests.reason, "issue_blockers_resolved"),
+      ))
+      .then((rows) => rows[0] ?? null);
+    expect(wake?.idempotencyKey).toBe(`issue_blockers_resolved:${blockedIssueId}:${blockerIssueId}`);
+
+    // Idempotent: second pass must not double-drop or double-log.
+    const second = await heartbeat.reconcileIssueGraphLiveness({ runId });
+    expect(second.findings).toBe(0);
+    expect(second.cancelledBlockerEdgesDropped).toBe(0);
+    const dropEventsAfterSecondPass = await db
+      .select({ id: activityLog.id })
+      .from(activityLog)
+      .where(and(
+        eq(activityLog.companyId, companyId),
+        eq(activityLog.action, "issue.blockers.auto_dropped_cancelled"),
+      ));
+    expect(dropEventsAfterSecondPass).toHaveLength(1);
+  });
+
+  it("dedupes liveness incident minting by source card and finding state", async () => {
+    await enableAutoRecovery();
+    const { companyId, managerId, coderId, blockedIssueId, blockerIssueId, secondBlockerIssueId } =
+      await (async () => {
+        const seed = await seedCancelledBlockerChain({ blockerStatus: "todo" });
+        const secondBlockerIssueId = randomUUID();
+        await db.update(issues).set({
+          status: "todo",
+          assigneeAgentId: null,
+          updatedAt: new Date(),
+        }).where(eq(issues.id, seed.blockerIssueId));
+        await db.update(issues).set({ status: "blocked" }).where(eq(issues.id, seed.blockedIssueId));
+        await db.insert(issues).values({
+          id: secondBlockerIssueId,
+          companyId: seed.companyId,
+          title: "Second unassigned blocker",
+          status: "todo",
+          priority: "medium",
+          issueNumber: 3,
+          identifier: `${seed.companyId.replace(/-/g, "").slice(0, 6)}-3`,
+        });
+        await db.insert(issueRelations).values({
+          companyId: seed.companyId,
+          issueId: secondBlockerIssueId,
+          relatedIssueId: seed.blockedIssueId,
+          type: "blocks",
+        });
+        return { ...seed, secondBlockerIssueId };
+      })();
+    const heartbeat = heartbeatService(db);
+
+    const first = await heartbeat.reconcileIssueGraphLiveness();
+    expect(first.escalationsCreated).toBe(1);
+    expect(first.existingEscalations).toBe(0);
+
+    const escalations = await db
+      .select()
+      .from(issues)
+      .where(and(
+        eq(issues.companyId, companyId),
+        eq(issues.originKind, "harness_liveness_escalation"),
+      ));
+    expect(escalations).toHaveLength(1);
+    const firstEscalation = escalations[0]!;
+    // The incident card's leaf is the blocker id carried in the incident key's
+    // last segment, and the finding stays on the same source + state.
+    expect(firstEscalation.originId).toContain(`blocked_by_unassigned_issue`);
+    const firstLeafBlockerId = (firstEscalation.originId ?? "").split(":")[4]!;
+
+    // Rotate the leaf: the escalated blocker resolves (done), so the second
+    // unassigned blocker becomes the leaf finding for the SAME source card.
+    await db.update(issues).set({
+      status: "done",
+      assigneeAgentId: coderId,
+      updatedAt: new Date(),
+    }).where(eq(issues.id, firstLeafBlockerId));
+
+    const second = await heartbeat.reconcileIssueGraphLiveness();
+    expect(second.escalationsCreated).toBe(0);
+    expect(second.existingEscalations).toBe(1);
+
+    const escalationsAfterSecondPass = await db
+      .select()
+      .from(issues)
+      .where(and(
+        eq(issues.companyId, companyId),
+        eq(issues.originKind, "harness_liveness_escalation"),
+      ));
+    expect(escalationsAfterSecondPass).toHaveLength(1);
+
+    const comments = await db
+      .select({ body: issueComments.body })
+      .from(issueComments)
+      .where(eq(issueComments.issueId, firstEscalation.id));
+    expect(comments.some((comment) => comment.body.includes("no new incident card was minted"))).toBe(true);
+
+    // The reuse comment is throttled: one per incident key per card — a third
+    // identical pass must not spam the card.
+    const third = await heartbeat.reconcileIssueGraphLiveness();
+    expect(third.escalationsCreated).toBe(0);
+    const commentsAfterThirdPass = await db
+      .select({ body: issueComments.body })
+      .from(issueComments)
+      .where(eq(issueComments.issueId, firstEscalation.id));
+    expect(commentsAfterThirdPass).toHaveLength(comments.length);
+  });
+
+  it("mints a fresh incident when a cancelled duplicate shares the source+state under a different incident key", async () => {
+    await enableAutoRecovery();
+    const { companyId, blockedIssueId, blockerIssueId } = await seedCancelledBlockerChain({
+      blockerStatus: "todo",
+    });
+    // The seeded blocker carries an assignee; strip it so the unassigned-blocker
+    // finding fires.
+    await db.update(issues).set({ assigneeAgentId: null, updatedAt: new Date() })
+      .where(eq(issues.id, blockerIssueId));
+    const heartbeat = heartbeatService(db);
+
+    // A CANCELLED escalation whose incident key differs from the current
+    // finding (rotated leaf) but shares the source + state. Cancelled cards
+    // are not open — the dedupe must not suppress minting.
+    await db.insert(issues).values({
+      id: randomUUID(),
+      companyId,
+      title: "Cancelled rotated-leaf duplicate",
+      status: "cancelled",
+      priority: "high",
+      parentId: blockerIssueId,
+      issueNumber: 7,
+      identifier: "XROT-7",
+      originKind: "harness_liveness_escalation",
+      originId: [
+        "harness_liveness",
+        companyId,
+        blockedIssueId,
+        "blocked_by_unassigned_issue",
+        "different-leaf",
+      ].join(":"),
+    });
+
+    const result = await heartbeat.reconcileIssueGraphLiveness();
+
+    expect(result.escalationsCreated).toBe(1);
+    const freshEscalations = await db
+      .select()
+      .from(issues)
+      .where(and(
+        eq(issues.companyId, companyId),
+        eq(issues.originKind, "harness_liveness_escalation"),
+        eq(issues.status, "todo"),
+      ));
+    expect(freshEscalations).toHaveLength(1);
+    expect(freshEscalations[0]!.originId).toBe([
+      "harness_liveness",
+      companyId,
+      blockedIssueId,
+      "blocked_by_unassigned_issue",
+      blockerIssueId,
+    ].join(":"));
+  });
+
+  it("sweeps a pre-existing hierarchy-violating escalation blocker edge", async () => {
+    await enableAutoRecovery();
+    const { companyId, blockedIssueId } = await seedCancelledBlockerChain({ blockerStatus: "todo" });
+    const heartbeat = heartbeatService(db);
+
+    // Minting-bug shape: an escalation issue that is a CHILD of the blocked
+    // source carrying a `blocks` edge back into the source.
+    const childEscalationId = randomUUID();
+    await db.insert(issues).values({
+      id: childEscalationId,
+      companyId,
+      title: "Child escalation sibling issue",
+      status: "todo",
+      priority: "high",
+      parentId: blockedIssueId,
+      originKind: "harness_liveness_escalation",
+      originId: [
+        "harness_liveness",
+        companyId,
+        randomUUID(),
+        "blocked_by_unassigned_issue",
+        "none",
+      ].join(":"),
+    });
+    await db.insert(issueRelations).values({
+      companyId,
+      issueId: childEscalationId,
+      relatedIssueId: blockedIssueId,
+      type: "blocks",
+    });
+
+    const result = await heartbeat.reconcileIssueGraphLiveness();
+
+    expect(result.hierarchyBlockerEdgesRemoved).toBe(1);
+    const relations = await db
+      .select({ blockerIssueId: issueRelations.issueId })
+      .from(issueRelations)
+      .where(eq(issueRelations.relatedIssueId, blockedIssueId));
+    expect(relations.some((row) => row.blockerIssueId === childEscalationId)).toBe(false);
+
+    const sweepEvents = await db
+      .select({ entityId: activityLog.entityId, details: activityLog.details })
+      .from(activityLog)
+      .where(and(
+        eq(activityLog.companyId, companyId),
+        eq(activityLog.action, "issue.blockers.auto_dropped_cancelled"),
+      ));
+    expect(sweepEvents).toHaveLength(1);
+    expect(sweepEvents[0]).toMatchObject({
+      entityId: blockedIssueId,
+      details: expect.objectContaining({
+        sourceIssueId: blockedIssueId,
+        blockerIssueId: childEscalationId,
+        sweep: true,
+      }),
+    });
+  });
+
+  it("refuses to block the watched source on a hierarchy-violating escalation", async () => {
+    await enableAutoRecovery();
+    const { companyId, blockedIssueId } = await seedCancelledBlockerChain({
+      blockerStatus: "todo",
+    });
+    const heartbeat = heartbeatService(db);
+
+    // Self-recovery shape: the blocked source has no unresolved blocker edge, so
+    // the minted escalation is parented on the source itself; the old engine then
+    // added that child as a blocker edge of its own parent.
+    await db.delete(issueRelations).where(eq(issueRelations.companyId, companyId));
+    await db.update(issues).set({ status: "in_review" })
+      .where(eq(issues.id, blockedIssueId));
+
+    const result = await heartbeat.reconcileIssueGraphLiveness();
+
+    expect(result.escalationsCreated).toBe(1);
+    const escalations = await db
+      .select()
+      .from(issues)
+      .where(and(
+        eq(issues.companyId, companyId),
+        eq(issues.originKind, "harness_liveness_escalation"),
+      ));
+    expect(escalations).toHaveLength(1);
+    expect(escalations[0]!.parentId).toBe(blockedIssueId);
+
+    const relations = await db
+      .select({ blockerIssueId: issueRelations.issueId })
+      .from(issueRelations)
+      .where(eq(issueRelations.relatedIssueId, blockedIssueId));
+    expect(relations).toHaveLength(0);
+
+    const source = await db
+      .select({ status: issues.status })
+      .from(issues)
+      .where(eq(issues.id, blockedIssueId));
+    expect(source[0]!.status).toBe("in_review");
+
+    const skipEvents = await db
+      .select({ entityId: activityLog.entityId, details: activityLog.details })
+      .from(activityLog)
+      .where(and(
+        eq(activityLog.companyId, companyId),
+        eq(activityLog.action, "issue.blockers.escalation_blocker_skipped"),
+      ));
+    expect(skipEvents).toHaveLength(1);
+    expect(skipEvents[0]).toMatchObject({
+      entityId: blockedIssueId,
+      details: expect.objectContaining({
+        sourceIssueId: blockedIssueId,
+        escalationIssueId: escalations[0]!.id,
+        guard: "descendant",
+      }),
+    });
+  });
+
+  it("realigns orphan and cross-company blocker edges out of the blocked projection", async () => {
+    await enableAutoRecovery();
+    const { companyId, blockedIssueId, blockerIssueId } = await seedCancelledBlockerChain({
+      blockerStatus: "todo",
+    });
+    const heartbeat = heartbeatService(db);
+
+    const otherCompanyId = randomUUID();
+    await db.insert(companies).values({
+      id: otherCompanyId,
+      name: "Other",
+      issuePrefix: "OTH",
+      requireBoardApprovalForNewAgents: false,
+    });
+    const crossCompanyIssueId = randomUUID();
+    await db.insert(issues).values({
+      id: crossCompanyIssueId,
+      companyId: otherCompanyId,
+      title: "Cross-company issue",
+      status: "todo",
+      priority: "medium",
+      issueNumber: 1,
+      identifier: "OTHER-1",
+    });
+    // Cross-company mis-scoped write: the relation row's companyId is ours but
+    // the blocker issue belongs to another company — invisible to company-scoped
+    // reads while still live in the relations store, and the detector/auth joins
+    // disagree about it.
+    await db.insert(issueRelations).values([
+      {
+        companyId,
+        issueId: crossCompanyIssueId,
+        relatedIssueId: blockedIssueId,
+        type: "blocks",
+      },
+    ]);
+
+    const result = await heartbeat.reconcileIssueGraphLiveness();
+
+    expect(result.blockerProjectionsRealigned).toBe(1);
+    const relations = await db
+      .select({ blockerIssueId: issueRelations.issueId })
+      .from(issueRelations)
+      .where(eq(issueRelations.relatedIssueId, blockedIssueId));
+    expect(relations).toHaveLength(1);
+    expect(relations[0]!.blockerIssueId).toBe(blockerIssueId);
+
+    const realignEvents = await db
+      .select({ entityId: activityLog.entityId, details: activityLog.details })
+      .from(activityLog)
+      .where(and(
+        eq(activityLog.companyId, companyId),
+        eq(activityLog.action, "issue.blockers.projection_realigned"),
+      ));
+    expect(realignEvents).toHaveLength(1);
+    expect(realignEvents[0]).toMatchObject({
+      entityId: blockedIssueId,
+      details: expect.objectContaining({
+        sourceIssueId: blockedIssueId,
+        orphanBlockerIssueIds: [crossCompanyIssueId],
+      }),
+    });
+  });
 });
