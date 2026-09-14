@@ -82,6 +82,43 @@ describe("isThrottleCandidateIssueRewake", () => {
       expect(isThrottleCandidateIssueRewake({ ...base, reason })).toBe(false);
     }
   });
+
+  // PAP-13775: operator-initiated assignment wakes must never be throttled.
+  // A board-initiated manual reassign is operator intent, not storm traffic.
+  // Board actions arrive on this code path as requestedByActorType="user"
+  // (the board user identity), so the "user" actor type is the operator
+  // class for this branch. Mirrors the comment-wake special case (line 117
+  // of the module) where non-agent actors bypass the throttle.
+  it("bypasses the throttle for operator-initiated issue_assigned wakes", () => {
+    expect(isThrottleCandidateIssueRewake({
+      ...base,
+      reason: "issue_assigned",
+      requestedByActorType: "user",
+    })).toBe(false);
+  });
+
+  it("still throttles system and agent-initiated issue_assigned wakes", () => {
+    expect(isThrottleCandidateIssueRewake({
+      ...base,
+      reason: "issue_assigned",
+      requestedByActorType: "system",
+    })).toBe(true);
+    expect(isThrottleCandidateIssueRewake({
+      ...base,
+      reason: "issue_assigned",
+      requestedByActorType: "agent",
+    })).toBe(true);
+  });
+
+  it("bypasses the throttle when requestedByActorType is omitted on an operator assignment wake", () => {
+    // Defensive: if a caller forgets to set the actor, the wake still
+    // represents an operator assignment and must not be throttled.
+    expect(isThrottleCandidateIssueRewake({
+      ...base,
+      reason: "issue_assigned",
+      requestedByActorType: undefined,
+    })).toBe(false);
+  });
 });
 
 describe("computeIssueRewakeCooldownMs", () => {
