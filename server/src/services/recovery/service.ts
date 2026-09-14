@@ -4840,6 +4840,35 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     }) ?? null;
   }
 
+  // Decision C (SPA-6514 paired ruling): dedupe incident minting by source card.
+  // The leaf fingerprint only matches when the same blocker stays the leaf —
+  // when the leaf rotates (blocker churn on the same source card) the incident
+  // key varies across passes and the old lookups missed, minting a fresh card
+  // per rotation. Match open escalations on companyId + source + state instead.
+  async function findOpenLivenessEscalationForSourceState(
+    companyId: string,
+    sourceIssueId: string,
+    state: string,
+  ) {
+    const openRecoveries = await db
+      .select()
+      .from(issues)
+      .where(
+        and(
+          eq(issues.companyId, companyId),
+          eq(issues.originKind, RECOVERY_ORIGIN_KINDS.issueGraphLivenessEscalation),
+          visibleIssueCondition(),
+          notInArray(issues.status, ["done", "cancelled"]),
+        ),
+      );
+    return openRecoveries.find((row) => {
+      const parsed = parseLivenessIncidentKey(row.originId);
+      return parsed?.companyId === companyId &&
+        parsed.issueId === sourceIssueId &&
+        parsed.state === state;
+    }) ?? null;
+  }
+
   async function findRecentCompletedLivenessRecoveryIssue(
     finding: IssueLivenessFinding,
     now: Date,
@@ -4847,25 +4876,40 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
   ) {
     if (cooldownMs <= 0) return null;
     const cutoff = new Date(now.getTime() - cooldownMs);
-    return db
+    const baseFilters = and(
+      eq(issues.companyId, finding.companyId),
+      eq(issues.originKind, RECOVERY_ORIGIN_KINDS.issueGraphLivenessEscalation),
+      visibleIssueCondition(),
+      eq(issues.status, "done"),
+      gte(issues.updatedAt, cutoff),
+    );
+    const byKey = await db
       .select({ id: issues.id })
       .from(issues)
-      .where(
-        and(
-          eq(issues.companyId, finding.companyId),
-          eq(issues.originKind, RECOVERY_ORIGIN_KINDS.issueGraphLivenessEscalation),
-          or(
-            eq(issues.originId, finding.incidentKey),
-            eq(issues.originFingerprint, livenessRecoveryLeafFingerprint(finding)),
-          ),
-          visibleIssueCondition(),
-          eq(issues.status, "done"),
-          gte(issues.updatedAt, cutoff),
+      .where(and(
+        baseFilters,
+        or(
+          eq(issues.originId, finding.incidentKey),
+          eq(issues.originFingerprint, livenessRecoveryLeafFingerprint(finding)),
         ),
-      )
+      ))
       .orderBy(desc(issues.updatedAt), desc(issues.id))
       .limit(1)
       .then((rows) => rows[0] ?? null);
+    if (byKey) return byKey;
+
+    const recentlyCompleted = await db
+      .select({ id: issues.id, originId: issues.originId })
+      .from(issues)
+      .where(baseFilters)
+      .orderBy(desc(issues.updatedAt), desc(issues.id))
+      .limit(100);
+    return recentlyCompleted.find((row) => {
+      const parsed = parseLivenessIncidentKey(row.originId);
+      return parsed?.companyId === finding.companyId &&
+        parsed.issueId === finding.issueId &&
+        parsed.state === finding.state;
+    }) ?? null;
   }
 
   async function removeRecoveryBlockerFromSource(recovery: typeof issues.$inferSelect) {
@@ -4920,6 +4964,12 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
 
   async function retireObsoleteLivenessRecoveryIssues(findings: IssueLivenessFinding[]) {
     const currentIncidentKeys = new Set(findings.map((finding) => finding.incidentKey));
+    // Decision C: an open escalation must also survive retirement while ANY
+    // current finding shares its source + state — the dedupe reuses that card
+    // instead of minting a rotated-key replacement.
+    const currentSourceStateKeys = new Set(
+      findings.map((finding) => `${finding.companyId}:${finding.issueId}:${finding.state}`),
+    );
     const currentLeafKeys = new Set(
       findings.map((finding) =>
         livenessRecoveryLeafKey(
@@ -4947,6 +4997,11 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     };
 
     for (const recovery of openRecoveries) {
+      const parsedKey = parseLivenessIncidentKey(recovery.originId);
+      if (parsedKey &&
+        currentSourceStateKeys.has(`${parsedKey.companyId}:${parsedKey.issueId}:${parsedKey.state}`)) {
+        continue;
+      }
       if (recovery.originId && currentIncidentKeys.has(recovery.originId)) continue;
       const parsed = parseLivenessIncidentKey(recovery.originId);
       if (!parsed) continue;
@@ -5173,12 +5228,450 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     return input.recoveryIssue.assigneeAgentId === input.ownerAgentId;
   }
 
+  async function issueAncestorIds(companyId: string, issueId: string) {
+    const ancestors = new Set<string>();
+    let current = issueId;
+    for (let depth = 0; depth < 64; depth += 1) {
+      const row = await db
+        .select({ parentId: issues.parentId })
+        .from(issues)
+        .where(and(eq(issues.companyId, companyId), eq(issues.id, current)))
+        .then((rows) => rows[0] ?? null);
+      const parentId = row?.parentId ?? null;
+      if (!parentId || ancestors.has(parentId)) break;
+      ancestors.add(parentId);
+      current = parentId;
+    }
+    return ancestors;
+  }
+
+  async function issueHierarchyRelation(
+    companyId: string,
+    blockerIssueId: string,
+    blockedIssueId: string,
+  ): Promise<"self" | "ancestor" | "descendant" | null> {
+    if (blockerIssueId === blockedIssueId) return "self" as const;
+    if ((await issueAncestorIds(companyId, blockedIssueId)).has(blockerIssueId)) {
+      return "ancestor" as const;
+    }
+    if ((await issueAncestorIds(companyId, blockerIssueId)).has(blockedIssueId)) {
+      return "descendant" as const;
+    }
+    return null;
+  }
+
+  // Decision A (SPA-7073 ruling, q-repair=yes): drop-then-recompute. A `blocks`
+  // edge whose blocker is cancelled is dead weight — the engine drops it, rewrites
+  // the blocked issue's blocker set, logs one audit row, and lets the existing
+  // blocker-resolution semantics (dependency wake backstop) do the unblocking.
+  // Terminal-drop semantics: only `cancelled` blockers fire this path (`done`
+  // blockers are unruled); dropping is not restorable if the blocker reopens.
+  async function autoDropCancelledBlockerEdges(input: { runId?: string | null }) {
+    const result = { dropped: 0, issueIds: [] as string[] };
+    const rows = await db
+      .select({
+        companyId: issueRelations.companyId,
+        sourceIssueId: issueRelations.relatedIssueId,
+        blockerIssueId: issueRelations.issueId,
+      })
+      .from(issueRelations)
+      .innerJoin(
+        issues,
+        and(eq(issues.id, issueRelations.issueId), eq(issues.companyId, issueRelations.companyId)),
+      )
+      .where(and(eq(issueRelations.type, "blocks"), eq(issues.status, "cancelled")));
+
+    for (const row of rows) {
+      const source = await db
+        .select({
+          id: issues.id,
+          companyId: issues.companyId,
+          status: issues.status,
+          assigneeAgentId: issues.assigneeAgentId,
+        })
+        .from(issues)
+        .where(and(eq(issues.companyId, row.companyId), eq(issues.id, row.sourceIssueId)))
+        .then((rows) => rows[0] ?? null);
+      if (!source || source.status === "done" || source.status === "cancelled") continue;
+      const previousBlockerIds = await existingBlockerIssueIds(source.companyId, source.id);
+      if (!previousBlockerIds.includes(row.blockerIssueId)) continue;
+      const nextBlockerIds = previousBlockerIds.filter(
+        (blockerId) => blockerId !== row.blockerIssueId,
+      );
+      const updated = await issuesSvc.update(source.id, { blockedByIssueIds: nextBlockerIds });
+      if (!updated) continue;
+      result.dropped += 1;
+      result.issueIds.push(source.id);
+      await logActivity(db, {
+        companyId: source.companyId,
+        actorType: "system",
+        actorId: "system",
+        agentId: null,
+        runId: input.runId ?? null,
+        action: "issue.blockers.auto_dropped_cancelled",
+        entityType: "issue",
+        entityId: source.id,
+        details: {
+          source: "recovery.reconcile_issue_graph_liveness",
+          sourceIssueId: source.id,
+          blockerIssueId: row.blockerIssueId,
+          previousBlockerIds,
+          nextBlockerIds,
+          findingState: "blocked_by_cancelled_issue",
+          runId: input.runId ?? null,
+        },
+      });
+      await emitBlockersResolvedWakeForBlockedDependency({
+        companyId: source.companyId,
+        dependentIssueId: source.id,
+        dependentAssigneeAgentId: source.assigneeAgentId,
+        resolvedBlockerIssueId: row.blockerIssueId,
+        blockerIssueIds: [row.blockerIssueId],
+        source: "recovery.reconcile_issue_graph_liveness",
+        runId: input.runId ?? null,
+      });
+    }
+
+    return result;
+  }
+
+  // Shared blockers-resolved wake emission used by the auto-drop repair pass.
+  // Mirrors the resolved-dependency wake backstop's guard chain and idempotency
+  // key so a dropped edge resolves exactly like any other resolved blocker.
+  async function emitBlockersResolvedWakeForBlockedDependency(input: {
+    companyId: string;
+    dependentIssueId: string;
+    dependentAssigneeAgentId: string | null;
+    resolvedBlockerIssueId: string;
+    blockerIssueIds: string[];
+    source: string;
+    runId?: string | null;
+    payloadBackstop?: string;
+  }): Promise<"emitted" | "existing" | "live_path" | "interaction" | "pause_hold" | "deferred" | "failed" | "no_assignee"> {
+    const agentId = input.dependentAssigneeAgentId;
+    if (!agentId) return "no_assignee" as const;
+    const idempotencyKeys = input.blockerIssueIds.map((blockerIssueId) =>
+      buildIssueBlockersResolvedWakeIdempotencyKey({
+        dependentIssueId: input.dependentIssueId,
+        resolvedBlockerIssueId: blockerIssueId,
+      })
+    );
+    const idempotencyKey = buildIssueBlockersResolvedWakeIdempotencyKey({
+      dependentIssueId: input.dependentIssueId,
+      resolvedBlockerIssueId: input.resolvedBlockerIssueId,
+    });
+    if (await findExistingIssueBlockersResolvedWakeForAnyKey(db, {
+      companyId: input.companyId,
+      idempotencyKeys,
+    })) {
+      return "existing" as const;
+    }
+    if (
+      await hasActiveExecutionPath(input.companyId, input.dependentIssueId, agentId) ||
+      await hasQueuedIssueWake(input.companyId, input.dependentIssueId, agentId)
+    ) {
+      return "live_path" as const;
+    }
+    if (await hasPendingWakeInteraction(input.companyId, input.dependentIssueId)) {
+      return "interaction" as const;
+    }
+    if (await isAutomaticRecoverySuppressedByPauseHold(db, input.companyId, input.dependentIssueId, treeControlSvc)) {
+      return "pause_hold" as const;
+    }
+    try {
+      const wake = await deps.enqueueWakeup(agentId, {
+        source: "automation",
+        triggerDetail: "system",
+        reason: ISSUE_BLOCKERS_RESOLVED_WAKE_REASON,
+        payload: {
+          issueId: input.dependentIssueId,
+          resolvedBlockerIssueId: input.resolvedBlockerIssueId,
+          blockerIssueIds: input.blockerIssueIds,
+          backstop: input.payloadBackstop ?? "issue_graph_liveness_reconciliation",
+        },
+        idempotencyKey,
+        requestedByActorType: "system",
+        requestedByActorId: "issue_graph_liveness_backstop",
+        contextSnapshot: {
+          issueId: input.dependentIssueId,
+          taskId: input.dependentIssueId,
+          wakeReason: ISSUE_BLOCKERS_RESOLVED_WAKE_REASON,
+          source: input.source,
+          resolvedBlockerIssueId: input.resolvedBlockerIssueId,
+          blockerIssueIds: input.blockerIssueIds,
+        },
+      });
+      if (!wake) return "deferred" as const;
+      await logActivity(db, {
+        companyId: input.companyId,
+        actorType: "system",
+        actorId: input.source,
+        agentId,
+        runId: input.runId ?? null,
+        action: "issue.blockers_resolved_wake_emitted",
+        entityType: "issue",
+        entityId: input.dependentIssueId,
+        details: {
+          source: input.source,
+          wakeupRunId: wake.id,
+          idempotencyKey,
+          resolvedBlockerIssueId: input.resolvedBlockerIssueId,
+          blockerIssueIds: input.blockerIssueIds,
+        },
+      });
+      return "emitted" as const;
+    } catch (err) {
+      logger.warn(
+        { err, issueId: input.dependentIssueId, agentId, idempotencyKey, source: input.source },
+        "failed to enqueue blockers-resolved wake from issue graph liveness repair pass",
+      );
+      return "failed" as const;
+    }
+  }
+
+  // Decision B retroactive sweep: remove pre-existing live `blocks` edges where
+  // the blocker is a liveness-escalation issue that is a child/ancestor/descendant
+  // (family) of the blocked issue. Scoped to escalation blockers so the
+  // task-watchdog and continuation-waiting child-blocks-parent patterns keep
+  // working (those carry their own SPA-6057 cycle guards).
+  async function sweepHierarchyViolatingLivenessBlockerEdges(input: { runId?: string | null }) {
+    const result = { removed: 0, issueIds: [] as string[] };
+    const rows = await db
+      .select({
+        companyId: issueRelations.companyId,
+        sourceIssueId: issueRelations.relatedIssueId,
+        blockerIssueId: issueRelations.issueId,
+      })
+      .from(issueRelations)
+      .innerJoin(
+        issues,
+        and(eq(issues.id, issueRelations.issueId), eq(issues.companyId, issueRelations.companyId)),
+      )
+      .where(
+        and(
+          eq(issueRelations.type, "blocks"),
+          eq(issues.originKind, RECOVERY_ORIGIN_KINDS.issueGraphLivenessEscalation),
+          notInArray(issues.status, ["done", "cancelled"]),
+        ),
+      );
+
+    for (const row of rows) {
+      const source = await db
+        .select({ id: issues.id, companyId: issues.companyId, status: issues.status })
+        .from(issues)
+        .where(and(eq(issues.companyId, row.companyId), eq(issues.id, row.sourceIssueId)))
+        .then((rows) => rows[0] ?? null);
+      if (!source || source.status === "done" || source.status === "cancelled") continue;
+      const hierarchyGuard = await issueHierarchyRelation(
+        row.companyId,
+        row.blockerIssueId,
+        row.sourceIssueId,
+      );
+      if (!hierarchyGuard) continue;
+      const previousBlockerIds = await existingBlockerIssueIds(source.companyId, source.id);
+      if (!previousBlockerIds.includes(row.blockerIssueId)) continue;
+      const nextBlockerIds = previousBlockerIds.filter(
+        (blockerId) => blockerId !== row.blockerIssueId,
+      );
+      const updated = await issuesSvc.update(source.id, { blockedByIssueIds: nextBlockerIds });
+      if (!updated) continue;
+      result.removed += 1;
+      result.issueIds.push(source.id);
+      await logActivity(db, {
+        companyId: source.companyId,
+        actorType: "system",
+        actorId: "system",
+        agentId: null,
+        runId: input.runId ?? null,
+        action: "issue.blockers.auto_dropped_cancelled",
+        entityType: "issue",
+        entityId: source.id,
+        details: {
+          source: "recovery.reconcile_issue_graph_liveness",
+          sourceIssueId: source.id,
+          blockerIssueId: row.blockerIssueId,
+          previousBlockerIds,
+          nextBlockerIds,
+          findingState: "blocked_by_cancelled_issue",
+          sweep: true,
+          guard: hierarchyGuard,
+          runId: input.runId ?? null,
+        },
+      });
+    }
+
+    return result;
+  }
+
+  // Decision D (SPA-7073, q-align=yes): realign the blocked projection with the
+  // detector store. `blocks` edges whose blocker no longer resolves to a
+  // same-company issue (orphaned by deletes or mis-scoped cross-company writes)
+  // are invisible to every reader join but still live in the relations store —
+  // drop them and log the realignment so GET /issues and /diagnostics agree.
+  async function realignBlockedIssueBlockerProjections(input: { runId?: string | null }) {
+    const result = { realigned: 0, issueIds: [] as string[] };
+    const rows = await db
+      .select({
+        companyId: issueRelations.companyId,
+        sourceIssueId: issueRelations.relatedIssueId,
+        blockerIssueId: issueRelations.issueId,
+      })
+      .from(issueRelations)
+      .innerJoin(
+        issues,
+        and(
+          eq(issues.id, issueRelations.relatedIssueId),
+          eq(issues.companyId, issueRelations.companyId),
+        ),
+      )
+      .where(and(eq(issueRelations.type, "blocks"), eq(issues.status, "blocked")));
+
+    const bySource = new Map<string, { companyId: string; sourceIssueId: string; blockerIds: Set<string> }>();
+    for (const row of rows) {
+      const key = `${row.companyId}:${row.sourceIssueId}`;
+      const entry = bySource.get(key) ?? {
+        companyId: row.companyId,
+        sourceIssueId: row.sourceIssueId,
+        blockerIds: new Set<string>(),
+      };
+      entry.blockerIds.add(row.blockerIssueId);
+      bySource.set(key, entry);
+    }
+
+    for (const entry of bySource.values()) {
+      const blockerIds = [...entry.blockerIds].sort();
+      const resolvable = await db
+        .select({ id: issues.id })
+        .from(issues)
+        .where(and(eq(issues.companyId, entry.companyId), inArray(issues.id, blockerIds)));
+      const resolvableIds = new Set(resolvable.map((row) => row.id));
+      const orphanBlockerIds = blockerIds.filter((blockerId) => !resolvableIds.has(blockerId));
+      if (orphanBlockerIds.length === 0) continue;
+      const nextBlockerIds = blockerIds.filter((blockerId) => resolvableIds.has(blockerId));
+      await db
+        .delete(issueRelations)
+        .where(
+          and(
+            eq(issueRelations.companyId, entry.companyId),
+            eq(issueRelations.type, "blocks"),
+            eq(issueRelations.relatedIssueId, entry.sourceIssueId),
+            inArray(issueRelations.issueId, orphanBlockerIds),
+          ),
+        );
+      result.realigned += 1;
+      result.issueIds.push(entry.sourceIssueId);
+      await logActivity(db, {
+        companyId: entry.companyId,
+        actorType: "system",
+        actorId: "system",
+        agentId: null,
+        runId: input.runId ?? null,
+        action: "issue.blockers.projection_realigned",
+        entityType: "issue",
+        entityId: entry.sourceIssueId,
+        details: {
+          source: "recovery.reconcile_issue_graph_liveness",
+          sourceIssueId: entry.sourceIssueId,
+          previousBlockerIds: blockerIds,
+          nextBlockerIds,
+          orphanBlockerIssueIds: orphanBlockerIds,
+          runId: input.runId ?? null,
+        },
+      });
+    }
+
+    return result;
+  }
+
+  function buildLivenessEscalationReuseComment(finding: IssueLivenessFinding) {
+    return [
+      "Paperclip re-detected this liveness incident; no new incident card was minted (SPA-2062 dedupe).",
+      "",
+      `- Incident key: \`${finding.incidentKey}\``,
+      `- Finding: \`${finding.state}\``,
+      `- Dependency path: ${formatDependencyPath(finding)}`,
+      `- Reason: ${finding.reason}`,
+      `- Manager action requested: ${finding.recommendedAction}`,
+    ].join("\n");
+  }
+
+  // Throttle the reuse comment: one per incident key per escalation card. The
+  // source+state dedupe funnels every repeat finding into the same open card,
+  // so an unkeyed comment would fire on every reconcile tick while the card
+  // stays stalled. A rotated leaf carries a new incident key and may comment
+  // once; identical repeats stay silent.
+  async function hasLivenessEscalationReuseComment(
+    escalationIssueId: string,
+    finding: IssueLivenessFinding,
+  ) {
+    const existing = await db
+      .select({ id: issueComments.id })
+      .from(issueComments)
+      .where(
+        and(
+          eq(issueComments.issueId, escalationIssueId),
+          eq(issueComments.companyId, finding.companyId),
+          sql`${issueComments.body} like ${`%- Incident key: \`${finding.incidentKey}\`%`}`,
+        ),
+      )
+      .limit(1)
+      .then((rows) => rows[0] ?? null);
+    return Boolean(existing);
+  }
+
   async function ensureIssueBlockedByEscalation(input: {
     issue: typeof issues.$inferSelect;
     escalationIssueId: string;
     finding: IssueLivenessFinding;
     runId?: string | null;
   }) {
+    // Decision B (SPA-7073 ruling, q-child=yes): the engine never creates a
+    // blocks edge whose blocker is a child or ancestor of the blocked issue —
+    // a freshly minted escalation can be parented on the watched card
+    // (self-recovery shapes), and adding it as a blocker would deadlock the
+    // card on its own subtree. Skip the edge (still comment + wake in the
+    // caller), and log the skip.
+    const escalationIssue = input.escalationIssueId === input.issue.id
+      ? input.issue
+      : await db
+        .select({
+          id: issues.id,
+          companyId: issues.companyId,
+          status: issues.status,
+          parentId: issues.parentId,
+        })
+        .from(issues)
+        .where(and(eq(issues.companyId, input.issue.companyId), eq(issues.id, input.escalationIssueId)))
+        .then((rows) => rows[0] ?? null);
+    if (escalationIssue) {
+      const hierarchyGuard = await issueHierarchyRelation(
+        input.issue.companyId,
+        escalationIssue.id,
+        input.issue.id,
+      );
+      if (hierarchyGuard) {
+        await logActivity(db, {
+          companyId: input.issue.companyId,
+          actorType: "system",
+          actorId: "system",
+          agentId: null,
+          runId: input.runId ?? null,
+          action: "issue.blockers.escalation_blocker_skipped",
+          entityType: "issue",
+          entityId: input.issue.id,
+          details: {
+            source: "recovery.reconcile_issue_graph_liveness",
+            sourceIssueId: input.issue.id,
+            escalationIssueId: input.escalationIssueId,
+            guard: hierarchyGuard,
+            findingState: input.finding.state,
+            runId: input.runId ?? null,
+          },
+        });
+        return input.issue;
+      }
+    }
+
     const blockerIds = await existingBlockerIssueIds(input.issue.companyId, input.issue.id);
     const nextBlockerIds = [...new Set([...blockerIds, input.escalationIssueId])];
     const isAlreadyBlockedByEscalation = blockerIds.includes(input.escalationIssueId);
@@ -5245,7 +5738,8 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
 
     const existing =
       await findOpenLivenessEscalation(issue.companyId, input.finding.incidentKey) ??
-      await findOpenLivenessRecoveryIssueForLeaf(input.finding);
+      await findOpenLivenessRecoveryIssueForLeaf(input.finding) ??
+      await findOpenLivenessEscalationForSourceState(issue.companyId, issue.id, input.finding.state);
     if (existing) {
       await ensureIssueBlockedByEscalation({
         issue,
@@ -5253,6 +5747,13 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         finding: input.finding,
         runId: input.runId ?? null,
       });
+      if (!(await hasLivenessEscalationReuseComment(existing.id, input.finding))) {
+        await issuesSvc.addComment(
+          existing.id,
+          buildLivenessEscalationReuseComment(input.finding),
+          { runId: input.runId ?? null },
+        );
+      }
       return { kind: "existing" as const, escalationIssueId: existing.id };
     }
     if (await findRecentCompletedLivenessRecoveryIssue(
@@ -5299,7 +5800,8 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       if (!isUniqueLivenessRecoveryConflict(error)) throw error;
       const raced =
         await findOpenLivenessEscalation(issue.companyId, input.finding.incidentKey) ??
-        await findOpenLivenessRecoveryIssueForLeaf(input.finding);
+        await findOpenLivenessRecoveryIssueForLeaf(input.finding) ??
+        await findOpenLivenessEscalationForSourceState(issue.companyId, issue.id, input.finding.state);
       if (!raced) throw error;
       await ensureIssueBlockedByEscalation({
         issue,
@@ -5307,6 +5809,13 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         finding: input.finding,
         runId: input.runId ?? null,
       });
+      if (!(await hasLivenessEscalationReuseComment(raced.id, input.finding))) {
+        await issuesSvc.addComment(
+          raced.id,
+          buildLivenessEscalationReuseComment(input.finding),
+          { runId: input.runId ?? null },
+        );
+      }
       return { kind: "existing" as const, escalationIssueId: raced.id };
     }
 
@@ -5639,6 +6148,20 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     now?: Date;
     reescalationCooldownMs?: number;
   }) {
+    // Decisions A/D repair passes run BEFORE classification (drop-then-recompute):
+    // cancelled-blocker edges, hierarchy-violating escalation edges, and orphan
+    // projection rows are repaired first so a healed card produces no finding
+    // and mints nothing. Data-repair passes run regardless of the auto-recovery
+    // flag, like the dependency wake backstop below.
+    const cancelledBlockerDrop = await autoDropCancelledBlockerEdges({
+      runId: opts?.runId ?? null,
+    });
+    const hierarchySweep = await sweepHierarchyViolatingLivenessBlockerEdges({
+      runId: opts?.runId ?? null,
+    });
+    const projectionRealignment = await realignBlockedIssueBlockerProjections({
+      runId: opts?.runId ?? null,
+    });
     let findings = await collectIssueGraphLivenessFindings();
     if (opts?.issueCreatedAtGte) {
       const findingIssueIds = [...new Set(findings.map((finding) => finding.recoveryIssueId))];
@@ -5678,6 +6201,12 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       autoRecoveryEnabled,
       lookbackHours,
       cutoff: cutoff.toISOString(),
+      cancelledBlockerEdgesDropped: cancelledBlockerDrop.dropped,
+      cancelledBlockerDropIssueIds: cancelledBlockerDrop.issueIds,
+      hierarchyBlockerEdgesRemoved: hierarchySweep.removed,
+      hierarchySweepIssueIds: hierarchySweep.issueIds,
+      blockerProjectionsRealigned: projectionRealignment.realigned,
+      projectionRealignedIssueIds: projectionRealignment.issueIds,
       escalationsCreated: 0,
       existingEscalations: 0,
       skipped: 0,
