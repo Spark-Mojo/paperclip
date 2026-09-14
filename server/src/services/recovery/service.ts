@@ -1,4 +1,4 @@
-import { and, asc, desc, eq, gt, gte, inArray, isNull, notInArray, or, sql } from "drizzle-orm";
+import { and, asc, desc, eq, gt, gte, inArray, isNull, like, notInArray, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
   DEFAULT_ISSUE_GRAPH_LIVENESS_AUTO_RECOVERY_LOOKBACK_HOURS,
@@ -4641,6 +4641,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
           title: agents.title,
           status: agents.status,
           reportsTo: agents.reportsTo,
+          pausedAt: agents.pausedAt,
         })
         .from(agents),
       db
@@ -4799,6 +4800,59 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
           eq(issues.originId, incidentKey),
           visibleIssueCondition(),
           notInArray(issues.status, ["done", "cancelled"]),
+        ),
+      )
+      .limit(1)
+      .then((rows) => rows[0] ?? null);
+  }
+
+  async function findOpenLivenessEscalationForSource(companyId: string, sourceIssueId: string) {
+    const openRecoveries = await db
+      .select()
+      .from(issues)
+      .where(
+        and(
+          eq(issues.companyId, companyId),
+          eq(issues.originKind, RECOVERY_ORIGIN_KINDS.issueGraphLivenessEscalation),
+          visibleIssueCondition(),
+          notInArray(issues.status, ["done", "cancelled"]),
+        ),
+      )
+      .orderBy(asc(issues.createdAt), asc(issues.id));
+    return openRecoveries.find((row) => parseLivenessIncidentKey(row.originId)?.issueId === sourceIssueId) ?? null;
+  }
+
+  function buildLivenessEscalationDedupeComment(finding: IssueLivenessFinding) {
+    return [
+      "Paperclip re-detected a liveness finding for the same source issue of this open escalation.",
+      "",
+      "- Deduped into this card instead of minting a new incident (SPA-2062 rule: one open incident card per source issue).",
+      `- Incident key: \`${finding.incidentKey}\``,
+      `- Finding: \`${finding.state}\``,
+      `- Dependency path: ${formatDependencyPath(finding)}`,
+      `- Reason: ${finding.reason}`,
+      "- Next action: resolve the finding below; no new card was created.",
+      "",
+      `Manager action requested: ${finding.recommendedAction}`,
+    ].join("\n");
+  }
+
+  // Identical re-detections must not spam the card (each sweep re-finds the
+  // same stuck state until the owner resolves it): if a dedupe comment with
+  // this exact incident key already exists, this sweep only logs.
+  async function findDedupeCommentWithIncidentKey(
+    escalation: typeof issues.$inferSelect,
+    incidentKey: string,
+  ) {
+    return db
+      .select({ id: issueComments.id })
+      .from(issueComments)
+      .where(
+        and(
+          eq(issueComments.companyId, escalation.companyId),
+          eq(issueComments.issueId, escalation.id),
+          like(issueComments.body, "%Deduped into this card instead of minting a new incident%"),
+          like(issueComments.body, `%Incident key: \`${incidentKey}\``),
         ),
       )
       .limit(1)
@@ -5220,6 +5274,34 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     return updated;
   }
 
+  // SPA-6514: recently CLOSED same-source escalations (nine states can collide
+  // on one stuck source card) must also suppress re-minting — the per-incident-
+  // key/per-leaf cooldown above matches only the same finding shape, which is
+  // how one source card collected up to 9 copies on 2026-09-10/11.
+  async function findRecentCompletedLivenessEscalationForSource(
+    companyId: string,
+    sourceIssueId: string,
+    now: Date,
+    cooldownMs: number,
+  ) {
+    if (cooldownMs <= 0) return null;
+    const cutoff = new Date(now.getTime() - cooldownMs);
+    const rows = await db
+      .select({ id: issues.id, originId: issues.originId })
+      .from(issues)
+      .where(
+        and(
+          eq(issues.companyId, companyId),
+          eq(issues.originKind, RECOVERY_ORIGIN_KINDS.issueGraphLivenessEscalation),
+          visibleIssueCondition(),
+          eq(issues.status, "done"),
+          gte(issues.updatedAt, cutoff),
+        ),
+      )
+      .orderBy(desc(issues.updatedAt), desc(issues.id));
+    return rows.find((row) => parseLivenessIncidentKey(row.originId)?.issueId === sourceIssueId) ?? null;
+  }
+
   async function createIssueGraphLivenessEscalation(input: {
     finding: IssueLivenessFinding;
     runId?: string | null;
@@ -5261,6 +5343,95 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       input.reescalationCooldownMs,
     )) {
       return { kind: "cooldown" as const };
+    }
+    // SPA-6514: recently closed same-source escalations suppress re-minting the
+    // same way the per-finding cooldown above does — otherwise a new finding
+    // shape on a source whose previous incident card was just closed mints a
+    // fresh copy every sweep.
+    if (await findRecentCompletedLivenessEscalationForSource(
+      issue.companyId,
+      input.finding.issueId,
+      input.now,
+      input.reescalationCooldownMs,
+    )) {
+      return { kind: "cooldown" as const };
+    }
+    // SPA-2062 / SPA-6514: one open incident card per source issue. If another
+    // finding already has an open escalation for this same source, fold this
+    // detection into it instead of minting yet another card (with a wake so a
+    // changed finding actually reaches its owner — a silent comment is a black
+    // hole).
+    const existingForSource =
+      await findOpenLivenessEscalationForSource(issue.companyId, input.finding.issueId);
+    if (existingForSource) {
+      await ensureIssueBlockedByEscalation({
+        issue,
+        escalationIssueId: existingForSource.id,
+        finding: input.finding,
+        runId: input.runId ?? null,
+      });
+      const alreadyDedupedWithSameEvidence = Boolean(
+        await findDedupeCommentWithIncidentKey(existingForSource, input.finding.incidentKey),
+      );
+      if (!alreadyDedupedWithSameEvidence) {
+        await issuesSvc.addComment(
+          existingForSource.id,
+          buildLivenessEscalationDedupeComment(input.finding),
+          { runId: input.runId ?? null },
+        );
+        if (existingForSource.assigneeAgentId) {
+          await deps.enqueueWakeup(existingForSource.assigneeAgentId, {
+            source: "assignment",
+            triggerDetail: "system",
+            reason: "issue_assigned",
+            payload: withRecoveryModelProfileHint({
+              issueId: existingForSource.id,
+              sourceIssueId: issue.id,
+              recoveryIssueId: recoveryIssue.id,
+              incidentKey: input.finding.incidentKey,
+              dedupeComment: true,
+            }, "status_only"),
+            requestedByActorType: "system",
+            requestedByActorId: null,
+            contextSnapshot: withRecoveryModelProfileHint({
+              issueId: existingForSource.id,
+              taskId: existingForSource.id,
+              wakeReason: "issue_assigned",
+              source: RECOVERY_ORIGIN_KINDS.issueGraphLivenessEscalation,
+              sourceIssueId: issue.id,
+              recoveryIssueId: recoveryIssue.id,
+              incidentKey: input.finding.incidentKey,
+              dedupeComment: true,
+            }, "status_only"),
+          });
+        }
+      }
+      await logActivity(db, {
+        companyId: issue.companyId,
+        actorType: "system",
+        actorId: "system",
+        agentId: null,
+        runId: input.runId ?? null,
+        action: "issue.harness_liveness_escalation_deduped_into_existing",
+        entityType: "issue",
+        entityId: existingForSource.id,
+        details: {
+          source: "recovery.reconcile_issue_graph_liveness",
+          incidentKey: input.finding.incidentKey,
+          findingState: input.finding.state,
+          sourceIssueId: issue.id,
+          dedupedEscalationIssueId: existingForSource.id,
+          commentSuppressed: alreadyDedupedWithSameEvidence,
+        },
+      });
+      logger.info({
+        incidentKey: input.finding.incidentKey,
+        findingState: input.finding.state,
+        sourceIssueId: issue.id,
+        escalationIssueId: existingForSource.id,
+        commentSuppressed: alreadyDedupedWithSameEvidence,
+      }, "deduped liveness finding into existing escalation for the same source issue");
+      return { kind: "existing" as const, escalationIssueId: existingForSource.id };
     }
 
     const ownerSelection = await resolveEscalationOwnerAgentId(input.finding, recoveryIssue);
