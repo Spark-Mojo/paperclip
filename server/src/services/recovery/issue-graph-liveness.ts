@@ -44,6 +44,12 @@ export interface IssueLivenessAgentInput {
   title?: string | null;
   status: string;
   reportsTo?: string | null;
+  /**
+   * When the agent was paused. A `paused` status without a pause record is a
+   * stale transition, not a real pause — liveness treats those agents as
+   * invokable (SPA-6514).
+   */
+  pausedAt?: Date | string | null;
 }
 
 export interface IssueLivenessExecutionPathInput {
@@ -146,7 +152,13 @@ function isInvokableAgent(
   agent: IssueLivenessAgentInput | null | undefined,
   agentsById: Map<string, IssueLivenessAgentInput>,
 ) {
-  return Boolean(agent && isAgentInvokable({ agent, agents: [...agentsById.values()] }));
+  if (!agent) return false;
+  // SPA-6514: `paused` without a pause record (pausedAt) is a stale status —
+  // pause() always writes pausedAt, so a gap can only come from a legacy or
+  // failed transition. Treat such agents as invokable instead of minting
+  // uninvokable-assignee incidents against agents that are not really paused.
+  if (agent.status === "paused" && !agent.pausedAt) return true;
+  return isAgentInvokable({ agent, agents: [...agentsById.values()] });
 }
 
 function hasActiveExecutionPath(
@@ -655,7 +667,17 @@ export function classifyIssueGraphLiveness(input: IssueGraphLivenessInput): Issu
     const blockerEligibility = blockerAgent
       ? getAgentWorkEligibility({ agent: blockerAgent, agents: input.agents })
       : null;
-    if (!blockerAgent || blockerAgent.companyId !== source.companyId || !blockerEligibility?.invokable) {
+    const blockerIsStalePaused = Boolean(
+      blockerAgent &&
+        blockerAgent.companyId === source.companyId &&
+        blockerAgent.status === "paused" &&
+        !blockerAgent.pausedAt,
+    );
+    if (
+      !blockerAgent ||
+      blockerAgent.companyId !== source.companyId ||
+      (blockerIsStalePaused ? false : !blockerEligibility?.invokable)
+    ) {
       return finding({
         issue: source,
         state: "blocked_by_uninvokable_assignee",
