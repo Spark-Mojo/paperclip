@@ -1103,6 +1103,192 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
       expect(await statusOf(seeded.executionWorkspaceId)).toBe("archived");
       expect(await pathExists(seeded.worktreePath)).toBe(false);
     }, 20_000);
+
+    // SPA-7354 review fix (CRITICAL-2): a worktree leaf that is already gone
+    // must not wedge the retry. Git cannot inspect a missing directory, so the
+    // sweep used to skip the row as skippedUndelivered forever, and the
+    // terminal git-state assertion threw on the null rev-parse. The leaf is
+    // gone; the retry's job is the DB bookkeeping that republishes the row.
+    it("retries a cleanup_failed workspace whose worktree leaf was already removed", async () => {
+      const seeded = await seedTerminalWorkspace({ mergedPr: true });
+      await fs.rm(seeded.worktreePath, { recursive: true, force: true });
+      await db
+        .update(executionWorkspaces)
+        .set({
+          status: "cleanup_failed",
+          closedAt: new Date(nowMs - DAY_MS),
+          cleanupReason: "issue_terminal | simulated prior failure",
+          updatedAt: new Date(nowMs - DAY_MS),
+        })
+        .where(eq(executionWorkspaces.id, seeded.executionWorkspaceId));
+
+      const sweep = await zeroCooldownService().sweepTerminalWorkspaces();
+
+      expect(sweep).toMatchObject({ archived: 1, cleanupFailed: 0, skippedUndelivered: 0 });
+      expect(await statusOf(seeded.executionWorkspaceId)).toBe("archived");
+      expect(await pathExists(seeded.worktreePath)).toBe(false);
+    }, 20_000);
+
+    it("archives a terminal workspace whose leaf was destroyed before the row was updated", async () => {
+      // The crash-between-dir-destroy-and-row-update class: the row is still
+      // active, but the leaf is gone. There is nothing left to destroy, so the
+      // sweep must archive the row instead of skipping it forever.
+      const seeded = await seedTerminalWorkspace({ mergedPr: true });
+      await ageIssueBeyondCooldown(seeded);
+      await fs.rm(seeded.worktreePath, { recursive: true, force: true });
+
+      const sweep = await zeroCooldownService().sweepTerminalWorkspaces();
+
+      expect(sweep).toMatchObject({ archived: 1, cleanupFailed: 0, skippedUndelivered: 0 });
+      expect(await statusOf(seeded.executionWorkspaceId)).toBe("archived");
+      expect(await pathExists(seeded.worktreePath)).toBe(false);
+    }, 20_000);
+
+    // SPA-7354 review fix (HIGH-1): a cleanup that throws on every sweep (for
+    // example a stale git index lock that keeps the cleanup lock unavailable)
+    // used to re-run forever with no cap. The retry now counts attempts in the
+    // row metadata, stops at the cap, and logs one distinct exhaustion event.
+    it("caps a cleanup that throws on every retry and logs one exhaustion event", async () => {
+      const seeded = await seedTerminalWorkspace();
+      const worktreeGitDir = path.join(
+        seeded.repoRoot,
+        ".git",
+        "worktrees",
+        path.basename(seeded.worktreePath),
+      );
+      await fs.writeFile(path.join(worktreeGitDir, "index.lock"), "", "utf8");
+      await ageIssueBeyondCooldown(seeded);
+      const service = zeroCooldownService();
+
+      const firstSweep = await service.sweepTerminalWorkspaces();
+      expect(firstSweep).toMatchObject({ cleanupFailed: 1, archived: 0 });
+      expect(await statusOf(seeded.executionWorkspaceId)).toBe("cleanup_failed");
+
+      for (let attempt = 2; attempt <= 5; attempt += 1) {
+        const sweep = await service.sweepTerminalWorkspaces();
+        expect(sweep).toMatchObject({ cleanupFailed: 1, archived: 0 });
+      }
+      const [row] = await db
+        .select({ metadata: executionWorkspaces.metadata })
+        .from(executionWorkspaces)
+        .where(eq(executionWorkspaces.id, seeded.executionWorkspaceId));
+      expect((row?.metadata as Record<string, unknown>).terminalCleanupAttempts).toBe(5);
+
+      const cappedSweep = await service.sweepTerminalWorkspaces();
+      expect(cappedSweep).toMatchObject({ cleanupFailed: 0, archived: 0, skippedCleanupRetryCapped: 1 });
+
+      const exhaustion = await db
+        .select({ action: activityLog.action })
+        .from(activityLog)
+        .where(eq(activityLog.action, "execution_workspace.issue_terminal_cleanup_retries_exhausted"));
+      expect(exhaustion).toHaveLength(1);
+      expect(await statusOf(seeded.executionWorkspaceId)).toBe("cleanup_failed");
+    }, 40_000);
+
+    // SPA-7354 review fix (HIGH-2): a teardown command that already ran for the
+    // workspace must not run again when the workspace is reopened and archived
+    // a second time. Non-idempotent commands (dropdb, docker down) would mutate
+    // twice on the reopen->re-archive cycle.
+    it("does not re-run a teardown command that already executed for the workspace", async () => {
+      const seeded = await seedTerminalWorkspace({ mergedPr: true });
+      const markerPath = path.join(path.dirname(seeded.repoRoot), `teardown-marker-${randomUUID()}`);
+      tempDirs.add(markerPath);
+      await db
+        .update(projects)
+        .set({
+          executionWorkspacePolicy: {
+            enabled: true,
+            defaultMode: "isolated_workspace",
+            workspaceStrategy: {
+              type: "git_worktree",
+              baseRef: "main",
+              teardownCommand: `touch "${markerPath}"`,
+            },
+          },
+        })
+        .where(eq(projects.id, seeded.projectId));
+      await db
+        .update(executionWorkspaces)
+        .set({ updatedAt: new Date(nowMs - DAY_MS) })
+        .where(eq(executionWorkspaces.id, seeded.executionWorkspaceId));
+      await db
+        .update(issues)
+        .set({ completedAt: new Date(nowMs) })
+        .where(eq(issues.id, seeded.sourceIssueId));
+
+      const firstSweep = await zeroCooldownService().sweepTerminalWorkspaces();
+      expect(firstSweep).toMatchObject({ archived: 1, cleanupFailed: 0 });
+      expect(await pathExists(markerPath)).toBe(true);
+      const markerAfterFirst = await fs.stat(markerPath);
+
+      // Simulate the reopen -> consume -> re-archive cycle: the row returns to
+      // active with the lifecycle generation raised, the issue is still
+      // terminal, and the command-execution record persists in the metadata.
+      const [row] = await db
+        .select({ metadata: executionWorkspaces.metadata })
+        .from(executionWorkspaces)
+        .where(eq(executionWorkspaces.id, seeded.executionWorkspaceId));
+      await db
+        .update(executionWorkspaces)
+        .set({
+          status: "active",
+          closedAt: null,
+          metadata: {
+            ...(row?.metadata as Record<string, unknown>),
+            lifecycleGeneration:
+              ((row?.metadata as Record<string, unknown>).lifecycleGeneration as number ?? 0) + 1,
+          },
+          updatedAt: new Date(nowMs - DAY_MS),
+        })
+        .where(eq(executionWorkspaces.id, seeded.executionWorkspaceId));
+
+      const secondSweep = await zeroCooldownService().sweepTerminalWorkspaces();
+      expect(secondSweep).toMatchObject({ archived: 1, cleanupFailed: 0 });
+      const markerAfterSecond = await fs.stat(markerPath);
+      expect(markerAfterSecond.mtimeMs).toBe(markerAfterFirst.mtimeMs);
+    }, 20_000);
+
+    // SPA-7354 review fix (CRITICAL-1 residual, reviewer's generation note):
+    // the archive UPDATE used to derive its write from the candidate snapshot
+    // without checking that the row's lifecycle generation still matched, so a
+    // reopen that raised the generation between the candidate read and the
+    // archive transaction could be archived from the stale snapshot. The
+    // archive now requires the row to still sit at the snapshot's generation.
+    it("does not archive a terminal workspace whose lifecycle generation moved after the candidate read", async () => {
+      const seeded = await seedTerminalWorkspace({ mergedPr: true });
+      await ageIssueBeyondCooldown(seeded);
+      let bumped = false;
+      const service = executionWorkspaceService(db, {
+        resolvePullRequestDetails: async (companyId, reference) => {
+          if (!bumped) {
+            bumped = true;
+            // Emulate a reopen that completed between the candidate read and
+            // the archive transaction: the generation moved, the row is active
+            // again, and the consuming request already cleared its flag.
+            await db
+              .update(executionWorkspaces)
+              .set({
+                status: "active",
+                closedAt: null,
+                metadata: { lifecycleGeneration: 7 },
+                updatedAt: new Date(nowMs - DAY_MS),
+              })
+              .where(eq(executionWorkspaces.id, seeded.executionWorkspaceId));
+          }
+          return pullRequestDetailsByKey.get(`${companyId}:${reference.number}`)
+            ?? { state: "unknown", headRef: null, headSha: null };
+        },
+        now: () => new Date(nowMs),
+        workspaceReaperCooldownDays: 0,
+      });
+
+      const sweep = await service.sweepTerminalWorkspaces();
+
+      expect(sweep.skippedRace).toBe(1);
+      expect(sweep.archived).toBe(0);
+      expect(await statusOf(seeded.executionWorkspaceId)).toBe("active");
+      expect(await pathExists(seeded.worktreePath)).toBe(true);
+    }, 20_000);
   });
 
   it("does not treat an unrelated inbound issue mention as delivery evidence", async () => {
