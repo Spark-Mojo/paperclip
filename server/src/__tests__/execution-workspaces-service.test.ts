@@ -417,6 +417,19 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
     return { companyId, projectId, executionWorkspaceId, sourceIssueId, identifier, repoRoot, worktreePath, headSha };
   }
 
+  // SPA-7354: a service whose seven-day reaper cooldown still shields undelivered
+  // or uncommitted terminal workspaces. The delivery-trust and uncommitted-work
+  // tests assert that shield, which now lives in the cooldown window instead of
+  // a permanent skip on every sweep.
+  function shieldedSweepService() {
+    return executionWorkspaceService(db, {
+      resolvePullRequestDetails: async (companyId, reference) =>
+        pullRequestDetailsByKey.get(`${companyId}:${reference.number}`)
+        ?? { state: "unknown", headRef: null, headSha: null },
+      workspaceReaperCooldownDays: 7,
+    });
+  }
+
   it("reports a squash cross-branch delivery as merged_via_pr and suppresses the ancestry warning", async () => {
     const repoRoot = await createTempRepo();
     tempDirs.add(repoRoot);
@@ -934,6 +947,164 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
     }, 20_000);
   });
 
+  // SPA-7354: the reaper used to skip dirty or undelivered terminal workspaces
+  // on every pass, so their worktree leaves accumulated on disk forever. After
+  // the cooldown expires the reopen window is over, the branch ref (and any
+  // merged history) survives worktree removal, and only uncommitted scratch can
+  // be lost — so the reaper must archive-then-force-remove those workspaces
+  // instead of skipping them forever.
+  describe("post-cooldown teardown of undelivered terminal workspaces", () => {
+    const DAY_MS = 24 * 60 * 60 * 1000;
+    const nowMs = Date.UTC(2026, 5, 1);
+
+    function zeroCooldownService() {
+      return executionWorkspaceService(db, {
+        resolvePullRequestDetails: async (companyId, reference) =>
+          pullRequestDetailsByKey.get(`${companyId}:${reference.number}`)
+          ?? { state: "unknown", headRef: null, headSha: null },
+        now: () => new Date(nowMs),
+        workspaceReaperCooldownDays: 0,
+      });
+    }
+
+    function windowedService(cooldownDays: number) {
+      return executionWorkspaceService(db, {
+        resolvePullRequestDetails: async (companyId, reference) =>
+          pullRequestDetailsByKey.get(`${companyId}:${reference.number}`)
+          ?? { state: "unknown", headRef: null, headSha: null },
+        now: () => new Date(nowMs),
+        workspaceReaperCooldownDays: cooldownDays,
+      });
+    }
+
+    async function statusOf(executionWorkspaceId: string) {
+      const [row] = await db
+        .select({ status: executionWorkspaces.status })
+        .from(executionWorkspaces)
+        .where(eq(executionWorkspaces.id, executionWorkspaceId));
+      return row?.status ?? null;
+    }
+
+    async function pathExists(filePath: string) {
+      return fs
+        .access(filePath)
+        .then(() => true)
+        .catch(() => false);
+    }
+
+    async function ageIssueBeyondCooldown(seeded: Awaited<ReturnType<typeof seedTerminalWorkspace>>) {
+      // Put the workspace inside the sweep boundary and make the issue terminal
+      // ten days ago, so a seven-day cooldown is over.
+      await db
+        .update(executionWorkspaces)
+        .set({ updatedAt: new Date(nowMs - DAY_MS) })
+        .where(eq(executionWorkspaces.id, seeded.executionWorkspaceId));
+      await db
+        .update(issues)
+        .set({ completedAt: new Date(nowMs - 10 * DAY_MS) })
+        .where(eq(issues.id, seeded.sourceIssueId));
+    }
+
+    it("force-reaps a clean terminal workspace whose branch was never merged", async () => {
+      // No merged PR product and a delivery branch one commit ahead of main:
+      // delivery derives to unknown/unmerged, which the pre-fix reaper skipped
+      // on every sweep. This is the squash-merge and cancelled-issue class.
+      const seeded = await seedTerminalWorkspace();
+      await ageIssueBeyondCooldown(seeded);
+
+      const sweep = await zeroCooldownService().sweepTerminalWorkspaces();
+
+      expect(sweep).toMatchObject({ archived: 1, cleanupFailed: 0, skippedUndelivered: 0 });
+      expect(await statusOf(seeded.executionWorkspaceId)).toBe("archived");
+      expect(await pathExists(seeded.worktreePath)).toBe(false);
+    }, 20_000);
+
+    it("force-reaps a dirty terminal workspace after the cooldown", async () => {
+      const seeded = await seedTerminalWorkspace();
+      await fs.writeFile(path.join(seeded.worktreePath, "scratch.txt"), "uncommitted\n", "utf8");
+      await ageIssueBeyondCooldown(seeded);
+
+      const sweep = await zeroCooldownService().sweepTerminalWorkspaces();
+
+      expect(sweep).toMatchObject({ archived: 1, cleanupFailed: 0, skippedUndelivered: 0 });
+      expect(await statusOf(seeded.executionWorkspaceId)).toBe("archived");
+      expect(await pathExists(seeded.worktreePath)).toBe(false);
+    }, 20_000);
+
+    it("keeps the cooldown shield over undelivered terminal workspaces inside the window", async () => {
+      const seeded = await seedTerminalWorkspace();
+      await fs.writeFile(path.join(seeded.worktreePath, "scratch.txt"), "uncommitted\n", "utf8");
+      await db
+        .update(executionWorkspaces)
+        .set({ updatedAt: new Date(nowMs - DAY_MS) })
+        .where(eq(executionWorkspaces.id, seeded.executionWorkspaceId));
+      await db
+        .update(issues)
+        .set({ completedAt: new Date(nowMs - DAY_MS) })
+        .where(eq(issues.id, seeded.sourceIssueId));
+
+      const sweep = await windowedService(7).sweepTerminalWorkspaces();
+
+      expect(sweep.archived).toBe(0);
+      expect(sweep.skippedCooldown).toBeGreaterThan(0);
+      expect(await statusOf(seeded.executionWorkspaceId)).toBe("active");
+      expect(await pathExists(seeded.worktreePath)).toBe(true);
+    }, 20_000);
+
+    it("runs the configured teardown command when the reaper cleans a terminal workspace", async () => {
+      const seeded = await seedTerminalWorkspace({ mergedPr: true });
+      const markerPath = path.join(path.dirname(seeded.repoRoot), `teardown-marker-${randomUUID()}`);
+      tempDirs.add(markerPath);
+      await db
+        .update(projects)
+        .set({
+          executionWorkspacePolicy: {
+            enabled: true,
+            defaultMode: "isolated_workspace",
+            workspaceStrategy: {
+              type: "git_worktree",
+              baseRef: "main",
+              teardownCommand: `touch "${markerPath}"`,
+            },
+          },
+        })
+        .where(eq(projects.id, seeded.projectId));
+      await db
+        .update(executionWorkspaces)
+        .set({ updatedAt: new Date(nowMs - DAY_MS) })
+        .where(eq(executionWorkspaces.id, seeded.executionWorkspaceId));
+      await db
+        .update(issues)
+        .set({ completedAt: new Date(nowMs) })
+        .where(eq(issues.id, seeded.sourceIssueId));
+
+      const sweep = await zeroCooldownService().sweepTerminalWorkspaces();
+
+      expect(sweep).toMatchObject({ archived: 1, cleanupFailed: 0 });
+      expect(await pathExists(markerPath)).toBe(true);
+      expect(await statusOf(seeded.executionWorkspaceId)).toBe("archived");
+    }, 20_000);
+
+    it("retries a cleanup_failed workspace on a later sweep and archives it", async () => {
+      const seeded = await seedTerminalWorkspace({ mergedPr: true });
+      await db
+        .update(executionWorkspaces)
+        .set({
+          status: "cleanup_failed",
+          closedAt: new Date(nowMs - DAY_MS),
+          cleanupReason: "issue_terminal | simulated prior failure",
+          updatedAt: new Date(nowMs - DAY_MS),
+        })
+        .where(eq(executionWorkspaces.id, seeded.executionWorkspaceId));
+
+      const sweep = await zeroCooldownService().sweepTerminalWorkspaces();
+
+      expect(sweep).toMatchObject({ archived: 1, cleanupFailed: 0 });
+      expect(await statusOf(seeded.executionWorkspaceId)).toBe("archived");
+      expect(await pathExists(seeded.worktreePath)).toBe(false);
+    }, 20_000);
+  });
+
   it("does not treat an unrelated inbound issue mention as delivery evidence", async () => {
     const seeded = await seedTerminalWorkspace();
     const unrelatedIssueId = randomUUID();
@@ -965,7 +1136,10 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
     });
 
     const readiness = await svc.getCloseReadiness(seeded.executionWorkspaceId);
-    const sweep = await svc.sweepTerminalWorkspaces();
+    // SPA-7354: the seven-day cooldown shields the undelivered workspace. This
+    // test's point is the readiness verdict (untrusted mention is not delivery
+    // evidence), which does not change.
+    const sweep = await shieldedSweepService().sweepTerminalWorkspaces();
     const [workspace] = await db
       .select({
         status: executionWorkspaces.status,
@@ -976,7 +1150,7 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
       .where(eq(executionWorkspaces.id, seeded.executionWorkspaceId));
 
     expect(readiness?.deliveryState).toBe("unmerged");
-    expect(sweep).toMatchObject({ archived: 0, skippedUndelivered: 1 });
+    expect(sweep).toMatchObject({ archived: 0, skippedCooldown: 1 });
     expect(workspace).toMatchObject({
       status: "active",
       cleanupEligibleAt: null,
@@ -1010,14 +1184,15 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
     ]);
 
     const readiness = await svc.getCloseReadiness(seeded.executionWorkspaceId);
-    const sweep = await svc.sweepTerminalWorkspaces();
+    // SPA-7354: shielded by the cooldown window; the trust verdict is readiness.
+    const sweep = await shieldedSweepService().sweepTerminalWorkspaces();
     const [workspace] = await db
       .select({ status: executionWorkspaces.status })
       .from(executionWorkspaces)
       .where(eq(executionWorkspaces.id, seeded.executionWorkspaceId));
 
     expect(readiness?.deliveryState).toBe("unmerged");
-    expect(sweep).toMatchObject({ archived: 0, skippedUndelivered: 1 });
+    expect(sweep).toMatchObject({ archived: 0, skippedCooldown: 1 });
     expect(workspace?.status).toBe("active");
   });
 
@@ -1028,7 +1203,9 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
     await runGit(seeded.worktreePath, ["commit", "-m", "New undelivered work"]);
 
     const readiness = await svc.getCloseReadiness(seeded.executionWorkspaceId);
-    const sweep = await svc.sweepTerminalWorkspaces();
+    // SPA-7354: shielded by the cooldown window; post-merge commits stay
+    // undelivered in readiness, and inside the window they are not reaped.
+    const sweep = await shieldedSweepService().sweepTerminalWorkspaces();
     const [workspace] = await db
       .select({ status: executionWorkspaces.status })
       .from(executionWorkspaces)
@@ -1038,7 +1215,7 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
     expect(readiness?.warnings).toContain(
       "This workspace is 2 commits ahead of main and is not merged.",
     );
-    expect(sweep).toMatchObject({ archived: 0, skippedUndelivered: 1 });
+    expect(sweep).toMatchObject({ archived: 0, skippedCooldown: 1 });
     expect(workspace?.status).toBe("active");
   });
 
@@ -1047,7 +1224,10 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
     await fs.writeFile(path.join(seeded.worktreePath, "uncommitted.txt"), "not delivered\n", "utf8");
 
     const readiness = await svc.getCloseReadiness(seeded.executionWorkspaceId);
-    const sweep = await svc.sweepTerminalWorkspaces();
+    // SPA-7354: uncommitted work is shielded by the cooldown window now instead
+    // of a permanent skip. After the cooldown expires the post-cooldown teardown
+    // deliberately reclaims it (see the post-cooldown describe block).
+    const sweep = await shieldedSweepService().sweepTerminalWorkspaces();
     const [workspace] = await db
       .select({ status: executionWorkspaces.status })
       .from(executionWorkspaces)
@@ -1055,8 +1235,10 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
 
     expect(readiness?.deliveryState).toBe("merged_via_pr");
     expect(readiness?.warnings).toContain("The workspace has 1 untracked file.");
-    expect(sweep).toMatchObject({ archived: 0, skippedUndelivered: 1 });
+    expect(sweep).toMatchObject({ archived: 0, skippedCooldown: 1 });
     expect(workspace?.status).toBe("active");
+    await expect(fs.readFile(path.join(seeded.worktreePath, "uncommitted.txt"), "utf8"))
+      .resolves.toBe("not delivered\n");
   });
 
   it("refuses cleanup when the worktree changes after delivery assessment", async () => {
@@ -1138,7 +1320,7 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
     ).toBe(2);
   });
 
-  it("archives terminal workspaces without running configured cleanup hooks", async () => {
+  it("runs configured cleanup hooks when reaping terminal workspaces", async () => {
     const seeded = await seedTerminalWorkspace({ mergedPr: true });
     const cleanupMarker = path.join(path.dirname(seeded.worktreePath), `cleanup-marker-${randomUUID()}`);
     tempDirs.add(cleanupMarker);
@@ -1158,7 +1340,10 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
     expect(sweep).toMatchObject({ archived: 1, cleanupFailed: 0 });
     expect(workspace?.status).toBe("archived");
     await expect(fs.access(seeded.worktreePath)).rejects.toThrow();
-    await expect(fs.access(cleanupMarker)).rejects.toThrow();
+    // SPA-7354: the reaper runs the operator-configured cleanup and teardown
+    // commands on the automatic path; the workspace-level cleanupCommand must
+    // have executed by the time the sweep returns.
+    await expect(fs.access(cleanupMarker)).resolves.toBeUndefined();
   });
 
   it("does not reap a reopened workspace while the source issue is still terminal", async () => {
@@ -1804,14 +1989,15 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
     });
 
     const readiness = await svc.getCloseReadiness(seeded.executionWorkspaceId);
-    const sweep = await svc.sweepTerminalWorkspaces();
+    // SPA-7354: shielded by the cooldown window; the trust verdict is readiness.
+    const sweep = await shieldedSweepService().sweepTerminalWorkspaces();
     const [parentWorkspace] = await db
       .select({ status: executionWorkspaces.status })
       .from(executionWorkspaces)
       .where(eq(executionWorkspaces.id, seeded.executionWorkspaceId));
 
     expect(readiness?.deliveryState).toBe("unmerged");
-    expect(sweep).toMatchObject({ archived: 0, skippedUndelivered: 1 });
+    expect(sweep).toMatchObject({ archived: 0, skippedCooldown: 1 });
     expect(parentWorkspace?.status).toBe("active");
   });
 
@@ -1833,12 +2019,15 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
       ]));
     const byId = new Map(rows.map((row) => [row.id, row]));
 
-    expect(result).toMatchObject({ archived: 1, skippedActiveRun: 1, skippedNonTerminalTree: 1, skippedUndelivered: 1 });
+    // SPA-7354: the undelivered workspace (no merged PR, untrusted state) is
+    // no longer skipped forever — with the cooldown at zero it reaps in the
+    // same sweep as the delivered one.
+    expect(result).toMatchObject({ archived: 2, skippedActiveRun: 1, skippedNonTerminalTree: 1, skippedUndelivered: 0 });
     expect(byId.get(eligible.executionWorkspaceId)).toMatchObject({ status: "archived", cleanupReason: "issue_terminal" });
     expect(byId.get(eligible.executionWorkspaceId)?.cleanupEligibleAt).toBeInstanceOf(Date);
+    expect(byId.get(undelivered.executionWorkspaceId)).toMatchObject({ status: "archived", cleanupReason: "issue_terminal" });
     expect(byId.get(activeRun.executionWorkspaceId)?.status).toBe("active");
     expect(byId.get(openDescendant.executionWorkspaceId)?.status).toBe("active");
-    expect(byId.get(undelivered.executionWorkspaceId)?.status).toBe("active");
 
     const second = await svc.sweepTerminalWorkspaces();
     expect(second.archived).toBe(0);

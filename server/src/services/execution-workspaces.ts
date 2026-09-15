@@ -228,6 +228,12 @@ export type ExecutionWorkspaceServiceOptions = {
   resolvePullRequestDetails?: PullRequestMergeDetailsResolver;
   now?: () => Date;
   beforeTerminalWorkspaceCleanup?: (workspace: ExecutionWorkspaceRow) => Promise<void>;
+  // SPA-7354: lifecycle-test hook. When set, the terminal reaper (and the
+  // seeded `opts` harness) passes forceWorktreeRemoval through to every
+  // terminal cleanup instead of deriving it from the delivery assessment.
+  // Lets tests assert the forced-cleanup leaf removal without ageing an issue
+  // past the cooldown.
+  forceTerminalWorktreeRemoval?: boolean;
   // The terminal-workspace reaper waits this many days after an issue tree
   // becomes terminal before it archives the workspace. A value of 0 disables
   // the cooldown. The default is 7 days.
@@ -1465,6 +1471,7 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
   async function assertTerminalCleanupGitStateUnchanged(
     workspace: ExecutionWorkspaceRow,
     expectedHeadSha: string | null,
+    opts: { allowDirtyWorktree?: boolean } = {},
   ) {
     if (workspace.providerType !== "git_worktree") return;
     const workspacePath = readNullableString(workspace.providerRef) ?? readNullableString(workspace.cwd);
@@ -1482,8 +1489,11 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
     }
     if (
       !current.git?.repoRoot
-      || current.git.hasDirtyTrackedFiles
-      || current.git.hasUntrackedFiles
+      // SPA-7354: post-cooldown force removal deliberately proceeds on a dirty
+      // worktree (uncommitted scratch in the reopen-expired window). The HEAD
+      // and branch checks below still hold, so a *diverged* worktree still
+      // fails closed.
+      || (!opts.allowDirtyWorktree && (current.git.hasDirtyTrackedFiles || current.git.hasUntrackedFiles))
       || currentHeadSha !== expectedHeadSha
       || (workspace.branchName && currentBranchName !== workspace.branchName)
     ) {
@@ -1671,6 +1681,7 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
     workspace: ExecutionWorkspaceRow,
     expectedHeadSha: string | null,
     capturedGeneration: number,
+    callOpts: { forceWorktreeRemoval?: boolean } = {},
   ): Promise<{ cleaned: boolean; warnings: string[]; skippedReopened?: boolean }> {
     // The gateway holds the per-workspace lifecycle lock across the destructive
     // actions. A reopen takes the same lock, so a reopen cannot rebuild the
@@ -1689,11 +1700,15 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
         message: "execution workspace cleanup skipped because it was reopened",
       },
       onSkip: () => ({ cleaned: false, warnings: [], skippedReopened: true }),
-      write: () => runTerminalWorkspaceCleanup(workspace, expectedHeadSha),
+      write: () => runTerminalWorkspaceCleanup(workspace, expectedHeadSha, callOpts),
     });
   }
 
-  async function runTerminalWorkspaceCleanup(workspace: ExecutionWorkspaceRow, expectedHeadSha: string | null) {
+  async function runTerminalWorkspaceCleanup(
+    workspace: ExecutionWorkspaceRow,
+    expectedHeadSha: string | null,
+    callOpts: { forceWorktreeRemoval?: boolean } = {},
+  ) {
     const [
       {
         acquireGitWorktreeCleanupLock,
@@ -1723,14 +1738,16 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
         .then((rows) => parseProjectExecutionWorkspacePolicy(rows[0]?.executionWorkspacePolicy)),
     ]);
     const config = readExecutionWorkspaceConfig((workspace.metadata as Record<string, unknown> | null) ?? null);
+    const allowDirtyWorktree = callOpts.forceWorktreeRemoval === true
+      || opts.forceTerminalWorktreeRemoval === true;
 
     const cleanupLock = workspace.providerType === "git_worktree" && (workspace.providerRef ?? workspace.cwd)
       ? await acquireGitWorktreeCleanupLock(workspace.providerRef ?? workspace.cwd!)
       : null;
     try {
-      await assertTerminalCleanupGitStateUnchanged(workspace, expectedHeadSha);
+      await assertTerminalCleanupGitStateUnchanged(workspace, expectedHeadSha, { allowDirtyWorktree });
       await opts.beforeTerminalWorkspaceCleanup?.(workspace);
-      await assertTerminalCleanupGitStateUnchanged(workspace, expectedHeadSha);
+      await assertTerminalCleanupGitStateUnchanged(workspace, expectedHeadSha, { allowDirtyWorktree });
       await stopRuntimeServicesForExecutionWorkspace({
         db,
         executionWorkspaceId: workspace.id,
@@ -1745,15 +1762,22 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
           companyId: workspace.companyId,
           executionWorkspaceId: workspace.id,
         }),
-        assertSafeToCleanup: () => assertTerminalCleanupGitStateUnchanged(workspace, expectedHeadSha),
+        assertSafeToCleanup: () => assertTerminalCleanupGitStateUnchanged(workspace, expectedHeadSha, { allowDirtyWorktree }),
         beforeBranchDelete: () => cleanupLock?.releaseBranchRefLock() ?? Promise.resolve(),
         expectedBranchHeadSha: expectedHeadSha,
         // Git index, HEAD, and branch-ref locks prevent a clean HEAD change
         // from crossing final validation. The branch lock is released only
         // after non-forced worktree removal, then deletion is anchored to the
         // verified HEAD so a raced ref update fails closed.
-        runCleanupCommands: false,
-        forceWorktreeRemoval: false,
+        // SPA-7354: the reaper now runs the operator-configured cleanup and
+        // teardown commands on the automatic path (they previously only ran on
+        // the explicit archive route, so project teardownCommand settings never
+        // fired on terminal close). forceWorktreeRemoval is set by the sweep
+        // for post-cooldown undelivered workspaces: the reopen window is over,
+        // branch refs survive worktree removal, and only uncommitted scratch is
+        // destroyed.
+        runCleanupCommands: true,
+        forceWorktreeRemoval: opts.forceTerminalWorktreeRemoval ?? callOpts.forceWorktreeRemoval ?? false,
       });
       if (cleanup.cleaned && workspace.mode === "shared_workspace") {
         await db
@@ -2549,8 +2573,11 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
       terminalSweepInProgress = true;
       try {
       const baseCandidateFilter = and(
-        inArray(executionWorkspaces.status, ["active", "idle", "in_review"]),
-        isNull(executionWorkspaces.closedAt),
+        // SPA-7354: cleanup_failed rows join the candidate set so a failed
+        // terminal cleanup is retried on a later sweep instead of stranding the
+        // worktree leaf forever. closedAt is intentionally not filtered: a
+        // cleanup_failed row was already archived once and carries its closedAt.
+        inArray(executionWorkspaces.status, ["active", "idle", "in_review", "cleanup_failed"]),
         sql<boolean>`${executionWorkspaces.sourceIssueId} IS NOT NULL`,
       );
       // Continue the scan after the previous sweep's last row. The keyset
@@ -2637,34 +2664,33 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
           result.skippedNonTerminalTree += 1;
           continue;
         }
-        if (assessment.workspaceDirty) {
-          result.skippedUndelivered += 1;
-          continue;
-        }
-        if (
-          assessment.deliveryState !== "merged_via_pr"
-          && assessment.deliveryState !== "merged_by_ancestry"
-        ) {
-          result.skippedUndelivered += 1;
-          continue;
-        }
-        // Hold the archive during the cooldown window. The anchor is the most
-        // recent terminal timestamp across the issue tree. A person can reopen
-        // the work inside this window. A cooldown of 0 disables the check, so the
-        // reaper archives the workspace on the same sweep. The archive statement
-        // below re-checks the same cutoff under the lifecycle lock, so the loop
-        // check and the guarded statement agree.
+        // SPA-7354: the cooldown gate now runs BEFORE the delivery gates. Inside
+        // the cooldown window an undelivered or dirty terminal workspace stays
+        // shielded exactly like a delivered one (skippedCooldown). Once the
+        // cooldown expires, the reopen window is over, so the previously
+        // never-archived classes below proceed to archive-then-force-remove
+        // instead of being skipped on every sweep forever.
         const cooldownCutoff = workspaceReaperCooldownMs > 0
           ? new Date(now().getTime() - workspaceReaperCooldownMs)
           : null;
-        if (
-          cooldownCutoff
-          && assessment.cooldownAnchor
-          && assessment.cooldownAnchor.getTime() > cooldownCutoff.getTime()
-        ) {
+        const cooldownExpired = !cooldownCutoff
+          || !assessment.cooldownAnchor
+          || assessment.cooldownAnchor.getTime() <= cooldownCutoff.getTime();
+        if (!cooldownExpired) {
           result.skippedCooldown += 1;
           continue;
         }
+        // SPA-7354: dirty or undelivered delivery states no longer skip the
+        // sweep. Worktree removal never deletes the branch ref, so unmerged
+        // commits survive; only uncommitted scratch in the worktree is lost, and
+        // the cooldown window above was the grace period to rescue it. The
+        // force flag escalates the removal to `git worktree remove --force`,
+        // which the non-forced path refuses on dirty trees.
+        const postCooldownForce = Boolean(assessment.workspaceDirty)
+          || (
+            assessment.deliveryState !== "merged_via_pr"
+            && assessment.deliveryState !== "merged_by_ancestry"
+          );
         if (reopenPending) {
           const pendingSince = readMetadataReopenPendingConsumptionSince(
             workspace.metadata as Record<string, unknown> | null,
@@ -2725,6 +2751,10 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
           continue;
         }
         result.eligible += 1;
+        // SPA-7354: a cleanup_failed row was already archived once (closedAt is
+        // set); the sweep re-runs only its cleanup against the generation it
+        // still carries, and republishes it as archived when the cleanup lands.
+        const wasCleanupFailed = workspace.status === "cleanup_failed";
         const closedAt = now();
         // Raise the lifecycle generation on archive. The cleanup below captures
         // this generation and re-checks it before it deletes the worktree, so a
@@ -2737,7 +2767,11 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
         // checks and the archive write. The archive statement re-checks the
         // status, the terminal predicates, and the reopen-pending flag under the
         // lock, so it never archives a workspace that a reopen just restored.
-        const archived = await db.transaction(async (tx) => {
+        // SPA-7354: cleanup_failed rows skip the archive transaction (they are
+        // already closed) and go straight to the fenced cleanup retry.
+        const cleanupTarget = wasCleanupFailed
+          ? workspace
+          : await db.transaction(async (tx) => {
           await acquireExecutionWorkspaceLifecycleLock(tx, workspace.id);
           return tx
             .update(executionWorkspaces)
@@ -2822,34 +2856,67 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
             .returning()
             .then((rows) => rows[0] ?? null);
         });
-        if (!archived) {
+        if (!cleanupTarget) {
           result.skippedRace += 1;
           continue;
         }
 
         await logActivity(db, {
-          companyId: archived.companyId,
+          companyId: cleanupTarget.companyId,
           actorType: "system",
           actorId: "workspace_terminality_reaper",
-          action: "execution_workspace.issue_terminal_archived",
+          action: wasCleanupFailed
+            ? "execution_workspace.issue_terminal_cleanup_retried"
+            : "execution_workspace.issue_terminal_archived",
           entityType: "execution_workspace",
-          entityId: archived.id,
+          entityId: cleanupTarget.id,
           details: {
-            sourceIssueId: archived.sourceIssueId,
+            sourceIssueId: cleanupTarget.sourceIssueId,
             deliveryState: assessment.deliveryState,
-            cleanupEligibleAt: archived.cleanupEligibleAt?.toISOString() ?? null,
+            cleanupEligibleAt: cleanupTarget.cleanupEligibleAt?.toISOString() ?? null,
             cleanupReason: ISSUE_TERMINAL_WORKSPACE_CLEANUP_REASON,
+            forceWorktreeRemoval: postCooldownForce,
           },
         });
 
         const capturedGeneration = readExecutionWorkspaceLifecycleGeneration(
-          archived.metadata as Record<string, unknown> | null,
+          cleanupTarget.metadata as Record<string, unknown> | null,
         );
         try {
-          const cleanup = await cleanupTerminalWorkspace(archived, assessment.workspaceHeadSha, capturedGeneration);
+          const cleanup = await cleanupTerminalWorkspace(
+            cleanupTarget,
+            assessment.workspaceHeadSha,
+            capturedGeneration,
+            { forceWorktreeRemoval: postCooldownForce },
+          );
           if (cleanup.skippedReopened) result.skippedReopened += 1;
           else if (!cleanup.cleaned) result.cleanupFailed += 1;
-          else result.archived += 1;
+          else {
+            result.archived += 1;
+            if (wasCleanupFailed) {
+              // The retry succeeded. Republish the row as archived under the
+              // lifecycle fence: a reopen that raced the cleanup raised the
+              // generation and restored an open status, and that newer lifecycle
+              // must not be overwritten by the retry's bookkeeping.
+              await fenceLifecycleGenerationWrite({
+                workspaceId: cleanupTarget.id,
+                expectedGeneration: capturedGeneration,
+                isWriteTarget: (fresh) => fresh.status === "cleanup_failed",
+                onSkip: () => false,
+                write: async ({ tx }) => {
+                  await tx
+                    .update(executionWorkspaces)
+                    .set({
+                      status: "archived",
+                      cleanupReason: ISSUE_TERMINAL_WORKSPACE_CLEANUP_REASON,
+                      updatedAt: now(),
+                    })
+                    .where(eq(executionWorkspaces.id, cleanupTarget.id));
+                  return true;
+                },
+              });
+            }
+          }
         } catch (error) {
           result.cleanupFailed += 1;
           const failure = error instanceof Error ? error.message : String(error);
@@ -2859,18 +2926,18 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
           // higher generation. The fenced write then skips, so stale
           // cleanup-failure state never lands on a newer archive lifecycle.
           await markTerminalCleanupFailedFenced({
-            workspaceId: archived.id,
+            workspaceId: cleanupTarget.id,
             capturedGeneration,
             cleanupReason: `${ISSUE_TERMINAL_WORKSPACE_CLEANUP_REASON} | ${failure}`,
           });
           await logActivity(db, {
-            companyId: archived.companyId,
+            companyId: cleanupTarget.companyId,
             actorType: "system",
             actorId: "workspace_terminality_reaper",
             action: "execution_workspace.issue_terminal_cleanup_failed",
             entityType: "execution_workspace",
-            entityId: archived.id,
-            details: { sourceIssueId: archived.sourceIssueId, failure },
+            entityId: cleanupTarget.id,
+            details: { sourceIssueId: cleanupTarget.sourceIssueId, failure },
           });
         }
       }
