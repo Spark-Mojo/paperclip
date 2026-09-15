@@ -1,5 +1,6 @@
 import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
+import { existsSync } from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { promisify } from "node:util";
@@ -134,6 +135,40 @@ export function bumpExecutionWorkspaceLifecycleGeneration(
     [EXECUTION_WORKSPACE_LIFECYCLE_GENERATION_METADATA_KEY]:
       readExecutionWorkspaceLifecycleGeneration(metadata) + 1,
   };
+}
+
+// SPA-7354 review fix (HIGH-1): the metadata key that counts how many times the
+// terminal reaper attempted this workspace's cleanup and failed. The sweep
+// stops retrying at MAX_TERMINAL_CLEANUP_ATTEMPTS, so a cleanup that throws on
+// every pass cannot churn the database and the logs forever.
+export const EXECUTION_WORKSPACE_TERMINAL_CLEANUP_ATTEMPTS_METADATA_KEY = "terminalCleanupAttempts";
+
+export const MAX_TERMINAL_CLEANUP_ATTEMPTS = 5;
+
+export function readTerminalCleanupAttempts(
+  metadata: Record<string, unknown> | null | undefined,
+): number {
+  const raw = metadata?.[EXECUTION_WORKSPACE_TERMINAL_CLEANUP_ATTEMPTS_METADATA_KEY];
+  return typeof raw === "number" && Number.isInteger(raw) && raw >= 0 ? raw : 0;
+}
+
+// SPA-7354 review fix (HIGH-2): the metadata key that records, per cleanup
+// command string, the ISO timestamp at which the terminal path last executed
+// it. A reopen -> re-archive cycle must not re-run a command that already ran
+// (`dropdb`, `docker compose down` are not idempotent), so the cleanup skips
+// recorded commands.
+export const EXECUTION_WORKSPACE_CLEANUP_COMMANDS_EXECUTED_METADATA_KEY = "terminalCleanupCommandsExecutedAt";
+
+export function readCleanupCommandsExecutedAt(
+  metadata: Record<string, unknown> | null | undefined,
+): Record<string, string> {
+  const raw = metadata?.[EXECUTION_WORKSPACE_CLEANUP_COMMANDS_EXECUTED_METADATA_KEY];
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return {};
+  return Object.fromEntries(
+    Object.entries(raw as Record<string, unknown>).filter(
+      (entry): entry is [string, string] => typeof entry[1] === "string",
+    ),
+  );
 }
 
 function isClosedExecutionWorkspaceStatus(status: string | null | undefined): boolean {
@@ -1452,6 +1487,11 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
   ) {
     if (workspace.providerType !== "git_worktree") return;
     const workspacePath = readNullableString(workspace.providerRef) ?? readNullableString(workspace.cwd);
+    // SPA-7354 review fix (CRITICAL-2): a leaf that is already gone has no git
+    // state that can change. Proceed so the retry reaches the bookkeeping that
+    // republishes the row; the removal step itself is a no-op when the path is
+    // absent. Without this, the null rev-parse wedged every retry forever.
+    if (workspacePath && !existsSync(workspacePath)) return;
     if (!workspacePath || !expectedHeadSha) {
       throw new Error("Refusing terminal workspace cleanup because the expected git HEAD is unknown");
     }
@@ -1718,8 +1758,12 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
     const allowDirtyWorktree = callOpts.forceWorktreeRemoval === true
       || opts.forceTerminalWorktreeRemoval === true;
 
-    const cleanupLock = workspace.providerType === "git_worktree" && (workspace.providerRef ?? workspace.cwd)
-      ? await acquireGitWorktreeCleanupLock(workspace.providerRef ?? workspace.cwd!)
+    const workspaceLeafPath = readNullableString(workspace.providerRef) ?? readNullableString(workspace.cwd);
+    // SPA-7354 review fix (CRITICAL-2): the git-path lock discovery reads git
+    // from inside the worktree, so a missing leaf rejects the whole cleanup
+    // before the try block. A missing leaf needs no native git locks.
+    const cleanupLock = workspace.providerType === "git_worktree" && workspaceLeafPath && existsSync(workspaceLeafPath)
+      ? await acquireGitWorktreeCleanupLock(workspaceLeafPath)
       : null;
     try {
       await assertTerminalCleanupGitStateUnchanged(workspace, expectedHeadSha, { allowDirtyWorktree });
@@ -1754,6 +1798,9 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
         // branch refs survive worktree removal, and only uncommitted scratch is
         // destroyed.
         runCleanupCommands: true,
+        // SPA-7354 review fix (HIGH-2): track and skip already-executed
+        // commands so the reopen -> re-archive cycle cannot re-run them.
+        skipAlreadyExecutedCleanupCommands: true,
         forceWorktreeRemoval: opts.forceTerminalWorktreeRemoval ?? callOpts.forceWorktreeRemoval ?? false,
       });
       if (cleanup.cleaned && workspace.mode === "shared_workspace") {
@@ -1772,6 +1819,31 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
           .set({
             ...(cleanup.cleaned ? {} : { status: "cleanup_failed" }),
             cleanupReason,
+            ...(cleanup.cleaned
+              ? {}
+              : {
+                  // SPA-7354 review fix (HIGH-1): count this failed attempt in
+                  // the row metadata so the sweep's retry cap sees it. The
+                  // jsonb merge preserves the row's live metadata, including
+                  // the lifecycle generation the archive just raised.
+                  metadata: sql`${executionWorkspaces.metadata} || jsonb_build_object(${EXECUTION_WORKSPACE_TERMINAL_CLEANUP_ATTEMPTS_METADATA_KEY}::text, (COALESCE((${executionWorkspaces.metadata} ->> ${EXECUTION_WORKSPACE_TERMINAL_CLEANUP_ATTEMPTS_METADATA_KEY}::text)::int, 0) + 1))`,
+                }),
+            updatedAt: now(),
+          })
+          .where(eq(executionWorkspaces.id, workspace.id));
+      }
+      // SPA-7354 review fix (HIGH-2): persist which cleanup commands ran, so a
+      // reopen -> re-archive cycle skips them instead of re-executing a
+      // non-idempotent command. The jsonb merge preserves the row's live
+      // metadata rather than rebuilding it from this call's snapshot.
+      if (Object.keys(cleanup.executedCommands).length > 0) {
+        await db
+          .update(executionWorkspaces)
+          .set({
+            metadata: sql`${executionWorkspaces.metadata} || jsonb_build_object(${EXECUTION_WORKSPACE_CLEANUP_COMMANDS_EXECUTED_METADATA_KEY}::text, ${JSON.stringify({
+              ...readCleanupCommandsExecutedAt(workspace.metadata as Record<string, unknown> | null),
+              ...cleanup.executedCommands,
+            })}::jsonb)`,
             updatedAt: now(),
           })
           .where(eq(executionWorkspaces.id, workspace.id));
@@ -1795,11 +1867,11 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
     workspaceId: string;
     capturedGeneration: number;
     cleanupReason: string;
-  }): Promise<boolean> {
+  }): Promise<number> {
     // A reopen restored the row after the cleanup threw when the guard fails. The
     // gateway then skips, so the stale cleanup-failure status never overwrites the
     // newer lifecycle state.
-    return fenceLifecycleGenerationWrite<boolean>({
+    return fenceLifecycleGenerationWrite<number>({
       workspaceId: input.workspaceId,
       expectedGeneration: input.capturedGeneration,
       isWriteTarget: (fresh) => isClosedExecutionWorkspaceStatus(fresh.status),
@@ -1807,17 +1879,26 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
         event: "execution_workspace.cleanup_failed_write_skipped",
         message: "execution workspace cleanup-failure write skipped because it was reopened",
       },
-      onSkip: () => false,
-      write: async ({ tx }) => {
+      onSkip: () => 0,
+      write: async ({ tx, fresh }) => {
+        // SPA-7354 review fix (HIGH-1): count this failed attempt so the sweep's
+        // retry cap can stop a cleanup that throws on every pass. Built from the
+        // fresh row read under the lifecycle lock, so no concurrent writer's
+        // metadata is lost.
+        const nextAttempts = readTerminalCleanupAttempts(fresh.metadata) + 1;
         await tx
           .update(executionWorkspaces)
           .set({
             status: "cleanup_failed",
             cleanupReason: input.cleanupReason,
+            metadata: {
+              ...(fresh.metadata ?? {}),
+              [EXECUTION_WORKSPACE_TERMINAL_CLEANUP_ATTEMPTS_METADATA_KEY]: nextAttempts,
+            },
             updatedAt: now(),
           })
           .where(eq(executionWorkspaces.id, input.workspaceId));
-        return true;
+        return nextAttempts;
       },
     });
   }
@@ -2540,6 +2621,7 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
           skippedRace: 0,
           skippedReopened: 0,
           skippedCooldown: 0,
+          skippedCleanupRetryCapped: 0,
           clearedStaleReopenPending: 0,
         };
       }
@@ -2607,13 +2689,23 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
         skippedRace: 0,
         skippedReopened: 0,
         skippedCooldown: 0,
+        skippedCleanupRetryCapped: 0,
         clearedStaleReopenPending: 0,
       };
 
       for (const workspace of candidates) {
         const executionWorkspace = toExecutionWorkspace(workspace);
+        // SPA-7354 review fix (CRITICAL-2): a worktree leaf that is already gone
+        // cannot be git-inspected, and that inspection failure used to skip the
+        // row on every sweep forever. A missing leaf is the success state of a
+        // previous cleanup attempt: let the row through so its bookkeeping
+        // (retry or archive) can complete.
+        const leafPath = readNullableString(workspace.providerRef) ?? readNullableString(workspace.cwd);
+        const leafMissing = workspace.providerType === "git_worktree"
+          && Boolean(leafPath)
+          && !existsSync(leafPath!);
         const { git, statusInspectionSucceeded } = await inspectGitCloseReadiness(executionWorkspace);
-        if (!statusInspectionSucceeded) {
+        if (!statusInspectionSucceeded && !leafMissing) {
           result.skippedUndelivered += 1;
           continue;
         }
@@ -2659,11 +2751,9 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
         // the cooldown window above was the grace period to rescue it. The
         // force flag escalates the removal to `git worktree remove --force`,
         // which the non-forced path refuses on dirty trees.
-        const postCooldownForce = Boolean(assessment.workspaceDirty)
-          || (
-            assessment.deliveryState !== "merged_via_pr"
-            && assessment.deliveryState !== "merged_by_ancestry"
-          );
+        // SPA-7354 review fix (LOW-1): postCooldownForce is only consumed below
+        // the reopen-pending block, so it is computed there instead of before
+        // it.
         if (reopenPending) {
           const pendingSince = readMetadataReopenPendingConsumptionSince(
             workspace.metadata as Record<string, unknown> | null,
@@ -2719,6 +2809,11 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
           }
           continue;
         }
+        const postCooldownForce = Boolean(assessment.workspaceDirty)
+          || (
+            assessment.deliveryState !== "merged_via_pr"
+            && assessment.deliveryState !== "merged_by_ancestry"
+          );
         if (await workspaceHasActiveRun(workspace)) {
           result.skippedActiveRun += 1;
           continue;
@@ -2728,11 +2823,30 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
         // set); the sweep re-runs only its cleanup against the generation it
         // still carries, and republishes it as archived when the cleanup lands.
         const wasCleanupFailed = workspace.status === "cleanup_failed";
+        if (wasCleanupFailed) {
+          // SPA-7354 review fix (HIGH-1): stop retrying a cleanup that has
+          // already failed MAX_TERMINAL_CLEANUP_ATTEMPTS times. Without the cap
+          // a persistent failure (a stale git lock, an unreadable leaf)
+          // re-executed on every sweep tick with no backoff.
+          const attempts = readTerminalCleanupAttempts(workspace.metadata as Record<string, unknown> | null);
+          if (attempts >= MAX_TERMINAL_CLEANUP_ATTEMPTS) {
+            result.skippedCleanupRetryCapped += 1;
+            continue;
+          }
+        }
         const closedAt = now();
         // Raise the lifecycle generation on archive. The cleanup below captures
         // this generation and re-checks it before it deletes the worktree, so a
         // reopen that runs in between fences the cleanup off.
         const archivedMetadata = bumpExecutionWorkspaceLifecycleGeneration(
+          workspace.metadata as Record<string, unknown> | null,
+        );
+        // SPA-7354 review fix (CRITICAL-1 residual): the generation this sweep
+        // snapshotted. The archive statement below requires the live row to
+        // still sit at this generation, so a reopen that raised it between the
+        // candidate read and this transaction is never archived from the stale
+        // snapshot.
+        const snapshotGeneration = readExecutionWorkspaceLifecycleGeneration(
           workspace.metadata as Record<string, unknown> | null,
         );
         // Take the per-workspace lifecycle lock before the archive decision, so a
@@ -2762,6 +2876,11 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
               inArray(executionWorkspaces.status, ["active", "idle", "in_review"]),
               isNull(executionWorkspaces.closedAt),
               sql<boolean>`(${executionWorkspaces.metadata} ->> ${EXECUTION_WORKSPACE_REOPEN_PENDING_METADATA_KEY}) IS DISTINCT FROM 'true'`,
+              // SPA-7354 review fix (CRITICAL-1 residual): the row must still
+              // carry the lifecycle generation this sweep snapshotted. A
+              // completed reopen raised the generation and must not be
+              // overwritten by an archive derived from the older snapshot.
+              sql<boolean>`COALESCE((${executionWorkspaces.metadata} ->> ${EXECUTION_WORKSPACE_LIFECYCLE_GENERATION_METADATA_KEY}::text)::int, 0) = ${snapshotGeneration}`,
               sql<boolean>`EXISTS (
                 SELECT 1
                 FROM ${issues} source_issue
@@ -2898,11 +3017,25 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
           // raises the generation and restores the row; a later archive keeps the
           // higher generation. The fenced write then skips, so stale
           // cleanup-failure state never lands on a newer archive lifecycle.
-          await markTerminalCleanupFailedFenced({
+          const attempts = await markTerminalCleanupFailedFenced({
             workspaceId: cleanupTarget.id,
             capturedGeneration,
             cleanupReason: `${ISSUE_TERMINAL_WORKSPACE_CLEANUP_REASON} | ${failure}`,
           });
+          if (attempts >= MAX_TERMINAL_CLEANUP_ATTEMPTS) {
+            // SPA-7354 review fix (HIGH-1): one distinct, durable event at the
+            // moment the retry cap is reached, so an operator can find the
+            // stopped row instead of discovering it from silent sweep skips.
+            await logActivity(db, {
+              companyId: cleanupTarget.companyId,
+              actorType: "system",
+              actorId: "workspace_terminality_reaper",
+              action: "execution_workspace.issue_terminal_cleanup_retries_exhausted",
+              entityType: "execution_workspace",
+              entityId: cleanupTarget.id,
+              details: { sourceIssueId: cleanupTarget.sourceIssueId, failure, attempts },
+            });
+          }
           await logActivity(db, {
             companyId: cleanupTarget.companyId,
             actorType: "system",

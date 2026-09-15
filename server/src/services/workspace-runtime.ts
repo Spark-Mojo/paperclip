@@ -62,7 +62,7 @@ import {
   writeLocalServiceRegistryRecord,
 } from "./local-service-supervisor.js";
 import { workspaceOperationService, type WorkspaceOperationRecorder } from "./workspace-operations.js";
-import { executionWorkspaceService, readExecutionWorkspaceConfig } from "./execution-workspaces.js";
+import { executionWorkspaceService, readCleanupCommandsExecutedAt, readExecutionWorkspaceConfig } from "./execution-workspaces.js";
 import { isRuntimeOwnedGitBranch } from "./execution-workspace-branch-ownership.js";
 import { logActivity } from "./activity-log.js";
 import { readProjectWorkspaceRuntimeConfig } from "./project-workspace-runtime-config.js";
@@ -4156,6 +4156,11 @@ export async function cleanupExecutionWorkspaceArtifacts(input: {
   beforeBranchDelete?: (() => Promise<void>) | null;
   expectedBranchHeadSha?: string | null;
   runCleanupCommands?: boolean;
+  // SPA-7354 review fix (HIGH-2): when set, cleanup commands already recorded
+  // in the workspace's metadata are skipped, and every command that runs is
+  // returned in `executedCommands` so the caller can persist the record. A
+  // reopen -> re-archive cycle must not re-execute a non-idempotent command.
+  skipAlreadyExecutedCleanupCommands?: boolean;
   forceWorktreeRemoval?: boolean;
 }) {
   const warnings: string[] = [];
@@ -4200,7 +4205,12 @@ export async function cleanupExecutionWorkspaceArtifacts(input: {
         .map((value) => asString(value, "").trim())
         .filter(Boolean);
 
+  const alreadyExecutedCommands = input.skipAlreadyExecutedCleanupCommands
+    ? readCleanupCommandsExecutedAt(input.workspace.metadata)
+    : {};
+  const executedCommands: Record<string, string> = {};
   for (const command of cleanupCommands) {
+    if (Object.prototype.hasOwnProperty.call(alreadyExecutedCommands, command)) continue;
     try {
       const resolvedCommand = repoRoot
         ? resolveRepoManagedWorkspaceCommand(command, repoRoot)
@@ -4221,6 +4231,10 @@ export async function cleanupExecutionWorkspaceArtifacts(input: {
         },
         successMessage: `Completed cleanup command "${command}"\n`,
       });
+      // SPA-7354 review fix (HIGH-2): record the command only after it
+      // succeeded, so a failing command still retries (bounded by the sweep's
+      // attempt cap) while a succeeded command never runs twice.
+      executedCommands[command] = new Date().toISOString();
     } catch (err) {
       warnings.push(err instanceof Error ? err.message : String(err));
     }
@@ -4353,6 +4367,7 @@ export async function cleanupExecutionWorkspaceArtifacts(input: {
     cleanedPath: workspacePath,
     cleaned,
     warnings,
+    executedCommands,
   };
 }
 
