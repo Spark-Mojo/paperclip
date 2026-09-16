@@ -1,0 +1,9 @@
+[Unit]
+Description=Timer for question-pinger
+
+[Timer]
+Unit=question-pinger.service
+OnUnitActiveSec=900s
+
+[Install]
+WantedBy=timers.target

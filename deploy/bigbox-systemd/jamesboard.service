@@ -1,0 +1,16 @@
+[Unit]
+Description=jamesboard (bigbox)
+After=network-online.target
+
+[Service]
+Type=simple
+Restart=always
+RestartSec=30
+WorkingDirectory=/home/jamesilsley
+Environment=PATH=/usr/local/bin:/usr/bin:/bin:/home/jamesilsley/.local/bin
+ExecStart=/usr/bin/python3 /home/jamesilsley/GitHub/spark-mojo-platform/scripts/jamesboard/serve.py
+StandardOutput=append:/home/jamesilsley//tmp/jamesboard.log
+StandardError=append:/home/jamesilsley//tmp/jamesboard.err
+
+[Install]
+WantedBy=default.target

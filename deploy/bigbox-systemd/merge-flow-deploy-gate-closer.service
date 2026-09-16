@@ -1,0 +1,15 @@
+[Unit]
+Description=merge-flow-deploy-gate-closer (bigbox)
+After=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/jamesilsley/.sparkmojo/platform-main
+EnvironmentFile=/home/jamesilsley/.config/paperclip/box.env
+Environment=SYNC_TREE=/home/jamesilsley/.sparkmojo/platform-main
+ExecStart=/bin/bash -lc 'exec /home/jamesilsley/.sparkmojo/monitor-sync-and-run.sh /usr/bin/python3 /home/jamesilsley/.sparkmojo/platform-main/scripts/merge-flow/deploy-gate-closer.py --api-base ${PAPERCLIP_API_URL}'
+StandardOutput=append:/home/jamesilsley/.sparkmojo/merge-flow/deploy-gate-closer-out.log
+StandardError=append:/home/jamesilsley/.sparkmojo/merge-flow/deploy-gate-closer-err.log
+
+[Install]
+WantedBy=default.target

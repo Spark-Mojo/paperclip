@@ -1,0 +1,9 @@
+[Unit]
+Description=Timer for merge-flow-guard-deadman
+
+[Timer]
+Unit=merge-flow-guard-deadman.service
+OnUnitActiveSec=300s
+
+[Install]
+WantedBy=timers.target

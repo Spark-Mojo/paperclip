@@ -1,0 +1,9 @@
+[Unit]
+Description=Timer for governance-workspace-detector
+
+[Timer]
+Unit=governance-workspace-detector.service
+OnUnitActiveSec=900s
+
+[Install]
+WantedBy=timers.target

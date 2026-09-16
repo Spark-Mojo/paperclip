@@ -1,0 +1,13 @@
+[Unit]
+Description=governance-autocommit (bigbox)
+After=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/jamesilsley
+ExecStart=/bin/bash /home/jamesilsley/.gbrain/governance-autocommit.sh
+StandardOutput=append:/home/jamesilsley/.gbrain/governance-autocommit-out.log
+StandardError=append:/home/jamesilsley/.gbrain/governance-autocommit-err.log
+
+[Install]
+WantedBy=default.target

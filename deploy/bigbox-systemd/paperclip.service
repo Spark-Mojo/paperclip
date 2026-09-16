@@ -1,0 +1,19 @@
+[Unit]
+Description=paperclip (bigbox)
+After=network-online.target
+
+[Service]
+Type=simple
+Restart=always
+RestartSec=30
+WorkingDirectory=/home/jamesilsley
+Environment=ANTHROPIC_BASE_URL=http://127.0.0.1:4141
+Environment=ANTHROPIC_API_KEY=sk-ant-proxy-dummy
+Environment=CLAUDE_CONFIG_DIR=/home/jamesilsley/.claude-fleet
+Environment=ACPX_CLAUDE_INCLUDE_USER_SETTINGS=1
+ExecStart=/usr/bin/node /usr/lib/node_modules/paperclipai/dist/index.js run --bind tailnet
+StandardOutput=append:/home/jamesilsley/.paperclip/instances/default/logs/launchd-out.log
+StandardError=append:/home/jamesilsley/.paperclip/instances/default/logs/launchd-err.log
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,13 @@
+[Unit]
+Description=health-monitor (bigbox)
+After=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/jamesilsley
+ExecStart=/bin/sh /home/jamesilsley/.sparkmojo/monitor-sync-and-run.sh /bin/bash /home/jamesilsley/.sparkmojo/monitor-main/platform/strategy-pipeline/monitor/bin/run-monitor.sh
+StandardOutput=append:/home/jamesilsley/.sparkmojo/monitor-main/platform/strategy-pipeline/monitor/state/launchd.out.log
+StandardError=append:/home/jamesilsley/.sparkmojo/monitor-main/platform/strategy-pipeline/monitor/state/launchd.err.log
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,9 @@
+[Unit]
+Description=Timer for installed-source-check
+
+[Timer]
+Unit=installed-source-check.service
+OnCalendar=*-*-* 05:10:00
+
+[Install]
+WantedBy=timers.target

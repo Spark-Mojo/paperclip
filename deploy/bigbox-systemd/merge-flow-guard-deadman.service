@@ -1,0 +1,14 @@
+[Unit]
+Description=merge-flow-guard-deadman (bigbox)
+After=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/jamesilsley/.sparkmojo
+EnvironmentFile=/home/jamesilsley/.config/paperclip/box.env
+ExecStart=/usr/bin/python3 /home/jamesilsley/.sparkmojo/bin/guard-deadman.py --api-base ${PAPERCLIP_API_URL}
+StandardOutput=append:/home/jamesilsley/.sparkmojo/merge-flow/guard-deadman-out.log
+StandardError=append:/home/jamesilsley/.sparkmojo/merge-flow/guard-deadman-err.log
+
+[Install]
+WantedBy=default.target

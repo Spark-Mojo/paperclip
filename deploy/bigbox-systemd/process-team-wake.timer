@@ -1,0 +1,9 @@
+[Unit]
+Description=Timer for process-team-wake
+
+[Timer]
+Unit=process-team-wake.service
+OnCalendar=Mon *-*-* 07:00:00
+
+[Install]
+WantedBy=timers.target

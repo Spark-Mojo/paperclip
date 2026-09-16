@@ -1,0 +1,13 @@
+[Unit]
+Description=cadence-heartbeat (bigbox)
+After=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/jamesilsley
+ExecStart=/bin/bash /home/jamesilsley/GitHub/sparkmojo-internal/platform/strategy-pipeline/scheduler/bin/gate.sh
+StandardOutput=append:/home/jamesilsley/GitHub/sparkmojo-internal/platform/strategy-pipeline/scheduler/state/launchd-heartbeat.out.log
+StandardError=append:/home/jamesilsley/GitHub/sparkmojo-internal/platform/strategy-pipeline/scheduler/state/launchd-heartbeat.err.log
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,9 @@
+[Unit]
+Description=Timer for deploy-failure-alarm
+
+[Timer]
+Unit=deploy-failure-alarm.service
+OnUnitActiveSec=900s
+
+[Install]
+WantedBy=timers.target

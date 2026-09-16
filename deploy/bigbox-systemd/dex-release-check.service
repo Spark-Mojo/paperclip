@@ -1,0 +1,13 @@
+[Unit]
+Description=dex-release-check (bigbox)
+After=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/jamesilsley/.paperclip/machine-bin
+ExecStart=/usr/bin/python3 /home/jamesilsley/.paperclip/machine-bin/dex_release_check.py
+StandardOutput=append:/home/jamesilsley/.paperclip/dex-release-check-out.log
+StandardError=append:/home/jamesilsley/.paperclip/dex-release-check-err.log
+
+[Install]
+WantedBy=default.target

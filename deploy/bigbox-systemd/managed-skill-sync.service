@@ -1,0 +1,14 @@
+[Unit]
+Description=managed-skill-sync (bigbox)
+After=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/jamesilsley
+Environment=SPARKMOJO_REPO=/home/jamesilsley/GitHub/sparkmojo-internal
+ExecStart=/bin/bash /home/jamesilsley/GitHub/sparkmojo-internal/skills/runner-managed-skill-sync.sh
+StandardOutput=append:/home/jamesilsley/.claude/managed-skill-sync.stdout.log
+StandardError=append:/home/jamesilsley/.claude/managed-skill-sync.stderr.log
+
+[Install]
+WantedBy=default.target

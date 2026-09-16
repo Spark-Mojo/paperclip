@@ -1,0 +1,9 @@
+[Unit]
+Description=Timer for gbrain-sync-reaper
+
+[Timer]
+Unit=gbrain-sync-reaper.service
+OnUnitActiveSec=900s
+
+[Install]
+WantedBy=timers.target

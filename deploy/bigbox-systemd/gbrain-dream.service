@@ -1,0 +1,13 @@
+[Unit]
+Description=gbrain-dream (bigbox)
+After=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/jamesilsley
+ExecStart=/bin/sh /home/jamesilsley/.gbrain/run-dream.sh
+StandardOutput=append:/home/jamesilsley/.gbrain/dream.log
+StandardError=append:/home/jamesilsley/.gbrain/dream.log
+
+[Install]
+WantedBy=default.target

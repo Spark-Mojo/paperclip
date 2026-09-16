@@ -1,0 +1,13 @@
+[Unit]
+Description=worktree-sweep (bigbox)
+After=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/jamesilsley/GitHub/sparkmojo-internal
+ExecStart=/bin/bash /home/jamesilsley/.sparkmojo/worktree-sweep/worktree-sweep.sh --apply
+StandardOutput=append:/home/jamesilsley/.paperclip/worktree-sweep.log
+StandardError=append:/home/jamesilsley/.paperclip/worktree-sweep.log
+
+[Install]
+WantedBy=default.target

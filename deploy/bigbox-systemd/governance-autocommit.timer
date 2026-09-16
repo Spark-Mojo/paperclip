@@ -1,0 +1,9 @@
+[Unit]
+Description=Timer for governance-autocommit
+
+[Timer]
+Unit=governance-autocommit.service
+OnUnitActiveSec=900s
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,13 @@
+[Unit]
+Description=process-team-wake (bigbox)
+After=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/jamesilsley
+ExecStart=/bin/bash /home/jamesilsley/Library/LaunchAgents/process-team-wake.sh
+StandardOutput=append:/home/jamesilsley//tmp/process-team.log
+StandardError=append:/home/jamesilsley//tmp/process-team.log
+
+[Install]
+WantedBy=default.target
