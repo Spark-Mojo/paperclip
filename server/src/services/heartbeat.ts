@@ -426,6 +426,20 @@ export const WORKSPACE_BUSY_RETRY_JITTER_MS = 60 * 1000;
 // workspace frees, because dispatching alongside a live holder is exactly the
 // concurrent-mutation failure this gate exists to prevent.
 export const WORKSPACE_BUSY_HOLDER_STALE_AFTER_MS = RECOVERY_ACTIVE_RUN_OUTPUT_SUSPICION_THRESHOLD_MS;
+// Reap grace for untracked-adapter / null-pid runs in reapOrphanedRuns:
+// a running run with fresh lastOutputAt hasn't proved itself dead and must
+// not be declared lost on handle absence alone. Reuse the same threshold
+// recovery uses for suspicious silent runs so a truly stuck run still gets
+// reaped after the same window — smallest correct, no new tuning knob.
+export const PROCESS_LOSS_REAP_OUTPUT_GRACE_MS = RECOVERY_ACTIVE_RUN_OUTPUT_SUSPICION_THRESHOLD_MS;
+// Small future lead still counts as fresh: a concurrent adapter flush can write
+// lastOutputAt milliseconds after the sweep sampled `now` (SPA-5034). Material
+// clock skew far into the future remains stale.
+export const PROCESS_LOSS_REAP_CONCURRENT_WRITE_TOLERANCE_MS = 5_000;
+// Staleness signal emitted by the one-non-terminal-run-per-issue claim gate
+// (fix 3b). The claim path upgrades it to a workspace_busy deferral instead of
+// dropping the wake.
+export const ISSUE_EXECUTION_CLAIM_GATE_STALENESS = "issue_execution_claim_gate_busy";
 // Issue-level executionWorkspaceSettings.mode values that unambiguously opt an
 // issue's runs out of the shared project workspace, and therefore out of
 // shared-workspace serialization ("isolated" is the legacy alias
@@ -433,6 +447,31 @@ export const WORKSPACE_BUSY_HOLDER_STALE_AFTER_MS = RECOVERY_ACTIVE_RUN_OUTPUT_S
 // other value — including agent_default and an absent mode — may still resolve
 // to the shared workspace and counts as a holder.
 const ISOLATED_EXECUTION_WORKSPACE_MODES = ["isolated_workspace", "operator_branch", "isolated"] as const;
+
+// Guard for reapOrphanedRuns fix (1): a running run that recently emitted output
+// has negative liveness evidence against "lost"; require staleness before reaping
+// untracked-adapter or null-pid runs. Output recency ONLY — never startedAt/createdAt.
+// A start/creation fallback would treat every young run as alive (and a skewed
+// clock as eternally alive), resurrecting the false-positive liveness this gate
+// exists to prevent; a null lastOutputAt simply carries no evidence either way.
+function isProcessLossReapFresh(
+  run: Pick<typeof heartbeatRuns.$inferSelect, "lastOutputAt">,
+  now: Date,
+): boolean {
+  if (!run.lastOutputAt) return false;
+  const lastMs = new Date(run.lastOutputAt as unknown as string | Date).getTime();
+  if (!Number.isFinite(lastMs)) return false;
+  // Future-dated output that is far ahead of the reader clock is stale — a
+  // skewed timestamp must not extend the reap grace. A tiny lead (a single
+  // concurrent adapter flush that lands after this sweep sampled `now`)
+  // is distinguished and still counts as FRESH so the live run is not reaped
+  // (SPA-5034 sweep-clock race). The caller must sample `now` as late as
+  // possible — ideally per-run or immediately after the FOR UPDATE lock.
+  const ageMs = now.getTime() - lastMs;
+  return ageMs >= -PROCESS_LOSS_REAP_CONCURRENT_WRITE_TOLERANCE_MS
+    && ageMs < PROCESS_LOSS_REAP_OUTPUT_GRACE_MS;
+}
+
 type CodexTransientFallbackMode =
   | "same_session"
   | "safer_invocation"
@@ -10000,25 +10039,29 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     agent: typeof agents.$inferSelect,
     now: Date,
   ) {
-    const existingRetry = await db
+    // Dedupe probe outside the tx is advisory only — the authoritative check re-runs
+    // inside the tx below, so two concurrent sweeps cannot both enqueue a retry.
+    // Keyed on retryOfRunId (one owed retry per dead run); concurrency safety comes
+    // from the issue/run row lock inside the tx, NOT from this probe.
+    const existingRetryAdvisory = await db
       .select()
       .from(heartbeatRuns)
       .where(and(eq(heartbeatRuns.companyId, run.companyId), eq(heartbeatRuns.retryOfRunId, run.id)))
       .orderBy(asc(heartbeatRuns.createdAt))
       .limit(1)
       .then((rows) => rows[0] ?? null);
-    if (existingRetry) {
+    if (existingRetryAdvisory) {
       await appendRunEvent(run, await nextRunEventSeq(run.id), {
         eventType: "lifecycle",
         stream: "system",
         level: "warn",
         message: "Process-loss retry already exists; skipping duplicate retry enqueue",
         payload: {
-          retryRunId: existingRetry.id,
-          retryRunStatus: existingRetry.status,
+          retryRunId: existingRetryAdvisory.id,
+          retryRunStatus: existingRetryAdvisory.status,
         },
       });
-      return existingRetry;
+      return existingRetryAdvisory;
     }
 
     const invokability = await getAgentInvokability(agent);
@@ -10053,7 +10096,105 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     }, "normal_model");
     const responsibleUserId = await resolveResponsibleUserIdForRunContext(run, retryContextSnapshot);
 
-    const queued = await db.transaction(async (tx) => {
+    type ProcessLossRetryTxOutcome =
+      | { kind: "created"; retryRun: typeof heartbeatRuns.$inferSelect }
+      | { kind: "duplicate" }
+      | { kind: "refused_alive"; refusalReasons: string[] };
+
+    const txOutcome = await db.transaction(async (tx): Promise<ProcessLossRetryTxOutcome> => {
+      // Serialize concurrent sweeps: issue-scoped runs take the issue row lock;
+      // issue-less runs fall back to the dead run's own row. Both give the
+      // re-verify + dedupe + insert below a single serialization point.
+      await tx.execute(
+        issueId
+          ? sql`select id from issues where company_id = ${run.companyId} and id = ${issueId} for update`
+          : sql`select id from heartbeat_runs where company_id = ${run.companyId} and id = ${run.id} for update`,
+      );
+
+      if (issueId) {
+        // Fix (2): re-verify old run is still dead INSIDE the tx before stealing executionRunId.
+        // (The issue row lock above already serializes concurrent sweeps; this read is the
+        // freshest post-lock view of the old run.)
+        const lockedOld = await tx
+          .select({
+            status: heartbeatRuns.status,
+            lastOutputAt: heartbeatRuns.lastOutputAt,
+            processPid: heartbeatRuns.processPid,
+            processGroupId: heartbeatRuns.processGroupId,
+          })
+          .from(heartbeatRuns)
+          .where(and(eq(heartbeatRuns.id, run.id), eq(heartbeatRuns.companyId, run.companyId)))
+          .for("update")
+          .then((rows) => rows[0] ?? null);
+        const tracksLocal = isTrackedLocalChildProcessAdapter(agent.adapterType);
+        const pidAlive = tracksLocal && lockedOld?.processPid ? isProcessAlive(lockedOld.processPid) : false;
+        const groupAlive = tracksLocal && lockedOld?.processGroupId ? isProcessGroupAlive(lockedOld.processGroupId) : false;
+        // SPA-5034: sample a fresh clock AFTER the FOR UPDATE lock. The
+        // outer sweep's `now` is stale — a concurrent adapter flush could
+        // have written lastOutputAt milliseconds after the sweep scanned
+        // activeRuns. Checking via a stale `now` would misclassify that
+        // fresh output as stale (future-dated) and reap the live run.
+        const freshTxNow = new Date();
+        const outputStillFresh = lockedOld ? isProcessLossReapFresh(lockedOld, freshTxNow) : false;
+        const stillNonTerminal = lockedOld
+          ? MAX_TURN_CONTINUATION_LIVE_RUN_STATUSES.includes(
+              lockedOld.status as (typeof MAX_TURN_CONTINUATION_LIVE_RUN_STATUSES)[number],
+            )
+          : true;
+        // Refuse ONLY on positive evidence the old run is alive (or was revived by a
+        // concurrent path): live tracked pid/pgid, fresh lastOutputAt, or a status that
+        // left the terminal set after reap. Absence of output carries no evidence either
+        // way and must never block an owed retry — shutdown-drain fixtures legitimately
+        // have lastOutputAt = null.
+        const refusalReasons: string[] = [];
+        if (pidAlive) refusalReasons.push("pid_alive");
+        if (groupAlive) refusalReasons.push("pgid_alive");
+        if (outputStillFresh) refusalReasons.push("output_fresh");
+        if (stillNonTerminal) refusalReasons.push(`status_${lockedOld?.status ?? "unknown"}`);
+        if (refusalReasons.length > 0) {
+          // Enqueue nothing, transfer nothing — the twin must not steal the execution lock
+          // from a run that may still be alive. Caller releases the execution lock instead,
+          // or restores a prematurely-finalized run (SPA-5043).
+          return { kind: "refused_alive", refusalReasons };
+        }
+
+        // Authoritative dedupe, now inside the tx and behind the issue row lock: two
+        // concurrent sweeps serialize here, and only the first sees no existing retry.
+        const existingRetryInTx = await tx
+          .select({ id: heartbeatRuns.id })
+          .from(heartbeatRuns)
+          .where(
+            and(
+              eq(heartbeatRuns.companyId, run.companyId),
+              eq(heartbeatRuns.retryOfRunId, run.id),
+              inArray(heartbeatRuns.status, [...MAX_TURN_CONTINUATION_LIVE_RUN_STATUSES]),
+            ),
+          )
+          .orderBy(asc(heartbeatRuns.createdAt), asc(heartbeatRuns.id))
+          .limit(1)
+          .then((rows) => rows[0] ?? null);
+        if (existingRetryInTx) {
+          return { kind: "duplicate" };
+        }
+      } else {
+        const existingIssuelessRetryInTx = await tx
+          .select({ id: heartbeatRuns.id })
+          .from(heartbeatRuns)
+          .where(
+            and(
+              eq(heartbeatRuns.companyId, run.companyId),
+              eq(heartbeatRuns.retryOfRunId, run.id),
+              inArray(heartbeatRuns.status, [...MAX_TURN_CONTINUATION_LIVE_RUN_STATUSES]),
+            ),
+          )
+          .orderBy(asc(heartbeatRuns.createdAt), asc(heartbeatRuns.id))
+          .limit(1)
+          .then((rows) => rows[0] ?? null);
+        if (existingIssuelessRetryInTx) {
+          return { kind: "duplicate" };
+        }
+      }
+
       const wakeupRequest = await tx
         .insert(agentWakeupRequests)
         .values({
@@ -10114,8 +10255,55 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           .where(and(eq(issues.id, issueId), eq(issues.companyId, run.companyId), eq(issues.executionRunId, run.id)));
       }
 
-      return retryRun;
+      return { kind: "created", retryRun };
     });
+
+    if (txOutcome.kind === "duplicate") {
+      // Lost the in-tx dedupe race — a retry already exists. Surface it so the caller
+      // keeps the issue's execution path pointed at that retry instead of releasing.
+      const existing = await db
+        .select()
+        .from(heartbeatRuns)
+        .where(and(eq(heartbeatRuns.companyId, run.companyId), eq(heartbeatRuns.retryOfRunId, run.id)))
+        .orderBy(asc(heartbeatRuns.createdAt))
+        .limit(1)
+        .then((rows) => rows[0] ?? null);
+      if (!existing) return null;
+      await appendRunEvent(run, await nextRunEventSeq(run.id), {
+        eventType: "lifecycle",
+        stream: "system",
+        level: "warn",
+        message: "Process-loss retry already exists; skipping duplicate retry enqueue",
+        payload: {
+          retryRunId: existing.id,
+          retryRunStatus: existing.status,
+        },
+      });
+      return existing;
+    }
+
+    if (txOutcome.kind === "refused_alive") {
+      await appendRunEvent(run, await nextRunEventSeq(run.id), {
+        eventType: "lifecycle",
+        stream: "system",
+        level: "warn",
+        message:
+          "Process-loss retry refused inside tx: old run re-verified as alive (live pid/pgid, fresh output, or revived status); executionRunId not transferred",
+        payload: {
+          deadRunId: run.id,
+          lastOutputAt: run.lastOutputAt ? new Date(run.lastOutputAt as unknown as string | Date).toISOString() : null,
+          refusalReasons: txOutcome.refusalReasons,
+        },
+      });
+      // SPA-5043 (codex 3838245812): a refusal is NOT the same as "no retry
+      // possible" — the caller may have already flipped this run to a terminal
+      // status before the in-tx re-verify caught it alive. Surface the refusal
+      // so the caller can undo that premature write instead of tearing down
+      // around an execution that is still live.
+      return { refusedAlive: true as const, refusalReasons: txOutcome.refusalReasons };
+    }
+
+    const queued = txOutcome.retryRun;
 
     publishLiveEvent({
       companyId: queued.companyId,
@@ -10601,22 +10789,31 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       const retry = await enqueueProcessLossRetry(interrupted, agent, now);
       if (!retry) {
         await releaseIssueExecutionAndPromote(interrupted);
+      } else if ("refusedAlive" in retry) {
+        // SPA-5043 (codex P1): the in-tx re-verify refused the retry as alive
+        // — the interrupted run's child was still running when the drain set
+        // its status to `interrupted`. Release the issue execution lock so
+        // hot-restart adoption (or a follow-up drain) can re-claim the
+        // workspace; do NOT enqueue a fresh retry against this run, do NOT
+        // re-mark its wakeup as failed, and do NOT finalize agent status
+        // (the agent slot may already have a successor queued for restart).
+        await releaseIssueExecutionAndPromote(interrupted);
       } else {
         retryRunIds.push(retry.id);
-      }
 
-      await appendRunEvent(interrupted, await nextRunEventSeq(interrupted.id), {
-        eventType: "lifecycle",
-        stream: "system",
-        level: "warn",
-        message,
-        payload: {
-          signal,
-          ...(run.processPid ? { processPid: run.processPid } : {}),
-          ...(run.processGroupId ? { processGroupId: run.processGroupId } : {}),
-          ...(retry ? { retryRunId: retry.id } : {}),
-        },
-      });
+        await appendRunEvent(interrupted, await nextRunEventSeq(interrupted.id), {
+          eventType: "lifecycle",
+          stream: "system",
+          level: "warn",
+          message,
+          payload: {
+            signal,
+            ...(run.processPid ? { processPid: run.processPid } : {}),
+            ...(run.processGroupId ? { processGroupId: run.processGroupId } : {}),
+            retryRunId: retry.id,
+          },
+        });
+      }
 
       await finalizeAgentStatus(run.agentId, "interrupted", message, {
         wasFirstHeartbeat: timerClaimWasFirstHeartbeat(run),
@@ -12421,12 +12618,52 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
       const staleness = await evaluateQueuedRunStaleness(run, issueId, context);
       if (staleness.stale) {
+        // Claim-gate signal upgrades to a deferral (workspace_busy retry ladder), not a
+        // plain cancellation — the wake must survive as a retry, not drop.
+        if (staleness.errorCode === ISSUE_EXECUTION_CLAIM_GATE_STALENESS) {
+          await deferQueuedRunBehindLiveIssueRun(run, issueId, String(staleness.details.holderRunId ?? "unknown"));
+          logger.info(
+            { runId: run.id, issueId, holderRunId: staleness.details.holderRunId ?? null },
+            "claimQueuedRun: deferred queued run behind live issue run",
+          );
+          return null;
+        }
         await cancelQueuedRunForStaleIssue(run, issueId, staleness);
         logger.info(
           { runId: run.id, issueId, errorCode: staleness.errorCode },
           "claimQueuedRun: cancelled stale queued run",
         );
         return null;
+      }
+
+      // Fix (3): one-non-terminal-run-per-issue claim gate. Without this, isolated workspaces
+      // bypass the shared-workspace holder check and two runs can claim the same issue concurrently
+      // (live repro: SPA-4929 twin verifier; see enqueue fix above).
+      //
+      // Carve-out: execution-review participant wakes and their recovery retries EXIST to
+      // run alongside a live holder — they are the lane that revives a pending review
+      // stage, and their enqueue path already refuses candidates that have an existing
+      // execution path for the participant. Cancelling them here would drop the only wake
+      // that revives a pending review stage, so they pass through this gate.
+      if (!isExecutionReviewParticipantRecoveryEligibleRun(run)) {
+        const holder = await db
+          .select({ id: heartbeatRuns.id })
+          .from(heartbeatRuns)
+          .where(
+            and(
+              eq(heartbeatRuns.companyId, run.companyId),
+              inArray(heartbeatRuns.status, [...MAX_TURN_CONTINUATION_LIVE_RUN_STATUSES]),
+              ne(heartbeatRuns.id, run.id),
+              sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${issueId}`,
+            ),
+          )
+          .orderBy(asc(heartbeatRuns.createdAt), asc(heartbeatRuns.id))
+          .limit(1)
+          .then((rows: Array<{ id: string }>) => rows[0] ?? null);
+        if (holder) {
+          await deferQueuedRunBehindLiveIssueRun(run, issueId, holder.id);
+          return null;
+        }
       }
     }
 
@@ -12568,6 +12805,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           | "issue_terminal_status"
           | "issue_not_in_progress"
           | "issue_execution_lock_changed"
+          | typeof ISSUE_EXECUTION_CLAIM_GATE_STALENESS
           | "issue_review_participant_changed"
           | "issue_continuation_waiting_on_review";
         details: Record<string, unknown>;
@@ -12697,6 +12935,37 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       };
     }
 
+    // Fix (3b): live-run invariant at evaluate time — a queued run whose issue
+    // already has a non-terminal run must not claim ahead of it. Carve-outs mirror
+    // the claim gate above, plus the execution-review wake itself: those runs ARE
+    // the lane that revives a pending review stage while another run holds the
+    // issue, and their enqueue path already refuses candidates that have an existing
+    // execution path, so gating them here would only drop that recovery.
+    if (!isExecutionReviewParticipantRecoveryEligibleRun(run)) {
+      const live = await db
+        .select({ id: heartbeatRuns.id })
+        .from(heartbeatRuns)
+        .where(
+          and(
+            eq(heartbeatRuns.companyId, run.companyId),
+            inArray(heartbeatRuns.status, [...MAX_TURN_CONTINUATION_LIVE_RUN_STATUSES]),
+            ne(heartbeatRuns.id, run.id),
+            sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${issueId}`,
+          ),
+        )
+        .orderBy(asc(heartbeatRuns.createdAt), asc(heartbeatRuns.id))
+        .limit(1)
+        .then((rows: Array<{ id: string }>) => rows[0] ?? null);
+      if (live) {
+        return {
+          stale: true,
+          errorCode: ISSUE_EXECUTION_CLAIM_GATE_STALENESS,
+          reason: `Issue already has a non-terminal run ${live.id}; deferring this wake as a ${WORKSPACE_BUSY_RETRY_REASON} retry`,
+          details: { issueId, holderRunId: live.id, queuedRunId: run.id },
+        };
+      }
+    }
+
     if (issue.status === "in_review") {
       const currentParticipant = reviewExecutionState?.currentParticipant ?? null;
       if (currentParticipant) {
@@ -12719,6 +12988,141 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     }
 
     return { stale: false };
+  }
+
+  // Fix (3) helper: defer (never drop) a queued run whose issue already has a
+  // non-terminal run. Mirrors finalizeWorkspaceBusyDeferral: the run is cancelled as a
+  // contention deferral (not a failure), a workspace_busy scheduled retry is enqueued with
+  // no attempt ceiling — holder liveness, not a counter, bounds the wait — and the issue
+  // execution lock transfers to the retry inside scheduleBoundedRetryForRun so recovery
+  // leaves the issue alone while it waits. Only when no retry can be scheduled is the
+  // lock released for other runs.
+  async function deferQueuedRunBehindLiveIssueRun(
+    run: typeof heartbeatRuns.$inferSelect,
+    issueId: string,
+    holderRunId: string,
+  ) {
+    const now = new Date();
+    const message =
+      `Deferred: issue already has a non-terminal run ${holderRunId}; rescheduled as ${WORKSPACE_BUSY_RETRY_REASON} retry`;
+    // Claim-time runs are still `queued`, so the guard must accept queued OR running
+    // (a scheduled_retry promoted between check and write lands in queued too).
+    // Conditional UPDATE = the atomic handoff: if another path finalized the run
+    // first, updated comes back empty and we leave that outcome alone.
+    const cancelWrite = await db
+      .update(heartbeatRuns)
+      .set({
+        status: "cancelled",
+        error: message,
+        errorCode: WORKSPACE_BUSY_ERROR_CODE,
+        finishedAt: now,
+        resultJson: {
+          ...parseObject(run.resultJson),
+          stopReason: WORKSPACE_BUSY_ERROR_CODE,
+          effectiveTimeoutSec: 0,
+          timeoutConfigured: false,
+          timeoutSource: "issue_execution_claim_gate",
+          timeoutFired: false,
+        },
+        updatedAt: now,
+      })
+      .where(
+        and(
+          eq(heartbeatRuns.id, run.id),
+          inArray(heartbeatRuns.status, [...MAX_TURN_CONTINUATION_LIVE_RUN_STATUSES]),
+        ),
+      )
+      .returning()
+      .then((rows) => rows[0] ?? null);
+    if (!cancelWrite) {
+      logger.info(
+        { runId: run.id },
+        "skipping issue-execution claim-gate deferral because the run already left its live state",
+      );
+      return;
+    }
+    clearHeartbeatRunRuntimeStatus(cancelWrite.id);
+    publishLiveEvent({
+      companyId: cancelWrite.companyId,
+      type: "heartbeat.run.status",
+      payload: buildHeartbeatRunStatusLiveEventPayload(cancelWrite),
+    });
+    publishRunLifecyclePluginEvent(cancelWrite);
+    const cancelled = cancelWrite;
+
+    await setWakeupStatus(run.wakeupRequestId, "cancelled", {
+      finishedAt: now,
+      error: message,
+    }).catch(() => undefined);
+
+    let scheduleOutcome: string | null = null;
+    const agentRow = await getAgent(run.agentId).catch(() => null);
+    if (agentRow) {
+      // Record whether this wake was executing under assignee-ship BEFORE the deferral
+      // mutates context, so the retry's promotion gate treats an assignee mismatch as
+      // expected rather than as a reassignment race.
+      const issueRow = await db
+        .select({ assigneeAgentId: issues.assigneeAgentId })
+        .from(issues)
+        .where(and(eq(issues.id, issueId), eq(issues.companyId, run.companyId)))
+        .then((rows) => rows[0] ?? null)
+        .catch(() => null);
+      await db
+        .update(heartbeatRuns)
+        .set({
+          contextSnapshot: {
+            ...parseObject(cancelled.contextSnapshot),
+            workspaceBusyDeferredWhileAssignee: issueRow?.assigneeAgentId === run.agentId,
+          },
+          updatedAt: new Date(),
+        })
+        .where(eq(heartbeatRuns.id, run.id))
+        .catch(() => undefined);
+      const deferredRun = (await getRun(run.id).catch(() => null)) ?? cancelled;
+      const scheduleResult = await scheduleBoundedRetryForRun(deferredRun, agentRow, {
+        now,
+        retryReason: WORKSPACE_BUSY_RETRY_REASON,
+        wakeReason: WORKSPACE_BUSY_RETRY_WAKE_REASON,
+        maxAttempts: (deferredRun.scheduledRetryAttempt ?? 0) + 1,
+        delayMs: computeWorkspaceBusyRetryDelayMs(),
+      }).catch((scheduleErr) => {
+        logger.error(
+          { err: scheduleErr, runId: run.id },
+          "failed to schedule issue-execution claim-gate retry after deferral",
+        );
+        return null;
+      });
+      scheduleOutcome = scheduleResult?.outcome === "scheduled" ? "scheduled" : scheduleResult?.outcome ?? null;
+    }
+
+    await appendRunEvent(cancelled, await nextRunEventSeq(cancelled.id), {
+      eventType: "lifecycle",
+      stream: "system",
+      level: scheduleOutcome === "scheduled" ? "info" : "warn",
+      message:
+        scheduleOutcome === "scheduled"
+          ? `Deferred queued claim: issue ${issueId} already has live run ${holderRunId}; rescheduled as ${WORKSPACE_BUSY_RETRY_REASON} retry`
+          : `Cancelled queued claim: issue ${issueId} already has live run ${holderRunId} and no retry could be scheduled; releasing the execution lock`,
+      payload: {
+        issueId,
+        holderRunId,
+        queuedRunId: run.id,
+        retryScheduled: scheduleOutcome === "scheduled",
+      },
+    }).catch(() => undefined);
+
+    if (scheduleOutcome !== "scheduled") {
+      await releaseIssueExecutionAndPromote(cancelled).catch((releaseErr) => {
+        logger.error(
+          { err: releaseErr, runId: run.id },
+          "failed to release issue execution after claim-gate deferral",
+        );
+      });
+    }
+
+    await finalizeAgentStatus(run.agentId, "cancelled", null, {
+      wasFirstHeartbeat: timerClaimWasFirstHeartbeat(run),
+    }).catch(() => undefined);
   }
 
   async function cancelQueuedRunForStaleIssue(
@@ -13059,7 +13463,6 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
   async function reapOrphanedRuns(opts?: { staleThresholdMs?: number }) {
     const staleThresholdMs = opts?.staleThresholdMs ?? 0;
-    const now = new Date();
 
     // Find all runs stuck in "running" state (queued runs are legitimately waiting; resumeQueuedRuns handles them)
     const activeRuns = await db
@@ -13098,12 +13501,17 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     const reaped: string[] = [];
 
     for (const { run, adapterType, adapterConfig } of activeRuns) {
+      // Fresh clock per run (SPA-5034): a concurrent adapter flush can write
+      // lastOutputAt after this sweep sampled its snapshot but before this
+      // iteration runs. Sampling now here ensures that fresh output is not
+      // misread as stale because the write timestamp lies ahead of a stale sweep-wide now.
+      const freshNow = new Date();
       if (runningProcesses.has(run.id) || activeRunExecutions.has(run.id)) continue;
 
       // Apply staleness threshold to avoid false positives
       if (staleThresholdMs > 0) {
         const refTime = run.updatedAt ? new Date(run.updatedAt).getTime() : 0;
-        if (now.getTime() - refTime < staleThresholdMs) continue;
+        if (freshNow.getTime() - refTime < staleThresholdMs) continue;
       }
 
       const tracksLocalChild = isTrackedLocalChildProcessAdapter(adapterType);
@@ -13146,6 +13554,26 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         });
       }
 
+      // Fix (1): untracked-adapter or null-pid running runs with fresh output are
+      // not proven dead — handle loss alone is not liveness evidence. Require
+      // output staleness (same threshold recovery uses for suspicious silence).
+      if ((!tracksLocalChild || (!run.processPid && !run.processGroupId)) && isProcessLossReapFresh(run, freshNow)) {
+        await appendRunEvent(run, await nextRunEventSeq(run.id), {
+          eventType: "lifecycle",
+          stream: "system",
+          level: "warn",
+          message: "Skipping process-loss reap for live run: recent output observed; treating as alive until output goes stale",
+          payload: {
+            lastOutputAt: run.lastOutputAt ? new Date(run.lastOutputAt as unknown as string | Date).toISOString() : null,
+            adapterType,
+            processPid: run.processPid ?? null,
+            processGroupId: run.processGroupId ?? null,
+            tracksLocalChild,
+          },
+        });
+        continue;
+      }
+
       const runContext = parseObject(run.contextSnapshot);
       const monitorIssueId = readNonEmptyString(runContext.issueId);
       const monitorNextCheckAt = monitorIssueId
@@ -13154,7 +13582,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       const monitorDispatchLostWithoutFutureWake =
         readNonEmptyString(runContext.wakeReason) === "issue_monitor_due" &&
         monitorNextCheckAt !== undefined &&
-        (!monitorNextCheckAt || monitorNextCheckAt.getTime() <= now.getTime());
+        (!monitorNextCheckAt || monitorNextCheckAt.getTime() <= freshNow.getTime());
       const shouldRetry = (run.processLossRetryCount ?? 0) < 1 && (
         (tracksLocalChild && (!!run.processPid || !!run.processGroupId)) ||
         monitorDispatchLostWithoutFutureWake
@@ -13171,10 +13599,22 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         }
         : null;
 
-      let finalizedRun = await setRunStatus(run.id, "failed", {
+      // SPA-5043 (codex P1 3838008781): make running→failed a COMPARE-AND-SET
+      // so the caller's terminal write cannot clobber a row that legitimately
+      // changed under us (a concurrent completion/cancel/flush). The predicate
+      // mirrors isProcessLossReapFresh (snapshot-phase guard) inverted: ONLY
+      // fire the transition when lastOutputAt is NULL, OLDER than the grace
+      // window, OR further into the future than the clock-skew tolerance —
+      // i.e. genuinely stale. A fresh concurrent flush (including the small
+      // within-tolerance future lead SPA-5034 allows) BLOCKS the write so the
+      // in-tx re-verify inside enqueueProcessLossRetry sees the run as alive.
+      const reapStaleCutoff = new Date(freshNow.getTime() - PROCESS_LOSS_REAP_OUTPUT_GRACE_MS);
+      const reapFutureSkewCutoff = new Date(freshNow.getTime() + PROCESS_LOSS_REAP_CONCURRENT_WRITE_TOLERANCE_MS);
+      const reapPatch = {
+        status: "failed" as const,
         error: shouldRetry ? `${baseMessage}; retrying once` : baseMessage,
         errorCode: "process_lost",
-        finishedAt: now,
+        finishedAt: freshNow,
         resultJson: (() => {
           const result = mergeRunStopMetadataForAgent(
             { adapterType, adapterConfig },
@@ -13193,38 +13633,113 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             }
             : result;
         })(),
-      });
-      await setWakeupStatus(run.wakeupRequestId, "failed", {
-        finishedAt: now,
-        error: shouldRetry ? `${baseMessage}; retrying once` : baseMessage,
-      });
-      if (!finalizedRun) finalizedRun = await getRun(run.id);
-      if (!finalizedRun) continue;
-      finalizedRun = await classifyAndPersistRunLiveness(finalizedRun, parseObject(finalizedRun.resultJson)) ?? finalizedRun;
-      await releaseEnvironmentLeasesForRun({
-        runId: finalizedRun.id,
-        companyId: finalizedRun.companyId,
-        agentId: finalizedRun.agentId,
-        status: finalizedRun.status,
-        failureReason: finalizedRun.error ?? undefined,
-      });
+        updatedAt: freshNow,
+      };
+      const reapWhere = and(
+        eq(heartbeatRuns.id, run.id),
+        eq(heartbeatRuns.companyId, run.companyId),
+        eq(heartbeatRuns.status, "running"),
+        or(
+          isNull(heartbeatRuns.lastOutputAt),
+          lte(heartbeatRuns.lastOutputAt, reapStaleCutoff),
+          gt(heartbeatRuns.lastOutputAt, reapFutureSkewCutoff),
+        ),
+      );
+      const reapedRows = await db
+        .update(heartbeatRuns)
+        .set(reapPatch)
+        .where(reapWhere)
+        .returning();
+      // The CAS may match multiple rows if the WHERE is mis-specified; assert a
+      // single-row invariant so a bug here fails loud rather than silently
+      // clobbering siblings. Defensive: also fall back to filtering by id if
+      // anything leaked through (it shouldn't, but the next guard prevents
+      // resurrecting a sibling row's id into the in-tx retry path).
+      const finalizedRun = reapedRows.length === 1 && reapedRows[0].id === run.id
+        ? reapedRows[0]
+        : null;
+      if (!finalizedRun) {
+        // Lost the compare-and-set. The row either left `running` (finalized by
+        // a sibling sweep / the adapter completion path) or grew fresh output
+        // (a concurrent flush landed between snapshot and this statement). No
+        // terminal side effects to undo — we never marked it failed.
+        continue;
+      }
 
+      // SPA-5043 (codex 3838245812): the in-tx liveness re-verify inside
+      // enqueueProcessLossRetry is the authoritative decision point on whether
+      // the run is genuinely dead. We run it BEFORE any irreversible side
+      // effects (wakeup failed, lease release, liveness classification, agent
+      // finalization) so a refusal restores cleanly without unwinding torn
+      // state across multiple tables. Until this call returns we own nothing
+      // beyond the terminal CAS write above.
       let retriedRun: typeof heartbeatRuns.$inferSelect | null = null;
+      let retryRefusedAlive = false;
       const retryAgent = await getAgent(run.agentId);
       if (shouldRetry) {
         if (retryAgent) {
-          retriedRun = await enqueueProcessLossRetry(finalizedRun, retryAgent, now);
+          const enqueued = await enqueueProcessLossRetry(finalizedRun, retryAgent, freshNow);
+          if (enqueued && typeof enqueued === "object" && "refusedAlive" in enqueued) {
+            retryRefusedAlive = true;
+          } else {
+            retriedRun = enqueued;
+          }
         }
       } else if (retryAgent) {
         const scheduled = await scheduleInteractionContinuationInfrastructureRetryIfEligible(finalizedRun, retryAgent);
         retriedRun = scheduled?.outcome === "scheduled" ? scheduled.run : null;
       }
 
-      if (!retriedRun) {
-        await releaseIssueExecutionAndPromote(finalizedRun);
+      if (retryRefusedAlive) {
+        // SPA-5043: the re-verify proved the run alive after our terminal
+        // CAS write. Undo that single write — and only that — before returning;
+        // wakeup status, environment leases, liveness classification, agent
+        // status and queued-run dispatch were NOT touched because they sit
+        // below this branch. The run row re-emerges as running; the in-tx
+        // refusal already left executionRunId untouched, so the issue lock
+        // still points at this row.
+        const restored = await setRunStatus(run.id, "running", {
+          error: null,
+          errorCode: null,
+          finishedAt: null,
+          resultJson: parseObject(run.resultJson),
+        });
+        await appendRunEvent(restored ?? finalizedRun, await nextRunEventSeq(finalizedRun.id), {
+          eventType: "lifecycle",
+          stream: "system",
+          level: "warn",
+          message:
+            "Restored prematurely failed run to running after process-loss retry refused it as alive; execution lock retained",
+          payload: {
+            refusalReasons: (await getRun(run.id))?.errorCode ?? null,
+            lastOutputAt: finalizedRun.lastOutputAt
+              ? new Date(finalizedRun.lastOutputAt as unknown as string | Date).toISOString()
+              : null,
+          },
+        });
+        continue;
       }
 
-      await appendRunEvent(finalizedRun, await nextRunEventSeq(finalizedRun.id), {
+      // From here on the failure is real and irreversible — commit to the rest
+      // of the teardown in the same order as the pre-SPA-5043 code path.
+      await setWakeupStatus(run.wakeupRequestId, "failed", {
+        finishedAt: freshNow,
+        error: shouldRetry ? `${baseMessage}; retrying once` : baseMessage,
+      });
+      const classified = await classifyAndPersistRunLiveness(finalizedRun, parseObject(finalizedRun.resultJson)) ?? finalizedRun;
+      await releaseEnvironmentLeasesForRun({
+        runId: classified.id,
+        companyId: classified.companyId,
+        agentId: classified.agentId,
+        status: classified.status,
+        failureReason: classified.error ?? undefined,
+      });
+
+      if (!retriedRun) {
+        await releaseIssueExecutionAndPromote(classified);
+      }
+
+      await appendRunEvent(classified, await nextRunEventSeq(classified.id), {
         eventType: "lifecycle",
         stream: "system",
         level: "error",
@@ -19032,6 +19547,45 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     retryScheduledRetryNow,
 
     resumeQueuedRuns,
+    // Exposed for the SPA-5005 claim-gate test: drives one queued run through
+    // the full claim path (budget → staleness → single-run gate) without the
+    // per-agent slot loop.
+    claimQueuedRun,
+    // Exposed for the SPA-5043 conditional-running-failed test: the CAS
+    // predicate that gates the running→failed transition in reapOrphanedRuns,
+    // isolated from the rest of the sweep so its freshness/identity boundaries
+    // are pinned without racing the snapshot vs. CAS window.
+    reapOrphanedRunsCASForTests: async (
+      run: typeof heartbeatRuns.$inferSelect,
+      patch: { error: string; errorCode: string; finishedAt: Date; resultJson: Record<string, unknown> },
+      opts: { freshNow?: Date } = {},
+    ) => {
+      const freshNow = opts.freshNow ?? new Date();
+      const reapStaleCutoff = new Date(freshNow.getTime() - PROCESS_LOSS_REAP_OUTPUT_GRACE_MS);
+      const reapFutureSkewCutoff = new Date(freshNow.getTime() + PROCESS_LOSS_REAP_CONCURRENT_WRITE_TOLERANCE_MS);
+      const rows = await db
+        .update(heartbeatRuns)
+        .set({
+          status: "failed",
+          error: patch.error,
+          errorCode: patch.errorCode,
+          finishedAt: patch.finishedAt,
+          resultJson: patch.resultJson,
+          updatedAt: freshNow,
+        })
+        .where(and(
+          eq(heartbeatRuns.id, run.id),
+          eq(heartbeatRuns.companyId, run.companyId),
+          eq(heartbeatRuns.status, "running"),
+          or(
+            isNull(heartbeatRuns.lastOutputAt),
+            lte(heartbeatRuns.lastOutputAt, reapStaleCutoff),
+            gt(heartbeatRuns.lastOutputAt, reapFutureSkewCutoff),
+          ),
+        ))
+        .returning();
+      return rows.length === 1 && rows[0].id === run.id ? rows[0] : null;
+    },
 
     scheduleBoundedRetry: async (
       runId: string,
