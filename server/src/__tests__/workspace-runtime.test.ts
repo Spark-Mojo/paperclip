@@ -3988,6 +3988,85 @@ describe("realizeExecutionWorkspace", () => {
   });
 });
 
+describe("cleanupExecutionWorkspaceArtifacts executed-command callback", () => {
+  function localFsCleanupInput(input: { cwd: string }) {
+    return {
+      workspace: {
+        id: "execution-workspace-1",
+        cwd: input.cwd,
+        providerType: "local_fs",
+        providerRef: input.cwd,
+        branchName: null,
+        repoUrl: null,
+        baseRef: null,
+        projectId: "project-1",
+        projectWorkspaceId: "workspace-1",
+        sourceIssueId: "issue-1",
+        metadata: {},
+      },
+      projectWorkspace: {
+        cwd: input.cwd,
+        cleanupCommand: null,
+      },
+      cleanupCommand: "printf 'one\\n'",
+      teardownCommand: "printf 'two\\n'",
+      runCleanupCommands: true,
+      skipAlreadyExecutedCleanupCommands: true,
+    };
+  }
+
+  it("invokes onCleanupCommandExecuted once per succeeded command (SPA-7391 F1)", async () => {
+    const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-cleanup-callback-"));
+    const executed: Array<{ command: string; executedAt: string }> = [];
+
+    const cleanup = await cleanupExecutionWorkspaceArtifacts({
+      ...localFsCleanupInput({ cwd }),
+      onCleanupCommandExecuted: async (command, executedAt) => {
+        executed.push({ command, executedAt });
+      },
+    });
+
+    expect(Object.keys(cleanup.executedCommands)).toEqual(["printf 'one\\n'", "printf 'two\\n'"]);
+    expect(executed).toEqual([
+      { command: "printf 'one\\n'", executedAt: cleanup.executedCommands["printf 'one\\n'"]! },
+      { command: "printf 'two\\n'", executedAt: cleanup.executedCommands["printf 'two\\n'"]! },
+    ]);
+    expect(new Date(executed[0]!.executedAt).getTime()).not.toBeNaN();
+  });
+
+  it("keeps the executed command in the returned map when the record callback throws (SPA-7391 F1)", async () => {
+    const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-cleanup-callback-fail-"));
+
+    const cleanup = await cleanupExecutionWorkspaceArtifacts({
+      ...localFsCleanupInput({ cwd }),
+      onCleanupCommandExecuted: async () => {
+        throw new Error("record write failed");
+      },
+    });
+
+    // The command ran: it stays recorded for the caller's later persistence
+    // paths even though the immediate write failed, and the failure is
+    // surfaced as a warning instead of aborting the remaining cleanup.
+    expect(Object.keys(cleanup.executedCommands)).toEqual(["printf 'one\\n'", "printf 'two\\n'"]);
+    expect(cleanup.warnings.join("\n")).toContain("record write failed");
+  });
+
+  it("runs a command configured in two fields only once per pass (SPA-7391 cross-model review cure)", async () => {
+    const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-cleanup-dedupe-"));
+    const markerPath = path.join(cwd, "dedupe-marker");
+    const sameCommand = `echo ran >> ${JSON.stringify(markerPath)}`;
+
+    const cleanup = await cleanupExecutionWorkspaceArtifacts({
+      ...localFsCleanupInput({ cwd }),
+      cleanupCommand: sameCommand,
+      teardownCommand: sameCommand,
+    });
+
+    expect(Object.keys(cleanup.executedCommands)).toEqual([sameCommand]);
+    expect((await fs.readFile(markerPath, "utf8")).split("\n").filter(Boolean)).toHaveLength(1);
+  });
+});
+
 describe("ensureRuntimeServicesForRun", () => {
   function configureRuntimeProvisionTestHome(workspaceRoot: string, suffix: string) {
     const previousPaperclipHome = process.env.PAPERCLIP_HOME;

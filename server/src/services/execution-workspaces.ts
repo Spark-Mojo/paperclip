@@ -157,6 +157,19 @@ export function readTerminalCleanupAttempts(
 // it. A reopen -> re-archive cycle must not re-run a command that already ran
 // (`dropdb`, `docker compose down` are not idempotent), so the cleanup skips
 // recorded commands.
+//
+// SPA-7391 (F3): the command string is the key verbatim (exact-string match on
+// the trimmed configured command). An intentional config change (e.g. an added
+// flag) therefore produces a new key and one spurious re-run of the changed
+// command. That is accepted: normalizing the key (e.g. stripping flags) could
+// treat a materially different command as already executed, which is worse.
+//
+// SPA-7391 (F4): the archive transaction's status write can land before this
+// cleanup's record writes, so the archived row's metadata snapshot may briefly
+// miss the just-run commands. The executor completes the record right after
+// the cleanup returns, so the settled row is correct; only the transaction's
+// snapshot is incomplete. Harmless while no cleanup/teardown commands are
+// configured.
 export const EXECUTION_WORKSPACE_CLEANUP_COMMANDS_EXECUTED_METADATA_KEY = "terminalCleanupCommandsExecutedAt";
 
 export function readCleanupCommandsExecutedAt(
@@ -169,6 +182,30 @@ export function readCleanupCommandsExecutedAt(
       (entry): entry is [string, string] => typeof entry[1] === "string",
     ),
   );
+}
+
+// SPA-7391 (F2): append cleanup-command records to the CURRENT stored value of
+// the executed-commands key in-SQL instead of replacing the key's value built
+// from a client-side snapshot. A concurrent executor updating the same key
+// between our read and write cannot be clobbered: the SQL expression unions
+// with whatever the row holds at write time, and new entries win per command
+// key. The outer COALESCE also creates the key on a row whose metadata is NULL.
+// jsonb_typeof guards the union: a stored key value that is not a JSON object
+// (JSON null, scalar, array) must fall back to an empty object, not feed the
+// `||` operator (object || non-array would wrap both into an array).
+export async function mergeCleanupCommandsExecutedMetadata(
+  db: Db,
+  workspaceId: string,
+  newEntries: Record<string, string>,
+): Promise<void> {
+  if (Object.keys(newEntries).length === 0) return;
+  await db
+    .update(executionWorkspaces)
+    .set({
+      metadata: sql`COALESCE(${executionWorkspaces.metadata}, '{}'::jsonb) || jsonb_build_object(${EXECUTION_WORKSPACE_CLEANUP_COMMANDS_EXECUTED_METADATA_KEY}::text, COALESCE(CASE WHEN jsonb_typeof(${executionWorkspaces.metadata} -> ${EXECUTION_WORKSPACE_CLEANUP_COMMANDS_EXECUTED_METADATA_KEY}::text) = 'object' THEN ${executionWorkspaces.metadata} -> ${EXECUTION_WORKSPACE_CLEANUP_COMMANDS_EXECUTED_METADATA_KEY}::text END, '{}'::jsonb) || ${JSON.stringify(newEntries)}::jsonb)`,
+      updatedAt: new Date(),
+    })
+    .where(eq(executionWorkspaces.id, workspaceId));
 }
 
 function isClosedExecutionWorkspaceStatus(status: string | null | undefined): boolean {
@@ -1765,6 +1802,16 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
     const cleanupLock = workspace.providerType === "git_worktree" && workspaceLeafPath && existsSync(workspaceLeafPath)
       ? await acquireGitWorktreeCleanupLock(workspaceLeafPath)
       : null;
+    // SPA-7391 (F1): each command's record is persisted the moment the command
+    // succeeds (via the callback below), so a throw in any later step —
+    // worktree removal, the shared-issue detach, the trailing row updates —
+    // or a crash between steps can no longer lose the record and cause the
+    // next attempt to re-run a command that already executed. This map mirrors
+    // what the immediate writes attempted so the catch path can flush anything
+    // that did not land before the throw.
+    const executedCommandRecords: Record<string, string> = {};
+    const persistExecutedCommands = (entries: Record<string, string>) =>
+      mergeCleanupCommandsExecutedMetadata(db, workspace.id, entries);
     try {
       await assertTerminalCleanupGitStateUnchanged(workspace, expectedHeadSha, { allowDirtyWorktree });
       await opts.beforeTerminalWorkspaceCleanup?.(workspace);
@@ -1801,6 +1848,13 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
         // SPA-7354 review fix (HIGH-2): track and skip already-executed
         // commands so the reopen -> re-archive cycle cannot re-run them.
         skipAlreadyExecutedCleanupCommands: true,
+        // SPA-7391 (F1): land each command's record before the next cleanup
+        // step runs. The merge is in-SQL (F2), so concurrent executors cannot
+        // clobber each other's entries.
+        onCleanupCommandExecuted: async (command, executedAt) => {
+          executedCommandRecords[command] = executedAt;
+          await persistExecutedCommands({ [command]: executedAt });
+        },
         forceWorktreeRemoval: opts.forceTerminalWorktreeRemoval ?? callOpts.forceWorktreeRemoval ?? false,
       });
       if (cleanup.cleaned && workspace.mode === "shared_workspace") {
@@ -1834,21 +1888,26 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
       }
       // SPA-7354 review fix (HIGH-2): persist which cleanup commands ran, so a
       // reopen -> re-archive cycle skips them instead of re-executing a
-      // non-idempotent command. The jsonb merge preserves the row's live
-      // metadata rather than rebuilding it from this call's snapshot.
-      if (Object.keys(cleanup.executedCommands).length > 0) {
-        await db
-          .update(executionWorkspaces)
-          .set({
-            metadata: sql`${executionWorkspaces.metadata} || jsonb_build_object(${EXECUTION_WORKSPACE_CLEANUP_COMMANDS_EXECUTED_METADATA_KEY}::text, ${JSON.stringify({
-              ...readCleanupCommandsExecutedAt(workspace.metadata as Record<string, unknown> | null),
-              ...cleanup.executedCommands,
-            })}::jsonb)`,
-            updatedAt: now(),
-          })
-          .where(eq(executionWorkspaces.id, workspace.id));
-      }
+      // non-idempotent command. SPA-7391 (F1): every command's record already
+      // landed immediately as the command succeeded; this backstop re-merges
+      // the returned map so commands whose immediate record write failed still
+      // get recorded. SPA-7391 (F2): the merge is in-SQL against the row's
+      // current value, so a concurrent executor's entries survive.
+      await persistExecutedCommands(cleanup.executedCommands);
       return cleanup;
+    } catch (error) {
+      // SPA-7391 (F1): a throw after a command succeeded must not lose the
+      // command's record — the next attempt would re-run a command that
+      // already executed. Flush whatever the immediate per-command writes did
+      // not land. Best-effort: if the DB cannot serve this write it also
+      // cannot serve the sweep's fenced failure write, and the next sweep
+      // retries with the same skip-check in place.
+      try {
+        await persistExecutedCommands(executedCommandRecords);
+      } catch {
+        // Swallow: the original error is the one that must propagate.
+      }
+      throw error;
     } finally {
       await cleanupLock?.release();
     }
