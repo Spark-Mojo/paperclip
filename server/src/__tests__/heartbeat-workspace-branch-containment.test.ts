@@ -218,13 +218,17 @@ async function waitForContainmentSideEffects(input: {
     const sameWorkspaceSibling = issueById.get(input.sameWorkspaceSiblingId);
     const otherWorkspaceSibling = issueById.get(input.otherWorkspaceSiblingId);
     const recoveryActionId = actionRows.length === 1 ? actionRows[0]?.id : null;
-    const hasRecoveryActionComment = recoveryActionId
+    // SPA-7105 skip contract (SPA-7132 ruling, Option 2): the blocked-empty
+    // parking write never lands — the source keeps in_progress and the
+    // durable escalation is the source-scoped action + the system skip note
+    // (whose body carries no recovery-action id).
+    const hasSkipNote = recoveryActionId
       ? comments.some((comment) =>
           comment.issueId === input.sourceIssueId &&
-          comment.body.includes(`Recovery action: \`${recoveryActionId}\``))
+          comment.body.includes("Recovery skipped the parking write"))
       : false;
     if (
-      source?.status === "blocked" &&
+      source?.status === "in_progress" &&
       source.executionRunId === null &&
       source.checkoutRunId === null &&
       sameWorkspaceSibling?.status === "in_progress" &&
@@ -234,7 +238,7 @@ async function waitForContainmentSideEffects(input: {
       otherWorkspaceSibling.executionRunId === null &&
       otherWorkspaceSibling.checkoutRunId === null &&
       actionRows.length === 1 &&
-      hasRecoveryActionComment
+      hasSkipNote
     ) {
       return latest;
     }
@@ -641,8 +645,11 @@ async function expectContainedWorkspaceBranchFailure(input: {
     otherWorkspaceSiblingId: input.otherWorkspaceSiblingId,
   });
   const issueById = new Map(issueRows.map((issue) => [issue.id, issue]));
+  // SPA-7105 skip contract (SPA-7132 ruling, Option 2): no blocked parking
+  // write on a blocked-empty card — the source keeps in_progress; the
+  // containment guarantees (execution/checkout runs released) are unchanged.
   expect(issueById.get(input.sourceIssueId)).toMatchObject({
-    status: "blocked",
+    status: "in_progress",
     executionRunId: null,
     checkoutRunId: null,
   });
@@ -692,7 +699,7 @@ async function expectContainedWorkspaceBranchFailure(input: {
     }),
   });
 
-  expect(comments.filter((comment) => comment.issueId === input.sourceIssueId && comment.body.includes(`Recovery action: \`${action.id}\``))).toHaveLength(1);
+  expect(comments.filter((comment) => comment.issueId === input.sourceIssueId && comment.body.includes("Recovery skipped the parking write"))).toHaveLength(1);
   expect(comments.filter((comment) => comment.issueId === input.sameWorkspaceSiblingId)).toHaveLength(0);
   expect(comments.filter((comment) => comment.issueId === input.otherWorkspaceSiblingId)).toHaveLength(0);
 }

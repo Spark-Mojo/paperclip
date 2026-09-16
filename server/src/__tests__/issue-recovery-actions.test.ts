@@ -314,20 +314,27 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     });
 
     const [updatedIssue] = await db.select().from(issues).where(eq(issues.id, sourceIssue.id));
+    // SPA-7105 broad fix: with no unresolved blocker edge (and no armed
+    // monitor) the blocked-empty parking write is skipped — the card keeps
+    // in_progress and the skip note names the preserved path.
     expect(updatedIssue).toMatchObject({
-      status: "blocked",
+      status: "in_progress",
     });
+    const skipNotes = await db
+      .select({ body: issueComments.body })
+      .from(issueComments)
+      .where(eq(issueComments.issueId, sourceIssue.id));
+    expect(skipNotes.filter((row) => (row.body ?? "").includes("Recovery skipped the parking write"))).toHaveLength(1);
     const recoveryIssues = await db
       .select()
       .from(issues)
       .where(and(eq(issues.companyId, companyId), eq(issues.originKind, "stranded_issue_recovery")));
     expect(recoveryIssues).toHaveLength(0);
-    expect(enqueueWakeup).toHaveBeenCalledTimes(2);
-    expect(enqueueWakeup.mock.calls[0]?.[1]?.payload).toMatchObject({
-      issueId: sourceIssue.id,
-      sourceIssueId: sourceIssue.id,
-      recoveryCause: "stranded_assigned_issue",
-    });
+    // SPA-7105 + SPA-7132 ruling (Steve, Option 2 — contract amendment): the
+    // skip path is a silent park. No recovery wake fires from a skip-path
+    // escalation, even across repeated reconcile passes; the source-scoped
+    // action row IS the durable escalation (SPA-7133 covers dormant wakes).
+    expect(enqueueWakeup).not.toHaveBeenCalled();
   });
 
   it.each([
@@ -370,15 +377,10 @@ describeEmbeddedPostgres("issue recovery actions", () => {
         .from(issueRecoveryActions)
         .where(eq(issueRecoveryActions.sourceIssueId, sourceIssue.id));
       expect(action?.ownerAgentId).toBe(expectedOwnerId);
-      expect(enqueueWakeup).toHaveBeenCalledWith(
-        expectedOwnerId,
-        expect.objectContaining({
-          reason: "source_scoped_recovery_action",
-          payload: expect.objectContaining({
-            recoveryCause: explicitCause ?? (errorCode === "adapter_failed" ? "stranded_assigned_issue" : errorCode),
-          }),
-        }),
-      );
+      // SPA-7105 + SPA-7132 ruling (Steve, Option 2 — contract amendment):
+      // the cause-keyed playbook still routes ownership, but the skip path
+      // (blocked-empty is never a legal write) fires no wake.
+      expect(enqueueWakeup).not.toHaveBeenCalled();
     },
   );
 
@@ -879,10 +881,20 @@ describeEmbeddedPostgres("issue recovery actions", () => {
 
     expect(result).toMatchObject({ escalated: 1, reviewParticipantRequeued: 0 });
     const [updatedIssue] = await db.select().from(issues).where(eq(issues.id, sourceIssueId));
+    // SPA-7105 broad fix: the escalation source-scoped action is recorded,
+    // but the status write is skipped — blocking an in_review card holding a
+    // live review stage would destroy the review continuation path, and the
+    // assignee stays the original reviewer's fallback instead of being moved.
     expect(updatedIssue).toMatchObject({
-      status: "blocked",
-      assigneeAgentId: managerId,
+      status: "in_review",
+      assigneeAgentId: coderId,
     });
+    const reviewSkipNotes = await db
+      .select({ body: issueComments.body })
+      .from(issueComments)
+      .where(eq(issueComments.issueId, sourceIssueId));
+    expect(reviewSkipNotes.filter((row) => (row.body ?? "").includes("Recovery skipped the parking write")))
+      .toHaveLength(1);
     const [updatedRun] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
     expect(updatedRun?.errorCode).toBe("configuration_incomplete");
     const [action] = await db.select().from(issueRecoveryActions);
@@ -946,7 +958,16 @@ describeEmbeddedPostgres("issue recovery actions", () => {
 
     expect(result).toMatchObject({ escalated: 1, skipped: 0 });
     const [updatedIssue] = await db.select().from(issues).where(eq(issues.id, sourceIssueId));
-    expect(updatedIssue?.status).toBe("blocked");
+    // SPA-7105 broad fix: the classification still lands, but the blocked
+    // parking write is skipped — the card keeps its status and the skip note
+    // records the preserved continuation path.
+    expect(updatedIssue?.status).toBe("in_progress");
+    const modelSkipNotes = await db
+      .select({ body: issueComments.body })
+      .from(issueComments)
+      .where(eq(issueComments.issueId, sourceIssueId));
+    expect(modelSkipNotes.filter((row) => (row.body ?? "").includes("Recovery skipped the parking write")))
+      .toHaveLength(1);
     const [updatedRun] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
     expect(updatedRun?.errorCode).toBe("configuration_incomplete");
     const [action] = await db.select().from(issueRecoveryActions);
@@ -1036,13 +1057,9 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       attemptCount: 2,
     });
     expect(actionRows[0]?.evidence).toMatchObject({ latestRunId: secondLatestRun.id });
-    expect(enqueueWakeup).toHaveBeenCalledTimes(2);
-    expect(enqueueWakeup.mock.calls[1]?.[1]?.payload).toMatchObject({
-      issueId: sourceIssue.id,
-      sourceIssueId: sourceIssue.id,
-      strandedRunId: secondLatestRun.id,
-      recoveryCause: "stranded_assigned_issue",
-    });
+    // SPA-7105 + SPA-7132 ruling (Steve, Option 2 — contract amendment): the
+    // skip path is a silent park — no wake across repeated escalations.
+    expect(enqueueWakeup).not.toHaveBeenCalled();
   });
 
   it("deduplicates workspace-incoherence recovery actions by the typed workspace fingerprint", async () => {
@@ -1147,7 +1164,7 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     expect(comments[0]?.presentation).toMatchObject({
       kind: "system_notice",
       tone: "warning",
-      title: "Recovery: workspace validation failed — moved to blocked (owner: CTO)",
+      title: "Recovery: parking write skipped — blocked-empty write is not legal",
       density: "compact",
     });
     expect(comments[0]?.metadata).toMatchObject({
@@ -1159,17 +1176,10 @@ describeEmbeddedPostgres("issue recovery actions", () => {
         ]),
       })],
     });
-    expect(enqueueWakeup).toHaveBeenCalledTimes(2);
-    expect(enqueueWakeup).toHaveBeenCalledWith(
-      expect.any(String),
-      expect.objectContaining({
-        reason: "source_scoped_recovery_action",
-        payload: expect.objectContaining({ recoveryCause: "workspace_validation_failed" }),
-      }),
-    );
+    expect(enqueueWakeup).not.toHaveBeenCalled();
   });
 
-  it("keeps the source issue blocked when source-scoped wakeup is claimed synchronously", async () => {
+  it("keeps the source issue in_progress across repeated escalations with no wake (SPA-7132 ruling)", async () => {
     const { companyId, managerId, coderId, sourceIssue } = await seedCompany();
     await db.update(agents).set({ status: "paused" }).where(eq(agents.id, managerId));
     const enqueueWakeup = vi.fn(async () => {
@@ -1198,7 +1208,11 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     });
 
     const [afterFirst] = await db.select().from(issues).where(eq(issues.id, sourceIssue.id));
-    expect(afterFirst?.status).toBe("blocked");
+    // SPA-7105 broad fix: no parking write lands on a blocked-empty card, so
+    // a synchronously claimed wakeup cannot clobber an escalation write —
+    // there is none. The card stays in_progress; the source-scoped action and
+    // the deduped skip note carry the escalation.
+    expect(afterFirst?.status).toBe("in_progress");
     expect(afterFirst?.assigneeAgentId).toBe(coderId);
 
     const secondLatestRun = {
@@ -1227,11 +1241,11 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       attemptCount: 2,
     });
     const [afterSecond] = await db.select().from(issues).where(eq(issues.id, sourceIssue.id));
-    expect(afterSecond?.status).toBe("blocked");
+    expect(afterSecond?.status).toBe("in_progress");
 
     const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, sourceIssue.id));
     expect(comments).toHaveLength(1);
-    expect(comments[0]?.body).toContain("Recovery action:");
+    expect(comments[0]?.body).toContain("Recovery skipped the parking write");
   });
 
   it("does not create nested recovery artifacts when issue-backed fallback work itself fails", async () => {
