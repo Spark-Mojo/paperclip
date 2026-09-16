@@ -176,6 +176,15 @@ export const STRANDED_RECENT_PROGRESS_EXEMPTION_MS = Math.max(
   Number(process.env.STRANDED_RECENT_PROGRESS_EXEMPTION_MS) || 30 * 60 * 1000,
 );
 
+// Marker stamped on the single bounded continuation that an exhausted
+// successful-run handoff is allowed before board escalation. On the next scan
+// that continuation is a repeated productive continuation; this marker tells the
+// GGU-809 guard to bypass the recent-visible-progress exemption and escalate,
+// so a handoff cannot avoid escalation indefinitely by posting progress.
+// Ordinary (non-handoff) batch continuations never carry this marker and keep
+// the GGU-809 exemption.
+export const HANDOFF_BOUNDED_CONTINUATION_MARKER = "handoffBoundedContinuation";
+
 type RecoveryWakeupOptions = {
   source?: "timer" | "assignment" | "on_demand" | "automation";
   triggerDetail?: "manual" | "ping" | "callback" | "system";
@@ -4976,6 +4985,10 @@ export function recoveryService(
         }
         continue;
       }
+      // Set when a productive exhausted successful-run handoff is allowed
+      // exactly one bounded normal continuation; the continuation enqueue reads
+      // it to stamp the bounded marker. Reset every iteration.
+      let handoffBoundedContext: { sourceRunId: string | null; correctiveRunId: string } | null = null;
       const handoffEvidence = isExhaustedSuccessfulRunHandoff(latestRun);
       if (handoffEvidence) {
         if (isPluginManagedIssueLifecycle(issue)) {
@@ -4987,20 +5000,31 @@ export function recoveryService(
           continue;
         }
 
-        const updated = await escalateStrandedAssignedIssue({
-          issue,
-          previousStatus: "in_progress",
-          latestRun,
-          recoveryCause: SUCCESSFUL_RUN_MISSING_STATE_REASON,
-          successfulRunHandoffEvidence: handoffEvidence,
-        });
-        if (updated) {
-          result.successfulRunHandoffEscalated += 1;
-          result.issueIds.push(issue.id);
-        } else {
-          result.skipped += 1;
+        if (!isProductiveContinuationRun(latestRun)) {
+          const updated = await escalateStrandedAssignedIssue({
+            issue,
+            previousStatus: "in_progress",
+            latestRun,
+            recoveryCause: SUCCESSFUL_RUN_MISSING_STATE_REASON,
+            successfulRunHandoffEvidence: handoffEvidence,
+          });
+          if (updated) {
+            result.successfulRunHandoffEscalated += 1;
+            result.issueIds.push(issue.id);
+          } else {
+            result.skipped += 1;
+          }
+          continue;
         }
-        continue;
+
+        // Set when a productive exhausted successful-run handoff is allowed
+        // exactly one bounded normal continuation; the continuation enqueue reads
+        // it to stamp the bounded marker. Lives in this scope so the
+        // isSuccessfulInProgressContinuationRun block below can read it.
+        handoffBoundedContext = {
+          sourceRunId: handoffEvidence.sourceRunId,
+          correctiveRunId: handoffEvidence.correctiveRunId,
+        };
       }
       if (isProductiveContinuationRun(latestRun)) {
         // Backport of upstream paperclipai/paperclip #12744
@@ -5037,11 +5061,19 @@ export function recoveryService(
         }
 
         if (isRepeatedProductiveContinuationRecovery(successfulRun)) {
-          // GGU-809: skip escalation if the assignee has shown visible progress
-          // (comment or attachment) within the exemption window. Falling
-          // through here lets the normal continuation-retry path enqueue the
-          // next wake, which is the correct behaviour for batch workflows.
-          const exempted = await hasRecentVisibleProgress(
+          // SPA-6335 bounded-handoff carve-out: the continuation created from
+          // an exhausted productive handoff carries HANDOFF_BOUNDED_CONTINUATION_MARKER.
+          // Read it from THIS run's own context (not the per-iteration handoff
+          // detector — the continuation's wakeReason is not a handoff reason).
+          // On the repeat, escalate regardless of visible progress — otherwise
+          // an agent could avoid escalation indefinitely by posting progress
+          // every heartbeat. GGU-809 still protects ordinary non-handoff
+          // batch continuations, which never carry the marker.
+          const isHandoffBounded = asBoolean(
+            parseObject(successfulRun.contextSnapshot)[HANDOFF_BOUNDED_CONTINUATION_MARKER],
+            false,
+          );
+          const exempted = isHandoffBounded ? false : await hasRecentVisibleProgress(
             issue.companyId,
             issue.id,
             agentId,
@@ -5052,9 +5084,11 @@ export function recoveryService(
               issue,
               previousStatus: "in_progress",
               latestRun: successfulRun,
-              comment:
-                "Paperclip automatically retried continuation for this assigned `in_progress` issue and the retry " +
-                "made progress, but it still has no live execution path. Moving it to `blocked` so it is visible for intervention.",
+              comment: isHandoffBounded
+                ? "Paperclip gave this exhausted successful-run handoff its one bounded normal continuation; " +
+                  "the continuation made progress, so escalating to the board now instead of queuing another."
+                : "Paperclip automatically retried continuation for this assigned `in_progress` issue and the retry " +
+                  "made progress, but it still has no live execution path. Moving it to `blocked` so it is visible for intervention.",
             });
             if (updated) {
               result.escalated += 1;
@@ -5079,6 +5113,13 @@ export function recoveryService(
           retryReason: "issue_continuation_needed",
           source: "issue.productive_terminal_continuation_recovery",
           retryOfRunId: successfulRun.id,
+          extraContext: handoffBoundedContext
+            ? {
+                [HANDOFF_BOUNDED_CONTINUATION_MARKER]: true,
+                handoffSourceRunId: handoffBoundedContext.sourceRunId,
+                handoffCorrectiveRunId: handoffBoundedContext.correctiveRunId,
+              }
+            : undefined,
         });
         if (queued) {
           result.continuationRequeued += 1;
