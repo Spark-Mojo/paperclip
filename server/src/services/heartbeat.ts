@@ -29253,6 +29253,61 @@ export function heartbeatService(
       return run ?? null;
     },
 
+    /**
+     * Cancel EVERY live run bound to an issue: runs whose contextSnapshot
+     * names the issue, plus (when provided) the run recorded in
+     * `executionRunId` even if its snapshot disagrees (a stale pointer must
+     * never keep a run alive past the issue's terminal transition). Runs are
+     * ordered running-first so the primary interrupted run is deterministic
+     * for callers that surface "the" cancelled run id.
+     */
+    cancelLiveRunsForIssue: async (
+      companyId: string,
+      issueId: string,
+      executionRunId?: string | null,
+      excludeRunId?: string | null,
+    ) => {
+      const liveRuns = await db
+        .select()
+        .from(heartbeatRuns)
+        .where(
+          and(
+            eq(heartbeatRuns.companyId, companyId),
+            inArray(heartbeatRuns.status, [...EXECUTION_PATH_HEARTBEAT_RUN_STATUSES]),
+            executionRunId
+              ? or(
+                  sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${issueId}`,
+                  eq(heartbeatRuns.id, executionRunId),
+                )
+              : sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${issueId}`,
+          ),
+        )
+        .orderBy(
+          sql`case when ${heartbeatRuns.status} = 'running' then 0 else 1 end`,
+          asc(heartbeatRuns.createdAt),
+        );
+
+      const cancelledRuns: (typeof heartbeatRuns.$inferSelect)[] = [];
+      for (const run of liveRuns) {
+        if (excludeRunId && run.id === excludeRunId) continue;
+        try {
+          const cancelled = await cancelRunInternal(run.id, "Cancelled by issue status transition");
+          // cancelRunInternal returns the row unchanged (status untouched)
+          // when the run already left a cancellable state — only count real
+          // transitions so callers neither double-log nor misreport.
+          if (cancelled && cancelled.status === "cancelled") {
+            cancelledRuns.push(cancelled);
+          }
+        } catch (err) {
+          logger.warn(
+            { err, runId: run.id, issueId, companyId },
+            "cancelLiveRunsForIssue: failed to cancel run",
+          );
+        }
+      }
+      return cancelledRuns;
+    },
+
     getActiveRunIssueSummaryForAgent: async (agentId: string) => {
       const [run] = await db
         .select(heartbeatRunIssueSummaryColumns)
