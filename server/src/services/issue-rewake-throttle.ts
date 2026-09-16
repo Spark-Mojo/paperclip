@@ -115,6 +115,15 @@ export function isThrottleCandidateIssueRewake(input: IssueRewakeCandidateInput)
   // Agent-authored resume comments remain subject to the normal rewake throttle.
   if (input.hasExplicitResume && input.requestedByActorType !== "agent") return false;
   if (input.wakeCommentId) return input.requestedByActorType === "agent";
+  // PAP-13775: operator-initiated assignment wakes (board / user actor, or an
+  // omitted actor on a manually-triggered assignment) are operator intent, not
+  // storm traffic — they must never be throttled. Mirrors the comment-wake
+  // special case above. System and agent actor types stay in the throttle class
+  // so the underlying storm protection (process-loss / external poller wakes)
+  // continues to apply.
+  if (input.reason === "issue_assigned" && input.requestedByActorType !== "agent" && input.requestedByActorType !== "system") {
+    return false;
+  }
   if (input.reason === null) return true;
   return THROTTLED_ISSUE_REWAKE_REASONS.has(input.reason);
 }
