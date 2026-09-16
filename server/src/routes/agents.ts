@@ -2866,6 +2866,7 @@ export function agentRoutes(
           createdByAgentId: actor.agentId,
           createdByUserId: actor.actorType === "user" ? actor.actorId : null,
           source: "instructions_path_patch",
+          force: true,
         },
       },
     );
@@ -2931,6 +2932,7 @@ export function agentRoutes(
           createdByAgentId: actor.agentId,
           createdByUserId: actor.actorType === "user" ? actor.actorId : null,
           source: "instructions_bundle_patch",
+          force: true,
         },
       },
     );
@@ -2972,6 +2974,14 @@ export function agentRoutes(
   });
 
   router.put("/agents/:id/instructions-bundle/file", validate(upsertAgentInstructionsFileSchema), async (req, res) => {
+    // SPA-5925: the file on disk is the system of record, so an agent-driven
+    // write to AGENTS.md (or any other bundle file) must always produce an
+    // agent_config_revisions row — even when adapterConfig normalizes to a
+    // byte-identical shape, which would otherwise drop the audit trail. The
+    // changeConsentGate has already consumed the matching request_confirmation
+    // for the target key `agent:<id>:instructions` (when this is an agent
+    // actor) so consent linkage is recorded on the interaction row, not the
+    // revision row. The revision row stores the actor + source verbatim.
     const id = req.params.id as string;
     const existing = await getAccessibleResource(req, res, svc.getById(id), "Agent not found");
     if (!existing) return;
@@ -2986,7 +2996,7 @@ export function agentRoutes(
       result.adapterConfig,
       { strictMode: strictSecretsMode, adapterType: existing.adapterType },
     );
-    await svc.update(
+await svc.update(
       id,
       { adapterConfig: normalizedAdapterConfig },
       {
@@ -2994,6 +3004,7 @@ export function agentRoutes(
           createdByAgentId: actor.agentId,
           createdByUserId: actor.actorType === "user" ? actor.actorId : null,
           source: "instructions_bundle_file_put",
+          force: true,
         },
       },
     );
