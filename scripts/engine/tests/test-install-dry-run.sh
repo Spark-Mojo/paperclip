@@ -8,6 +8,13 @@
 # install/build steps are short-circuited by install.sh's own dry-run path
 # (stage_fake_payload), and the only real network I/O is curl against a
 # local Node HTTP stub standing in for GET /api/health.
+#
+# SPA-7564 pointer-safety contract (root-cause fix for SPA-7223): the flip is
+# still exercised inside the run, but a dry-run restores $CURRENT_LINK to its
+# pre-install target on EVERY exit path — success, failure, and interrupt —
+# so the final pointer state after any dry-run is exactly the before-state.
+# Tests 25-28 pin that contract, including real-mode (DRY_RUN=0) failed
+# installs and the trap-based restore on an unexpected death after the flip.
 
 set -euo pipefail
 
@@ -134,8 +141,9 @@ capture out1 code1 "$ENGINE_DIR/install.sh" npm:1.2.3
 unset PAPERCLIP_ENGINE_TEST_FAIL_REPORT_READBACK
 echo "$out1" | sed 's/^/    /'
 assert_eq "install exits 0" "0" "$code1"
-assert_true "current symlink exists" test -L "$CURRENT_LINK"
-assert_eq "current -> paperclip-1.2.3" "$ENGINE_ROOT/paperclip-1.2.3" "$(readlink "$CURRENT_LINK")"
+assert_contains "dry-run flipped to the staged prefix during the run" "$out1" "+ ln -sfn $ENGINE_ROOT/paperclip-1.2.3 $CURRENT_LINK"
+assert_contains "dry-run restores the pointer at the end (SPA-7564)" "$out1" "restoring $CURRENT_LINK to its pre-install target"
+assert_true "current symlink removed after dry-run (SPA-7564: first install, pointer never left moved)" test ! -e "$CURRENT_LINK"
 assert_true "new prefix has a fake package.json" test -f "$ENGINE_ROOT/paperclip-1.2.3/lib/node_modules/paperclipai/package.json"
 assert_true "no previous-prefix state file yet (first install)" bash -c '[ ! -f "'"$STATE_DIR"'/previous-prefix" ]'
 
@@ -143,8 +151,13 @@ echo "== test 1b: idempotent re-install of the same version =="
 capture out1b code1b "$ENGINE_DIR/install.sh" npm:1.2.3
 assert_eq "re-install exits 0" "0" "$code1b"
 assert_contains "re-install logs reuse, not a fresh stage" "$out1b" "Reusing already-installed prefix"
+assert_true "re-install also leaves the pointer removed (SPA-7564)" test ! -e "$CURRENT_LINK"
 
 echo "== test 2: upgrade to npm:9.9.9 with health FAILING -> automatic rollback =="
+# Seed the pre-install state explicitly: since SPA-7564 a dry-run no longer
+# leaves the pointer moved, so each test that needs an existing pointer
+# establishes its own before-state.
+ln -sfn "$ENGINE_ROOT/paperclip-1.2.3" "$CURRENT_LINK"
 export PAPERCLIP_WHATS_RUNNING_PATH="$SANDBOX/bin/whats-running"
 mkdir -p "$(dirname "$PAPERCLIP_WHATS_RUNNING_PATH")"
 printf 'stale-report\n' > "$PAPERCLIP_WHATS_RUNNING_PATH"
@@ -185,15 +198,19 @@ assert_eq "reporter install failure rolls back current prefix" "$ENGINE_ROOT/pap
 echo "== test 3: healthy upgrade to npm:2.0.0, then explicit rollback.sh with no args =="
 echo "ok" > "$MODE_FILE"
 capture out3 code3 "$ENGINE_DIR/install.sh" npm:2.0.0
+echo "$out3" | sed 's/^/    /'
 assert_eq "install to 2.0.0 exits 0" "0" "$code3"
-assert_eq "current -> paperclip-2.0.0" "$ENGINE_ROOT/paperclip-2.0.0" "$(readlink "$CURRENT_LINK")"
+assert_contains "dry-run flipped to paperclip-2.0.0 during the run" "$out3" "+ ln -sfn $ENGINE_ROOT/paperclip-2.0.0 $CURRENT_LINK"
+assert_eq "current restored to paperclip-1.2.3 after dry-run (SPA-7564)" "$ENGINE_ROOT/paperclip-1.2.3" "$(readlink "$CURRENT_LINK")"
 assert_eq "previous-prefix state file recorded 1.2.3" "$ENGINE_ROOT/paperclip-1.2.3" "$(cat "$STATE_DIR/previous-prefix")"
 
 capture out3b code3b "$ENGINE_DIR/rollback.sh"
 echo "$out3b" | sed 's/^/    /'
 assert_eq "rollback.sh exits 0" "0" "$code3b"
 assert_eq "current rolled back to paperclip-1.2.3" "$ENGINE_ROOT/paperclip-1.2.3" "$(readlink "$CURRENT_LINK")"
-assert_eq "previous-prefix state file now records 2.0.0" "$ENGINE_ROOT/paperclip-2.0.0" "$(cat "$STATE_DIR/previous-prefix")"
+# SPA-7564: the pointer never moved (the dry-run restored it), so the
+# pre-rollback pointer rollback.sh records IS 1.2.3 — not the staged 2.0.0.
+assert_eq "previous-prefix state file records the pre-rollback pointer" "$ENGINE_ROOT/paperclip-1.2.3" "$(cat "$STATE_DIR/previous-prefix")"
 
 echo "== test 4: fork source uses distinct receipt-bound overlay prefix =="
 LEGACY_SHA="$(git -C "$ENGINE_DIR/../.." rev-parse HEAD | cut -c1-12)"
@@ -203,8 +220,9 @@ printf '%s\n' '{"name":"paperclipai","version":"legacy"}' > "$LEGACY_PREFIX/lib/
 capture out4 code4 "$ENGINE_DIR/install.sh" fork:HEAD
 echo "$out4" | sed 's/^/    /'
 assert_eq "fork install exits 0" "0" "$code4"
-assert_true "current symlink points at distinct overlay prefix" bash -c '[[ "$(readlink "'"$CURRENT_LINK"'")" == "'"$ENGINE_ROOT"'"/paperclip-overlay-2026.831.1-* ]]'
-assert_true "legacy same-source prefix was not reused" test "$(readlink "$CURRENT_LINK")" != "$LEGACY_PREFIX"
+assert_contains "fork dry-run flipped to the overlay prefix during the run" "$out4" "+ ln -sfn $ENGINE_ROOT/paperclip-overlay-2026.831.1-"
+assert_eq "current restored to paperclip-1.2.3 after fork dry-run (SPA-7564)" "$ENGINE_ROOT/paperclip-1.2.3" "$(readlink "$CURRENT_LINK")"
+assert_true "legacy same-source prefix was not reused" bash -c '[[ "$1" != *"ln -sfn '"$LEGACY_PREFIX"'"* ]]' _ "$out4"
 
 echo "== test 5: status.sh runs cleanly against the sandbox =="
 capture status_out status_code "$ENGINE_DIR/status.sh"
@@ -415,7 +433,8 @@ capture out12 code12 env \
 echo "$out12" | sed 's/^/    /'
 assert_eq "adoption install exits 0" "0" "$code12"
 assert_eq "adoption records legacy prefix for rollback" "$ADOPT_PREFIX" "$(cat "$ADOPT_STATE/previous-prefix")"
-assert_eq "adoption cutover points at staged prefix" "$ADOPT_ROOT/paperclip-12.0.0" "$(readlink "$ADOPT_LINK")"
+assert_contains "adoption dry-run flipped to the staged prefix during the run" "$out12" "+ ln -sfn $ADOPT_ROOT/paperclip-12.0.0 $ADOPT_LINK"
+assert_eq "adoption dry-run restored the adopted prefix (SPA-7564)" "$ADOPT_PREFIX" "$(readlink "$ADOPT_LINK")"
 adopt_log_pos="$(printf '%s\n' "$out12" | grep -n "Seeded current link from adopted prefix" | cut -d: -f1)"
 stage_log_pos="$(printf '%s\n' "$out12" | grep -n "Staged fake dry-run payload" | cut -d: -f1)"
 assert_true "legacy link is seeded before replacement staging" test "$adopt_log_pos" -lt "$stage_log_pos"
@@ -1022,6 +1041,137 @@ printf '{"commit":"%s"}\n' "$STAMP_SHORT" > "$STAMP_FILE"
 capture stamp_out stamp_code env ENGINE_DIR_FOR_TEST="$ENGINE_DIR" STAMP_REPO="$STAMP_REPO" STAMP_FILE="$STAMP_FILE" STAMP_FULL="$STAMP_FULL" bash -c '. "$ENGINE_DIR_FOR_TEST/lib.sh"; validate_and_expand_build_stamp "$STAMP_REPO" "$STAMP_FILE" "$STAMP_FULL"'
 assert_eq "actual short build stamp accepted" "0" "$stamp_code"
 assert_contains "accepted stamp expands to frozen SHA" "$(cat "$STAMP_FILE")" "$STAMP_FULL"
+
+echo "== test 25: SPA-7564 — dry-run leaves paperclip-current exactly as it found it =="
+SEED_PREFIX="$ENGINE_ROOT/paperclip-3.0.0"
+mkdir -p "$SEED_PREFIX/lib/node_modules/paperclipai" "$SEED_PREFIX/bin"
+printf '%s\n' '{"name":"paperclipai","version":"3.0.0"}' > "$SEED_PREFIX/lib/node_modules/paperclipai/package.json"
+printf '%s\n' '#!/usr/bin/env bash' 'exit 0' > "$SEED_PREFIX/bin/paperclipai"
+chmod +x "$SEED_PREFIX/bin/paperclipai"
+ln -sfn "$SEED_PREFIX" "$CURRENT_LINK"
+echo "ok" > "$MODE_FILE"
+capture out25 code25 "$ENGINE_DIR/install.sh" npm:3.1.0
+echo "$out25" | sed 's/^/    /'
+assert_eq "healthy dry-run upgrade exits 0" "0" "$code25"
+assert_contains "dry-run flipped to 3.1.0 during the run" "$out25" "+ ln -sfn $ENGINE_ROOT/paperclip-3.1.0 $CURRENT_LINK"
+assert_contains "dry-run restore receipt printed" "$out25" "DRY-RUN COMPLETE"
+assert_eq "readlink after dry-run is unchanged (SPA-7564)" "$SEED_PREFIX" "$(readlink "$CURRENT_LINK")"
+
+echo "== test 26: SPA-7564 — unexpected death after the flip restores the pointer (trap, dry-run) =="
+export PAPERCLIP_ENGINE_TEST_DIE_AFTER_FLIP=1
+capture out26 code26 "$ENGINE_DIR/install.sh" npm:3.2.0
+unset PAPERCLIP_ENGINE_TEST_DIE_AFTER_FLIP
+echo "$out26" | sed 's/^/    /'
+assert_eq "terminated install exits 143" "143" "$code26"
+assert_contains "testhook fired after the flip" "$out26" "+TESTHOOK simulating unexpected death"
+assert_contains "restore guard restored the pre-install target" "$out26" "install aborted (exit status 143) — restoring $CURRENT_LINK to its pre-install target"
+assert_eq "readlink after terminated install is unchanged (SPA-7564)" "$SEED_PREFIX" "$(readlink "$CURRENT_LINK")"
+
+echo "== test 27: SPA-7564 — real-mode failed install (health) restores the previous prefix =="
+REAL_HOME="$SANDBOX/real-home"
+REAL_ROOT="$SANDBOX/real-root"
+REAL_INSTANCE="$SANDBOX/real-paperclip/instances/default"
+REAL_OLD="$REAL_ROOT/paperclip-4.0.0"
+REAL_BIN="$SANDBOX/real-bin"
+REAL_MARKERS="$SANDBOX/real-markers"
+mkdir -p "$REAL_HOME/.config/systemd/user" "$REAL_INSTANCE" "$REAL_OLD/lib/node_modules/paperclipai" "$REAL_OLD/bin" "$REAL_BIN" "$REAL_MARKERS"
+cp "$ENGINE_DIR/systemd/paperclip-831.service" "$REAL_HOME/.config/systemd/user/paperclip-831.service"
+printf '%s\n' '{"name":"paperclipai","version":"4.0.0"}' > "$REAL_OLD/lib/node_modules/paperclipai/package.json"
+printf '%s\n' '#!/usr/bin/env bash' 'exit 0' > "$REAL_OLD/bin/paperclipai"
+chmod +x "$REAL_OLD/bin/paperclipai"
+ln -sfn "$REAL_OLD" "$REAL_ROOT/paperclip-current"
+cat > "$REAL_INSTANCE/config.json" <<EOF
+{"server":{"host":"127.0.0.1","port":$HEALTH_PORT},"database":{"mode":"postgres","connectionString":"postgres://fake:fake@127.0.0.1:5432/paperclip831"}}
+EOF
+cat > "$REAL_BIN/npm" <<'EOF'
+#!/usr/bin/env bash
+prefix=""
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = "--prefix" ]; then prefix="$2"; shift 2; continue; fi
+  shift
+done
+[ -n "$prefix" ]
+mkdir -p "$prefix/lib/node_modules/paperclipai/node_modules/@paperclipai/db/dist" "$prefix/bin"
+printf '%s\n' '{"name":"paperclipai","version":"4.1.0"}' > "$prefix/lib/node_modules/paperclipai/package.json"
+printf 'process.exit(0);\n' > "$prefix/lib/node_modules/paperclipai/node_modules/@paperclipai/db/dist/migrate.js"
+printf '%s\n' '#!/usr/bin/env bash' 'exit 0' > "$prefix/bin/paperclipai"
+chmod 0755 "$prefix/bin/paperclipai"
+EOF
+cat > "$REAL_BIN/psql" <<'EOF'
+#!/usr/bin/env bash
+exit 0
+EOF
+cat > "$REAL_BIN/systemctl" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$REAL_MARKERS/systemctl"
+exit 0
+EOF
+cat > "$REAL_BIN/pg_restore" <<'EOF'
+#!/usr/bin/env bash
+exit 0
+EOF
+cat > "$REAL_BIN/pg_dump" <<'EOF'
+#!/usr/bin/env bash
+out=""
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = "-f" ]; then shift; out="$1"; fi
+  shift
+done
+printf 'VALID_DUMP\n' > "$out"
+EOF
+chmod +x "$REAL_BIN"/*
+echo "fail" > "$MODE_FILE"
+capture out27 code27 env \
+  PATH="$REAL_BIN:$PATH" \
+  HOME="$REAL_HOME" \
+  PAPERCLIP_ENGINE_DRY_RUN=0 \
+  ENGINE_ROOT="$REAL_ROOT" \
+  PAPERCLIP_HOME="$SANDBOX/real-paperclip" \
+  PAPERCLIP_INSTANCE_ID=default \
+  CURRENT_LINK="$REAL_ROOT/paperclip-current" \
+  UNIT_NAME=paperclip-831.service \
+  EXPECTED_DB=paperclip831 \
+  BACKUP_DIR="$REAL_ROOT/backups" \
+  STATE_DIR="$REAL_ROOT/state" \
+  MIN_FREE_KB=0 \
+  HEALTH_TIMEOUT_SECS=3 \
+  HEALTH_POLL_SECS=1 \
+  REAL_MARKERS="$REAL_MARKERS" \
+  "$ENGINE_DIR/install.sh" npm:4.1.0
+echo "$out27" | sed 's/^/    /'
+assert_true "real failed install exits non-zero" test "$code27" -ne 0
+assert_eq "real failed install restored the previous prefix (SPA-7564)" "$REAL_OLD" "$(readlink "$REAL_ROOT/paperclip-current")"
+assert_contains "real failed install went through the explicit rollback" "$out27" "rolling back symlink to previous prefix"
+assert_true "real failed install restarted the unit on the restored prefix" bash -c '[[ "$1" == *"start paperclip-831.service"* ]]' _ "$(cat "$REAL_MARKERS/systemctl")"
+echo "ok" > "$MODE_FILE"
+
+echo "== test 28: SPA-7564 — real-mode unexpected death after the flip restores and restarts (trap) =="
+rm -f "$REAL_MARKERS/systemctl"
+export PAPERCLIP_ENGINE_TEST_DIE_AFTER_FLIP=1
+capture out28 code28 env \
+  PATH="$REAL_BIN:$PATH" \
+  HOME="$REAL_HOME" \
+  PAPERCLIP_ENGINE_DRY_RUN=0 \
+  ENGINE_ROOT="$REAL_ROOT" \
+  PAPERCLIP_HOME="$SANDBOX/real-paperclip" \
+  PAPERCLIP_INSTANCE_ID=default \
+  CURRENT_LINK="$REAL_ROOT/paperclip-current" \
+  UNIT_NAME=paperclip-831.service \
+  EXPECTED_DB=paperclip831 \
+  BACKUP_DIR="$REAL_ROOT/backups" \
+  STATE_DIR="$REAL_ROOT/state" \
+  MIN_FREE_KB=0 \
+  HEALTH_TIMEOUT_SECS=3 \
+  HEALTH_POLL_SECS=1 \
+  REAL_MARKERS="$REAL_MARKERS" \
+  "$ENGINE_DIR/install.sh" npm:4.2.0
+unset PAPERCLIP_ENGINE_TEST_DIE_AFTER_FLIP
+echo "$out28" | sed 's/^/    /'
+assert_eq "terminated real install exits 143" "143" "$code28"
+assert_contains "testhook fired after the flip (real mode)" "$out28" "+TESTHOOK simulating unexpected death"
+assert_contains "trap restored the pre-install target (real mode)" "$out28" "install aborted (exit status 143) — restoring $REAL_ROOT/paperclip-current to its pre-install target"
+assert_eq "readlink after terminated real install is unchanged (SPA-7564)" "$REAL_OLD" "$(readlink "$REAL_ROOT/paperclip-current")"
+assert_true "trap restarted the unit against the restored prefix" bash -c '[[ "$1" == *"start paperclip-831.service"* ]]' _ "$(cat "$REAL_MARKERS/systemctl")"
 
 echo
 echo "PASS=$PASS FAIL=$FAIL"
