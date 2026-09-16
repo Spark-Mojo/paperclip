@@ -29,6 +29,7 @@ const mockHeartbeatService = vi.hoisted(() => ({
   getRun: vi.fn(async () => null),
   getActiveRunForAgent: vi.fn(async () => null),
   cancelRun: vi.fn(async () => null),
+  cancelLiveRunsForIssue: vi.fn(async () => [] as Array<{ id: string; companyId: string; agentId: string; status: string }>),
 }));
 
 const mockAgentService = vi.hoisted(() => ({
@@ -283,6 +284,7 @@ describe.sequential("issue comment reopen routes", () => {
     mockHeartbeatService.getRun.mockReset();
     mockHeartbeatService.getActiveRunForAgent.mockReset();
     mockHeartbeatService.cancelRun.mockReset();
+    mockHeartbeatService.cancelLiveRunsForIssue.mockReset();
     mockAgentService.getById.mockReset();
     mockAgentService.list.mockReset();
     mockAgentService.resolveByReference.mockReset();
@@ -324,6 +326,7 @@ describe.sequential("issue comment reopen routes", () => {
     mockHeartbeatService.getRun.mockResolvedValue(null);
     mockHeartbeatService.getActiveRunForAgent.mockResolvedValue(null);
     mockHeartbeatService.cancelRun.mockResolvedValue(null);
+    mockHeartbeatService.cancelLiveRunsForIssue.mockResolvedValue([]);
     mockExternalObjectService.syncCommentSafely.mockResolvedValue(undefined);
     mockExternalObjectService.syncIssueSafely.mockResolvedValue(undefined);
     mockObserveCrossIssueInfluence.mockResolvedValue({
@@ -2327,49 +2330,152 @@ describe.sequential("issue comment reopen routes", () => {
     );
   });
 
-  it("cancels an active run when an issue is marked cancelled", async () => {
+  it("cancels the live runs of an issue marked cancelled (union sweep, incl. null executionRunId)", async () => {
     const issue = {
       ...makeIssue("in_progress"),
-      executionRunId: "run-1",
+      executionRunId: null,
     };
     mockIssueService.getById.mockResolvedValue(issue);
     mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
       ...issue,
       ...patch,
     }));
-    mockHeartbeatService.getRun.mockResolvedValue({
-      id: "run-1",
-      companyId: "company-1",
-      agentId: "22222222-2222-4222-8222-222222222222",
-      status: "running",
-    });
-    mockHeartbeatService.cancelRun.mockResolvedValue({
-      id: "run-1",
-      companyId: "company-1",
-      agentId: "22222222-2222-4222-8222-222222222222",
-      status: "cancelled",
-    });
+    // Incident shape (SPA-7507): the run kept executing after the review-stage
+    // cancel because only executionRunId/getActiveRunForAgent were consulted.
+    // The sweep must receive the issue identity (not a resolved run) and the
+    // running-first ordering decides which run id is surfaced as primary.
+    mockHeartbeatService.cancelLiveRunsForIssue.mockResolvedValue([
+      { id: "run-dup", companyId: "company-1", agentId: "22222222-2222-4222-8222-222222222222", status: "running" },
+      { id: "run-queued", companyId: "company-1", agentId: "22222222-2222-4222-8222-222222222222", status: "queued" },
+    ]);
 
     const res = await request(await installActor(createApp()))
       .patch("/api/issues/11111111-1111-4111-8111-111111111111")
       .send({ status: "cancelled" });
 
     expect(res.status).toBe(200);
-    expect(mockHeartbeatService.getRun).toHaveBeenCalledWith("run-1");
-    expect(mockHeartbeatService.cancelRun).toHaveBeenCalledWith("run-1");
-    expect(mockLogActivity).toHaveBeenCalledWith(
-      expect.anything(),
+    expect(mockHeartbeatService.cancelLiveRunsForIssue).toHaveBeenCalledWith(
+      "company-1",
+      "11111111-1111-4111-8111-111111111111",
+      null,
+      null,
+    );
+    const cancelledRows = mockLogActivity.mock.calls
+      .map((call) => call[1])
+      .filter((payload: { action?: string }) => payload.action === "heartbeat.cancelled");
+    expect(cancelledRows).toHaveLength(2);
+    expect(cancelledRows[0]).toEqual(
       expect.objectContaining({
-        action: "heartbeat.cancelled",
+        entityType: "heartbeat_run",
+        entityId: "run-dup",
+        issueId: "11111111-1111-4111-8111-111111111111",
         details: expect.objectContaining({
           source: "issue_status_cancelled",
           issueId: "11111111-1111-4111-8111-111111111111",
         }),
       }),
     );
+    expect(cancelledRows[1]).toEqual(
+      expect.objectContaining({
+        action: "heartbeat.cancelled",
+        entityId: "run-queued",
+      }),
+    );
   });
 
-  it("does not cancel active runs when an issue is marked done", async () => {
+  it("surfaces the first cancelled run and count in the status-change activity details", async () => {
+    const issue = {
+      ...makeIssue("in_progress"),
+      executionRunId: null,
+    };
+    mockIssueService.getById.mockResolvedValue(issue);
+    mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+      ...issue,
+      ...patch,
+    }));
+    mockHeartbeatService.cancelLiveRunsForIssue.mockResolvedValue([
+      { id: "run-dup", companyId: "company-1", agentId: "22222222-2222-4222-8222-222222222222", status: "running" },
+      { id: "run-queued", companyId: "company-1", agentId: "22222222-2222-4222-8222-222222222222", status: "queued" },
+    ]);
+
+    await request(await installActor(createApp()))
+      .patch("/api/issues/11111111-1111-4111-8111-111111111111")
+      .send({ status: "cancelled" });
+
+    const statusChangeRow = mockLogActivity.mock.calls
+      .map((call) => call[1])
+      .find((payload: { details?: Record<string, unknown> }) => payload.details?.cancelledStatusRunId !== undefined);
+    expect(statusChangeRow).toBeDefined();
+    expect(statusChangeRow.details).toEqual(
+      expect.objectContaining({
+        cancelledStatusRunId: "run-dup",
+        cancelledStatusRunCount: 2,
+      }),
+    );
+  });
+
+  it("sweeps non-actor live runs when an issue is marked done", async () => {
+    const issue = {
+      ...makeIssue("in_progress"),
+      executionRunId: null,
+    };
+    mockIssueService.getById.mockResolvedValue(issue);
+    mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+      ...issue,
+      ...patch,
+    }));
+    mockHeartbeatService.cancelLiveRunsForIssue.mockResolvedValue([
+      { id: "run-dup", companyId: "company-1", agentId: "33333333-3333-4333-8333-333333333333", status: "running" },
+    ]);
+
+    const res = await request(await installActor(createApp()))
+      .patch("/api/issues/11111111-1111-4111-8111-111111111111")
+      .send({ status: "done" });
+
+    expect(res.status).toBe(200);
+    expect(mockHeartbeatService.cancelLiveRunsForIssue).toHaveBeenCalledWith(
+      "company-1",
+      "11111111-1111-4111-8111-111111111111",
+      null,
+      null,
+    );
+    expect(mockLogActivity).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({
+        action: "heartbeat.cancelled",
+        entityId: "run-dup",
+      }),
+    );
+  });
+
+  it("spares the completing run from the done sweep (the actor's own run)", async () => {
+    const issue = {
+      ...makeIssue("in_progress"),
+      executionRunId: null,
+    };
+    mockIssueService.getById.mockResolvedValue(issue);
+    mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+      ...issue,
+      ...patch,
+    }));
+    mockHeartbeatService.cancelLiveRunsForIssue.mockResolvedValue([]);
+
+    const res = await request(await installActor(createApp(), agentActor()))
+      .patch("/api/issues/11111111-1111-4111-8111-111111111111")
+      .send({ status: "done" });
+
+    expect(res.status).toBe(200);
+    // agentActor() carries runId "run-1": the done sweep must exclude it so
+    // the run issuing its own completion PATCH is never cancelled.
+    expect(mockHeartbeatService.cancelLiveRunsForIssue).toHaveBeenCalledWith(
+      "company-1",
+      "11111111-1111-4111-8111-111111111111",
+      null,
+      "run-1",
+    );
+  });
+
+  it("does not cancel runs when a done transition has no live runs on the issue", async () => {
     const issue = {
       ...makeIssue("in_progress"),
       executionRunId: "run-1",
