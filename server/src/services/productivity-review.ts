@@ -16,6 +16,7 @@ import { logActivity } from "./activity-log.js";
 import { budgetService } from "./budgets.js";
 import { issueService } from "./issues.js";
 import { visibleIssueCondition } from "./issue-visibility.js";
+import { hasScheduledIssueMonitorPath } from "./recovery/issue-graph-liveness.js";
 import {
   recoveryAssigneeAdapterOverrides,
   withRecoveryModelProfileHint,
@@ -33,6 +34,7 @@ export const DEFAULT_PRODUCTIVITY_REVIEW_MAX_REFRESH_COMMENTS = 3;
 export const DEFAULT_PRODUCTIVITY_REVIEW_CREATION_WINDOW_MS = 24 * 60 * 60 * 1000;
 export const DEFAULT_PRODUCTIVITY_REVIEW_MAX_CREATIONS_PER_WINDOW = 1;
 export const DEFAULT_PRODUCTIVITY_REVIEW_MAX_CONSECUTIVE_NO_ACTION_REVIEWS = 3;
+export const DEFAULT_PRODUCTIVITY_REVIEW_MONITOR_RESOLVED_SNOOZE_MS = 72 * 60 * 60 * 1000;
 
 const TERMINAL_RUN_STATUSES = ["succeeded", "interrupted", "failed", "cancelled", "timed_out"] as const;
 const ACTIVE_RUN_STATUSES = ["queued", "running", "scheduled_retry"] as const;
@@ -52,6 +54,7 @@ type ProductivityReviewThresholds = {
   highChurnHourly: number;
   highChurnSixHours: number;
   resolvedSnoozeMs: number;
+  monitorResolvedSnoozeMs: number;
   refreshIntervalMs: number;
   maxRefreshComments: number;
   creationWindowMs: number;
@@ -137,6 +140,13 @@ function readPositiveInteger(value: number, fallback: number) {
   return Number.isFinite(value) && value > 0 ? Math.floor(value) : fallback;
 }
 
+function readMonitorResolvedSnoozeMsOverride(): number | null {
+  const raw = process.env.PAPERCLIP_PRODUCTIVITY_REVIEW_MONITOR_RESOLVED_SNOOZE_MS;
+  if (!raw) return null;
+  const parsed = Number.parseInt(raw, 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : null;
+}
+
 function coerceDate(value: Date | string | null | undefined) {
   if (!value) return null;
   return value instanceof Date ? value : new Date(value);
@@ -163,6 +173,12 @@ function buildThresholds(overrides?: Partial<ProductivityReviewThresholds>): Pro
     resolvedSnoozeMs: readPositiveInteger(
       overrides?.resolvedSnoozeMs ?? DEFAULT_PRODUCTIVITY_REVIEW_RESOLVED_SNOOZE_MS,
       DEFAULT_PRODUCTIVITY_REVIEW_RESOLVED_SNOOZE_MS,
+    ),
+    monitorResolvedSnoozeMs: readPositiveInteger(
+      overrides?.monitorResolvedSnoozeMs
+        ?? readMonitorResolvedSnoozeMsOverride()
+        ?? DEFAULT_PRODUCTIVITY_REVIEW_MONITOR_RESOLVED_SNOOZE_MS,
+      DEFAULT_PRODUCTIVITY_REVIEW_MONITOR_RESOLVED_SNOOZE_MS,
     ),
     refreshIntervalMs: readPositiveInteger(
       overrides?.refreshIntervalMs ?? DEFAULT_PRODUCTIVITY_REVIEW_REFRESH_INTERVAL_MS,
@@ -554,7 +570,24 @@ export function productivityReviewService(db: Db, deps?: { enqueueWakeup?: Enque
         "productivity review long_active_duration suppressed for idle episode",
       );
     }
-    const longActive = !idleEpisode && elapsedMs !== null && elapsedMs >= thresholds.longActiveMs;
+    // SPA-7248: a live scheduled external monitor is itself the continuation signal — the
+    // monitor owns the next wake, so a watch card's active episode is expected to run long
+    // by design. Suppress long_active_duration while the monitor path is live (future
+    // nextCheckAt, not timed out, attempts not exhausted — the same predicate the liveness
+    // engine uses). Other triggers are unaffected: they measure run/comment activity,
+    // not episode wall-clock.
+    const monitorLive = hasScheduledIssueMonitorPath(sourceIssue, now);
+    const longActive = !idleEpisode && !monitorLive && elapsedMs !== null && elapsedMs >= thresholds.longActiveMs;
+    if (!longActive && monitorLive && elapsedMs !== null && elapsedMs >= thresholds.longActiveMs) {
+      logger.debug(
+        {
+          companyId: sourceIssue.companyId,
+          issueId: sourceIssue.id,
+          elapsedMs,
+        },
+        "productivity review long_active_duration suppressed for live scheduled monitor",
+      );
+    }
     const highChurn =
       runCountLastHour >= thresholds.highChurnHourly ||
       assigneeRunCommentCountLastHour >= thresholds.highChurnHourly ||
@@ -677,6 +710,7 @@ export function productivityReviewService(db: Db, deps?: { enqueueWakeup?: Enque
       `- Long active duration: ${msToHuman(evidence.thresholds.longActiveMs)}`,
       `- High churn: ${evidence.thresholds.highChurnHourly}/1h or ${evidence.thresholds.highChurnSixHours}/6h runs/assignee-run comments`,
       `- Resolved-review snooze: ${msToHuman(evidence.thresholds.resolvedSnoozeMs)}`,
+      `- Monitor-resolved snooze: ${msToHuman(evidence.thresholds.monitorResolvedSnoozeMs)}`,
       "",
       "## Latest Runs",
       "",
@@ -894,7 +928,38 @@ export function productivityReviewService(db: Db, deps?: { enqueueWakeup?: Enque
         result.skipped += 1;
         continue;
       }
-      if (await findRecentTerminalProductivityReview(candidate.companyId, candidate.id, thresholds, now)) {
+      // SPA-7248: monitor-backed watch cards legitimately run for days; a terminal review
+      // on the same episode only suppresses re-fire for the base 6h resolved snooze. While
+      // the candidate's scheduled monitor is live, hold the snooze open for
+      // monitorResolvedSnoozeMs (default 72h, env-tunable) — monitor liveness is a stronger
+      // continuation signal than the snooze clock. The extension is a floor-raise on the
+      // base window and is gated on the prior verdict being a productive closure (done): a
+      // cancelled review keeps the base window, and an unproductive disposition stops the
+      // source work outright (removing the candidate), so neither should get a 72h tail.
+      // Suppression tracks liveness-engine semantics by design: it lifts exactly when the
+      // recovery engine declares the monitor path dead (stale nextCheckAt, timeout,
+      // exhausted attempts).
+      const candidateMonitorLive = hasScheduledIssueMonitorPath(candidate, now);
+      if (candidateMonitorLive) {
+        const extended = await findRecentTerminalProductivityReview(
+          candidate.companyId,
+          candidate.id,
+          {
+            ...thresholds,
+            resolvedSnoozeMs: Math.max(thresholds.resolvedSnoozeMs, thresholds.monitorResolvedSnoozeMs),
+          },
+          now,
+        );
+        if (extended) {
+          const withinBaseWindow = extended.updatedAt.getTime() > now.getTime() - thresholds.resolvedSnoozeMs;
+          if (extended.status === "done" || withinBaseWindow) {
+            result.snoozed += 1;
+            continue;
+          }
+        }
+      } else if (
+        await findRecentTerminalProductivityReview(candidate.companyId, candidate.id, thresholds, now)
+      ) {
         result.snoozed += 1;
         continue;
       }
