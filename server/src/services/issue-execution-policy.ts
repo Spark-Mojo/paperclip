@@ -1126,14 +1126,25 @@ function applyMonitorTransition(input: TransitionInput, stagePatch: Record<strin
       if (input.monitorExplicitlyUpdated) {
         throw unprocessable(MONITOR_INVALID_MESSAGE);
       }
-      patch.executionPolicy = stripMonitorFromExecutionPolicy(input.policy);
-      patch.monitorNextCheckAt = null;
-      patch.monitorWakeRequestedAt = null;
-      targetMonitorState = buildClearedMonitorState({
-        previous: currentMonitorState,
-        clearReason: invalidReason,
-        clearedAt: new Date(),
-      });
+      // SPA-7105 (DECISION-140 rule 5): a non-explicit status write must never
+      // silently strip an armed monitor (SPA-5921, 2026-09-10 15:14:43Z +
+      // 15:41:53Z). The exception is a terminal transition (done/cancelled):
+      // the work is over, so the monitor clears with its terminal reason as
+      // before. Any other invalid transition (e.g. in_progress→blocked) is
+      // rejected — mirroring the explicit path's `unprocessable` — so the
+      // write cannot execute while leaving the monitor behind as silent loss.
+      if (nextStatus === "done" || nextStatus === "cancelled") {
+        patch.executionPolicy = stripMonitorFromExecutionPolicy(input.policy);
+        patch.monitorNextCheckAt = null;
+        patch.monitorWakeRequestedAt = null;
+        targetMonitorState = buildClearedMonitorState({
+          previous: currentMonitorState,
+          clearReason: invalidReason,
+          clearedAt: new Date(),
+        });
+      } else {
+        throw unprocessable(MONITOR_INVALID_MESSAGE, { clearReason: invalidReason });
+      }
     } else {
       const exhaustedReason = exhaustedMonitorClearReason({
         monitor: input.policy.monitor,
@@ -1161,16 +1172,36 @@ function applyMonitorTransition(input: TransitionInput, stagePatch: Record<strin
       }
     }
   } else if (previousPolicy?.monitor) {
-    patch.monitorNextCheckAt = null;
-    patch.monitorWakeRequestedAt = null;
-    targetMonitorState = buildClearedMonitorState({
-      previous: currentMonitorState,
-      clearReason:
-        input.monitorExplicitlyUpdated
-          ? "manual"
-          : monitorClearReasonForIssue(nextStatus, assigneeAgentId, assigneeUserId) ?? "manual",
-      clearedAt: new Date(),
-    });
+    // SPA-7105 (DECISION-140 rule 5): a non-explicit monitor-policy removal
+    // must never silently strip an armed monitor. SPA-5921 lost its only
+    // continuation path twice in 24h (2026-09-10 15:14:43Z, 15:41:53Z,
+    // recovery.reconcile_stranded_assigned_issue in_progress→blocked) when the
+    // invalid transition executed AND cleared the armed monitor
+    // (clearReason=invalid_status, nextCheckAt=null). When the target keeps the
+    // card monitor-eligible (in_progress/in_review with the agent assignee)
+    // the monitor is preserved, not cleared: re-attach the previous policy
+    // monitor and keep nextCheckAt intact. A genuinely monitor-ineligible
+    // target (done/cancelled/assignee removed) still clears, as before.
+    if (!invalidReason) {
+      const carriedMonitor = previousPolicy.monitor;
+      patch.executionPolicy = input.policy
+        ? { ...input.policy, monitor: carriedMonitor }
+        : { mode: "normal" as const, commentRequired: true, stages: [], monitor: carriedMonitor };
+      patch.monitorNextCheckAt = input.issue.monitorNextCheckAt ?? null;
+      patch.monitorWakeRequestedAt = input.issue.monitorWakeRequestedAt ?? null;
+      targetMonitorState = currentMonitorState;
+    } else {
+      patch.monitorNextCheckAt = null;
+      patch.monitorWakeRequestedAt = null;
+      targetMonitorState = buildClearedMonitorState({
+        previous: currentMonitorState,
+        clearReason:
+          input.monitorExplicitlyUpdated
+            ? "manual"
+            : monitorClearReasonForIssue(nextStatus, assigneeAgentId, assigneeUserId) ?? "manual",
+        clearedAt: new Date(),
+      });
+    }
   }
 
   if (stagePatch.executionState !== undefined || !monitorStatesEqual(currentMonitorState, targetMonitorState)) {

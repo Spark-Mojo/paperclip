@@ -29,7 +29,14 @@ export type {
   IssueLivenessState,
 } from "./issue-graph-liveness.js";
 export {
+  RECOVERY_ARMED_MONITOR_MAX_ATTEMPTS,
+  isLiveArmedRecoveryMonitor,
+  readRecoveryArmedMonitorContext,
   recoveryService,
+} from "./service.js";
+export type {
+  LiveArmedRecoveryMonitorInput,
+  RecoveryArmedMonitorContextInput,
 } from "./service.js";
 export {
   DEFAULT_MAX_LIVENESS_CONTINUATION_ATTEMPTS,
