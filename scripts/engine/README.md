@@ -127,6 +127,24 @@ top of `lib.sh` (`ENGINE_ROOT`, `PAPERCLIP_HOME`, `PAPERCLIP_INSTANCE_ID`,
    symlink back to the previous prefix, restarts, and waits for health
    again. Exits non-zero either way (success only means the rollback itself
    worked; the install still failed).
+9. **Pointer safety (SPA-7564, root cause of the SPA-7223 incident):** the
+   live `paperclip-current` pointer is guarded by a trap-based restore on
+   every exit path. A **dry-run always restores the pointer to its
+   pre-install target before exiting — including on success** — so a dry-run
+   never leaves the live pointer moved (on 2026-09-14 a dry-run left the
+   pointer on a stub overlay, the real install that followed died in
+   preflight and restored nothing, and any engine restart during that window
+   would have crash-looped the board). A real install keeps the pointer on
+   the new prefix only after health passes; any failure after the flip —
+   explicit rollback, unexpected `set -e` death, or an interrupt
+   (INT/TERM/HUP) — restores the previous target and restarts the unit on
+   it, logging loudly if that restart fails. **Known residual (accepted
+   scope):** the guard cannot catch `SIGKILL`/OOM/power-loss — a dry-run
+   killed exactly inside its multi-second flip-to-restore window could still
+   leave the pointer on the stub. That window is bounded by the run itself
+   (SPA-7223's harm came from the unbounded post-exit window this fix
+   closes); a dry-run that ends in any orderly way always leaves the pointer
+   exactly where it found it.
 
 ## Rollback semantics — read this before running `rollback.sh`
 
@@ -181,11 +199,15 @@ Runs `install.sh` / `rollback.sh` under `PAPERCLIP_ENGINE_DRY_RUN=1` in an
 isolated sandbox root (`ENGINE_ROOT` pointed at a temp dir, stub
 `systemctl`/`pg_dump`/`pg_restore`/`psql` on `PATH` that log invocations
 instead of touching real infrastructure, and a real local HTTP server acting
-as the fake `/api/health` endpoint). It asserts: the symlink is created and
-points at the new prefix; a failed health check triggers an automatic
-rollback of the symlink to the previous prefix with a non-zero exit code; and
-`rollback.sh` with no argument reads the recorded previous-prefix state file
-and flips back to it, restarting and passing health.
+as the fake `/api/health` endpoint). It asserts: the symlink flip happens
+during the run and the pointer is **restored to its pre-install target when
+the dry-run ends, on every exit path** (SPA-7564: success, failed health
+check with automatic rollback, and an injected unexpected death after the
+flip — tests 25-28 also cover real-mode `DRY_RUN=0` installs with stubbed
+`systemctl`/`npm`/`pg_dump`); a failed health check triggers an automatic
+rollback to the previous prefix with a non-zero exit code; and `rollback.sh`
+with no argument reads the recorded previous-prefix state file and flips
+back to it, restarting and passing health.
 
 No step in the test touches bigbox, npmjs.org, or GitHub, and no step touches
 the laptop's real Paperclip install.

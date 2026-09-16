@@ -30,6 +30,13 @@
 # failure: automatic rollback to the previous symlink target (NOT a DB
 # rollback — see README) and exit non-zero.
 #
+# Pointer safety (SPA-7564, root-cause fix for SPA-7223): the live
+# paperclip-current pointer is guarded by a trap-based restore on EVERY exit
+# path — an interrupt, any unexpected failure after the flip, and a completed
+# dry-run all restore the pre-install target; only a successful REAL install
+# intentionally leaves the pointer on the new prefix. See the "SPA-7564
+# restore guard" block below.
+#
 # Idempotent: re-running with the same source reuses an already-installed,
 # smoke-tested prefix instead of reinstalling.
 
@@ -76,6 +83,95 @@ case "$SOURCE_KIND" in
 esac
 
 guard_host
+
+# ---------------------------------------------------------------------------
+# SPA-7564 restore guard — armed before preflight, active for the whole run.
+#
+# SPA-7223 (2026-09-14): a dry-run flipped the live paperclip-current pointer
+# onto a stub overlay and left it there; the real install that followed died
+# in preflight and restored nothing. paperclip.service runs with
+# Restart=always and execs "$CURRENT_LINK/bin/paperclipai" on every start, so
+# for ~3.5 hours any engine restart would have brought the board up inside a
+# crash loop.
+#
+# Contract (this block is the single home of the pointer-safety guarantee):
+#   LINK_FLIPPED=1  this run flipped $CURRENT_LINK onto its new prefix.
+#   LINK_FINAL=1    $CURRENT_LINK has reached its intended final state for
+#                   this run — kept on the new prefix after a successful REAL
+#                   install, or returned to the pre-install target after a
+#                   dry-run ends, an explicit rollback, or this trap.
+#   The EXIT/INT/TERM/HUP traps restore the pre-install target whenever the
+#   script dies in the flipped-not-final window: an interrupt, a genuine
+#   `set -e` abort after the flip (a bare failing command — note that a
+#   failing `var="$(cmd)"` assignment is NOT always a set -e abort in bash,
+#   which is why health_url below is also guarded explicitly), any failure
+#   path that does not route through main()'s explicit rollback. A
+#   successful dry-run restores explicitly in main() for a readable
+#   receipt; the trap remains the net behind it.
+#
+# Note: prepare_existing_prefix_adoption() may seed $CURRENT_LINK during
+# preflight (first install on an adopted prefix). That seed points at a REAL
+# prefix, happens before LINK_FLIPPED can be set, and `previous` is captured
+# after preflight — so a later restore always returns to the adopted prefix.
+LINK_FLIPPED=0
+LINK_FINAL=0
+UNIT_STOPPED=0
+PREVIOUS_FOR_RESTORE=""
+
+restore_link_to_pre_install() {
+  # Best-effort and idempotent; every command is guarded so the trap always
+  # completes and the script exits with its original status.
+  if [ -n "$PREVIOUS_FOR_RESTORE" ]; then
+    if ln -sfn "$PREVIOUS_FOR_RESTORE" "$CURRENT_LINK"; then
+      log "RESTORE: $CURRENT_LINK -> $PREVIOUS_FOR_RESTORE"
+    else
+      log "ERROR: automatic pointer restore FAILED — restore manually: ln -sfn '$PREVIOUS_FOR_RESTORE' '$CURRENT_LINK'"
+    fi
+  else
+    if rm -f "$CURRENT_LINK"; then
+      log "RESTORE: removed $CURRENT_LINK (no pre-install target existed — first install)"
+    else
+      log "ERROR: automatic pointer restore FAILED — restore manually: rm -f '$CURRENT_LINK'"
+    fi
+  fi
+}
+
+engine_install_restore_trap() {
+  local rc=$?
+  if [ "$LINK_FLIPPED" = "1" ] && [ "$LINK_FINAL" = "0" ]; then
+    if [ "$rc" -eq 0 ]; then
+      log "=== dry-run finished — restoring $CURRENT_LINK to its pre-install target (SPA-7564: a dry-run never leaves the pointer moved) ==="
+    else
+      log "=== install aborted (exit status $rc) — restoring $CURRENT_LINK to its pre-install target (SPA-7564) ==="
+    fi
+    restore_link_to_pre_install
+    if [ "$DRY_RUN" = "1" ]; then
+      log "+DRYRUN would start $UNIT_NAME against the restored prefix"
+    elif unit_start; then
+      log "RESTORE: $UNIT_NAME started against the restored prefix"
+    else
+      log "ERROR: $UNIT_NAME failed to start against the restored prefix — manual intervention required"
+    fi
+    LINK_FINAL=1
+  elif [ "$LINK_FLIPPED" = "0" ] && [ "$LINK_FINAL" = "0" ] && [ "$UNIT_STOPPED" = "1" ]; then
+    # Interrupted between unit_stop and the flip: the pointer was never
+    # touched, so nothing to restore — but the unit is stopped and nothing
+    # would restart it. Bring it back up on the untouched (previous) prefix.
+    log "=== install interrupted after stopping $UNIT_NAME — restarting it on the untouched prefix (SPA-7564) ==="
+    if [ "$DRY_RUN" = "1" ]; then
+      log "+DRYRUN would start $UNIT_NAME"
+    elif unit_start; then
+      log "RESTORE: $UNIT_NAME started against the untouched prefix"
+    else
+      log "ERROR: $UNIT_NAME failed to start — manual intervention required"
+    fi
+  fi
+  exit "$rc"
+}
+trap engine_install_restore_trap EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 # ---------------------------------------------------------------------------
 # Preflight
@@ -335,13 +431,25 @@ main() {
 
   local previous
   previous="$(current_target)"
+  PREVIOUS_FOR_RESTORE="$previous"
   record_previous_target "$previous"
 
   if [ -z "$PAPERCLIP_ENGINE_ADOPT_EXISTING_PREFIX" ]; then
     unit_ensure_installed "$SCRIPT_DIR/systemd/$UNIT_NAME"
   fi
   unit_stop
+  UNIT_STOPPED=1
   flip_symlink "$NEW_PREFIX"
+  LINK_FLIPPED=1
+  UNIT_STOPPED=0
+  if [ "${PAPERCLIP_ENGINE_TEST_DIE_AFTER_FLIP:-0}" = "1" ]; then
+    # Test hook (SPA-7564): simulates an unexpected death inside the
+    # flipped-not-final window (interrupt, OOM, operator kill) so the
+    # trap-based restore can be exercised without a real fault.
+    log "+TESTHOOK simulating unexpected death after the pointer flip (PAPERCLIP_ENGINE_TEST_DIE_AFTER_FLIP=1)"
+    kill -TERM "$$"
+    sleep 5
+  fi
 
   # unit_start can legitimately fail (Type=notify blocks for sd_notify
   # READY=1; a broken new version times out non-zero). It must NOT be called
@@ -351,7 +459,14 @@ main() {
   local url body started=1
   unit_start || started=0
 
-  url="$(health_url "$INSTANCE_CONFIG")"
+  # url must be built before the health wait; a config that cannot yield a
+  # URL (missing/unreadable) must fail LOUDLY here, not silently poll a
+  # garbage URL for the full HEALTH_TIMEOUT_SECS deadline (SPA-7564: this
+  # sits inside the flipped-pointer window — keep it short and explicit).
+  if ! url="$(health_url "$INSTANCE_CONFIG")"; then
+    log "ERROR: cannot build the health URL from $INSTANCE_CONFIG — proceeding to the rollback path."
+    url=""
+  fi
   local report_failed=0
   if [ "$started" = "1" ] && body="$(wait_for_health "$url")"; then
     local after_migrations="unknown"
@@ -371,6 +486,15 @@ main() {
       log "migrations before: $before_migrations"
       log "migrations after:  $after_migrations"
       log "health:            $body"
+      if [ "$DRY_RUN" = "1" ]; then
+        log "=== DRY-RUN COMPLETE — restoring $CURRENT_LINK to its pre-install target (SPA-7564: a dry-run never leaves the pointer moved) ==="
+        restore_link_to_pre_install
+        if [ "$(current_target)" = "$PREVIOUS_FOR_RESTORE" ]; then
+          LINK_FINAL=1
+        fi
+        exit 0
+      fi
+      LINK_FINAL=1
       exit 0
     fi
   fi
@@ -390,13 +514,30 @@ main() {
     flip_symlink "$previous"
     local rollback_started=1
     unit_start || rollback_started=0
+    # The pointer is now in its intended final state (restored). LINK_FINAL
+    # is set only AFTER the restart attempt so an interrupt landing between
+    # the flip and here still gets a restart attempt from the SPA-7564 trap;
+    # the restore itself is idempotent, so a trap fire after a successful
+    # rollback would only re-point the same (already correct) target.
+    LINK_FINAL=1
     if [ "$rollback_started" = "1" ] && body="$(wait_for_health "$url")"; then
       log "Rollback to $previous succeeded. New prefix $NEW_PREFIX left on disk for investigation (not deleted)."
     else
       log "ERROR: rollback to $previous ALSO failed to start/pass health. Manual intervention required."
     fi
   else
-    log "No previous prefix recorded — nothing to roll back to. This was a first install."
+    if [ "$DRY_RUN" = "1" ]; then
+      # SPA-7564: a dry-run must never leave the pointer moved — and with no
+      # previous prefix, the pre-install state is "no link at all".
+      log "=== dry-run rollback with no previous prefix — removing $CURRENT_LINK (SPA-7564) ==="
+      restore_link_to_pre_install
+      LINK_FINAL=1
+    else
+      log "No previous prefix recorded — nothing to roll back to. This was a first install."
+      # Deliberate keep: the pointer stays on the new (real, non-stub)
+      # prefix for investigation, matching first-install semantics.
+      LINK_FINAL=1
+    fi
   fi
   log "NOTE: this rollback only reverted the code symlink. If migrations ran above, the DATABASE SCHEMA WAS NOT ROLLED BACK. Use rollback.sh --restore <dump> if the new schema is incompatible with the previous code."
   exit 1
