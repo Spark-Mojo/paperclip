@@ -1210,54 +1210,11 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       ));
     expect(recoveryIssues).toHaveLength(0);
 
-    const recoveryWakeup = await waitForValue(async () => {
-      const wakeups = await db
-        .select()
-        .from(agentWakeupRequests)
-        .where(eq(agentWakeupRequests.agentId, input.agentId));
-      return wakeups.find((wakeup) => {
-        const payload = wakeup.payload as Record<string, unknown> | null;
-        return payload?.issueId === input.issueId &&
-          payload?.sourceIssueId === input.issueId &&
-          payload?.recoveryActionId === action.id &&
-          payload?.strandedRunId === input.runId;
-      }) ?? null;
-    });
-    expect(recoveryWakeup).toMatchObject({
-      companyId: input.companyId,
-      reason: "source_scoped_recovery_action",
-      source: "assignment",
-      payload: expect.objectContaining({
-        modelProfile: "cheap",
-        allowDeliverableWork: false,
-        allowDocumentUpdates: false,
-        resumeRequiresNormalModel: true,
-      }),
-    });
-
-    if (input.expectRecoveryRun ?? true) {
-      const recoveryRun = recoveryWakeup?.runId
-        ? await db
-          .select()
-          .from(heartbeatRuns)
-          .where(eq(heartbeatRuns.id, recoveryWakeup.runId))
-          .then((rows) => rows[0] ?? null)
-        : null;
-      expect(recoveryRun?.contextSnapshot).toMatchObject({
-        issueId: input.issueId,
-        taskId: input.issueId,
-        source: "issue_recovery_action",
-        recoveryActionId: action.id,
-        sourceIssueId: input.issueId,
-        strandedRunId: input.runId,
-        modelProfile: "cheap",
-        allowDeliverableWork: false,
-        allowDocumentUpdates: false,
-        resumeRequiresNormalModel: true,
-      });
-    } else {
-      expect(recoveryWakeup?.runId).toBeNull();
-    }
+    const recoveryWakeups = await db.select().from(agentWakeupRequests).where(
+      sql`${agentWakeupRequests.payload} ->> 'recoveryActionId' = ${action.id}`,
+    );
+    expect(recoveryWakeups).toHaveLength(0);
+    await waitForHeartbeatIdle(db);
     await waitForHeartbeatIdle(db);
     const sourceIssue = await db
       .select()
@@ -4368,8 +4325,8 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     const heartbeat = recoveryServiceForTest({ persistWakeup: true });
 
     const result = await heartbeat.reconcileStrandedAssignedIssues();
-    expect(result.escalated).toBe(1);
-    expect(result.successfulRunHandoffEscalated).toBe(0);
+    expect(result.escalated).toBe(0);
+    expect(result.successfulRunHandoffEscalated).toBe(1);
     expect(result.recentProgressExempted).toBe(0);
     expect(result.continuationRequeued).toBe(0);
     expect(result.issueIds).toEqual([issueId]);
@@ -4449,6 +4406,202 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       expect(actions[0]?.cause).toBe(SUCCESSFUL_RUN_MISSING_STATE_REASON);
     },
   );
+
+  it.each([
+    { runStatus: "failed", livenessState: null, runErrorCode: "provider_quota" },
+    { runStatus: "timed_out", livenessState: null, runErrorCode: "provider_quota" },
+    { runStatus: "succeeded", livenessState: null },
+    { runStatus: "succeeded", livenessState: "plan_only" },
+    { runStatus: "succeeded", livenessState: "empty_response" },
+    { runStatus: "failed", livenessState: null, acceptedInteraction: true },
+    { runStatus: "succeeded", livenessState: "advanced", acceptedInteraction: true },
+  ] as const)("canonically escalates bounded C1 before generic recovery ($runStatus, $livenessState, $runErrorCode, $acceptedInteraction)", async (scenario) => {
+    const fixture = await seedStrandedIssueFixture({ status: "in_progress", ...scenario });
+    const { companyId, agentId, issueId, runId } = fixture;
+    await stampBoundedHandoffContinuationRun(fixture);
+    if ("acceptedInteraction" in scenario) {
+      await db.insert(issueThreadInteractions).values({
+        companyId,
+        issueId,
+        kind: "request_confirmation",
+        status: "accepted",
+        continuationPolicy: "wake_assignee",
+        createdByAgentId: agentId,
+        resolvedByUserId: "responsible-user",
+        resolvedAt: new Date(),
+        payload: { version: 1, prompt: "Continue?" },
+        result: { version: 1, outcome: "accepted" },
+      });
+    }
+    const result = await recoveryServiceForTest({ persistWakeup: true }).reconcileStrandedAssignedIssues();
+    expect(result.continuationRequeued).toBe(0);
+    expect(result.providerQuotaMonitored).toBe(0);
+    expect(result.successfulRunHandoffEscalated).toBe(1);
+    const [issue] = await db.select().from(issues).where(eq(issues.id, issueId));
+    expect(issue?.status).toBe("blocked");
+    const actions = await db.select().from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.sourceIssueId, issueId));
+    expect(actions).toHaveLength(1);
+    expect(actions[0]).toMatchObject({ cause: SUCCESSFUL_RUN_MISSING_STATE_REASON, kind: "missing_disposition" });
+    const wakes = await db.select().from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.companyId, companyId));
+    // Rebuild-line contract: escalation routes to the board
+    // (board_escalation_no_takeover_v1) — no source-scoped agent wake is fired.
+    // Non-scope wakes (e.g. the bounded C1 continuation wake when productive)
+    // ARE allowed; only source_scoped_recovery_action is forbidden.
+    expect(wakes.filter((wake) => wake.reason === "source_scoped_recovery_action")).toHaveLength(0);
+    const runs = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, companyId));
+    expect(runs).toHaveLength(3);
+    expect(runs.find((run) => run.id === runId)?.status).toBe(scenario.runStatus);
+  });
+
+  it.each(["source", "corrective", "bounded", "handoff"] as const)(
+    "rejects contradictory issueId/taskId aliases in %s provenance",
+    async (target) => {
+      const fixture = await seedStrandedIssueFixture({ status: "in_progress", runStatus: "succeeded", livenessState: "advanced" });
+      const { companyId, issueId, runId } = fixture;
+      const lineage = target === "handoff"
+        ? { sourceRunId: await stampExhaustedSuccessfulHandoffRun(fixture), correctiveRunId: runId }
+        : await stampBoundedHandoffContinuationRun(fixture);
+      const targetRunId = target === "source" ? lineage.sourceRunId
+        : target === "corrective" ? lineage.correctiveRunId : runId;
+      await db.update(heartbeatRuns).set({
+        contextSnapshot: sql`${heartbeatRuns.contextSnapshot} || ${JSON.stringify({ taskId: randomUUID() })}::jsonb`,
+      }).where(eq(heartbeatRuns.id, targetRunId));
+      const result = await recoveryServiceForTest({ persistWakeup: true }).reconcileStrandedAssignedIssues();
+      expect(result.continuationRequeued).toBe(0);
+      expect(result.successfulRunHandoffEscalated).toBe(0);
+      expect(result.escalated).toBe(0);
+      const [issue] = await db.select().from(issues).where(eq(issues.id, issueId));
+      expect(issue?.status).toBe("in_progress");
+      expect(await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, issueId))).toHaveLength(0);
+      expect((await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, companyId)))
+        .filter((wake) => wake.reason === "source_scoped_recovery_action" || wake.reason === "issue_continuation_needed")).toHaveLength(0);
+    },
+  );
+
+  it("deduplicates bounded C1 through two stale services and the real database queue", async () => {
+    const fixture = await seedStrandedIssueFixture({ status: "in_progress", runStatus: "succeeded", livenessState: "advanced" });
+    const { companyId, agentId, issueId, runId } = fixture;
+    await stampExhaustedSuccessfulHandoffRun(fixture);
+    if (!tempDb) throw new Error("Disposable database is required");
+    const secondDb = createDb(tempDb.connectionString);
+    const firstHeartbeat = heartbeatService(db);
+    const secondHeartbeat = heartbeatService(secondDb);
+    let arrived = 0;
+    let release!: () => void;
+    const bothAtEnqueue = new Promise<void>((resolve) => { release = resolve; });
+    const calls: Array<Record<string, unknown>> = [];
+    const makeWorker = (workerDb: typeof db, heartbeat: ReturnType<typeof heartbeatService>) => recoveryService(workerDb, {
+      enqueueWakeup: async (id, options = {}) => {
+        calls.push(options);
+        arrived += 1;
+        if (arrived === 2) release();
+        await bothAtEnqueue;
+        return heartbeat.wakeup(id, options);
+      },
+    });
+    // Hold the adapter open so neither worker can finish C1 during the race.
+    let finishAdapter!: () => void;
+    const adapterGate = new Promise<void>((resolve) => { finishAdapter = resolve; });
+    mockAdapterExecute.mockImplementation(async () => {
+      await adapterGate;
+      return { exitCode: 0, signal: null, timedOut: false, errorMessage: null, summary: "Bounded C1", provider: "test", model: "test-model" };
+    });
+    try {
+      const results = await Promise.all([
+        makeWorker(db, firstHeartbeat).reconcileStrandedAssignedIssues(),
+        makeWorker(secondDb, secondHeartbeat).reconcileStrandedAssignedIssues(),
+      ]);
+      expect(arrived).toBe(2);
+      const key = `handoff_bounded_continuation:${companyId}:${issueId}:${runId}`;
+      expect(calls.map((call) => call.idempotencyKey)).toEqual([key, key]);
+      expect(results.reduce((total, result) => total + result.continuationRequeued, 0)).toBe(1);
+      const wakes = await db.select().from(agentWakeupRequests).where(and(
+        eq(agentWakeupRequests.companyId, companyId), eq(agentWakeupRequests.idempotencyKey, key),
+      ));
+      expect(wakes).toHaveLength(1);
+      const continuations = await db.select().from(heartbeatRuns).where(and(
+        eq(heartbeatRuns.companyId, companyId),
+        sql`${heartbeatRuns.contextSnapshot} ->> 'handoffBoundedContinuation' = 'true'`,
+      ));
+      expect(continuations).toHaveLength(1);
+      expect(wakes[0]?.runId).toBe(continuations[0]?.id);
+      const [issue] = await db.select().from(issues).where(eq(issues.id, issueId));
+      expect(issue?.status).toBe("in_progress");
+      // Deduplication survives terminal queue state and service recreation.
+      await db.update(agentWakeupRequests).set({ status: "fulfilled" }).where(eq(agentWakeupRequests.id, wakes[0]!.id));
+      await expect(db.insert(agentWakeupRequests).values({
+        companyId, agentId, source: "automation", idempotencyKey: key,
+      })).rejects.toThrow();
+      const restartedHeartbeat = heartbeatService(secondDb);
+      expect(await restartedHeartbeat.wakeup(agentId, calls[0])).toBeNull();
+      expect(await db.select().from(agentWakeupRequests).where(and(
+        eq(agentWakeupRequests.companyId, companyId), eq(agentWakeupRequests.idempotencyKey, key),
+      ))).toHaveLength(1);
+      expect(await db.select().from(heartbeatRuns).where(and(
+        eq(heartbeatRuns.companyId, companyId),
+        sql`${heartbeatRuns.contextSnapshot} ->> 'handoffBoundedContinuation' = 'true'`,
+      ))).toHaveLength(1);
+    } finally {
+      finishAdapter();
+      release();
+      await Promise.all([firstHeartbeat.drainActiveRunExecutions(), secondHeartbeat.drainActiveRunExecutions()]);
+      await secondDb.$client.end();
+    }
+  }, 20_000);
+
+  it.each([
+    { runStatus: "failed", livenessState: "advanced" },
+    { runStatus: "timed_out", livenessState: "advanced" },
+    { runStatus: "cancelled", livenessState: "advanced" },
+    { runStatus: "succeeded", livenessState: null },
+    { runStatus: "succeeded", livenessState: "plan_only" },
+    { runStatus: "succeeded", livenessState: "empty_response" },
+  ] as const)("does not grant C1 to an ineligible exhausted handoff ($runStatus, $livenessState)", async (scenario) => {
+    const fixture = await seedStrandedIssueFixture({ status: "in_progress", ...scenario });
+    await stampExhaustedSuccessfulHandoffRun(fixture);
+    const result = await recoveryServiceForTest({ persistWakeup: true }).reconcileStrandedAssignedIssues();
+    expect(result.continuationRequeued).toBe(0);
+    expect(result.successfulRunHandoffEscalated).toBe(1);
+    expect((await db.select().from(agentWakeupRequests).where(
+      eq(agentWakeupRequests.companyId, fixture.companyId),
+    )).filter((wake) => wake.reason === "issue_continuation_needed")).toHaveLength(0);
+  });
+
+  it("keeps C1 idempotency company/agent scoped without consuming skipped wakes", async () => {
+    const fixture = await seedStrandedIssueFixture({ status: "in_progress", runStatus: "succeeded", livenessState: "advanced" });
+    const { companyId, agentId, issueId, runId } = fixture;
+    await stampExhaustedSuccessfulHandoffRun(fixture);
+    const key = `handoff_bounded_continuation:${companyId}:${issueId}:${runId}`;
+    await db.insert(agentWakeupRequests).values({
+      companyId, agentId, source: "automation", status: "skipped", idempotencyKey: key,
+    });
+    const heartbeat = heartbeatService(db);
+    try {
+      const result = await heartbeat.reconcileStrandedAssignedIssues();
+      expect(result.continuationRequeued).toBe(1);
+      const wakes = await db.select().from(agentWakeupRequests).where(
+        eq(agentWakeupRequests.idempotencyKey, key),
+      );
+      expect(wakes).toHaveLength(2);
+      expect(wakes.filter((wake) => wake.status !== "skipped")).toHaveLength(1);
+      const otherAgentId = randomUUID();
+      await db.insert(agents).values({ id: otherAgentId, companyId, name: "Other agent", role: "engineer", adapterType: "process" });
+      await db.insert(agentWakeupRequests).values({
+        companyId, agentId: otherAgentId, source: "automation", idempotencyKey: key,
+      });
+      const otherCompany = await seedStrandedIssueFixture({ status: "in_progress", runStatus: "succeeded", livenessState: "advanced" });
+      await db.insert(agentWakeupRequests).values({
+        companyId: otherCompany.companyId, agentId: otherCompany.agentId, source: "automation", idempotencyKey: key,
+      });
+      expect(await db.select().from(agentWakeupRequests).where(
+        eq(agentWakeupRequests.idempotencyKey, key),
+      )).toHaveLength(4);
+    } finally {
+      await heartbeat.drainActiveRunExecutions();
+    }
+  });
 
   it.each(["nonexistent", "wrong_company", "wrong_issue", "wrong_agent", "unbound"] as const)(
     "does not trust an invalid successful-handoff source run (%s)",
@@ -4587,7 +4740,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(agentId).not.toBe(foreignAgentId);
   });
 
-  it("creates one durable bounded-handoff escalation wake across concurrent replay", async () => {
+  it("creates one durable bounded-handoff escalation action across concurrent replay", async () => {
     const { companyId, agentId, issueId, runId } = await seedStrandedIssueFixture({
       status: "in_progress",
       runStatus: "failed",
@@ -4608,15 +4761,13 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       .where(eq(issues.id, issueId));
     await recoveryServiceForTest({ persistWakeup: true }).reconcileStrandedAssignedIssues();
 
-    const idempotencyKey = `handoff_bounded_continuation_escalation:${companyId}:${issueId}:${runId}`;
+    // Rebuild-line contract: escalation dedupes as ONE board-routed recovery
+    // action across replays; no source-scoped agent wake is fired on this lineage.
     const wakes = await db
       .select()
       .from(agentWakeupRequests)
-      .where(and(
-        eq(agentWakeupRequests.companyId, companyId),
-        eq(agentWakeupRequests.idempotencyKey, idempotencyKey),
-      ));
-    expect(wakes).toHaveLength(1);
+      .where(eq(agentWakeupRequests.companyId, companyId));
+    expect(wakes.filter((wake) => wake.reason === "source_scoped_recovery_action")).toHaveLength(0);
     const actions = await db
       .select()
       .from(issueRecoveryActions)
@@ -4625,6 +4776,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
         eq(issueRecoveryActions.sourceIssueId, issueId),
       ));
     expect(actions).toHaveLength(1);
+    expect(actions[0]).toMatchObject({ cause: SUCCESSFUL_RUN_MISSING_STATE_REASON, kind: "missing_disposition" });
   });
 
   it("converts a continuation parked for review into a dependency wait on its open sub-tasks", async () => {
