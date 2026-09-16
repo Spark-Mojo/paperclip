@@ -2902,53 +2902,63 @@ export async function realizeExecutionWorkspace(input: {
     throw new Error(`Registered worktree for branch "${branchName}" at "${registeredBranchWorktree}" is not reusable${reason}.`);
   }
 
+  let reusableExistingPath: string | null = null;
   try {
-    await recordGitOperation(input.recorder, {
-      phase: "worktree_prepare",
-      args: ["worktree", "add", "-b", branchName, worktreePath, baseRef],
-      cwd: repoRoot,
-      metadata: {
-        repoRoot,
-        worktreePath,
-        branchName,
-        baseRef,
-        baseRefSha: currentBaseRefSha,
-        created: true,
-      },
-      successMessage: `Created git worktree at ${worktreePath}\n`,
-      failureLabel: `git worktree add ${worktreePath}`,
+    await withWorktreeProvisionLock(repoRoot, async () => {
+      try {
+        await recordGitOperation(input.recorder, {
+          phase: "worktree_prepare",
+          args: ["worktree", "add", "-b", branchName, worktreePath, baseRef],
+          cwd: repoRoot,
+          metadata: {
+            repoRoot,
+            worktreePath,
+            branchName,
+            baseRef,
+            baseRefSha: currentBaseRefSha,
+            created: true,
+          },
+          successMessage: `Created git worktree at ${worktreePath}\n`,
+          failureLabel: `git worktree add ${worktreePath}`,
+        });
+      } catch (error) {
+        if (!gitErrorIncludes(error, "already exists")) {
+          throw error;
+        }
+        try {
+          await recordGitOperation(input.recorder, {
+            phase: "worktree_prepare",
+            args: ["worktree", "add", worktreePath, branchName],
+            cwd: repoRoot,
+            metadata: {
+              repoRoot,
+              worktreePath,
+              branchName,
+              baseRef,
+              baseRefSha: currentBaseRefSha,
+              created: false,
+              reusedExistingBranch: true,
+            },
+            successMessage: `Attached existing branch ${branchName} at ${worktreePath}\n`,
+            failureLabel: `git worktree add ${worktreePath}`,
+          });
+        } catch (attachError) {
+          if (!gitErrorIncludes(attachError, "already checked out")) {
+            throw attachError;
+          }
+          const registeredPath = await findRegisteredGitWorktreeByBranch(repoRoot, branchName);
+          if (!registeredPath || !await isGitCheckout(registeredPath)) {
+            throw attachError;
+          }
+          reusableExistingPath = registeredPath;
+        }
+      }
     });
   } catch (error) {
-    if (!gitErrorIncludes(error, "already exists")) {
-      throw error;
-    }
-    try {
-      await recordGitOperation(input.recorder, {
-        phase: "worktree_prepare",
-        args: ["worktree", "add", worktreePath, branchName],
-        cwd: repoRoot,
-        metadata: {
-          repoRoot,
-          worktreePath,
-          branchName,
-          baseRef,
-          baseRefSha: currentBaseRefSha,
-          created: false,
-          reusedExistingBranch: true,
-        },
-        successMessage: `Attached existing branch ${branchName} at ${worktreePath}\n`,
-        failureLabel: `git worktree add ${worktreePath}`,
-      });
-    } catch (attachError) {
-      if (!gitErrorIncludes(attachError, "already checked out")) {
-        throw attachError;
-      }
-      const reusablePath = await findRegisteredGitWorktreeByBranch(repoRoot, branchName);
-      if (!reusablePath || !await isGitCheckout(reusablePath)) {
-        throw attachError;
-      }
-      return await reuseExistingWorktree(reusablePath);
-    }
+    throw error;
+  }
+  if (reusableExistingPath) {
+    return await reuseExistingWorktree(reusableExistingPath);
   }
   await provisionExecutionWorktree({
     strategy: rawStrategy,
@@ -3136,51 +3146,53 @@ export async function ensurePersistedExecutionWorkspaceAvailable(input: {
   const restoreCurrentBaseRefSha = restoreBaseRef ? await resolveBaseRefSha(repoRoot, restoreBaseRef) : null;
 
   let created = false;
-  try {
-    await recordGitOperation(input.recorder, {
-      phase: "worktree_prepare",
-      args: ["worktree", "add", worktreePath, branchName],
-      cwd: repoRoot,
-      metadata: {
-        repoRoot,
-        worktreePath,
-        branchName,
-        baseRef: input.workspace.baseRef ?? input.base.repoRef ?? null,
-        currentBaseRefSha: restoreCurrentBaseRefSha,
-        created: false,
-        restored: true,
-      },
-      successMessage: `Reattached missing git worktree at ${worktreePath}\n`,
-      failureLabel: `git worktree add ${worktreePath}`,
-    });
-  } catch (error) {
-    if (
-      !gitErrorIncludes(error, "invalid reference")
-      && !gitErrorIncludes(error, "not a commit")
-      && !gitErrorIncludes(error, "unknown revision")
-    ) {
-      throw error;
+  await withWorktreeProvisionLock(repoRoot, async () => {
+    try {
+      await recordGitOperation(input.recorder, {
+        phase: "worktree_prepare",
+        args: ["worktree", "add", worktreePath, branchName],
+        cwd: repoRoot,
+        metadata: {
+          repoRoot,
+          worktreePath,
+          branchName,
+          baseRef: input.workspace.baseRef ?? input.base.repoRef ?? null,
+          currentBaseRefSha: restoreCurrentBaseRefSha,
+          created: false,
+          restored: true,
+        },
+        successMessage: `Reattached missing git worktree at ${worktreePath}\n`,
+        failureLabel: `git worktree add ${worktreePath}`,
+      });
+    } catch (error) {
+      if (
+        !gitErrorIncludes(error, "invalid reference")
+        && !gitErrorIncludes(error, "not a commit")
+        && !gitErrorIncludes(error, "unknown revision")
+      ) {
+        throw error;
+      }
+      const baseRef = input.workspace.baseRef ?? await detectDefaultBranch(repoRoot) ?? "HEAD";
+      const recreatedBaseRefSha = await resolveBaseRefSha(repoRoot, baseRef);
+      await recordGitOperation(input.recorder, {
+        phase: "worktree_prepare",
+        args: ["worktree", "add", "-b", branchName, worktreePath, baseRef],
+        cwd: repoRoot,
+        metadata: {
+          repoRoot,
+          worktreePath,
+          branchName,
+          baseRef,
+          baseRefSha: recreatedBaseRefSha,
+          created: true,
+          restored: true,
+        },
+        successMessage: `Recreated missing git worktree at ${worktreePath}\n`,
+        failureLabel: `git worktree add ${worktreePath}`,
+      });
+      created = true;
     }
-    const baseRef = input.workspace.baseRef ?? await detectDefaultBranch(repoRoot) ?? "HEAD";
-    const recreatedBaseRefSha = await resolveBaseRefSha(repoRoot, baseRef);
-    await recordGitOperation(input.recorder, {
-      phase: "worktree_prepare",
-      args: ["worktree", "add", "-b", branchName, worktreePath, baseRef],
-      cwd: repoRoot,
-      metadata: {
-        repoRoot,
-        worktreePath,
-        branchName,
-        baseRef,
-        baseRefSha: recreatedBaseRefSha,
-        created: true,
-        restored: true,
-      },
-      successMessage: `Recreated missing git worktree at ${worktreePath}\n`,
-      failureLabel: `git worktree add ${worktreePath}`,
-    });
-    created = true;
-  }
+  });
 
   const baseDrift = await inspectExecutionWorkspaceBaseDrift({
     repoRoot,
@@ -3217,6 +3229,123 @@ export async function ensurePersistedExecutionWorkspaceAvailable(input: {
       ?? (created ? restoreCurrentBaseRefSha : baseDrift.branchBaseRefSha)
       ?? baseDrift.currentBaseRefSha,
   };
+}
+
+export type WorktreeProvisionLockOptions = {
+  timeoutMs?: number;
+  staleMs?: number;
+  lockDir?: string;
+};
+
+const WORKTREE_PROVISION_LOCK_DEFAULT_TIMEOUT_MS = 60_000;
+const WORKTREE_PROVISION_LOCK_DEFAULT_STALE_MS = 5 * 60_000;
+
+function resolveWorktreeProvisionLockDir(override?: string): string {
+  if (override && override.trim().length > 0) return path.resolve(override);
+  const fromEnv = asString(process.env.PAPERCLIP_WORKTREE_LOCK_DIR, "").trim();
+  if (fromEnv) return path.resolve(fromEnv);
+  // Scope the per-repo lock dir to PAPERCLIP_HOME when set so concurrent test
+  // processes (each with their own PAPERCLIP_HOME) do not serialize against
+  // each other or against a live dev server sharing `~/.paperclip`. Falls back
+  // to the user home so production runs still get a stable, per-host location.
+  const paperclipHome = asString(process.env.PAPERCLIP_HOME, "").trim();
+  if (paperclipHome) return path.resolve(paperclipHome, "locks");
+  return path.resolve(resolveHomeAwarePath("~/.paperclip/locks"));
+}
+
+function deriveWorktreeProvisionLockKey(repoRoot: string): string {
+  // Canonicalize the repo identity so symlinked paths, relative segments, and
+  // trailing slashes all collapse to a single lock. We resolve (realpath) but
+  // tolerate failure — falling back to an absolute, normalized form keeps the
+  // mutex usable in environments where the path does not yet exist (tests).
+  const normalized = (() => {
+    try {
+      return realpathSync.native(repoRoot);
+    } catch {
+      try {
+        return realpathSync(repoRoot);
+      } catch {
+        return path.resolve(repoRoot);
+      }
+    }
+  })();
+  return createHash("sha256").update(normalized).digest("hex").slice(0, 16);
+}
+
+async function removeStaleWorktreeProvisionLock(lockFile: string, staleMs: number): Promise<boolean> {
+  let shouldRemove = false;
+  try {
+    const ownerRaw = await fs.readFile(lockFile, "utf8");
+    const owner = JSON.parse(ownerRaw) as { pid?: unknown; createdAt?: unknown };
+    const pid = typeof owner.pid === "number" ? owner.pid : 0;
+    const createdAt = typeof owner.createdAt === "string" ? Date.parse(owner.createdAt) : Number.NaN;
+    const ageMs = Number.isFinite(createdAt) ? Date.now() - createdAt : staleMs + 1;
+    shouldRemove = !isProcessAlive(pid) || ageMs > staleMs;
+  } catch {
+    const stat = await fs.stat(lockFile).catch(() => null);
+    shouldRemove = !stat || Date.now() - stat.mtimeMs > staleMs;
+  }
+  if (!shouldRemove) return false;
+  await fs.rm(lockFile, { force: true }).catch(() => undefined);
+  return true;
+}
+
+function isProcessAlive(pid: number): boolean {
+  if (!Number.isFinite(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === "ESRCH") return false;
+    // EPERM means the process exists but we cannot signal it — treat as alive
+    // so we do not delete a lock held by a process we merely lack rights to
+    // signal.
+    return code === "EPERM";
+  }
+}
+
+export async function withWorktreeProvisionLock<T>(
+  repoRoot: string,
+  operation: () => Promise<T>,
+  options: WorktreeProvisionLockOptions = {},
+): Promise<T> {
+  const baseDir = resolveWorktreeProvisionLockDir(options.lockDir);
+  const key = deriveWorktreeProvisionLockKey(repoRoot);
+  const lockFile = path.join(baseDir, `worktree-${key}.lock`);
+  const timeoutMs = options.timeoutMs ?? WORKTREE_PROVISION_LOCK_DEFAULT_TIMEOUT_MS;
+  const staleMs = options.staleMs ?? WORKTREE_PROVISION_LOCK_DEFAULT_STALE_MS;
+  const deadline = Date.now() + timeoutMs;
+  const ownerPayload = `${JSON.stringify({ pid: process.pid, createdAt: new Date().toISOString() })}\n`;
+
+  await fs.mkdir(baseDir, { recursive: true });
+
+  let acquired = false;
+  while (!acquired) {
+    try {
+      // Atomic exclusive create — either the file is ours in one syscall and we
+      // hold the lock, or the file already exists and we wait. Avoids the
+      // mkdir-then-writeFile race where a contending release deletes the dir
+      // between our two syscalls.
+      await fs.writeFile(lockFile, ownerPayload, { flag: "wx" });
+      acquired = true;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+      if (await removeStaleWorktreeProvisionLock(lockFile, staleMs)) continue;
+      if (Date.now() >= deadline) {
+        throw new Error(
+          `Timed out waiting for worktree provision lock at ${lockFile} (timeout ${timeoutMs}ms)`,
+        );
+      }
+      await delay(25);
+    }
+  }
+
+  try {
+    return await operation();
+  } finally {
+    await fs.rm(lockFile, { force: true }).catch(() => undefined);
+  }
 }
 
 export async function acquireGitWorktreeCleanupLock(worktreePath: string) {
