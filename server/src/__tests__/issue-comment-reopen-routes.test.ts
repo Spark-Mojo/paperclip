@@ -2958,6 +2958,249 @@ describe.sequential("issue comment reopen routes", () => {
     expect(mockHeartbeatService.cancelRun).not.toHaveBeenCalled();
   });
 
+  it("sweeps live runs when a board cancel lands a terminal status through a pending review stage (SPA-7477 leak shape)", async () => {
+    const policy = await normalizePolicy({
+      stages: [
+        {
+          id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+          type: "review",
+          participants: [{ type: "agent", agentId: "33333333-3333-4333-8333-333333333333" }],
+        },
+      ],
+    })!;
+    const issue = {
+      ...makeIssue("in_review"),
+      reviewPolicy: "anyone",
+      assigneeAgentId: "33333333-3333-4333-8333-333333333333",
+      executionRunId: null,
+      executionPolicy: policy,
+      executionState: {
+        status: "pending",
+        currentStageId: policy.stages[0].id,
+        currentStageIndex: 0,
+        currentStageType: "review",
+        currentParticipant: { type: "agent", agentId: "33333333-3333-4333-8333-333333333333" },
+        returnAssignee: { type: "agent", agentId: "22222222-2222-4222-8222-222222222222" },
+        completedStageIds: [],
+        lastDecisionId: null,
+        lastDecisionOutcome: null,
+      },
+    };
+    mockIssueService.getById.mockResolvedValue(issue);
+    mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+      ...issue,
+      ...patch,
+      updatedAt: new Date(),
+    }));
+    mockHeartbeatService.cancelLiveRunsForIssue.mockResolvedValue([
+      { id: "run-review", companyId: "company-1", agentId: "33333333-3333-4333-8333-333333333333", status: "running" },
+    ]);
+
+    const res = await request(await installActor(createApp()))
+      .patch("/api/issues/11111111-1111-4111-8111-111111111111")
+      .send({ status: "cancelled" });
+
+    expect(res.status).toBe(200);
+    // The board override clears the pending review stage; the requested
+    // terminal status survives the transition merge and must land.
+    const updatePatch = mockIssueService.update.mock.calls[0]?.[1] as Record<string, unknown>;
+    expect(updatePatch.executionState).toBeNull();
+    // SPA-7477: the reviewer's live run is unstamped (executionRunId null),
+    // so only the contextSnapshot union inside the sweep can find it. The
+    // sweep must fire even though the request went through the
+    // execution-policy transition machinery.
+    expect(mockHeartbeatService.cancelLiveRunsForIssue).toHaveBeenCalledWith(
+      "company-1",
+      "11111111-1111-4111-8111-111111111111",
+      null,
+      null,
+    );
+    expect(mockLogActivity).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({
+        action: "heartbeat.cancelled",
+        entityId: "run-review",
+        details: expect.objectContaining({
+          source: "issue_status_cancelled",
+          issueId: "11111111-1111-4111-8111-111111111111",
+        }),
+      }),
+    );
+  });
+
+  it("does not sweep live runs when a review-stage decision coerces a terminal request into changes_requested (trigger reads the merged status)", async () => {
+    const policy = await normalizePolicy({
+      stages: [
+        {
+          id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+          type: "review",
+          participants: [{ type: "agent", agentId: "33333333-3333-4333-8333-333333333333" }],
+        },
+      ],
+    })!;
+    const issue = {
+      ...makeIssue("in_review"),
+      assigneeAgentId: "33333333-3333-4333-8333-333333333333",
+      executionRunId: null,
+      executionPolicy: policy,
+      executionState: {
+        status: "pending",
+        currentStageId: policy.stages[0].id,
+        currentStageIndex: 0,
+        currentStageType: "review",
+        currentParticipant: { type: "agent", agentId: "33333333-3333-4333-8333-333333333333" },
+        returnAssignee: { type: "agent", agentId: "22222222-2222-4222-8222-222222222222" },
+        completedStageIds: [],
+        lastDecisionId: null,
+        lastDecisionOutcome: null,
+      },
+    };
+    mockIssueService.getById.mockResolvedValue(issue);
+    mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+      ...issue,
+      ...patch,
+      updatedAt: new Date(),
+    }));
+
+    const res = await request(
+      await installActor(createApp(), {
+        type: "agent",
+        agentId: "33333333-3333-4333-8333-333333333333",
+        companyId: "company-1",
+        runId: "run-2",
+      }),
+    )
+      .patch("/api/issues/11111111-1111-4111-8111-111111111111")
+      .send({ status: "cancelled", comment: "Requesting changes instead of cancelling" });
+
+    expect(res.status).toBe(200);
+    // The review-stage participant cannot cancel through the transition: the
+    // decision is coerced into changes_requested and the landed status is
+    // in_progress.
+    expect(res.body.status).toBe("in_progress");
+    expect(res.body.executionState).toMatchObject({
+      status: "changes_requested",
+      lastDecisionOutcome: "changes_requested",
+    });
+    // Trigger-ordering invariant (SPA-7517 post-merge): the terminal-status
+    // sweep is evaluated on the POST-transition-merge status. Evaluating it
+    // from the request body before the merge (the pre-fix ordering) sees the
+    // requested "cancelled" and would sweep live runs — including the
+    // reviewer's own run — off a card that is still live under
+    // changes_requested.
+    expect(mockHeartbeatService.cancelLiveRunsForIssue).not.toHaveBeenCalled();
+  });
+
+  it("does not sweep live runs when a stage approval coerces a done request into the next pending stage (done arm of the trigger)", async () => {
+    const policy = await normalizePolicy({
+      stages: [
+        {
+          id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+          type: "review",
+          participants: [{ type: "agent", agentId: "33333333-3333-4333-8333-333333333333" }],
+        },
+        {
+          id: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+          type: "approval",
+          participants: [{ type: "agent", agentId: "44444444-4444-4444-8444-444444444444" }],
+        },
+      ],
+    })!;
+    const issue = {
+      ...makeIssue("in_review"),
+      assigneeAgentId: "33333333-3333-4333-8333-333333333333",
+      executionRunId: null,
+      executionPolicy: policy,
+      executionState: {
+        status: "pending",
+        currentStageId: policy.stages[0].id,
+        currentStageIndex: 0,
+        currentStageType: "review",
+        currentParticipant: { type: "agent", agentId: "33333333-3333-4333-8333-333333333333" },
+        returnAssignee: { type: "agent", agentId: "22222222-2222-4222-8222-222222222222" },
+        completedStageIds: [],
+        lastDecisionId: null,
+        lastDecisionOutcome: null,
+      },
+    };
+    mockIssueService.getById.mockResolvedValue(issue);
+    mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+      ...issue,
+      ...patch,
+      updatedAt: new Date(),
+    }));
+
+    const res = await request(
+      await installActor(createApp(), {
+        type: "agent",
+        agentId: "33333333-3333-4333-8333-333333333333",
+        companyId: "company-1",
+        runId: "run-2",
+      }),
+    )
+      .patch("/api/issues/11111111-1111-4111-8111-111111111111")
+      .send({ status: "done", comment: "Approving the review stage" });
+
+    expect(res.status).toBe(200);
+    // The stage-1 approval advances the workflow to the pending approval
+    // stage: the landed status is in_review, not the requested done.
+    expect(res.body.status).toBe("in_review");
+    expect(res.body.executionState).toMatchObject({
+      status: "pending",
+      currentStageId: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+    });
+    // Done arm of the same invariant: the pre-merge ordering would see the
+    // requested "done" and sweep live runs off a card that just advanced to
+    // its next review stage.
+    expect(mockHeartbeatService.cancelLiveRunsForIssue).not.toHaveBeenCalled();
+  });
+
+  it("passes the issue's stale executionRunId into the terminal sweep as the executionRunId argument", async () => {
+    const issue = {
+      ...makeIssue("in_progress"),
+      executionRunId: "run-stale-1",
+    };
+    mockIssueService.getById.mockResolvedValue(issue);
+    mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+      ...issue,
+      ...patch,
+      updatedAt: new Date(),
+    }));
+    // Stale pointer: the run is not resolvable via getRun and its context
+    // snapshot no longer names the issue — only the sweep's id-union leg can
+    // still cancel it.
+    mockHeartbeatService.getRun.mockResolvedValue(null);
+    mockHeartbeatService.cancelLiveRunsForIssue.mockResolvedValue([
+      { id: "run-stale-1", companyId: "company-1", agentId: "22222222-2222-4222-8222-222222222222", status: "running" },
+    ]);
+
+    const res = await request(await installActor(createApp()))
+      .patch("/api/issues/11111111-1111-4111-8111-111111111111")
+      .send({ status: "cancelled" });
+
+    expect(res.status).toBe(200);
+    // The route must forward the issue's stale (non-null) executionRunId as
+    // the sweep's 3rd argument so the heartbeat union
+    // (contextSnapshot ->> issueId OR id = executionRunId) can cancel a run
+    // the snapshot no longer names.
+    expect(mockHeartbeatService.cancelLiveRunsForIssue).toHaveBeenCalledWith(
+      "company-1",
+      "11111111-1111-4111-8111-111111111111",
+      "run-stale-1",
+      null,
+    );
+    expect(mockLogActivity).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({
+        action: "heartbeat.cancelled",
+        entityId: "run-stale-1",
+        details: expect.objectContaining({
+          source: "issue_status_cancelled",
+        }),
+      }),
+    );
+  });
+
   it("writes decision ids into executionState and inserts the decision inside the transaction", async () => {
     const policy = await normalizePolicy({
       stages: [
