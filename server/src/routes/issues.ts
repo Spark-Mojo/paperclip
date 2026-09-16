@@ -12867,8 +12867,6 @@ export function issueRoutes(
         );
         return;
       }
-      const shouldCancelActiveRunForCancelledStatus =
-        existing.status !== "cancelled" && updateFields.status === "cancelled";
       if (resumeRequested === true && !commentBody) {
         res.status(400).json({ error: "Follow-up intent requires a comment" });
         return;
@@ -13090,11 +13088,6 @@ export function issueRoutes(
         }
       }
 
-      const runToCancelForCancelledStatus =
-        shouldCancelActiveRunForCancelledStatus
-          ? await resolveActiveIssueRun(existing)
-          : null;
-
       if (hiddenAtRaw !== undefined) {
         updateFields.hiddenAt = hiddenAtRaw ? new Date(hiddenAtRaw) : null;
       }
@@ -13187,6 +13180,22 @@ export function issueRoutes(
         };
       }
       Object.assign(updateFields, transition.patch);
+
+      // Terminal-status transitions must interrupt EVERY live run bound to the
+      // issue (heartbeat.cancelLiveRunsForIssue), not just the run named by
+      // executionRunId or the agent's currently-active run — a review-stage
+      // cancel on a card with a null executionRunId used to leave dup/queued/
+      // running runs executing a terminal card. The final status can arrive
+      // through the execution-policy transition patch above (e.g. a review
+      // stage's changes_requested decision), so the trigger is evaluated after
+      // that merge. The done transition is issued from inside the completing
+      // run itself, so the sweep must spare the actor's own run there;
+      // cancelled transitions carry no such exclusion (cancelling your own
+      // card stops your own run).
+      const shouldCancelActiveRunForTerminalStatus =
+        (updateFields.status === "cancelled" &&
+          existing.status !== "cancelled") ||
+        (updateFields.status === "done" && existing.status !== "done");
 
       const nextStatus = updateFields.status ?? existing.status;
       if (updateFields.unblockDescriptor && nextStatus !== "blocked") {
@@ -13769,16 +13778,28 @@ export function issueRoutes(
       }
 
       let cancelledStatusRunId: string | null = null;
-      if (
-        runToCancelForCancelledStatus &&
-        runToCancelForCancelledStatus.id !== interruptedRunId
-      ) {
+      let cancelledStatusRunCount = 0;
+      if (shouldCancelActiveRunForTerminalStatus) {
+        // Spare a run already handled earlier in this same request
+        // (board-comment interrupt / reassignment / terminalization stop)
+        // before falling back to the done-transition's actor-run exclusion —
+        // the completing run is still `running` when it PATCHes its own
+        // completion, so it must not cancel itself.
+        const terminalSweepExcludeRunId =
+          interruptedRunId ??
+          (updateFields.status === "done" ? actor.runId : null);
         try {
-          const cancelled = await heartbeat.cancelRun(
-            runToCancelForCancelledStatus.id,
+          const cancelledRuns = await heartbeat.cancelLiveRunsForIssue(
+            existing.companyId,
+            existing.id,
+            existing.executionRunId,
+            terminalSweepExcludeRunId,
           );
-          if (cancelled) {
-            cancelledStatusRunId = cancelled.id;
+          for (const cancelled of cancelledRuns) {
+            cancelledStatusRunCount += 1;
+            if (!cancelledStatusRunId) {
+              cancelledStatusRunId = cancelled.id;
+            }
             await logActivity(db, {
               companyId: cancelled.companyId,
               actorType: actor.actorType,
@@ -13799,12 +13820,8 @@ export function issueRoutes(
           }
         } catch (err) {
           logger.warn(
-            {
-              err,
-              issueId: existing.id,
-              runId: runToCancelForCancelledStatus.id,
-            },
-            "failed to cancel run for cancelled issue",
+            { err, issueId: existing.id },
+            "failed to cancel live runs for terminal issue status",
           );
           await logActivity(db, {
             companyId: existing.companyId,
@@ -13815,7 +13832,7 @@ export function issueRoutes(
             agentApiKeyId: actor.agentApiKeyId,
             action: "heartbeat.cancel_failed",
             entityType: "heartbeat_run",
-            entityId: runToCancelForCancelledStatus.id,
+            entityId: cancelledStatusRunId ?? existing.id,
             issueId: existing.id,
             details: { source: "issue_status_cancelled", issueId: existing.id },
           });
@@ -13977,6 +13994,7 @@ export function issueRoutes(
               : {}),
             ...(interruptedRunId ? { interruptedRunId } : {}),
             ...(cancelledStatusRunId ? { cancelledStatusRunId } : {}),
+            ...(cancelledStatusRunCount > 0 ? { cancelledStatusRunCount } : {}),
             ...(workspaceChange ? { workspaceChange } : {}),
             _previous: hasFieldChanges ? previous : undefined,
             ...summarizeIssueReferenceActivityDetails(
