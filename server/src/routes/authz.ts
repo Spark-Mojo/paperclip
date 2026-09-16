@@ -1,4 +1,7 @@
 import type { Request, Response } from "express";
+import { and, eq } from "drizzle-orm";
+import type { Db } from "@paperclipai/db";
+import { agents } from "@paperclipai/db";
 import type { SecretBindingTargetType } from "@paperclipai/shared";
 import { forbidden, HttpError, unauthorized } from "../errors.js";
 import { logger } from "../middleware/logger.js";
@@ -31,6 +34,36 @@ export function assertAuthenticated(req: Request) {
 
 export function assertBoard(req: Request) {
   if (req.actor.type !== "board") {
+    throw forbidden("Board access required");
+  }
+}
+
+/**
+ * Board actors pass; agent actors pass only when their agents-table row
+ * carries one of `roles` (e.g. ["ceo"] for read-only attention curation).
+ * The agent row is loaded at most once per request. Denies with the same
+ * message as `assertBoard` so clients cannot distinguish the guards.
+ */
+export async function assertBoardOrAgentRole(
+  req: Request,
+  db: Db,
+  companyId: string,
+  roles: readonly string[],
+) {
+  assertAuthenticated(req);
+  if (req.actor.type === "board") {
+    return;
+  }
+  const agentId = req.actor.type === "agent" ? req.actor.agentId : undefined;
+  if (!agentId) {
+    throw forbidden("Board access required");
+  }
+  const row = await db
+    .select({ role: agents.role })
+    .from(agents)
+    .where(and(eq(agents.id, agentId), eq(agents.companyId, companyId)))
+    .then((rows) => rows[0] ?? null);
+  if (!row || !roles.includes(row.role)) {
     throw forbidden("Board access required");
   }
 }
