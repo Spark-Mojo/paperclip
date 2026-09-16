@@ -50,7 +50,7 @@ describe("issue subresource commands", () => {
     const fetchMock = vi.fn().mockImplementation(() => Promise.resolve(jsonResponse()));
     vi.stubGlobal("fetch", fetchMock);
 
-    await run(["issue", "get", ISSUE_ID]);
+    await run(["issue", "get", ISSUE_ID, "--json"]);
     await run(["issue", "update", ISSUE_ID, "--title", "New title"]);
     await run(["issue", "delete", ISSUE_ID, "--yes"]);
 
@@ -58,6 +58,93 @@ describe("issue subresource commands", () => {
       ["GET", `http://localhost:3100/api/issues/${ISSUE_ID}`],
       ["PATCH", `http://localhost:3100/api/issues/${ISSUE_ID}`],
       ["DELETE", `http://localhost:3100/api/issues/${ISSUE_ID}`],
+    ]);
+  });
+
+  it("augments issue get with pendingInteractions (pending + expired) when --include-interactions is set", async () => {
+    const fetchMock = vi
+      .fn()
+      .mockImplementation((url: string) => {
+        if (url.endsWith(`/interactions`)) {
+          return Promise.resolve(
+            jsonResponse([
+              {
+                id: INTERACTION_ID,
+                kind: "request_confirmation",
+                status: "pending",
+                title: "Approve PR",
+                summary: "Ship it",
+                createdAt: "2026-08-22T00:00:00Z",
+              },
+              {
+                id: "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
+                kind: "request_confirmation",
+                status: "expired",
+                title: "Approve PR (expired)",
+                summary: null,
+                createdAt: "2026-08-20T00:00:00Z",
+              },
+              {
+                id: "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+                kind: "ask_user_questions",
+                status: "accepted",
+                title: "Already answered",
+                summary: null,
+                createdAt: "2026-08-21T00:00:00Z",
+              },
+            ]),
+          );
+        }
+        return Promise.resolve(jsonResponse({ id: ISSUE_ID, status: "todo" }));
+      });
+    vi.stubGlobal("fetch", fetchMock);
+
+    await run(["issue", "get", ISSUE_ID, "--json", "--include-interactions"]);
+
+    expect(fetchMock.mock.calls.map((call) => call[0])).toEqual([
+      `http://localhost:3100/api/issues/${ISSUE_ID}`,
+      `http://localhost:3100/api/issues/${ISSUE_ID}/interactions`,
+    ]);
+    // SPA-4971 honest-state set: pending + expired surface; accepted does not.
+    expect(vi.mocked(console.log).mock.calls).toEqual([
+      [
+        JSON.stringify(
+          {
+            ...{ id: ISSUE_ID, status: "todo" },
+            pendingInteractions: [
+              {
+                id: INTERACTION_ID,
+                kind: "request_confirmation",
+                status: "pending",
+                title: "Approve PR",
+                summary: "Ship it",
+                createdAt: "2026-08-22T00:00:00Z",
+              },
+              {
+                id: "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
+                kind: "request_confirmation",
+                status: "expired",
+                title: "Approve PR (expired)",
+                summary: null,
+                createdAt: "2026-08-20T00:00:00Z",
+              },
+            ],
+          },
+          null,
+          2,
+        ),
+      ],
+    ]);
+  });
+
+  it("skips the interactions fetch when --no-include-interactions is set", async () => {
+    const fetchMock = vi.fn().mockImplementation(() => Promise.resolve(jsonResponse()));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await run(["issue", "get", ISSUE_ID, "--no-include-interactions"]);
+
+    expect(fetchMock.mock.calls.map((call) => call[0])).toEqual([
+      `http://localhost:3100/api/issues/${ISSUE_ID}`,
     ]);
   });
 
