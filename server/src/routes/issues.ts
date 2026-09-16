@@ -8771,10 +8771,56 @@ export function issueRoutes(
       });
     }
     if (req.body.executionPolicy !== undefined) {
-      updateFields.executionPolicy = applyActorMonitorScheduledBy(
-        normalizeIssueExecutionPolicy(req.body.executionPolicy),
-        actor.actorType,
-      );
+      // SPA-5973: a stage-decision PATCH (approve / request_changes) MUST NOT
+      // erase executionPolicy.stages. The actor is the current stage participant
+      // recording a verdict on stage N; dropping the policy would skip stages
+      // N+1..K and let the card land in `done` with no review chain remaining.
+      // The skill body owns verdict behaviour; this guard keeps the policy
+      // array intact on the row even if the body sends executionPolicy:null.
+      const incomingNormalizedPolicy = normalizeIssueExecutionPolicy(req.body.executionPolicy);
+      const existingExecutionPolicy = normalizeIssueExecutionPolicy(existing.executionPolicy ?? null);
+      const existingExecutionState = parseIssueExecutionState(existing.executionState);
+      const currentStageIdValue = existingExecutionState?.currentStageId ?? null;
+      const activeStage =
+        existingExecutionPolicy && currentStageIdValue
+          ? existingExecutionPolicy.stages.find((stage) => stage.id === currentStageIdValue) ?? null
+          : null;
+      const actorPrincipalForGuard =
+        actor.agentId
+          ? { type: "agent" as const, agentId: actor.agentId, userId: null }
+          : actor.actorType === "user" && actor.actorId
+            ? { type: "user" as const, userId: actor.actorId, agentId: null }
+            : null;
+      const isStageDecision =
+        activeStage !== null &&
+        existingExecutionState?.status === "pending" &&
+        actorPrincipalForGuard !== null &&
+        activeStage.participants.some((participant) => {
+          if (participant.type !== actorPrincipalForGuard.type) return false;
+          if (participant.type === "agent") {
+            return participant.agentId === actorPrincipalForGuard.agentId;
+          }
+          return participant.userId === actorPrincipalForGuard.userId;
+        });
+      if (
+        isStageDecision &&
+        incomingNormalizedPolicy === null &&
+        existingExecutionPolicy !== null &&
+        existingExecutionPolicy.stages.length > 0
+      ) {
+        // Preserve the existing policy array (with monitor metadata re-stamped
+        // to the actor). The skill wanted to record a verdict; dropping the
+        // chain is the bug we are fixing.
+        updateFields.executionPolicy = applyActorMonitorScheduledBy(
+          existingExecutionPolicy,
+          actor.actorType,
+        );
+      } else {
+        updateFields.executionPolicy = applyActorMonitorScheduledBy(
+          incomingNormalizedPolicy,
+          actor.actorType,
+        );
+      }
     }
     const previousExecutionPolicy = normalizeIssueExecutionPolicy(existing.executionPolicy ?? null);
     const nextExecutionPolicy =

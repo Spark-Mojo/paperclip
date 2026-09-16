@@ -9,7 +9,13 @@ const mockIssueService = vi.hoisted(() => ({
   assertCheckoutOwner: vi.fn(),
   update: vi.fn(),
   createChild: vi.fn(),
-  addComment: vi.fn(),
+  addComment: vi.fn(async (_id: string, body: string) => ({
+    id: "99999999-9999-4999-8999-999999999999",
+    body,
+    authorType: "agent",
+    authorId: "33333333-3333-4333-8333-333333333333",
+    referencedIssueIds: [],
+  } as unknown as { id: string; body: string })),
   findMentionedAgents: vi.fn(),
   getRelationSummaries: vi.fn(),
   listWakeableBlockedDependents: vi.fn(),
@@ -52,11 +58,19 @@ const mockDbSelectWhere = vi.hoisted(() => vi.fn(() => ({
 })));
 const mockDbSelectFrom = vi.hoisted(() => vi.fn(() => ({ where: mockDbSelectWhere })));
 const mockDbSelect = vi.hoisted(() => vi.fn(() => ({ from: mockDbSelectFrom })));
-const mockDb = vi.hoisted(() => ({
-  select: mockDbSelect,
-  transaction: vi.fn(async (callback: (tx: { select: typeof mockDbSelect }) => Promise<unknown>) =>
-    callback({ select: mockDbSelect })),
-}));
+const mockDb = vi.hoisted(() => {
+  const insertValues = vi.fn(() => Promise.resolve({ returning: vi.fn(async () => []), onConflictDoNothing: vi.fn(async () => []) }));
+  const insertFn = vi.fn(() => ({ values: insertValues }));
+  const transactionFn = vi.fn(async (callback: (tx: { select: typeof mockDbSelect; insert: typeof insertFn }) => Promise<unknown>) => {
+    return callback({ select: mockDbSelect, insert: insertFn });
+  });
+  return {
+    select: mockDbSelect,
+    insert: insertFn,
+    insertValues,
+    transaction: transactionFn,
+  };
+});
 
 const mockLogActivity = vi.hoisted(() => vi.fn(async () => undefined));
 const mockIssueThreadInteractionService = vi.hoisted(() => ({
@@ -199,6 +213,10 @@ describe("issue execution policy routes", () => {
     mockIssueApprovalService.listApprovalsForIssue.mockResolvedValue([]);
     mockDbSelect.mockImplementation(() => ({ from: mockDbSelectFrom }));
     mockDbSelectFrom.mockImplementation(() => ({ where: mockDbSelectWhere }));
+    mockDb.insertValues.mockImplementation(() => Promise.resolve({ returning: vi.fn(async () => []), onConflictDoNothing: vi.fn(async () => []) }));
+    mockDb.insert.mockImplementation(() => ({ values: mockDb.insertValues }));
+    mockDb.transaction.mockImplementation(async (callback: (tx: { select: typeof mockDbSelect; insert: typeof mockDb.insert }) => Promise<unknown>) =>
+      callback({ select: mockDbSelect, insert: mockDb.insert }));
     mockDbSelectWhere.mockImplementation(() => ({
       for: () => ({
         then: (onFulfilled: (rows: unknown[]) => unknown, onRejected?: (reason: unknown) => unknown) =>
@@ -1069,5 +1087,167 @@ describe("issue execution policy routes", () => {
         details: expect.not.objectContaining({ externalRef: expect.anything() }),
       }),
     );
+  });
+
+  it("SPA-5973: Sable approve on a 2-stage card preserves executionPolicy.stages (Argus still pending)", async () => {
+    // Use the agent ID that the test harness recognises as permitted
+    const sableAgentId = "33333333-3333-4333-8333-333333333333";
+    const argusAgentId = "55555555-5555-4555-8555-555555555555";
+    const pattiAgentId = "44444444-4444-4444-8444-444444444444";
+    const policy = normalizeIssueExecutionPolicy({
+      stages: [
+        {
+          id: "11111111-1111-4111-8111-111111111111",
+          type: "review",
+          participants: [{ type: "agent", agentId: sableAgentId }],
+        },
+        {
+          id: "22222222-2222-4222-8222-222222222222",
+          type: "review",
+          participants: [{ type: "agent", agentId: argusAgentId }],
+        },
+      ],
+    })!;
+    const sableStageId = policy.stages[0].id;
+    const argusStageId = policy.stages[1].id;
+    const issue = {
+      id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      companyId: "company-1",
+      status: "in_review",
+      assigneeAgentId: sableAgentId,
+      assigneeUserId: null,
+      createdByUserId: "local-board",
+      identifier: "PAP-5973",
+      title: "Stage engine preservation regression",
+      executionPolicy: policy,
+      executionState: {
+        status: "pending",
+        currentStageId: sableStageId,
+        currentStageIndex: 0,
+        currentStageType: "review",
+        currentParticipant: { type: "agent", agentId: sableAgentId },
+        returnAssignee: { type: "agent", agentId: pattiAgentId },
+        completedStageIds: [],
+        lastDecisionId: null,
+        lastDecisionOutcome: null,
+      },
+      monitorAttemptCount: 0,
+      monitorNextCheckAt: null,
+      monitorLastTriggeredAt: null,
+      monitorNotes: null,
+      monitorScheduledBy: null,
+    };
+    mockIssueService.getById.mockResolvedValue(issue);
+    mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+      ...issue,
+      ...patch,
+      updatedAt: new Date(),
+    }));
+
+    // Sable approves by PATCHing to status=done with a comment, AND the body
+    // also includes executionPolicy:null (the canary SPA-5957 shape that
+    // previously wiped the policy). The route must preserve the array.
+    const res = await request(await createApp({
+      type: "agent",
+      agentId: sableAgentId,
+      companyId: "company-1",
+      runId: "55555555-5555-4555-8555-555555555555",
+    }))
+      .patch("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+      .send({
+        status: "done",
+        executionPolicy: null,
+        comment: "SPA-5973 Sable signoff",
+      });
+
+    expect(res.status).toBe(200);
+    const updatePayload = mockIssueService.update.mock.calls[0]?.[1] as Record<string, unknown>;
+    const preserved = updatePayload.executionPolicy as { stages: Array<{ id: string; type: string }> } | null;
+    expect(preserved).not.toBeNull();
+    expect(preserved?.stages).toHaveLength(2);
+    expect(preserved?.stages.map((stage) => stage.id)).toEqual([
+      sableStageId,
+      argusStageId,
+    ]);
+    // Execution state must have advanced: stage-sable completed, currentStage is argus.
+    const state = updatePayload.executionState as {
+      status: string;
+      currentStageId: string;
+      currentStageType: string;
+      currentParticipant: { type: string; agentId: string };
+      completedStageIds: string[];
+    };
+    expect(state.status).toBe("pending");
+    expect(state.currentStageId).toBe(argusStageId);
+    expect(state.currentStageType).toBe("review");
+    expect(state.currentParticipant).toMatchObject({ type: "agent", agentId: argusAgentId });
+    expect(state.completedStageIds).toEqual([sableStageId]);
+  });
+
+  it("SPA-5973: 1-stage card Sable approve still collapses to done (existing behaviour unchanged)", async () => {
+    const sableAgentId = "33333333-3333-4333-8333-333333333333";
+    const pattiAgentId = "44444444-4444-4444-8444-444444444444";
+    const policy = normalizeIssueExecutionPolicy({
+      stages: [
+        {
+          id: "11111111-1111-4111-8111-111111111111",
+          type: "review",
+          participants: [{ type: "agent", agentId: sableAgentId }],
+        },
+      ],
+    })!;
+    const sableStageId = policy.stages[0].id;
+    const issue = {
+      id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      companyId: "company-1",
+      status: "in_review",
+      assigneeAgentId: sableAgentId,
+      assigneeUserId: null,
+      createdByUserId: "local-board",
+      identifier: "PAP-5973-SOLO",
+      title: "Stage engine preservation - 1-stage baseline",
+      executionPolicy: policy,
+      executionState: {
+        status: "pending",
+        currentStageId: sableStageId,
+        currentStageIndex: 0,
+        currentStageType: "review",
+        currentParticipant: { type: "agent", agentId: sableAgentId },
+        returnAssignee: { type: "agent", agentId: pattiAgentId },
+        completedStageIds: [],
+        lastDecisionId: null,
+        lastDecisionOutcome: null,
+      },
+      monitorAttemptCount: 0,
+      monitorNextCheckAt: null,
+      monitorLastTriggeredAt: null,
+      monitorNotes: null,
+      monitorScheduledBy: null,
+    };
+    mockIssueService.getById.mockResolvedValue(issue);
+    mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+      ...issue,
+      ...patch,
+      updatedAt: new Date(),
+    }));
+
+    const res = await request(await createApp({
+      type: "agent",
+      agentId: sableAgentId,
+      companyId: "company-1",
+      runId: "55555555-5555-4555-8555-555555555555",
+    }))
+      .patch("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+      .send({
+        status: "done",
+        executionPolicy: null,
+        comment: "SPA-5973 1-stage baseline",
+      });
+
+    expect(res.status).toBe(200);
+    const updatePayload = mockIssueService.update.mock.calls[0]?.[1] as Record<string, unknown>;
+    const state = updatePayload.executionState as { status: string; completedStageIds: string[] };
+    expect(state.status).toBe("completed");
+    expect(state.completedStageIds).toEqual([sableStageId]);
   });
 });
