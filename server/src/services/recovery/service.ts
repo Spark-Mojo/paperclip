@@ -3611,36 +3611,19 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       },
     });
 
+    // Rebuild-line contract: recovery actions on this lineage always route to the
+    // board (ownerType "board", routingPolicy board_escalation_no_takeover_v1),
+    // never to a live agent — there is no source-scoped agent wake to enqueue
+    // and no agent reblock path. The c3 helper above early-returns on a null
+    // ownerAgentId already, and any legacy active action reused from an earlier
+    // agent-owned record is treated as board-routed here too.
     await enqueueSourceScopedStrandedRecoveryWake({
       action: recoveryAction,
       issue: input.issue,
       latestRun: input.latestRun,
       recoveryCause,
       boundedHandoffContinuationRunId: input.boundedHandoffContinuationRunId,
-    });
-
-    if (recoveryAction.ownerAgentId && recoveryAction.ownerAgentId === input.issue.assigneeAgentId) {
-      const [currentIssue] = await db
-        .select({
-          status: issues.status,
-          assigneeAgentId: issues.assigneeAgentId,
-        })
-        .from(issues)
-        .where(eq(issues.id, input.issue.id))
-        .limit(1);
-      if (
-        currentIssue &&
-        (currentIssue.status !== "blocked" ||
-          currentIssue.assigneeAgentId !== recoveryAction.ownerAgentId)
-      ) {
-        const reblocked = await issuesSvc.update(input.issue.id, {
-          status: "blocked",
-          blockedByIssueIds: blockerIds,
-          assigneeAgentId: recoveryAction.ownerAgentId,
-        });
-        if (reblocked) return reblocked;
-      }
-    }
+    }).catch(() => null);
 
     if (!sourceAssigneePreserved) {
       logger.error({
