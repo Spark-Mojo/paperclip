@@ -2706,61 +2706,7 @@ export function recoveryService(
     return action;
   }
 
-  function isBoundedHandoffEscalationIdempotencyConflict(error: unknown) {
-    const conflict = unwrapDatabaseConflictError(error);
-    return conflict?.code === "23505" &&
-      (conflict.constraint === "agent_wakeup_requests_handoff_bounded_escalation_uq" ||
-        conflict.constraint_name === "agent_wakeup_requests_handoff_bounded_escalation_uq" ||
-        conflict.message?.includes("agent_wakeup_requests_handoff_bounded_escalation_uq"));
-  }
 
-  async function enqueueSourceScopedStrandedRecoveryWake(input: {
-    action: Awaited<ReturnType<typeof recoveryActionsSvc.upsertSourceScoped>>;
-    issue: typeof issues.$inferSelect;
-    latestRun: LatestIssueRun;
-    recoveryCause: StrandedRecoveryCause;
-    boundedHandoffContinuationRunId?: string | null;
-  }) {
-    if (input.recoveryCause === "provider_quota" && !input.action.ownerAgentId) return;
-    if (input.recoveryCause === "configuration_incomplete") return;
-    if (!input.action.ownerAgentId) return;
-    const idempotencyKey = input.boundedHandoffContinuationRunId
-      ? buildBoundedHandoffEscalationIdempotencyKey({
-        companyId: input.issue.companyId,
-        issueId: input.issue.id,
-        boundedContinuationRunId: input.boundedHandoffContinuationRunId,
-      })
-      : `source_scoped_recovery_action:${input.action.id}:${input.action.attemptCount}`;
-    await deps.enqueueWakeup(input.action.ownerAgentId, {
-      source: "assignment",
-      triggerDetail: "system",
-      reason: "source_scoped_recovery_action",
-      idempotencyKey,
-      payload: withRecoveryModelProfileHint({
-        issueId: input.issue.id,
-        sourceIssueId: input.issue.id,
-        recoveryActionId: input.action.id,
-        strandedRunId: input.latestRun?.id ?? null,
-        recoveryCause: input.recoveryCause,
-      }, "status_only"),
-      requestedByActorType: "system",
-      requestedByActorId: null,
-      contextSnapshot: withRecoveryModelProfileHint({
-        issueId: input.issue.id,
-        taskId: input.issue.id,
-        wakeReason: "source_scoped_recovery_action",
-        skipIssueComment: true,
-        source: "issue_recovery_action",
-        recoveryActionId: input.action.id,
-        sourceIssueId: input.issue.id,
-        strandedRunId: input.latestRun?.id ?? null,
-        recoveryCause: input.recoveryCause,
-      }, "status_only"),
-    }).catch((error: unknown) => {
-      if (input.boundedHandoffContinuationRunId && isBoundedHandoffEscalationIdempotencyConflict(error)) return null;
-      throw error;
-    });
-  }
 
   function readProviderQuotaRetryAt(latestRun: LatestIssueRun, now: Date) {
     const result = parseObject(latestRun?.resultJson);
@@ -4187,18 +4133,14 @@ export function recoveryService(
     });
 
     // Rebuild-line contract: recovery actions on this lineage always route to the
-    // board (ownerType "board", routingPolicy board_escalation_no_takeover_v1),
-    // never to a live agent — there is no source-scoped agent wake to enqueue
-    // and no agent reblock path. The c3 helper above early-returns on a null
-    // ownerAgentId already, and any legacy active action reused from an earlier
-    // agent-owned record is treated as board-routed here too.
-    await enqueueSourceScopedStrandedRecoveryWake({
-      action: recoveryAction,
-      issue: input.issue,
-      latestRun: input.latestRun,
-      recoveryCause,
-      boundedHandoffContinuationRunId: input.boundedHandoffContinuationRunId,
-    }).catch(() => null);
+    // board (ownerType "board", routingPolicy board_escalation_no_takeover_v1)
+    // and escalation notifies the board via the recovery-action comment — never
+    // by waking an agent. The fork-master lineage's
+    // enqueueSourceScopedStrandedRecoveryWake call is deliberately NOT carried:
+    // preserveExistingOwner can revive a legacy agent-owned action, which would
+    // wake an agent in violation of board-only routing. If a future change
+    // introduces agent-owned recovery on this line, reintroduce that call behind
+    // an explicit routing-policy check, not an owner-presence check.
 
     if (!sourceAssigneePreserved) {
       logger.error(
