@@ -14,19 +14,20 @@ All source references and evidence below are validated against PR #37 head `aa80
 
 ## R1 — Allocator exclusivity
 
-**Rule: an execution workspace can be bound to at most one open issue.** The same issue can reuse its own binding. A different issue cannot reuse that workspace while its holder has any status other than `done` or `cancelled`.
+**Rule: the allocator cannot reuse an execution workspace held by a different open issue.** The same issue can reuse its own binding. A different issue cannot reuse that workspace while its holder has any status other than `done` or `cancelled`. This is application policy, not a database uniqueness guarantee.
 
-The allocator enforces this rule at both allocation entry points in `server/src/services/heartbeat.ts`:
+The allocator checks this rule at two points in `server/src/services/heartbeat.ts`:
 
-1. It queries for a different issue in the same company with the requested `execution_workspace_id` and an open status. The checks run in initial allocation near line 14592 and in the transaction-backed path near line 18640.
-2. `resolveAllocatorExecutionWorkspaceReuseDecision` carries the result into the reuse decision. A conflict makes `existingExecutionWorkspaceAvailable` false and records `inherited_workspace_reuse_unavailable`; the allocator then clears the reuse intent and continues through normal realization, which provisions a fresh workspace.
+1. Each point queries for a different issue in the same company with the requested `execution_workspace_id` and an open status. The checks run in initial allocation near line 14592 and in the transaction-backed path near line 18640.
+2. In initial allocation, `resolveAllocatorExecutionWorkspaceReuseDecision` refuses the cross-issue binding. The caller clears the reuse request before downstream policy sees it, avoids the `inherited_workspace_reuse_unavailable` error, and falls through to `realizeWorkspace` for fresh provisioning.
+3. In the transaction-backed path, `resolveExecutionWorkspaceReuseRequestForIssue` marks the contested workspace unavailable before the result reaches `isUnrunnableWorktreeCombo`.
 
-The shared helpers in `server/src/services/execution-workspace-policy.ts` preserve the same invariant:
+The shared helpers in `server/src/services/execution-workspace-policy.ts` preserve the same decision:
 
 - `hasReusableExecutionWorkspaceBinding` returns false when `executionWorkspaceHeldByAnotherOpenIssue` is true.
-- `isUnrunnableWorktreeCombo` uses that result, so a contested binding cannot become runnable through the worktree-policy path.
+- `isUnrunnableWorktreeCombo` uses that result, so a contested binding cannot be treated as an available reusable workspace through the worktree-policy path.
 
-**Evidence oracle:** `server/src/__tests__/execution-workspace-policy.test.ts` verifies same-issue reuse, cross-issue refusal, terminal-holder reuse, and the unrunnable-worktree gate. The R1 port also has allocation-path coverage in `server/src/__tests__/heartbeat-workspace-session.test.ts` and `server/src/__tests__/heartbeat-workspace-branch-containment.test.ts`.
+**Evidence oracle:** `server/src/__tests__/execution-workspace-policy.test.ts` verifies cross-issue refusal and the unrunnable-worktree gate. `server/src/__tests__/heartbeat-workspace-session.test.ts` directly covers the allocator decision helper for same-issue reuse, cross-issue refusal, and terminal-holder recycling. These are helper-level tests; they do not prove a database uniqueness constraint or a full allocation integration path.
 
 ## R3 — Per-repository worktree provisioning mutex
 
