@@ -527,6 +527,220 @@ describeEmbeddedPostgres("productivity review service", () => {
     expect(await listProductivityReviews(seeded.companyId)).toHaveLength(1);
   });
 
+  it("suppresses long-active for an idle episode whose runs all finished over an hour ago (SPA-7111)", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue({
+      status: "in_progress",
+      startedAt: new Date(now.getTime() - 7 * 60 * 60 * 1000),
+    });
+    // SPA-5899 signature: completed-but-unclosed episode — last run finished ~6h ago,
+    // zero active runs, zero runs in the last hour, below the churn thresholds.
+    await insertRuns({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      count: 2,
+      now: new Date(now.getTime() - 6 * 60 * 60 * 1000),
+      withRunComments: true,
+    });
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+    });
+
+    expect(result.created).toBe(0);
+    expect(await listProductivityReviews(seeded.companyId)).toHaveLength(0);
+  });
+
+  it("still fires long-active when the episode has a recent run (SPA-7111 guard)", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue({
+      status: "in_progress",
+      startedAt: new Date(now.getTime() - 7 * 60 * 60 * 1000),
+    });
+    await insertRuns({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      count: 1,
+      now,
+      withRunComments: true,
+    });
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+    });
+
+    expect(result.created).toBe(1);
+    const [review] = await listProductivityReviews(seeded.companyId);
+    expect(review?.description).toContain("Primary trigger: `long_active_duration`");
+  });
+
+  it("suppresses long-active for a candidate with a live scheduled monitor (SPA-7248)", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue({
+      status: "in_progress",
+      startedAt: new Date(now.getTime() - 7 * 60 * 60 * 1000),
+    });
+    await db
+      .update(issues)
+      .set({ monitorNextCheckAt: new Date(now.getTime() + 60 * 60 * 1000) })
+      .where(eq(issues.id, seeded.issueId));
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+    });
+
+    expect(result.created).toBe(0);
+    expect(await listProductivityReviews(seeded.companyId)).toHaveLength(0);
+  });
+
+  it("still fires long-active without the monitor snooze extension once the monitor path is no longer live (SPA-7248 guard)", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue({
+      status: "in_progress",
+      startedAt: new Date(now.getTime() - 7 * 60 * 60 * 1000),
+    });
+    await db
+      .update(issues)
+      .set({ monitorNextCheckAt: new Date(now.getTime() - 60 * 1000) })
+      .where(eq(issues.id, seeded.issueId));
+    // Terminal review closed 30h ago: outside the base 6h snooze and the 24h creation
+    // window, so only a live monitor could have extended suppression over it.
+    const closedAt = new Date(now.getTime() - 30 * 60 * 60 * 1000);
+    await db.insert(issues).values({
+      id: randomUUID(),
+      companyId: seeded.companyId,
+      title: "Review productivity for monitor watch",
+      status: "done",
+      priority: "medium",
+      originKind: PRODUCTIVITY_REVIEW_ORIGIN_KIND,
+      originId: seeded.issueId,
+      originFingerprint: `productivity-review:${seeded.issueId}`,
+      parentId: seeded.issueId,
+      issueNumber: 2,
+      identifier: `${seeded.issuePrefix}-2`,
+      createdAt: closedAt,
+      updatedAt: closedAt,
+    });
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+    });
+
+    expect(result.snoozed).toBe(0);
+    expect(result.created).toBe(1);
+    const reviews = await listProductivityReviews(seeded.companyId);
+    expect(reviews.filter((review) => review.status !== "done")).toHaveLength(1);
+    const [created] = reviews.filter((review) => review.status !== "done");
+    expect(created?.description).toContain("Primary trigger: `long_active_duration`");
+  });
+
+  it("extends the resolved-review snooze while a candidate's monitor is live, honoring configured overrides (SPA-7248)", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue({
+      status: "in_progress",
+      startedAt: new Date(now.getTime() - 7 * 60 * 60 * 1000),
+    });
+    await db
+      .update(issues)
+      .set({ monitorNextCheckAt: new Date(now.getTime() + 60 * 60 * 1000) })
+      .where(eq(issues.id, seeded.issueId));
+    // A no-comment run streak keeps the candidate trigger-eligible (the monitor only
+    // suppresses long_active_duration), so this test isolates the snooze window itself.
+    await insertRuns({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      count: DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS,
+      now: new Date(now.getTime() - 60 * 1000),
+    });
+    const closedAt = new Date(now.getTime() - 30 * 60 * 60 * 1000);
+    await db.insert(issues).values({
+      id: randomUUID(),
+      companyId: seeded.companyId,
+      title: "Review productivity for monitor watch",
+      status: "done",
+      priority: "medium",
+      originKind: PRODUCTIVITY_REVIEW_ORIGIN_KIND,
+      originId: seeded.issueId,
+      originFingerprint: `productivity-review:${seeded.issueId}`,
+      parentId: seeded.issueId,
+      issueNumber: 2,
+      identifier: `${seeded.issuePrefix}-2`,
+      createdAt: closedAt,
+      updatedAt: closedAt,
+    });
+    const service = productivityReviewService(db);
+
+    const defaulted = await service.reconcileProductivityReviews({ now, companyId: seeded.companyId });
+    expect(defaulted.snoozed).toBe(1);
+    expect(defaulted.created).toBe(0);
+
+    const overridden = await service.reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+      thresholds: { monitorResolvedSnoozeMs: 12 * 60 * 60 * 1000 },
+    });
+    expect(overridden.snoozed).toBe(0);
+    expect(overridden.created).toBe(1);
+    const reviews = await listProductivityReviews(seeded.companyId);
+    expect(reviews.filter((review) => review.status !== "done")).toHaveLength(1);
+    const [created] = reviews.filter((review) => review.status !== "done");
+    expect(created?.description).toContain("Primary trigger: `no_comment_streak`");
+  });
+
+  it("does not extend the snooze past the base window for a cancelled review on a monitor-backed candidate (SPA-7248)", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue({
+      status: "in_progress",
+      startedAt: new Date(now.getTime() - 7 * 60 * 60 * 1000),
+    });
+    await db
+      .update(issues)
+      .set({ monitorNextCheckAt: new Date(now.getTime() + 60 * 60 * 1000) })
+      .where(eq(issues.id, seeded.issueId));
+    await insertRuns({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      count: DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS,
+      now: new Date(now.getTime() - 60 * 1000),
+    });
+    const closedAt = new Date(now.getTime() - 30 * 60 * 60 * 1000);
+    await db.insert(issues).values({
+      id: randomUUID(),
+      companyId: seeded.companyId,
+      title: "Review productivity for monitor watch",
+      status: "cancelled",
+      priority: "medium",
+      originKind: PRODUCTIVITY_REVIEW_ORIGIN_KIND,
+      originId: seeded.issueId,
+      originFingerprint: `productivity-review:${seeded.issueId}`,
+      parentId: seeded.issueId,
+      issueNumber: 2,
+      identifier: `${seeded.issuePrefix}-2`,
+      createdAt: closedAt,
+      updatedAt: closedAt,
+    });
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+    });
+
+    expect(result.snoozed).toBe(0);
+    expect(result.created).toBe(1);
+    const reviews = await listProductivityReviews(seeded.companyId);
+    expect(reviews.filter((review) => review.status !== "cancelled")).toHaveLength(1);
+    const [created] = reviews.filter((review) => review.status !== "cancelled");
+    expect(created?.description).toContain("Primary trigger: `no_comment_streak`");
+  });
+
   it("creates a high-churn review even when every sampled run has a progress comment", async () => {
     const now = new Date("2026-04-28T12:00:00.000Z");
     const seeded = await seedAssignedIssue();
