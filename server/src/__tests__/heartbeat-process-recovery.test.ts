@@ -227,7 +227,10 @@ import {
   CONTROL_PLANE_CONFORMANCE_RESULT,
   CONTROL_PLANE_CONFORMANCE_TERMINAL,
 } from "../vendor/paperclip-runner/testing.js";
-import { recoveryService } from "../services/recovery/service.ts";
+import {
+  HANDOFF_BOUNDED_CONTINUATION_MARKER,
+  recoveryService,
+} from "../services/recovery/service.ts";
 import {
   readHotRestartIntent,
   readProcessStartedAt,
@@ -243,10 +246,6 @@ import {
   noticeMetadataReferencesRecoveryAction,
 } from "../services/recovery/index.ts";
 import { collectDispositionRepairSourceState } from "../services/recovery/disposition-repair.ts";
-import {
-  HANDOFF_BOUNDED_CONTINUATION_MARKER,
-  recoveryService,
-} from "../services/recovery/service.ts";
 import {
   UNMANAGED_BACKGROUND_TASK_LIVENESS_REASON,
   UNMANAGED_BACKGROUND_TASK_STOP_REASON,
