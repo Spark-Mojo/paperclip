@@ -5852,6 +5852,13 @@ export function resolveExecutionWorkspaceReuseRequestForIssue(input: {
   existingExecutionWorkspaceStatus?: string | null;
   requestedExistingBranch?: string | null;
   existingExecutionWorkspaceBranchName?: string | null;
+  /**
+   * R1 exclusivity invariant: when `true`, the requested execution workspace is
+   * already bound to a DIFFERENT open issue (`status NOT IN ('done','cancelled')`).
+   * The allocator must refuse the binding even if the requesting issue opted
+   * into `reuse_existing`; a fresh workspace is provisioned instead.
+   */
+  executionWorkspaceHeldByAnotherOpenIssue?: boolean | null;
 }): ExecutionWorkspaceReuseRequestForIssue {
   const requestedExecutionWorkspaceId = readNonEmptyString(
     input.issueExecutionWorkspaceId,
@@ -5871,14 +5878,62 @@ export function resolveExecutionWorkspaceReuseRequestForIssue(input: {
     requestedExecutionWorkspaceId !== null &&
     existingWorkspaceMatchesRequestedBranch;
 
+  const baseAvailable =
+    requestedShouldReuseExisting &&
+    input.existingExecutionWorkspaceStatus !== null &&
+    input.existingExecutionWorkspaceStatus !== undefined &&
+    input.existingExecutionWorkspaceStatus !== "archived";
+
   return {
     requestedExecutionWorkspaceId,
     requestedShouldReuseExisting,
     existingExecutionWorkspaceAvailable:
-      requestedShouldReuseExisting &&
-      input.existingExecutionWorkspaceStatus !== null &&
-      input.existingExecutionWorkspaceStatus !== undefined &&
-      input.existingExecutionWorkspaceStatus !== "archived",
+      baseAvailable && input.executionWorkspaceHeldByAnotherOpenIssue !== true,
+  };
+}
+
+export type AllocatorExecutionWorkspaceReuseDecision = {
+  requestedExecutionWorkspaceId: string | null;
+  /**
+   * `true` only when the allocator should attempt to restore the existing
+   * execution workspace. `false` whenever the request is invalid for any
+   * reason (no id, wrong preference, archived, or — per R1 — bound to a
+   * different open issue).
+   */
+  shouldRestoreExistingWorkspace: boolean;
+  /** `true` when R1 explicitly refused the binding; useful for logging/metrics. */
+  refusedCrossIssueBinding: boolean;
+};
+
+/**
+ * R1 allocator exclusivity invariant, factored as a pure helper so the
+ * "cross-issue reuse → fresh provisioned" decision is unit-testable without a
+ * heartbeat caller.
+ *
+ * When the requested `execution_workspace_id` is already bound to a DIFFERENT
+ * open issue (`status NOT IN ('done','cancelled')`), the allocator MUST refuse
+ * the binding and provision a fresh workspace instead of attempting to restore
+ * the existing one. This helper centralizes that decision alongside
+ * `resolveExecutionWorkspaceReuseRequestForIssue` so callers cannot forget to
+ * apply it before handing off to `provisionExecutionWorkspaceForFreshnessDecision`.
+ */
+export function resolveAllocatorExecutionWorkspaceReuseDecision(input: {
+  issueExecutionWorkspaceId?: string | null;
+  issueExecutionWorkspacePreference?: string | null;
+  existingExecutionWorkspaceStatus?: string | null;
+  requestedExistingBranch?: string | null;
+  existingExecutionWorkspaceBranchName?: string | null;
+  executionWorkspaceHeldByAnotherOpenIssue?: boolean | null;
+}): AllocatorExecutionWorkspaceReuseDecision {
+  const reuseRequest = resolveExecutionWorkspaceReuseRequestForIssue(input);
+  const refusedCrossIssueBinding =
+    reuseRequest.existingExecutionWorkspaceAvailable === false &&
+    reuseRequest.requestedShouldReuseExisting;
+  return {
+    requestedExecutionWorkspaceId: reuseRequest.requestedExecutionWorkspaceId,
+    shouldRestoreExistingWorkspace:
+      reuseRequest.existingExecutionWorkspaceAvailable,
+    refusedCrossIssueBinding,
   };
 }
 
