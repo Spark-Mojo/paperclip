@@ -1,0 +1,2 @@
+-- paperclip:migration-safety-ignore large-create-index-not-concurrently: Drizzle migrations run transactionally, so CONCURRENTLY is unavailable because this partial index is required for atomic at-most-once bounded-handoff escalation.
+CREATE UNIQUE INDEX "agent_wakeup_requests_handoff_bounded_escalation_uq" ON "agent_wakeup_requests" USING btree ("company_id","idempotency_key") WHERE "agent_wakeup_requests"."idempotency_key" LIKE 'handoff_bounded_continuation_escalation:%';
