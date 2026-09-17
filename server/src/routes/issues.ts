@@ -5078,9 +5078,10 @@ export function issueRoutes(
     issue: { identifier?: string | null; assigneeAgentId: string | null },
     code: IssueWriteDenialCode,
     extraDetails: Record<string, unknown> = {},
+    contextOverride: Partial<IssueWriteDenialContext> = {},
   ) {
     const labels = await issueWriteDenialLabels(req, issue);
-    const { status, body } = issueWriteDenialResponse(code, labels);
+    const { status, body } = issueWriteDenialResponse(code, { ...labels, ...contextOverride });
     res.status(status).json({
       error: body.error,
       details: { ...body.details, ...extraDetails },
