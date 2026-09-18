@@ -148,7 +148,12 @@ export function prepareBundledPackage(sourceDir, destinationDir, { sourceRoot = 
   rmSync(destinationDir, { recursive: true, force: true });
   mkdirSync(destinationDir, { recursive: true });
   for (const entry of sourcePackage.files ?? []) {
-    cpSync(resolve(sourceDir, entry), resolve(destinationDir, entry), { recursive: true });
+    const entrySource = resolve(sourceDir, entry);
+    // Publish-only artifacts (server/skills, and ui-dist on a git checkout) do not
+    // exist in a plain source tree. Skip them the same way README/LICENSE are
+    // skipped below, instead of throwing ENOENT and failing the whole install.
+    if (!existsSync(entrySource)) continue;
+    cpSync(entrySource, resolve(destinationDir, entry), { recursive: true });
   }
   for (const entry of ["README.md", "LICENSE", "LICENSE.md"]) {
     const sourcePath = resolve(sourceDir, entry);
