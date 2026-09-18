@@ -28,6 +28,16 @@ export function materializePublishManifest(pkg) {
   }
 
   delete publishManifest.publishConfig;
+  // The staged directory is not a workspace and its artifacts are already built,
+  // so build lifecycle scripts must not re-run there: npm pack would invoke
+  // prepack (prepare:ui-dist && build) and fail to resolve workspace: deps.
+  if (publishManifest.scripts) {
+    const stagedScripts = { ...publishManifest.scripts };
+    for (const lifecycle of ["prepack", "postpack", "prepare", "prepublishOnly"]) {
+      delete stagedScripts[lifecycle];
+    }
+    publishManifest.scripts = stagedScripts;
+  }
   return publishManifest;
 }
 
