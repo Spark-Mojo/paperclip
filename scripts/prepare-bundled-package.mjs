@@ -1,13 +1,53 @@
 #!/usr/bin/env node
 
 import { execFileSync } from "node:child_process";
-import { cpSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { cpSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const repoRoot = resolve(fileURLToPath(new URL("..", import.meta.url)));
 
-export function materializePublishManifest(pkg) {
+function readWorkspaceVersions(startDir) {
+  // Map every workspace package name to its real version. workspace:* deps must
+  // resolve to the DEPENDENCY's version, not the parent's: @paperclipai/plugin-sdk
+  // is 1.0.0 while the rest of the workspace is 0.3.1, so rewriting to the parent
+  // version produced an unresolvable @paperclipai/plugin-sdk@0.3.1.
+  const versions = new Map();
+  let dir = startDir;
+  for (let depth = 0; depth < 6; depth += 1) {
+    const workspaceFile = resolve(dir, "pnpm-workspace.yaml");
+    if (existsSync(workspaceFile)) {
+      const globs = readFileSync(workspaceFile, "utf8")
+        .split("\n")
+        .map((line) => line.match(/^\s*-\s*["']?([^"'#]+?)["']?\s*$/))
+        .filter(Boolean)
+        .map((match) => match[1].trim());
+      for (const glob of globs) {
+        const base = glob.replace(/\/\*+$/, "");
+        const baseDir = resolve(dir, base);
+        if (!existsSync(baseDir)) continue;
+        const candidates = glob.includes("*")
+          ? readdirSync(baseDir, { withFileTypes: true }).filter((e) => e.isDirectory()).map((e) => resolve(baseDir, e.name))
+          : [baseDir];
+        for (const candidate of candidates) {
+          const manifestPath = resolve(candidate, "package.json");
+          if (!existsSync(manifestPath)) continue;
+          try {
+            const manifest = JSON.parse(readFileSync(manifestPath, "utf8"));
+            if (manifest.name && manifest.version) versions.set(manifest.name, manifest.version);
+          } catch {}
+        }
+      }
+      break;
+    }
+    const parent = resolve(dir, "..");
+    if (parent === dir) break;
+    dir = parent;
+  }
+  return versions;
+}
+
+export function materializePublishManifest(pkg, workspaceVersions) {
   const publishConfig = pkg.publishConfig ?? {};
   const publishManifest = { ...pkg };
 
@@ -22,7 +62,8 @@ export function materializePublishManifest(pkg) {
         if (typeof specifier !== "string" || !specifier.startsWith("workspace:")) return [name, specifier];
         const range = specifier.slice("workspace:".length);
         const prefix = range === "^" || range === "~" ? range : "";
-        return [name, `${prefix}${pkg.version}`];
+        const resolvedVersion = workspaceVersions?.get(name) ?? pkg.version;
+        return [name, `${prefix}${resolvedVersion}`];
       }),
     );
   }
@@ -171,7 +212,7 @@ export function prepareBundledPackage(sourceDir, destinationDir, { sourceRoot = 
   }
 
   const deployedPackagePath = resolve(destinationDir, "package.json");
-  const publishManifest = materializePublishManifest(sourcePackage);
+  const publishManifest = materializePublishManifest(sourcePackage, readWorkspaceVersions(sourceDir));
   const installManifest = createBundledInstallManifest(publishManifest, bundledDependencies);
   writeFileSync(deployedPackagePath, `${JSON.stringify(installManifest, null, 2)}\n`);
 
