@@ -16,6 +16,7 @@ import {
   issueThreadInteractions,
   issueWorkProducts,
   issues,
+  issueRelations,
   issueWatchdogs,
 } from "@paperclipai/db";
 import {
@@ -54,6 +55,7 @@ describeEmbeddedPostgres("task watchdog scheduler", () => {
     await db.delete(heartbeatRuns);
     await db.delete(agentWakeupRequests);
     await db.delete(issueWatchdogs);
+    await db.delete(issueRelations);
     await db.delete(issues);
     await db.delete(agents);
     await db.delete(companies);
@@ -219,6 +221,11 @@ describeEmbeddedPostgres("task watchdog scheduler", () => {
 
     const [watchdog] = await db.select().from(issueWatchdogs).where(eq(issueWatchdogs.issueId, sourceId));
     expect(watchdog?.watchdogIssueId).toBe(watchdogIssues[0]?.id);
+    expect(await db.select().from(issueRelations).where(and(
+      eq(issueRelations.issueId, watchdogIssues[0]!.id),
+      eq(issueRelations.relatedIssueId, sourceId),
+      eq(issueRelations.type, "blocks"),
+    ))).toHaveLength(0);
     expect(watchdog?.lastObservedFingerprint).toMatch(/^task_watchdog_stop:/);
     expect(watchdog?.lastObservedStopSnapshot).toMatchObject({
       version: 2,
@@ -436,6 +443,11 @@ describeEmbeddedPostgres("task watchdog scheduler", () => {
       .where(and(eq(issues.companyId, companyId), eq(issues.originKind, "task_watchdog")));
     expect(watchdogIssues).toHaveLength(1);
     expect(watchdogIssues[0]).toMatchObject({ id: watchdogIssueId, status: "todo" });
+    expect(await db.select().from(issueRelations).where(and(
+      eq(issueRelations.issueId, watchdogIssueId),
+      eq(issueRelations.relatedIssueId, sourceId),
+      eq(issueRelations.type, "blocks"),
+    ))).toHaveLength(0);
     const comments = await db
       .select()
       .from(issueComments)
