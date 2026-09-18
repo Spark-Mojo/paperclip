@@ -67,8 +67,11 @@
 # executed; the install functions instead synthesize a minimal but
 # structurally valid fake prefix (package.json + bin/paperclipai shim) so the
 # surrounding orchestration (symlink flip, health wait, rollback-on-failure)
-# can be exercised end to end without a real build or network access. See
-# scripts/engine/tests/.
+# can be exercised end to end without a real build or network access. The
+# symlink flip itself is always real (see flip_symlink below), but since
+# SPA-7564 install.sh restores $CURRENT_LINK to its pre-install target on
+# EVERY exit path of a dry-run — including a successful one — so a dry-run
+# never leaves the live pointer moved. See scripts/engine/tests/.
 
 set -euo pipefail
 
@@ -505,6 +508,9 @@ flip_symlink() {
   # Always a real filesystem operation, even under PAPERCLIP_ENGINE_DRY_RUN=1
   # — it is local, cheap, and it IS the state this script (and its tests)
   # exist to exercise; unlike npm/git/systemctl/pg_dump it is never stubbed.
+  # Since SPA-7564, install.sh guarantees the pointer ends the run either on
+  # the new prefix (successful REAL install) or restored to its pre-install
+  # target — flip_symlink itself stays a bare atomic flip.
   # ln -sfn atomically replaces an existing symlink (rename() under the
   # hood) on both GNU and BSD/macOS ln — unlike `mv`, which has the
   # well-known "moves INTO an existing symlink-to-directory" gotcha.
