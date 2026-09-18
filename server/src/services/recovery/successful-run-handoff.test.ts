@@ -343,6 +343,36 @@ describe("successful run handoff decision", () => {
     });
   });
 
+  // SPA-8037 / SPA-8024: issue has executionPolicy reviewer/approval
+  // stages that have not claimed (no approval row, no thread
+  // interaction) — the assignee's bare status PATCH cannot stamp
+  // lastStatusDecisionId, so the handoff must skip instead of re-waking.
+  it("does not queue when an unclaimed reviewer/approval queue owns the next action", () => {
+    const reviewerQueueIssue = {
+      ...issue,
+      executionPolicy: {
+        mode: "normal",
+        commentRequired: true,
+        stages: [
+          { id: "stage-review", type: "review", approvalsNeeded: 1, participants: [{ id: "p1", type: "agent", agentId: "agent-2" }] },
+          { id: "stage-approval", type: "approval", approvalsNeeded: 1, participants: [{ id: "p2", type: "agent", agentId: "agent-3" }] },
+        ],
+      },
+    } as any;
+    expect(decide({ issue: reviewerQueueIssue })).toEqual({
+      kind: "skip",
+      reason: "unclaimed reviewer/approval queue owns the next action",
+    });
+    expect(isSuccessfulRunHandoffValidPathSkip(decide({ issue: reviewerQueueIssue }))).toBe(true);
+    // Pending interaction/approval still wins over the reviewer queue.
+    expect(decide({ issue: reviewerQueueIssue, hasPendingInteractionOrApproval: true })).toEqual({
+      kind: "skip",
+      reason: "pending interaction or approval owns the next action",
+    });
+    // commentRequired=false (or no review/approval stage) is not the ruled shape.
+    expect(decide({ issue: { ...issue, executionPolicy: { mode: "normal", commentRequired: false, stages: [] } } as any }).kind).toBe("enqueue");
+  });
+
   it("does not queue when the issue is the recurring parent of an active routine", () => {
     expect(decide({ hasActiveRoutineContinuation: true })).toEqual({
       kind: "skip",

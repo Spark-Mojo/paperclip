@@ -82,6 +82,7 @@ type IssueRow = Pick<
   | "status"
   | "assigneeAgentId"
   | "assigneeUserId"
+  | "executionPolicy"
   | "executionState"
   | "originKind"
 >;
@@ -139,6 +140,7 @@ const SUCCESSFUL_RUN_HANDOFF_VALID_PATH_SKIP_REASONS = new Set([
   "issue is under an active pause hold",
   "corrective handoff wake already exists for this source run",
   "chat conversation already owns the next action",
+  "unclaimed reviewer/approval queue owns the next action",
 ]);
 
 export function isSuccessfulRunHandoffValidPathSkip(
@@ -290,6 +292,22 @@ function readRecord(value: unknown): Record<string, unknown> {
 
 function readString(value: unknown) {
   return typeof value === "string" && value.trim().length > 0 ? value.trim() : null;
+}
+
+// SPA-8037 / SPA-8024: issue.executionPolicy is a JSONB column — validate
+// its shape defensively (never assume the live row matches the typed
+// schema) before reading review/approval stages.
+function issueHasUnclaimedReviewerQueue(executionPolicy: unknown): boolean {
+  if (!executionPolicy || typeof executionPolicy !== "object") return false;
+  const policy = executionPolicy as Record<string, unknown>;
+  if (policy.commentRequired !== true) return false;
+  const stages = policy.stages;
+  if (!Array.isArray(stages)) return false;
+  return stages.some((stage) =>
+    !!stage && typeof stage === "object" &&
+    ((stage as Record<string, unknown>).type === "review" ||
+     (stage as Record<string, unknown>).type === "approval")
+  );
 }
 
 function ellipsize(value: string | null, maxLength: number) {
@@ -528,6 +546,30 @@ export function decideSuccessfulRunHandoff(input: {
   if (input.budgetBlocked) return { kind: "skip", reason: "budget hard stop blocks corrective wake" };
   if (input.idempotentWakeExists) {
     return { kind: "skip", reason: "corrective handoff wake already exists for this source run" };
+  }
+  // SPA-8037 / SPA-8024: the assignee's bare status PATCH cannot stamp
+  // lastStatusDecisionId on a card whose executionPolicy populates
+  // REVIEW/APPROVAL participants that have not yet claimed (no approval
+  // row, no thread interaction, no executionState.currentParticipant).
+  // The disposition reminder still belongs to the assignee, but it must
+  // not re-wake them with the "successful run missing issue disposition"
+  // path when the reviewer/approval queue is the unblock owner — every
+  // assignee-side retry would just churn statusVersion. Predicate is
+  // narrow on purpose: assignee run + in_progress + executionPolicy
+  // present + commentRequired + review/approval stage present with no
+  // pending interaction or approval row. All earlier skip reasons
+  // (existing execution state, pending interaction, pending approval,
+  // open recovery, etc.) still win — this fires only when the
+  // unclaimed reviewer queue is the unambiguous next-action owner.
+  if (
+    issue.assigneeAgentId === run.agentId &&
+    issue.status === "in_progress" &&
+    issueHasUnclaimedReviewerQueue(issue.executionPolicy) &&
+    !input.hasPendingInteractionOrApproval &&
+    !input.hasOpenRecoveryIssue &&
+    !input.hasPersistedMonitor
+  ) {
+    return { kind: "skip", reason: "unclaimed reviewer/approval queue owns the next action" };
   }
 
   const instruction = buildSuccessfulRunHandoffInstruction({
