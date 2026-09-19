@@ -63,6 +63,39 @@ describe("buildHeartbeatRunIssueComment", () => {
   it("returns null when there is no usable final text", () => {
     expect(buildHeartbeatRunIssueComment({ costUsd: 1.2 })).toBeNull();
   });
+
+  it("withholds litellm empty-message placeholder soup (SPA-8089, pure-filler shape)", () => {
+    const filler = "[System: Empty message content sanitised to satisfy protocol]";
+    const summary = Array(13).fill(filler).join("\n\n");
+    const comment = buildHeartbeatRunIssueComment({ summary });
+
+    expect(comment).not.toContain("sanitised to satisfy protocol");
+    expect(comment).toContain("did not post a summary comment");
+  });
+
+  it("withholds filler plus leaked tool-call serialization (SPA-8089, mixed shape)", () => {
+    const summary =
+      "[System: Empty message content sanitised to satisfy protocol]\n\n" +
+      "[System: Empty message content sanitised to satisfy protocol]]<]minimax[>[<function_calls.js:invoke_ash\">]<]minimax[>[<parameter name=\"command\">grep -n \"stalledReviewDecisionSchema\" server/src/routes/issues.ts | head -20]<]minimax[>[</command>]<]minimax[>[</workdir>]<]minimax[>[</invoke>\n]<]minimax[>[</tool_call>";
+    const comment = buildHeartbeatRunIssueComment({ summary });
+
+    expect(comment).not.toContain("invoke_ash");
+    expect(comment).toContain("did not post a summary comment");
+  });
+
+  it("withholds serialized tool calls with no natural-language sentence", () => {
+    const summary =
+      "]<]minimax[>[<function_calls.js:invoke_ash\">]<]minimax[>[<parameter name=\"command\">ls server/src";
+    const comment = buildHeartbeatRunIssueComment({ summary });
+
+    expect(comment).not.toContain("invoke_ash");
+    expect(comment).toContain("did not post a summary comment");
+  });
+
+  it("still posts a genuine summary that merely mentions a tool name in prose", () => {
+    const summary = "Fixed deploy config; verified with grep that no stale route remains. 13/13 pass.";
+    expect(buildHeartbeatRunIssueComment({ summary })).toBe(summary);
+  });
 });
 
 describe("mergeHeartbeatRunResultJson", () => {
