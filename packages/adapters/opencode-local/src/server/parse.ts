@@ -99,3 +99,18 @@ export function isOpenCodeUnknownSessionError(stdout: string, stderr: string): b
     haystack,
   );
 }
+
+// SPA-7226: OpenCode sessions share one SQLite database
+// (~/.local/share/opencode/opencode.db). During a concurrent agent burst the
+// drizzle project/project_directory upserts can lose the race for the write
+// lock and OpenCode dies with SQLiteError: database is locked before the run
+// produces any output. That failure is transient — a few seconds of backoff
+// is enough for the burst to drain — so the adapter retries instead of
+// failing the whole run.
+// detects the shared-DB lock error class only (not other SQLite errors) —
+// opencode's own internal failures on a plain I/O error should not be retried.
+export function isOpenCodeTransientDbLockError(stdout: string, stderr: string): boolean {
+  const haystack = `${stdout}\n${stderr}`;
+  return /database\s+is\s+locked|LockTimeoutError|SQLITE_BUSY/i.test(haystack);
+}
+
