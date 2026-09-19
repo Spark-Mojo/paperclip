@@ -45,7 +45,11 @@ import {
   readPaperclipIssueWorkModeFromContext,
   resolvePaperclipDesiredSkillNames,
 } from "@paperclipai/adapter-utils/server-utils";
-import { isOpenCodeUnknownSessionError, parseOpenCodeJsonl } from "./parse.js";
+import {
+  isOpenCodeTransientDbLockError,
+  isOpenCodeUnknownSessionError,
+  parseOpenCodeJsonl,
+} from "./parse.js";
 import {
   ensureOpenCodeModelConfiguredAndAvailable,
   isTruthyEnvFlag,
@@ -65,6 +69,10 @@ function firstNonEmptyLine(text: string): string {
       .map((line) => line.trim())
       .find(Boolean) ?? ""
   );
+}
+
+export async function sleep(ms: number): Promise<void> {
+  await new Promise<void>((resolve) => setTimeout(resolve, ms));
 }
 
 function parseModelProvider(model: string | null): string | null {
@@ -704,6 +712,53 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         );
         const retry = await runAttempt(null);
         return toResult(retry, true);
+      }
+
+      // SPA-7226: during a concurrent agent burst every OpenCode session shares
+      // one SQLite database, and a startup run can die on
+      // "SQLiteError: database is locked" (LockTimeoutError) before producing
+      // any output. That is transient contention — wait a few seconds and retry
+      // the same session instead of failing the whole run.
+      if (initialFailed && isOpenCodeTransientDbLockError(initial.proc.stdout, initial.rawStderr)) {
+        // Base delays get ±25% jitter: fleet wakes are correlated (board dispatch
+        // storms), and colliding processes re-collide at identical offsets.
+        const lockRetryDelaysMs = [2_000, 6_000].map((baseMs) => {
+          const jitterFactor = 1 + (Math.random() * 0.5 - 0.25);
+          return Math.round(baseMs * jitterFactor);
+        });
+        let lockRetryAttempt = initial;
+        for (let attemptIndex = 0; attemptIndex < lockRetryDelaysMs.length; attemptIndex++) {
+          const delayMs = lockRetryDelaysMs[attemptIndex];
+          await onLog(
+            "stdout",
+            `[paperclip] OpenCode hit a shared-DB SQLite lock (database is locked); retrying in ${delayMs}ms (attempt ${
+              attemptIndex + 1
+            }/${lockRetryDelaysMs.length}).\n`,
+          );
+          await sleep(delayMs);
+          lockRetryAttempt = await runAttempt(sessionId);
+          const lockRetryFailed =
+            !lockRetryAttempt.proc.timedOut &&
+            ((lockRetryAttempt.proc.exitCode ?? 0) !== 0 || Boolean(lockRetryAttempt.parsed.errorMessage));
+          if (!lockRetryFailed) {
+            return toResult(lockRetryAttempt);
+          }
+          if (
+            sessionId &&
+            isOpenCodeUnknownSessionError(lockRetryAttempt.proc.stdout, lockRetryAttempt.rawStderr)
+          ) {
+            await onLog(
+              "stdout",
+              `[paperclip] OpenCode session "${sessionId}" is unavailable; retrying with a fresh session.\n`,
+            );
+            const fresh = await runAttempt(null);
+            return toResult(fresh, true);
+          }
+          if (!isOpenCodeTransientDbLockError(lockRetryAttempt.proc.stdout, lockRetryAttempt.rawStderr)) {
+            return toResult(lockRetryAttempt);
+          }
+        }
+        return toResult(lockRetryAttempt);
       }
 
       return toResult(initial);
