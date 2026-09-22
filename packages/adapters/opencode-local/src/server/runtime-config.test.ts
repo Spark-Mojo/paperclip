@@ -321,4 +321,46 @@ describe("prepareOpenCodeRuntimeConfig", () => {
     expect(prepared.notes).toEqual([]);
     await prepared.cleanup();
   });
+
+  it("passes host gh auth through via GH_CONFIG_DIR when the caller sets none (SPA-7079)", async () => {
+    const hostConfigHome = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-gh-host-"));
+    cleanupPaths.add(hostConfigHome);
+    const hostGhDir = path.join(hostConfigHome, "gh");
+    await fs.mkdir(hostGhDir, { recursive: true });
+    await fs.writeFile(path.join(hostGhDir, "hosts.yml"), "github.com:\n", "utf8");
+    const prepared = await prepareOpenCodeRuntimeConfig({
+      env: { XDG_CONFIG_HOME: hostConfigHome },
+      config: {},
+    });
+    cleanupPaths.add(prepared.env.XDG_CONFIG_HOME);
+
+    expect(prepared.env.GH_CONFIG_DIR).toBe(hostGhDir);
+    await prepared.cleanup();
+  });
+
+  it("respects an explicit caller GH_CONFIG_DIR untouched (SPA-7079)", async () => {
+    const configHome = await makeConfigHome();
+    const explicitGhDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-gh-explicit-"));
+    cleanupPaths.add(explicitGhDir);
+    const prepared = await prepareOpenCodeRuntimeConfig({
+      env: { XDG_CONFIG_HOME: configHome, GH_CONFIG_DIR: explicitGhDir },
+      config: {},
+    });
+    cleanupPaths.add(prepared.env.XDG_CONFIG_HOME);
+
+    expect(prepared.env.GH_CONFIG_DIR).toBe(explicitGhDir);
+    await prepared.cleanup();
+  });
+
+  it("leaves GH_CONFIG_DIR unset when the host has no gh auth (SPA-7079)", async () => {
+    const configHome = await makeConfigHome();
+    const prepared = await prepareOpenCodeRuntimeConfig({
+      env: { XDG_CONFIG_HOME: configHome },
+      config: {},
+    });
+    cleanupPaths.add(prepared.env.XDG_CONFIG_HOME);
+
+    expect(prepared.env.GH_CONFIG_DIR).toBeUndefined();
+    await prepared.cleanup();
+  });
 });
