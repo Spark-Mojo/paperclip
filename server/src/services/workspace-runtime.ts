@@ -4166,6 +4166,14 @@ export async function cleanupExecutionWorkspaceArtifacts(input: {
   // returned in `executedCommands` so the caller can persist the record. A
   // reopen -> re-archive cycle must not re-execute a non-idempotent command.
   skipAlreadyExecutedCleanupCommands?: boolean;
+  // SPA-7391 (F1): invoked immediately after each cleanup command succeeds,
+  // BEFORE the function returns, so the record of a command that already ran
+  // survives a throw in any later step (worktree removal, the executor's
+  // trailing row updates) or a crash between commands. Implementations must
+  // merge in-SQL (no client-side read-modify-write) and are best-effort: a
+  // callback failure is pushed as a warning and the command stays in the
+  // returned `executedCommands` map for the caller's fallback persistence.
+  onCleanupCommandExecuted?: (command: string, executedAt: string) => Promise<void>;
   forceWorktreeRemoval?: boolean;
 }) {
   const warnings: string[] = [];
@@ -4213,9 +4221,21 @@ export async function cleanupExecutionWorkspaceArtifacts(input: {
   const alreadyExecutedCommands = input.skipAlreadyExecutedCleanupCommands
     ? readCleanupCommandsExecutedAt(input.workspace.metadata)
     : {};
+  // SPA-7391 (F3): skip matching is exact-string on the trimmed configured
+  // command. An intentional config change (e.g. an added flag) produces a new
+  // key and one spurious re-run of the changed command; normalizing the key
+  // (e.g. stripping flags) could treat a materially different command as
+  // already executed, so the exact string is the key.
   const executedCommands: Record<string, string> = {};
   for (const command of cleanupCommands) {
-    if (Object.prototype.hasOwnProperty.call(alreadyExecutedCommands, command)) continue;
+    // SPA-7391 cross-model review cure: the same trimmed command can be
+    // configured in more than one field (cleanupCommand, projectWorkspace
+    // cleanupCommand, teardownCommand). Skip a command already executed in
+    // THIS pass, not only one recorded from a previous pass.
+    if (
+      Object.prototype.hasOwnProperty.call(alreadyExecutedCommands, command)
+      || Object.prototype.hasOwnProperty.call(executedCommands, command)
+    ) continue;
     try {
       const resolvedCommand = repoRoot
         ? resolveRepoManagedWorkspaceCommand(command, repoRoot)
@@ -4240,6 +4260,18 @@ export async function cleanupExecutionWorkspaceArtifacts(input: {
       // succeeded, so a failing command still retries (bounded by the sweep's
       // attempt cap) while a succeeded command never runs twice.
       executedCommands[command] = new Date().toISOString();
+      // SPA-7391 (F1): hand the record to the caller the moment the command
+      // succeeded, not when the whole cleanup returns — the steps below this
+      // loop can throw, and the record must already be durable by then.
+      if (input.onCleanupCommandExecuted) {
+        try {
+          await input.onCleanupCommandExecuted(command, executedCommands[command]!);
+        } catch (err) {
+          warnings.push(
+            `Failed to persist executed cleanup command record for "${command}": ${err instanceof Error ? err.message : String(err)}`,
+          );
+        }
+      }
     } catch (err) {
       warnings.push(err instanceof Error ? err.message : String(err));
     }
