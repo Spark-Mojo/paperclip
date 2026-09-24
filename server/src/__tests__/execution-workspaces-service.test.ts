@@ -1,5 +1,6 @@
 import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
+import { existsSync } from "node:fs";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -22,19 +23,23 @@ import {
   projectWorkspaces,
   projects,
   workspaceRuntimeServices,
+  type Db,
 } from "@paperclipai/db";
 import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
 import {
+  EXECUTION_WORKSPACE_CLEANUP_COMMANDS_EXECUTED_METADATA_KEY,
   EXECUTION_WORKSPACE_LIFECYCLE_GENERATION_METADATA_KEY,
   EXECUTION_WORKSPACE_REOPEN_PENDING_METADATA_KEY,
   EXECUTION_WORKSPACE_REOPEN_PENDING_SINCE_METADATA_KEY,
   executionWorkspaceService,
   deriveExecutionWorkspaceDeliveryState,
+  mergeCleanupCommandsExecutedMetadata,
   mergeExecutionWorkspaceConfig,
   metadataHasReopenPendingConsumption,
+  readCleanupCommandsExecutedAt,
   readExecutionWorkspaceConfig,
   readMetadataReopenPendingConsumptionSince,
 } from "../services/execution-workspaces.ts";
@@ -1530,6 +1535,153 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
     // commands on the automatic path; the workspace-level cleanupCommand must
     // have executed by the time the sweep returns.
     await expect(fs.access(cleanupMarker)).resolves.toBeUndefined();
+  });
+
+  it("persists executed cleanup command records when a later cleanup step throws (SPA-7391 F1)", async () => {
+    // The executor's shared-workspace issue detach runs after the artifacts
+    // cleanup returns; it is the deterministic post-command throw injection
+    // point (the only db.update(issues) call in the service). The command
+    // record must already be durable when that step throws, so the retry skips
+    // the command instead of re-running it.
+    const seeded = await seedTerminalWorkspace({ mergedPr: true });
+    const counterPath = path.join(path.dirname(seeded.worktreePath), `cleanup-counter-${randomUUID()}`);
+    tempDirs.add(counterPath);
+    const cleanupCommand = `echo ran >> ${JSON.stringify(counterPath)}`;
+    await db.update(executionWorkspaces).set({
+      mode: "shared_workspace",
+      metadata: {
+        createdByRuntime: true,
+        config: { cleanupCommand },
+      },
+    }).where(eq(executionWorkspaces.id, seeded.executionWorkspaceId));
+
+    const pathExists = () => existsSync(counterPath);
+    const throwingDb = new Proxy(db, {
+      get(target, prop, receiver) {
+        if (prop === "update") {
+          return (table: unknown) => {
+            if (table === issues && pathExists()) {
+              throw new Error("forced post-command update failure");
+            }
+            return (target as Db).update(table as Parameters<Db["update"]>[0]);
+          };
+        }
+        const value = Reflect.get(target, prop, receiver);
+        return typeof value === "function" ? (value as (...args: unknown[]) => unknown).bind(target) : value;
+      },
+    });
+    const failingService = executionWorkspaceService(throwingDb as Db, {
+      resolvePullRequestDetails: async (_companyId, reference) =>
+        pullRequestDetailsByKey.get(`${seeded.companyId}:${reference.number}`) ?? { state: "unknown" },
+      workspaceReaperCooldownDays: 0,
+    });
+
+    const firstSweep = await failingService.sweepTerminalWorkspaces();
+    const [afterThrow] = await db
+      .select({ status: executionWorkspaces.status, metadata: executionWorkspaces.metadata })
+      .from(executionWorkspaces)
+      .where(eq(executionWorkspaces.id, seeded.executionWorkspaceId));
+
+    expect(firstSweep).toMatchObject({ archived: 0, cleanupFailed: 1 });
+    expect(afterThrow?.status).toBe("cleanup_failed");
+    // F1: the record of the command that already ran survived the post-command
+    // throw, so the next attempt can skip it.
+    expect(readCleanupCommandsExecutedAt(afterThrow?.metadata as Record<string, unknown> | null)).toEqual({
+      [cleanupCommand]: expect.any(String),
+    });
+    expect((await fs.readFile(counterPath, "utf8")).split("\n").filter(Boolean)).toHaveLength(1);
+
+    const secondSweep = await svc.sweepTerminalWorkspaces();
+    const [afterRetry] = await db
+      .select({ status: executionWorkspaces.status, metadata: executionWorkspaces.metadata })
+      .from(executionWorkspaces)
+      .where(eq(executionWorkspaces.id, seeded.executionWorkspaceId));
+
+    expect(secondSweep).toMatchObject({ archived: 1, cleanupFailed: 0 });
+    expect(afterRetry?.status).toBe("archived");
+    // The recorded command was skipped on the retry: still exactly one run.
+    expect((await fs.readFile(counterPath, "utf8")).split("\n").filter(Boolean)).toHaveLength(1);
+    expect(readCleanupCommandsExecutedAt(afterRetry?.metadata as Record<string, unknown> | null)).toEqual({
+      [cleanupCommand]: expect.any(String),
+    });
+  });
+
+  it("merges cleanup-command records in SQL so a concurrent writer's entries survive (SPA-7391 F2)", async () => {
+    const seeded = await seedTerminalWorkspace({ mergedPr: true });
+    const key = EXECUTION_WORKSPACE_CLEANUP_COMMANDS_EXECUTED_METADATA_KEY;
+    const workspaceId = seeded.executionWorkspaceId;
+    await db.update(executionWorkspaces).set({
+      metadata: { [key]: { "cmd-a": "2026-09-16T00:00:00.000Z" } },
+    }).where(eq(executionWorkspaces.id, workspaceId));
+
+    // A concurrent executor appended its entry after our caller took its
+    // snapshot (the stale-read shape the previous client-side merge clobbered).
+    await db.update(executionWorkspaces).set({
+      metadata: sql`COALESCE(${executionWorkspaces.metadata}, '{}'::jsonb) || jsonb_build_object(${key}::text, COALESCE(${executionWorkspaces.metadata} -> ${key}::text, '{}'::jsonb) || ${JSON.stringify({ "cmd-b": "2026-09-16T00:01:00.000Z" })}::jsonb)`,
+    }).where(eq(executionWorkspaces.id, workspaceId));
+
+    // The merge must union with the CURRENT stored value, not the caller's
+    // snapshot: cmd-b from the concurrent writer survives alongside cmd-c.
+    await mergeCleanupCommandsExecutedMetadata(db, workspaceId, { "cmd-c": "2026-09-16T00:02:00.000Z" });
+    const [merged] = await db
+      .select({ metadata: executionWorkspaces.metadata })
+      .from(executionWorkspaces)
+      .where(eq(executionWorkspaces.id, workspaceId));
+    expect(readCleanupCommandsExecutedAt(merged?.metadata as Record<string, unknown> | null)).toEqual({
+      "cmd-a": "2026-09-16T00:00:00.000Z",
+      "cmd-b": "2026-09-16T00:01:00.000Z",
+      "cmd-c": "2026-09-16T00:02:00.000Z",
+    });
+
+    // A row with NULL metadata gets the key created (COALESCE on the whole
+    // document, not just the key's value).
+    await db.update(executionWorkspaces).set({ metadata: null }).where(eq(executionWorkspaces.id, workspaceId));
+    await mergeCleanupCommandsExecutedMetadata(db, workspaceId, { "cmd-d": "2026-09-16T00:03:00.000Z" });
+    const [fromNull] = await db
+      .select({ metadata: executionWorkspaces.metadata })
+      .from(executionWorkspaces)
+      .where(eq(executionWorkspaces.id, workspaceId));
+    expect(readCleanupCommandsExecutedAt(fromNull?.metadata as Record<string, unknown> | null)).toEqual({
+      "cmd-d": "2026-09-16T00:03:00.000Z",
+    });
+
+    // Re-persisting an already-recorded command refreshes its timestamp
+    // (new-wins per command key).
+    await mergeCleanupCommandsExecutedMetadata(db, workspaceId, { "cmd-d": "2026-09-16T00:04:00.000Z" });
+    const [refreshed] = await db
+      .select({ metadata: executionWorkspaces.metadata })
+      .from(executionWorkspaces)
+      .where(eq(executionWorkspaces.id, workspaceId));
+    expect(readCleanupCommandsExecutedAt(refreshed?.metadata as Record<string, unknown> | null)).toEqual({
+      "cmd-d": "2026-09-16T00:04:00.000Z",
+    });
+
+    // Cross-model review cure: a stored key value that is not a JSON object
+    // (null, scalar, array) must be treated as an empty object, not fed to the
+    // jsonb || operator (which would wrap object || scalar into an array).
+    for (const malformed of [null, 7, ["x"]]) {
+      await db.update(executionWorkspaces).set({
+        metadata: { [key]: malformed } as Record<string, unknown>,
+      }).where(eq(executionWorkspaces.id, workspaceId));
+      await mergeCleanupCommandsExecutedMetadata(db, workspaceId, { "cmd-e": "2026-09-16T00:05:00.000Z" });
+      const [recovered] = await db
+        .select({ metadata: executionWorkspaces.metadata })
+        .from(executionWorkspaces)
+        .where(eq(executionWorkspaces.id, workspaceId));
+      expect(readCleanupCommandsExecutedAt(recovered?.metadata as Record<string, unknown> | null)).toEqual({
+        "cmd-e": "2026-09-16T00:05:00.000Z",
+      });
+    }
+
+    // An empty entry set is a no-op write.
+    await mergeCleanupCommandsExecutedMetadata(db, workspaceId, {});
+    const [afterEmpty] = await db
+      .select({ metadata: executionWorkspaces.metadata })
+      .from(executionWorkspaces)
+      .where(eq(executionWorkspaces.id, workspaceId));
+    expect(readCleanupCommandsExecutedAt(afterEmpty?.metadata as Record<string, unknown> | null)).toEqual({
+      "cmd-e": "2026-09-16T00:05:00.000Z",
+    });
   });
 
   it("does not reap a reopened workspace while the source issue is still terminal", async () => {
