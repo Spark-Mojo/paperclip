@@ -56,6 +56,76 @@ Two cases per card description, no new timers / watchdogs:
 - **CHECK:** verifier subagent returns `VERDICT: PASS` (per `WORKFLOW.md` step 4).
 - **EXPECT:** verifier posts `<!-- requirements-signoff:v1 head=<sha> verdict=pass -->` on the PR, bound to the source HEAD; auto-merge arms on green.
 
+## SPA-8655 regression (PR #70 not merge-approved at `e2b1623f`)
+
+PR #70 regressed the signoff e2e shard: `tests/e2e/signoff-policy.spec.ts` 3 tests failed
+twice in CI (`changes requested: reviewer bounces back to executor`,
+`comment required: approval without comment fails`, `review-only policy: reviewer approval
+completes execution`) with `invokeHeartbeat` 3s-poll timeout — no issue-bound run for the new
+assignee. Reproduced locally on `e2b1623f` against base `ab1eea690` (base: 13/13 pass, head:
+repeat failures), A/B starting from identical HTTP flows.
+
+### Root cause
+
+The `legacy-execution-recovery` exclusion added in `e2b1623f`
+(`issue_reassigned` / `lock_released_on_reassignment` → `false`) was global. Its intended effect
+was one call site —the wake-queue release pre-drain, so a reassignment cancel releases into the
+deferred-wake drain. But it also flipped the recovery/retry schedulers that gate on the same
+predicate (`enqueueProcessLossRetry` and `scheduleBoundedRetryForRun`): a run cancelled
+`issue_reassigned` during a signoff handoff no longer reads as "needs reconciliation", so the
+process-loss retry path scheduled a **fresh replacement run for the OLD assignee** right inside
+the reassignment window. That replacement run entered the execution path (`queued` → `running`,
+adapter echo-success), and the wake-queue admission
+(`decideWakeAdmission` → `availableActiveExecutionRunPresent`) then **parked the NEW assignee's
+stage wake** (`execution_review_requested`) as `deferred_issue_execution` behind an
+old-assignee run. The old run's release pre-drains as `released` (succeeded) with no drain, so
+the parked wake is never promoted — stranded until a human or an unrelated wake. Exactly one
+deferred-wake park per handoff, hence exactly 3 failing tests, deterministically.
+
+Answer to the card's design-floor question: **nothing** re-claims the parked wake after the lease
+clears when no new wake arrives — the same "parked forever" gap Case-1 was built for, now
+suffered by the next wake in the queue. With the retry leg removed (below) the wake never parks.
+
+### Fix (this PR's head)
+
+1. **Revert the global exclusion in `legacy-execution-recovery.ts`** to base semantics — a
+   reassignment-cancelled run is terminal: no process-loss retry, no bounded retry, terminalized
+   as before. This kills the old-assignee replacement run that parked the new wake.
+2. **Scope the SPA-8631 Case-1 exemption to the wake-queue pre-drain only**
+   (`wake-queue/adapters/postgres.ts`): the release still proceeds to the deferred-wake drain
+   for `issue_reassigned` / `lock_released_on_reassignment` cancels, preserving Case-1's
+   promotion of the new assignee's parked wake (its unit tests stay green).
+3. **Drain guard (`wake-queue/application/use-cases.ts`):** the drain never promotes a plain
+   issue-execution wake for an agent who is no longer the issue's owner (finishing run cancelled
+   for reassignment with the wake same-agent, or wake-agent differing from the current assignee)
+   — cancels it as obsolete instead of launching a former-owner run.
+
+The DOD oracle (the signoff e2e shard) is green 1/1 locally so far with the fix; the targeted
+unit suites run green (below).
+
+## Captured actuals (SPA-8655 fix verification)
+
+- **A/B evidence, signoff-policy e2e, local, runner box** (fake HOME for the doctor's
+  managed-install shim check; `PAPERCLIP_PLAYWRIGHT_CHANNEL=chrome`):
+  - `ab1eea690` (base): 5/5 pass — happy path 17.7s, changes-requested 1.2s, comment-required
+    785ms, non-participant 939ms, review-only 1.3s.
+  - `e2b1623f` (head, un-fixed): 3/5 fail (changes-requested, comment-required, review-only);
+    happy path + non-participant pass — matches CI's failure set exactly.
+  - head + SPA-8655 fix: 5/5 pass — happy path 18.3s, changes-requested 3.9s, comment-required
+    825ms, non-participant 907ms, review-only 1.1s. Repeat run: 5/5 pass (12.0s, 1.8s, 754ms,
+    912ms, 1.1s).
+- **Unit suites** (`cd server && pnpm exec vitest run`):
+  - `heartbeat-deferred-promote-on-reassignment.test.ts` + `heartbeat-lease-not-released-retry.test.ts` + `heartbeat-process-recovery.test.ts`: 3 files, 329 tests, exit 0.
+  - `wake-queue/application/use-cases.test.ts` + `heartbeat-lock-release-on-reassignment.test.ts`: 2 files, 53 tests, exit 0.
+- **Full shard (4/8) scope locally**: 13/14 pass; the only failure was
+  `archived-company-url.spec.ts` (15s `page.waitForURL` browser timeout while the same server
+  was serving 4 specs + vite optimizer) — passes in isolation (20.0s) and passed on both CI runs
+  of #70; not related to this diff (browser-only, waits on URL redirect UI).
+- DB-level mechanism verified via instrumented server logs (wake-queue admission facts +
+  wake-queue drain runner) on the failing head build: reviewer stage wake deferred with
+  `availableActiveExecutionRunPresent=true`, `activeRunAgent` = old assignee, `activeRunStatus`
+  `running`; drain candidate logs show the old-assignee wake consumed by the retry leg.
+
 ## Out of scope (per card)
 
 - 5-minute orphan sweep (SPA-5732 layer B) — DO NOT build.
