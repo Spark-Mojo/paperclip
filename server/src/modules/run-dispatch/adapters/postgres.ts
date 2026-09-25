@@ -64,6 +64,17 @@ import type {
 } from "../application/types.js";
 import { RunDispatchApplicationError } from "../application/types.js";
 
+/**
+ * SPA-8631 (Case 2): bound the lease-not-released re-queue attempt count.
+ * Each attempt doubles the previous backoff (`LEASE_NOT_RELEASED_BASE_BACKOFF_MS`
+ * × 2^attempt), so 5 attempts with a 5s base covers ~155s of total wait
+ * (5s + 10s + 20s + 40s + 80s). After the bound the wake falls through to
+ * the terminal skip with `Recovery required: previous execution lease not
+ * released after N attempts` so the existing recovery surface can take over.
+ */
+const LEASE_NOT_RELEASED_MAX_ATTEMPTS = 5;
+const LEASE_NOT_RELEASED_BASE_BACKOFF_MS = 5_000;
+
 type HeartbeatRun = typeof heartbeatRuns.$inferSelect;
 type LoadGateFactsInput = {
   conversationContinuation: boolean;
@@ -825,18 +836,100 @@ export function createPostgresRunDispatchAdapter(
     expectedStatus: "queued" | "running",
     now: Date,
   ): Promise<CancelStaleQueuedRunOutcome> {
+      // SPA-8631 (Case 2): when the only reason a queued run is being
+      // skipped is that the previous run's environment lease has not yet
+      // been released, re-queue it as a `scheduled_retry` with short
+      // backoff instead of writing a terminal `skipped` wake. Bound the
+      // attempts: after `LEASE_NOT_RELEASED_MAX_ATTEMPTS` arrivals, fall
+      // through to the terminal skip with the recovery-required reason so
+      // the existing recovery surface takes over. The next-action text
+      // below is the lease-not-released string from
+      // `services/conversation-continuation.ts` — pid-alive and broader
+      // reconciliation causes carry different text and keep the existing
+      // terminal-skip behavior.
+      let effectiveDecision = decision;
+      const isLeaseNotReleased =
+        decision.errorCode === "execution_reconciliation_required" &&
+        typeof decision.reason === "string" &&
+        decision.reason.startsWith(
+          "The previous execution has not released its environment lease",
+        );
+
+      if (isLeaseNotReleased && expectedStatus === "queued") {
+        const previousAttempt =
+          typeof run.scheduledRetryAttempt === "number" ? run.scheduledRetryAttempt : 0;
+        const nextAttempt = previousAttempt + 1;
+        if (nextAttempt <= LEASE_NOT_RELEASED_MAX_ATTEMPTS) {
+          const backoffMs = LEASE_NOT_RELEASED_BASE_BACKOFF_MS *
+            Math.pow(2, previousAttempt);
+          const dueAt = new Date(now.getTime() + backoffMs);
+          const [rescheduledRow] = await tx
+            .update(heartbeatRuns)
+            .set({
+              status: "scheduled_retry",
+              scheduledRetryAt: dueAt,
+              scheduledRetryAttempt: nextAttempt,
+              scheduledRetryReason: "execution_lease_not_released",
+              updatedAt: now,
+            })
+            .where(
+              and(
+                eq(heartbeatRuns.id, run.id),
+                eq(heartbeatRuns.companyId, run.companyId),
+                eq(heartbeatRuns.status, expectedStatus),
+              ),
+            )
+            .returning();
+          // A concurrent claimant or canceller already moved the run off
+          // `expectedStatus`: the caller's staleness decision lost the race,
+          // so this write must not overwrite whatever status won it.
+          if (!rescheduledRow) return { outcome: "lost_race" };
+
+          await appendHeartbeatRunEvent(tx as unknown as Db, {
+            companyId: rescheduledRow.companyId,
+            runId: rescheduledRow.id,
+            agentId: rescheduledRow.agentId,
+            eventType: "lifecycle",
+            stream: "system",
+            level: "info",
+            message: `Lease not yet released: re-queued as scheduled_retry (attempt ${nextAttempt}/${LEASE_NOT_RELEASED_MAX_ATTEMPTS})`,
+            payload: {
+              ...(decision.details ?? {}),
+              leaseNotReleasedAttempt: nextAttempt,
+              leaseNotReleasedDueAt: dueAt.toISOString(),
+            },
+          });
+
+          return {
+            outcome: "rescheduled",
+            reason: decision.reason,
+            errorCode: "execution_reconciliation_required",
+            rescheduledRunId: rescheduledRow.id,
+            attempt: nextAttempt,
+            dueAt,
+            postCommitEffects: [statusEffect(rescheduledRow, expectedStatus)],
+          };
+        }
+        // Bound exceeded: fall through to the terminal skip below with a
+        // reason text that flags the recovery surface.
+        effectiveDecision = {
+          ...decision,
+          reason: `Recovery required: previous execution lease not released after ${LEASE_NOT_RELEASED_MAX_ATTEMPTS} attempts`,
+        };
+      }
+
       const [row] = await tx
         .update(heartbeatRuns)
         .set({
           status: "cancelled",
           finishedAt: now,
-          error: decision.reason,
-          errorCode: decision.errorCode,
+          error: effectiveDecision.reason,
+          errorCode: effectiveDecision.errorCode,
           resultJson: {
             ...parseObject(run.resultJson),
-            stopReason: decision.errorCode,
-            ...(decision.errorCode === "execution_reconciliation_required"
-              ? { executionWait: decision.details }
+            stopReason: effectiveDecision.errorCode,
+            ...(effectiveDecision.errorCode === "execution_reconciliation_required"
+              ? { executionWait: effectiveDecision.details }
               : {}),
             effectiveTimeoutSec: 0,
             timeoutConfigured: false,
@@ -861,7 +954,7 @@ export function createPostgresRunDispatchAdapter(
       if (row.wakeupRequestId) {
         await tx
           .update(agentWakeupRequests)
-          .set({ status: "skipped", finishedAt: now, error: decision.reason, updatedAt: now })
+          .set({ status: "skipped", finishedAt: now, error: effectiveDecision.reason, updatedAt: now })
           .where(
             and(
               eq(agentWakeupRequests.id, row.wakeupRequestId),
@@ -893,14 +986,14 @@ export function createPostgresRunDispatchAdapter(
         eventType: "lifecycle",
         stream: "system",
         level: "warn",
-        message: decision.reason,
-        payload: decision.details,
+        message: effectiveDecision.reason,
+        payload: effectiveDecision.details,
       });
 
       return {
         outcome: "cancelled",
-        reason: decision.reason,
-        errorCode: decision.errorCode,
+        reason: effectiveDecision.reason,
+        errorCode: effectiveDecision.errorCode,
         postCommitEffects: [statusEffect(row, expectedStatus)],
       };
   }
