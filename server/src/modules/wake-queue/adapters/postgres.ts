@@ -1099,7 +1099,20 @@ export function createPostgresWakeQueueAdapter(db: Db, deps: WakeQueuePostgresAd
           issueStatus: issueRow?.status ?? "",
           hasAssigneeUser: Boolean(issueRow?.assigneeUserId),
           assigneeAgentMatchesRunAgent: issueRow?.assigneeAgentId === run.agentId,
-          legacyExecutionNeedsReconciliation: legacyExecutionNeedsReconciliation(run),
+          // SPA-8631 (Case 1): a run cancelled because the issue moved to a
+          // different owner is not a failed provider execution; the release
+          // must proceed to the deferred-wake drain so the NEW assignee's
+          // parked wake is promoted instead of stranding the card. The
+          // exemption is scoped here — the retry/recovery schedulers
+          // (`enqueueProcessLossRetry`, `scheduleBoundedRetryForRun`,
+          // terminalization) must keep treating a reassignment-cancelled run
+          // as terminal and never schedule a replacement run for the former
+          // owner (that replacement parked the new assignee's wake in SPA-8655).
+          legacyExecutionNeedsReconciliation:
+            legacyExecutionNeedsReconciliation(run) &&
+            !(run.status === "cancelled" &&
+              (run.errorCode === "issue_reassigned" ||
+                run.errorCode === "lock_released_on_reassignment")),
           // An operator stop never promotes old queued work by itself. The
           // next explicit wake adopts those messages atomically when it
           // queues a run.

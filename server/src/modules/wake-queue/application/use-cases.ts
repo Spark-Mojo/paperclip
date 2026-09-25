@@ -217,6 +217,43 @@ async function runReleaseDrain(
       continue;
     }
 
+    // SPA-8655: never drain a plain issue-execution wake for an agent who no
+    // longer owns the issue. The Case-1 drain (SPA-8631) promoted such a wake
+    // into an execution-path run for the OLD assignee; the wake-queue
+    // admission then parked the NEW assignee's stage wake behind that run
+    // (`deferred_issue_execution`), so the reassigned card got no run within
+    // the signoff e2e's poll window. Two triggers cover both release orders:
+    //   (a) the finishing run was itself cancelled for a reassignment — key
+    //       off the run because the issue's assignee column still names the
+    //       old owner inside the cancelling transition; and
+    //   (b) the issue is now assigned to a different agent (a later release,
+    //       e.g. the next participant finishing) name-mismatches the wake.
+    // Comment/mention/interaction and independent-continuation wakes keep
+    // their own handoff rules above and below; this only touches wakes carrying
+    // no queued comments, no independent continuation, and no interaction.
+    const reassignmentRelease =
+      run.status === "cancelled" &&
+      (run.errorCode === "issue_reassigned" || run.errorCode === "lock_released_on_reassignment");
+    const plainExecutionWake =
+      !candidate.authorizedFailedChatRetry &&
+      candidate.payload.mutation !== "interaction" &&
+      !candidate.preservesIndependentContinuation &&
+      candidate.queuedCommentIds.length === 0 &&
+      !["issue_commented", "issue_reopened_via_comment"].includes(candidate.wakeReason ?? candidate.reason ?? "");
+    if (
+      plainExecutionWake &&
+      ((reassignmentRelease && candidate.agentId === run.agentId) ||
+        (issue.assigneeAgentId !== null && candidate.agentId !== issue.assigneeAgentId))
+    ) {
+      await ports.transaction.cancelDeferredWake({
+        companyId: run.companyId,
+        wakeId: candidate.id,
+        reason: "Deferred execution wake belongs to a former assignee of a reassigned issue",
+        now: input.now,
+      });
+      continue;
+    }
+
     let liveness = { liveNonSelfCommentIds: candidate.queuedCommentIds, containedSelfAuthoredComment: false };
     if (
       !candidate.authorizedFailedChatRetry &&
