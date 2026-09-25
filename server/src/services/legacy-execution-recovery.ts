@@ -20,6 +20,19 @@ export function legacyExecutionNeedsReconciliation(
     !["failed", "timed_out", "interrupted", "cancelled"].includes(run.status)
   )
     return false;
+  // SPA-8631 (Case 1): runs cancelled by the inline lock-clear sites in
+  // `enqueueWakeup` (cross-agent stale-holder cancel,
+  // `cancelStaleScheduledRetry`) are not real failed executions that need
+  // operator reconciliation. The lock has already been cleared; what
+  // remains is the deferred-wake promotion that those inline sites
+  // previously skipped. Returning false here lets the wake-queue's
+  // release path drain the deferred-wake queue instead of exiting as
+  // "released" with no post-commit effects.
+  if (
+    run.errorCode === "lock_released_on_reassignment" ||
+    run.errorCode === "issue_reassigned"
+  )
+    return false;
   // A fresh conversation turn lets the agent decide what remains. The retry
   // scheduler, not an action-outcome hold, owns the automatic attempt limit.
   if (hasConversationContinuationPolicy(run.resultJson)) return false;

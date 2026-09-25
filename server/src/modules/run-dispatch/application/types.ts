@@ -53,6 +53,21 @@ export type CancelStaleQueuedRunOutcome =
       reason: string;
       errorCode: QueuedRunStalenessErrorCode;
       postCommitEffects: PostCommitEffect[];
+    }
+  /**
+   * SPA-8631 (Case 2): the run was flipped from `queued` to `scheduled_retry`
+   * because the previous run's environment lease has not yet been released.
+   * A bounded number of attempts is allowed before this outcome falls through
+   * to `cancelled` with the recovery-action-required reason text.
+   */
+  | {
+      outcome: "rescheduled";
+      reason: string;
+      errorCode: "execution_reconciliation_required";
+      rescheduledRunId: string;
+      attempt: number;
+      dueAt: Date;
+      postCommitEffects: PostCommitEffect[];
     };
 
 export type RunDispatchApplicationErrorCode = "run_not_found";

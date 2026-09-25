@@ -1828,14 +1828,32 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     const [lease] = await db.insert(environmentLeases).values({ companyId, issueId, heartbeatRunId: runId, status: "active" }).returning();
     expect(await getExecutionBlocker(db, companyId, issueId)).toMatchObject({ runId, cause: "execution_owner_active" });
     // Scheduling itself has no execution authority. Actual queued admission
-    // must still block while the predecessor owns a process or lease.
+    // must still block while the predecessor owns a process or lease. SPA-8631
+    // (Case 2) re-queues the queued run as `scheduled_retry` with a bounded
+    // attempt counter instead of writing a terminal `skipped` wake; the
+    // observable outcome (the queued run does not proceed) is the same.
     const queuedId = randomUUID();
     const previous = (await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId)))[0]!;
     await db.insert(heartbeatRuns).values({ id: queuedId, companyId, agentId: previous.agentId,
       status: "queued", contextSnapshot: { issueId, wakeReason: "issue_commented" } });
     const { createPostgresRunDispatchAdapter } = await import("../modules/run-dispatch/adapters/postgres.js");
-    expect(await createPostgresRunDispatchAdapter(db).cancelStaleQueuedRun({ companyId, runId: queuedId,
-      expectedStatus: "queued", now: new Date() })).toMatchObject({ outcome: "cancelled", errorCode: "execution_reconciliation_required" });
+    const now = new Date();
+    const firstAttempt = await createPostgresRunDispatchAdapter(db).cancelStaleQueuedRun({
+      companyId, runId: queuedId, expectedStatus: "queued", now,
+    });
+    expect(firstAttempt).toMatchObject({
+      outcome: "rescheduled",
+      errorCode: "execution_reconciliation_required",
+      attempt: 1,
+    });
+    expect(firstAttempt.outcome).toBe("rescheduled");
+    if (firstAttempt.outcome === "rescheduled") {
+      expect(firstAttempt.dueAt.getTime()).toBeGreaterThan(now.getTime());
+    }
+    const rescheduledRow = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, queuedId)).then((rows) => rows[0]);
+    expect(rescheduledRow?.status).toBe("scheduled_retry");
+    expect(rescheduledRow?.scheduledRetryAttempt).toBe(1);
+    expect(rescheduledRow?.scheduledRetryReason).toBe("execution_lease_not_released");
     await db.update(environmentLeases).set({ releasedAt: new Date(), status: "released" }).where(eq(environmentLeases.id, lease!.id));
     expect(await getExecutionBlocker(db, companyId, issueId)).toBeNull();
   });

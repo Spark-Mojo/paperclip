@@ -17232,6 +17232,19 @@ export function heartbeatService(
         );
         return null;
       }
+      if (staleness.outcome === "rescheduled") {
+        applyRunDispatchPostCommitEffects(staleness.postCommitEffects);
+        logger.info(
+          {
+            runId: staleness.rescheduledRunId,
+            issueId,
+            attempt: staleness.attempt,
+            dueAt: staleness.dueAt.toISOString(),
+          },
+          "claimQueuedRun: rescheduled queued run because previous execution lease is not yet released",
+        );
+        return null;
+      }
     }
 
     const claimedAt = new Date();
@@ -20007,6 +20020,10 @@ export function heartbeatService(
             expectedStatus: "running",
           });
           if (staleness.outcome === "cancelled") {
+            applyRunDispatchPostCommitEffects(staleness.postCommitEffects);
+            return;
+          }
+          if (staleness.outcome === "rescheduled") {
             applyRunDispatchPostCommitEffects(staleness.postCommitEffects);
             return;
           }
@@ -27705,6 +27722,29 @@ export function heartbeatService(
       // lookup must not delay them.
       for (const cancelledRun of cancelledRunsToEmit) {
         void emitAgentTaskRun(db, cancelledRun);
+      }
+
+      // SPA-8631 (Case 1): the inline lock-clear sites above
+      // (`cancelStaleScheduledRetry`, the cross-agent stale-holder cancel,
+      // and the `if (!activeExecutionRun && issue.executionRunId)` block) do
+      // not promote a `deferred_issue_execution` wake for the issue. The
+      // wake-queue module's `releaseIssueExecution` drains that queue after
+      // it clears the lock; we replay it here so a fresh-assignee wake that
+      // parked while this run held the lock actually becomes a run, instead
+      // of sitting in `deferred_issue_execution` until a human resumes it.
+      // The wake-queue's pre-drain check tolerates an already-null
+      // `executionRunId` (it considers the issue lock released and proceeds
+      // to drain), so this is safe to call even though our inline clear
+      // already nulled the column.
+      if (cancelledRunsToEmit.length > 0) {
+        for (const cancelledRun of cancelledRunsToEmit) {
+          const { postCommitEffects } = await wakeQueue.releaseIssueExecution({
+            companyId: cancelledRun.companyId,
+            runId: cancelledRun.id,
+            now: new Date(),
+          });
+          await applyWakeQueuePostCommitEffects(postCommitEffects);
+        }
       }
 
       if (outcome.kind === "durable") {
