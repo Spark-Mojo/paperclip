@@ -15382,6 +15382,49 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           ]
         : []),
     ];
+    // SPA-8870 (Dex SPA-8869 case C2): when the workspace fell through to
+    // the fresh-off-baseRef recreate path because the branch is gone from
+    // BOTH local and origin, surface a single system comment on the issue so
+    // the agent run, board, and any reviewer see the data-loss signal — the
+    // runtime log warnings ride `runtimeWorkspaceWarnings` (visible in run
+    // stdout), but a comment makes the signal durable + board-visible.
+    if (executionWorkspace.dataLossSuspected && issueRef?.id) {
+      const branchName = executionWorkspace.branchName ?? "<unknown>";
+      const priorSha = (executionWorkspace as { priorRecordedBaseRefSha?: string | null }).priorRecordedBaseRefSha ?? null;
+      const newSha = executionWorkspace.baseRefSha ?? null;
+      const priorLine = priorSha ? `\nPrior recorded tip: \`${priorSha}\`.` : "";
+      const newLine = newSha ? `\nFresh tip on \`${executionWorkspace.repoRef ?? "HEAD"}\`: \`${newSha}\`.` : "";
+      const dataLossCommentBody = [
+        `**DATA LOSS SUSPECTED (SPA-8870 / Dex SPA-8869 case C2)**`,
+        ``,
+        `Execution workspace branch \`${branchName}\` was not found on local refs or origin/${branchName}.`,
+        `The engine created a fresh branch off \`${executionWorkspace.repoRef ?? "HEAD"}\` and the prior tip is not reachable from any ref.`,
+        ``,
+        `Any work only on a deleted or unpushed \`${branchName}\` tip is lost — review the run log, workspace operations, and the engine's recorded baseRefSha for this run (${run.id}) before relying on this branch's content.`,
+        `${priorLine}${newLine}`,
+      ].join("\n");
+      const existingDataLossComment = await db
+        .select({ id: issueComments.id })
+        .from(issueComments)
+        .where(
+          and(
+            eq(issueComments.companyId, run.companyId),
+            eq(issueComments.issueId, issueRef.id),
+            sql`${issueComments.body} like ${`${dataLossCommentBody.split("\n")[0]}%`}`,
+          ),
+        )
+        .limit(1)
+        .then((rows) => rows[0] ?? null);
+      if (!existingDataLossComment) {
+        await db.insert(issueComments).values({
+          companyId: run.companyId,
+          issueId: issueRef.id,
+          authorType: "system",
+          body: dataLossCommentBody,
+          createdByRunId: run.id,
+        });
+      }
+    }
     context.paperclipWorkspace = {
       cwd: executionWorkspace.cwd,
       source: executionWorkspace.source,
