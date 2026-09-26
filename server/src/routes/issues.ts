@@ -2944,42 +2944,6 @@ export function issueRoutes(
     return false;
   }
 
-  function hasExplicitIssueWorkspaceCreateSelection(input: Record<string, unknown>) {
-    return input.parentId !== undefined ||
-      input.inheritExecutionWorkspaceFromIssueId !== undefined ||
-      input.projectWorkspaceId !== undefined ||
-      input.executionWorkspaceId !== undefined ||
-      input.executionWorkspacePreference !== undefined ||
-      input.executionWorkspaceSettings !== undefined;
-  }
-
-  async function resolveRunIssueWorkspaceInheritanceSource(
-    companyId: string,
-    actor: ReturnType<typeof getActorInfo>,
-  ): Promise<string | null> {
-    if (actor.actorType !== "agent" || !actor.agentId || !actor.runId) return null;
-    const run = await db
-      .select({
-        agentId: heartbeatRuns.agentId,
-        contextSnapshot: heartbeatRuns.contextSnapshot,
-      })
-      .from(heartbeatRuns)
-      .where(and(
-        eq(heartbeatRuns.id, actor.runId),
-        eq(heartbeatRuns.companyId, companyId),
-      ))
-      .then((rows) => rows[0] ?? null);
-    if (!run || run.agentId !== actor.agentId) return null;
-    const context = run.contextSnapshot && typeof run.contextSnapshot === "object"
-      ? run.contextSnapshot as Record<string, unknown>
-      : null;
-    if (!context || !readNonEmptyString(context.executionWorkspaceId)) return null;
-    const paperclipIssue = context.paperclipIssue && typeof context.paperclipIssue === "object"
-      ? context.paperclipIssue as Record<string, unknown>
-      : null;
-    return readNonEmptyString(context.issueId) ?? readNonEmptyString(paperclipIssue?.id);
-  }
-
   async function resolveAgentTrustForIssue(
     input: {
       agentId: string | null | undefined;
@@ -8566,9 +8530,20 @@ export function issueRoutes(
       assigneeAgentId: normalizedAssigneeAgentId ?? null,
     });
     const actor = getActorInfo(req);
-    const runWorkspaceInheritanceSourceIssueId = hasExplicitIssueWorkspaceCreateSelection(rawCreateBody)
-      ? null
-      : await resolveRunIssueWorkspaceInheritanceSource(companyId, actor);
+    // SPA-8707: a newly created card MUST get its own fresh execution
+    // workspace and a branch named for itself. Auto-inheriting the
+    // currently-active run's workspace (the PAP-10871 / PAP-10873 behavior)
+    // made follow-up cards collide in the parent's worktree folder
+    // (`workspace_validation_failed`, SPA-8661/8662) and routed their PRs
+    // back to the closed parent by branch name (SPA-8656 x2 via PR #1068;
+    // SPA-8664 x2 via PR #1078). Explicit inheritance is still supported
+    // via `inheritExecutionWorkspaceFromIssueId` (set by `createChild`,
+    // task-watchdog discovery, and the recovery cycle), and the
+    // `/api/issues/:id/children` endpoint is the canonical path for true
+    // parent-child inheritance -- it always sets `inheritExecutionWorkspaceFromIssueId:
+    // parent.id`. Root follow-ups filed via `/api/companies/:companyId/issues`
+    // never inherit from the run context.
+    const runWorkspaceInheritanceSourceIssueId: string | null = null;
     const createBody = {
       ...rawCreateBody,
       parentId: effectiveParentId,
