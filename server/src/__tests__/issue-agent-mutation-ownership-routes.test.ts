@@ -1233,7 +1233,15 @@ describe("agent issue mutation checkout ownership", () => {
     expect(mockIssueService.update).not.toHaveBeenCalled();
   });
 
-  it("defaults agent-created root follow-up issues to inherit the current run workspace", async () => {
+  it("defaults agent-created root follow-up issues to a fresh workspace (SPA-8707)", async () => {
+    // SPA-8707 (engine): auto-inheriting the current run's workspace for a
+    // newly created card made follow-up cards collide in the parent's
+    // worktree folder (`workspace_validation_failed`, SPA-8661/8662) and
+    // routed their PRs back to the closed parent by branch name (SPA-8656
+    // x2 via PR #1068; SPA-8664 x2 via PR #1078). The follow-up must get
+    // its own fresh workspace; the canonical path for true parent-child
+    // inheritance is `POST /api/issues/:id/children`, which always sets
+    // `inheritExecutionWorkspaceFromIssueId: parent.id` via `createChild`.
     const app = await createApp(
       ownerActor(),
       createRunContextDb({
@@ -1245,7 +1253,7 @@ describe("agent issue mutation checkout ownership", () => {
     const res = await request(app)
       .post(`/api/companies/${companyId}/issues`)
       .send({
-        title: "Follow-up in same worktree",
+        title: "Follow-up must NOT inherit the run workspace",
         projectId: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
       });
 
@@ -1253,7 +1261,41 @@ describe("agent issue mutation checkout ownership", () => {
     expect(mockIssueService.create).toHaveBeenCalledWith(
       companyId,
       expect.objectContaining({
-        title: "Follow-up in same worktree",
+        title: "Follow-up must NOT inherit the run workspace",
+      }),
+    );
+    expect(mockIssueService.create).toHaveBeenCalledWith(
+      companyId,
+      expect.not.objectContaining({
+        inheritExecutionWorkspaceFromIssueId: issueId,
+      }),
+    );
+  });
+
+  it("respects an explicit inheritExecutionWorkspaceFromIssueId on a root follow-up", async () => {
+    // Explicit opt-in still works: an agent that knows it wants the same
+    // workspace as a known source issue can still pass the field directly.
+    const app = await createApp(
+      ownerActor(),
+      createRunContextDb({
+        issueId,
+        executionWorkspaceId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      }),
+    );
+
+    const res = await request(app)
+      .post(`/api/companies/${companyId}/issues`)
+      .send({
+        title: "Explicit inheritance request",
+        projectId: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+        inheritExecutionWorkspaceFromIssueId: issueId,
+      });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(201);
+    expect(mockIssueService.create).toHaveBeenCalledWith(
+      companyId,
+      expect.objectContaining({
+        title: "Explicit inheritance request",
         inheritExecutionWorkspaceFromIssueId: issueId,
       }),
     );
