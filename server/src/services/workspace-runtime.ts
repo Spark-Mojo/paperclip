@@ -115,6 +115,10 @@ export interface RealizedExecutionWorkspace extends ExecutionWorkspaceInput {
   created: boolean;
   baseRefSha?: string | null;
   pendingForwardBranchReconcile?: PendingForwardBranchReconcile | null;
+  restoredFromOrigin?: boolean;
+  freshOffBaseRefFallback?: boolean;
+  dataLossSuspected?: boolean;
+  priorRecordedBaseRefSha?: string | null;
 }
 
 export class WorkspaceRuntimeValidationFailure extends Error {
@@ -721,6 +725,67 @@ async function remoteExists(repoRoot: string, remote: string): Promise<boolean> 
   return runGit(["remote", "get-url", remote], repoRoot)
     .then(() => true)
     .catch(() => false);
+}
+
+async function remoteTrackingBranchExists(
+  repoRoot: string,
+  remote: string,
+  branch: string,
+): Promise<boolean> {
+  return runGit(["show-ref", "--verify", "--quiet", `refs/remotes/${remote}/${branch}`], repoRoot)
+    .then(() => true)
+    .catch(() => false);
+}
+
+/**
+ * Refresh `refs/remotes/<remote>/<branch>` from origin so a persisted
+ * execution workspace that lost its local branch can be reattached to the
+ * origin-side tip instead of being silently recreated off the base ref.
+ *
+ * SPA-8870: returns the warnings list to surface in the run log (network /
+ * credential failures, masked credentials per `refreshRemoteTrackingBaseRef`)
+ * and a boolean indicating whether `origin/<branch>` is now resolvable.
+ * Never throws — caller's fallback path remains available if the fetch fails.
+ */
+export async function refreshRemoteTrackingBranch(
+  repoRoot: string,
+  remote: string,
+  branch: string,
+  resolveGitAuth?: GitRemoteAuthProvider | null,
+): Promise<{ warnings: string[]; originBranchExists: boolean }> {
+  if (!await remoteExists(repoRoot, remote)) {
+    return { warnings: [], originBranchExists: false };
+  }
+  const remoteUrl = await runGit(["remote", "get-url", remote], repoRoot)
+    .then((value) => value.trim() || null)
+    .catch(() => null);
+  if (!remoteUrl) {
+    return { warnings: [], originBranchExists: false };
+  }
+  const auth = resolveGitAuth ? await resolveGitAuth(remoteUrl).catch(() => null) : null;
+  const warnings: string[] = [];
+  try {
+    await runGit([
+      ...(auth?.configArgs ?? []),
+      "fetch",
+      "--prune",
+      remote,
+      `+refs/heads/${branch}:refs/remotes/${remote}/${branch}`,
+    ], repoRoot, auth ? { env: { ...process.env, ...auth.env } } : undefined);
+  } catch (error) {
+    const rawMessage = error instanceof Error ? error.message : String(error);
+    const message = rawMessage
+      .replace(/([a-z][a-z0-9+.-]*:\/\/)[^/@\s]+@/gi, "$1***@")
+      .replace(/([a-z][a-z0-9+.-]*:\/\/[^\s"'?]*)\?[^\s"']*/gi, "$1?***");
+    const authNote = auth
+      ? ` The fetch authenticated with ${auth.secretName ? `the ${auth.secretName} company-secret GitHub credential` : "the server-environment GitHub credential"}, which may have been rejected.`
+      : "";
+    warnings.push(
+      `Could not refresh ${remote}/${branch} before restoring the persisted execution workspace: ${message}${authNote}`,
+    );
+  }
+  const originBranchExists = await remoteTrackingBranchExists(repoRoot, remote, branch);
+  return { warnings, originBranchExists };
 }
 
 const GIT_WORKTREE_BRANCH_INCOHERENCE_REASON = "git_worktree_branch_incoherence";
@@ -3136,6 +3201,10 @@ export async function ensurePersistedExecutionWorkspaceAvailable(input: {
   const restoreCurrentBaseRefSha = restoreBaseRef ? await resolveBaseRefSha(repoRoot, restoreBaseRef) : null;
 
   let created = false;
+  let restoredFromOrigin = false;
+  let restoredFromOriginSha: string | null = null;
+  let freshOffBaseRefFallback = false;
+  let freshOffBaseRefPriorSha: string | null = null;
   try {
     await recordGitOperation(input.recorder, {
       phase: "worktree_prepare",
@@ -3161,25 +3230,90 @@ export async function ensurePersistedExecutionWorkspaceAvailable(input: {
     ) {
       throw error;
     }
-    const baseRef = input.workspace.baseRef ?? await detectDefaultBranch(repoRoot) ?? "HEAD";
-    const recreatedBaseRefSha = await resolveBaseRefSha(repoRoot, baseRef);
-    await recordGitOperation(input.recorder, {
-      phase: "worktree_prepare",
-      args: ["worktree", "add", "-b", branchName, worktreePath, baseRef],
-      cwd: repoRoot,
-      metadata: {
-        repoRoot,
-        worktreePath,
-        branchName,
-        baseRef,
-        baseRefSha: recreatedBaseRefSha,
-        created: true,
-        restored: true,
-      },
-      successMessage: `Recreated missing git worktree at ${worktreePath}\n`,
-      failureLabel: `git worktree add ${worktreePath}`,
-    });
-    created = true;
+    // SPA-8870: before silently recreating the branch off the base ref, check
+    // whether the branch still exists on origin. If it does, restore from
+    // origin/<branch> — a persisted execution workspace whose local branch
+    // was lost (e.g. host disk rotated, `git worktree prune` ran, local branch
+    // deleted manually) must not be replaced by a fresh branch off HEAD/main
+    // when the real tip is still on origin.
+    const { warnings: originFetchWarnings, originBranchExists } = await refreshRemoteTrackingBranch(
+      repoRoot,
+      "origin",
+      branchName,
+      input.resolveGitAuth,
+    );
+    if (originBranchExists) {
+      const originBranchRef = `origin/${branchName}`;
+      const originBranchSha = await resolveBaseRefSha(repoRoot, originBranchRef);
+      restoredFromOrigin = true;
+      restoredFromOriginSha = originBranchSha;
+      await recordGitOperation(input.recorder, {
+        phase: "worktree_prepare",
+        args: ["worktree", "add", "-b", branchName, worktreePath, originBranchRef],
+        cwd: repoRoot,
+        metadata: {
+          repoRoot,
+          worktreePath,
+          branchName,
+          baseRef: originBranchRef,
+          baseRefSha: originBranchSha,
+          created: true,
+          restored: true,
+          restoredFromOrigin: true,
+        },
+        successMessage: `Restored missing git worktree from origin at ${worktreePath} (${originBranchRef})\n`,
+        failureLabel: `git worktree add ${worktreePath}`,
+      });
+      created = true;
+      // Surface any fetch warnings collected while we ensured origin had the
+      // ref; the worktree itself landed cleanly but the operator should know
+      // the fetch was authenticated / network-noteworthy.
+      if (originFetchWarnings.length > 0) {
+        restoreRefreshWarnings.push(...originFetchWarnings);
+      }
+    } else {
+      const baseRef = input.workspace.baseRef ?? await detectDefaultBranch(repoRoot) ?? "HEAD";
+      const recreatedBaseRefSha = await resolveBaseRefSha(repoRoot, baseRef);
+      freshOffBaseRefFallback = true;
+      freshOffBaseRefPriorSha = recordedBaseRefSha;
+      await recordGitOperation(input.recorder, {
+        phase: "worktree_prepare",
+        args: ["worktree", "add", "-b", branchName, worktreePath, baseRef],
+        cwd: repoRoot,
+        metadata: {
+          repoRoot,
+          worktreePath,
+          branchName,
+          baseRef,
+          baseRefSha: recreatedBaseRefSha,
+          priorRecordedBaseRefSha: recordedBaseRefSha,
+          dataLossSuspected: true,
+          created: true,
+          restored: true,
+        },
+        successMessage: `Recreated missing git worktree at ${worktreePath}\n`,
+        failureLabel: `git worktree add ${worktreePath}`,
+      });
+      created = true;
+      if (originFetchWarnings.length > 0) {
+        restoreRefreshWarnings.push(...originFetchWarnings);
+      }
+      // SPA-8870: the fallback "fresh branch off baseRef" fires when the
+      // branch is gone from BOTH local AND origin (Dex SPA-8869 case C2).
+      // It is the only path that can silently lose work, and Dex's
+      // recommendation is to make it visible — a warning that surfaces in
+      // the run log AND on the workspace result so any downstream caller
+      // (agent run, board comment) sees the data-loss signal.
+      const priorShaText = recordedBaseRefSha
+        ? ` Prior recorded tip: ${recordedBaseRefSha}.`
+        : "";
+      const baseShaText = recreatedBaseRefSha
+        ? ` Fresh tip (off ${baseRef}): ${recreatedBaseRefSha}.`
+        : ` Fresh tip (off ${baseRef}): unresolved.`;
+      restoreRefreshWarnings.push(
+        `Execution workspace branch "${branchName}" was not found on local refs or origin/${branchName}; engine created a fresh branch off ${baseRef}. Any work only on a deleted/unpushed ${branchName} tip is lost — review the run log and consider restoring from a backup if the prior tip is recoverable.${priorShaText}${baseShaText}`,
+      );
+    }
   }
 
   const baseDrift = await inspectExecutionWorkspaceBaseDrift({
@@ -3214,8 +3348,19 @@ export async function ensurePersistedExecutionWorkspaceAvailable(input: {
     created,
     baseRefSha:
       recordedBaseRefSha
+      ?? (restoredFromOrigin ? restoredFromOriginSha : null)
       ?? (created ? restoreCurrentBaseRefSha : baseDrift.branchBaseRefSha)
       ?? baseDrift.currentBaseRefSha,
+    ...(restoredFromOrigin ? { restoredFromOrigin: true as const } : {}),
+    ...(freshOffBaseRefFallback
+      ? {
+          freshOffBaseRefFallback: true as const,
+          dataLossSuspected: true as const,
+          ...(freshOffBaseRefPriorSha
+            ? { priorRecordedBaseRefSha: freshOffBaseRefPriorSha }
+            : {}),
+        }
+      : {}),
   };
 }
 

@@ -2324,6 +2324,198 @@ describe("realizeExecutionWorkspace", () => {
     expect(actualHead).toBe(expectedHead);
   }, 15_000);
 
+  it("restores a missing persisted git worktree from origin when the local branch is gone (SPA-8870)", async () => {
+    const sourceRepo = await createTempRepo("master");
+    const remoteDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-origin-only-remote-"));
+    const remotePath = path.join(remoteDir, "paperclip.git");
+    await execFileAsync("git", ["clone", "--bare", sourceRepo, remotePath]);
+
+    const cloneRoot = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-origin-only-clone-"));
+    const repoRoot = path.join(cloneRoot, "paperclip");
+    await execFileAsync("git", ["clone", remotePath, repoRoot]);
+    await runGit(repoRoot, ["config", "user.email", "paperclip@example.com"]);
+    await runGit(repoRoot, ["config", "user.name", "Paperclip Test"]);
+
+    const branchName = "PAP-8870-restore-from-origin";
+    await runGit(repoRoot, ["checkout", "-b", branchName]);
+    await fs.writeFile(path.join(repoRoot, "origin-only-feature.txt"), "ship it\n", "utf8");
+    await runGit(repoRoot, ["add", "origin-only-feature.txt"]);
+    await runGit(repoRoot, ["commit", "-m", "Origin-only feature commit"]);
+    const originOnlyHead = (await execFileAsync("git", ["rev-parse", branchName], { cwd: repoRoot })).stdout.trim();
+    await runGit(repoRoot, ["push", "-u", "origin", branchName]);
+    await runGit(repoRoot, ["checkout", "master"]);
+
+    const initial = await realizeExecutionWorkspace({
+      base: {
+        baseCwd: repoRoot,
+        source: "project_primary",
+        projectId: "project-1",
+        workspaceId: "workspace-1",
+        repoUrl: null,
+        repoRef: "HEAD",
+      },
+      config: {
+        workspaceStrategy: {
+          type: "git_worktree",
+          branchTemplate: "{{issue.identifier}}-{{slug}}",
+        },
+      },
+      issue: {
+        id: "issue-8870",
+        identifier: "PAP-8870",
+        title: "Restore missing branch from origin",
+      },
+      agent: {
+        id: "agent-1",
+        name: "Codex Coder",
+        companyId: "company-1",
+      },
+    });
+
+    await fs.rm(initial.cwd, { recursive: true, force: true });
+    await runGit(repoRoot, ["update-ref", "-d", `refs/heads/${branchName}`]);
+    await runGit(repoRoot, ["update-ref", "-d", `refs/remotes/origin/${branchName}`]);
+    await runGit(repoRoot, ["worktree", "prune"]);
+
+    const restored = await ensurePersistedExecutionWorkspaceAvailable({
+      base: {
+        baseCwd: repoRoot,
+        source: "project_primary",
+        projectId: "project-1",
+        workspaceId: "workspace-1",
+        repoUrl: null,
+        repoRef: "HEAD",
+      },
+      workspace: {
+        mode: "isolated_workspace",
+        strategyType: "git_worktree",
+        cwd: initial.cwd,
+        providerRef: initial.worktreePath,
+        projectId: "project-1",
+        projectWorkspaceId: "workspace-1",
+        repoUrl: null,
+        baseRef: "HEAD",
+        branchName,
+      },
+      issue: {
+        id: "issue-8870",
+        identifier: "PAP-8870",
+        title: "Restore missing branch from origin",
+      },
+      agent: {
+        id: "agent-1",
+        name: "Codex Coder",
+        companyId: "company-1",
+      },
+    });
+
+    expect(restored).not.toBeNull();
+    expect(restored?.cwd).toBe(initial.cwd);
+    expect(restored?.restoredFromOrigin).toBe(true);
+    expect(restored?.baseRefSha).toBe(originOnlyHead);
+    const restoredBranch = (await execFileAsync("git", ["rev-parse", "--abbrev-ref", "HEAD"], { cwd: initial.cwd })).stdout.trim();
+    expect(restoredBranch).toBe(branchName);
+    const restoredHead = (await execFileAsync("git", ["rev-parse", "HEAD"], { cwd: initial.cwd })).stdout.trim();
+    expect(restoredHead).toBe(originOnlyHead);
+    await expect(fs.readFile(path.join(initial.cwd, "origin-only-feature.txt"), "utf8")).resolves.toBe("ship it\n");
+  }, 20_000);
+
+  it("surfaces a visible data-loss warning when a persisted branch is gone from BOTH local and origin (SPA-8870 / SPA-8869 case C2)", async () => {
+    const sourceRepo = await createTempRepo("master");
+    const remoteDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-data-loss-remote-"));
+    const remotePath = path.join(remoteDir, "paperclip.git");
+    await execFileAsync("git", ["clone", "--bare", sourceRepo, remotePath]);
+
+    const cloneRoot = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-data-loss-clone-"));
+    const repoRoot = path.join(cloneRoot, "paperclip");
+    await execFileAsync("git", ["clone", remotePath, repoRoot]);
+    await runGit(repoRoot, ["config", "user.email", "paperclip@example.com"]);
+    await runGit(repoRoot, ["config", "user.name", "Paperclip Test"]);
+
+    const branchName = "PAP-8870-data-loss-fallback";
+    await runGit(repoRoot, ["checkout", "-b", branchName]);
+    await fs.writeFile(path.join(repoRoot, "data-loss-feature.txt"), "doomed\n", "utf8");
+    await runGit(repoRoot, ["add", "data-loss-feature.txt"]);
+    await runGit(repoRoot, ["commit", "-m", "Data-loss feature commit"]);
+    const priorTip = (await execFileAsync("git", ["rev-parse", branchName], { cwd: repoRoot })).stdout.trim();
+    await runGit(repoRoot, ["checkout", "master"]);
+
+    const initial = await realizeExecutionWorkspace({
+      base: {
+        baseCwd: repoRoot,
+        source: "project_primary",
+        projectId: "project-1",
+        workspaceId: "workspace-1",
+        repoUrl: null,
+        repoRef: "HEAD",
+      },
+      config: {
+        workspaceStrategy: {
+          type: "git_worktree",
+          branchTemplate: "{{issue.identifier}}-{{slug}}",
+        },
+      },
+      issue: {
+        id: "issue-8870-c2",
+        identifier: "PAP-8870-C2",
+        title: "Data-loss fallback visibility",
+      },
+      agent: {
+        id: "agent-1",
+        name: "Codex Coder",
+        companyId: "company-1",
+      },
+    });
+
+    await fs.rm(initial.cwd, { recursive: true, force: true });
+    await runGit(repoRoot, ["update-ref", "-d", `refs/heads/${branchName}`]);
+    await runGit(repoRoot, ["update-ref", "-d", `refs/remotes/origin/${branchName}`]);
+    await runGit(repoRoot, ["worktree", "prune"]);
+
+    const restored = await ensurePersistedExecutionWorkspaceAvailable({
+      base: {
+        baseCwd: repoRoot,
+        source: "project_primary",
+        projectId: "project-1",
+        workspaceId: "workspace-1",
+        repoUrl: null,
+        repoRef: "HEAD",
+      },
+      workspace: {
+        mode: "isolated_workspace",
+        strategyType: "git_worktree",
+        cwd: initial.cwd,
+        providerRef: initial.worktreePath,
+        projectId: "project-1",
+        projectWorkspaceId: "workspace-1",
+        repoUrl: null,
+        baseRef: "HEAD",
+        branchName,
+      },
+      issue: {
+        id: "issue-8870-c2",
+        identifier: "PAP-8870-C2",
+        title: "Data-loss fallback visibility",
+      },
+      agent: {
+        id: "agent-1",
+        name: "Codex Coder",
+        companyId: "company-1",
+      },
+    });
+
+    expect(restored).not.toBeNull();
+    expect(restored?.restoredFromOrigin).toBeFalsy();
+    expect(restored?.freshOffBaseRefFallback).toBe(true);
+    expect(restored?.dataLossSuspected).toBe(true);
+    expect(restored?.warnings.some((w) => w.includes("DATA LOSS") || w.includes("created a fresh branch off"))).toBe(true);
+    expect(restored?.warnings.some((w) => w.includes(branchName))).toBe(true);
+    const newTip = (await execFileAsync("git", ["rev-parse", "HEAD"], { cwd: initial.cwd })).stdout.trim();
+    expect(newTip).not.toBe(priorTip);
+    const newBranch = (await execFileAsync("git", ["rev-parse", "--abbrev-ref", "HEAD"], { cwd: initial.cwd })).stdout.trim();
+    expect(newBranch).toBe(branchName);
+  }, 20_000);
+
   it("repairs a clean persisted git worktree branch mismatch when both branches point at the same commit", async () => {
     const repoRoot = await createTempRepo();
     const expectedBranch = "PAP-454-repair-clean-branch-mismatch";
