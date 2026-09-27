@@ -348,6 +348,16 @@ import {
 const MAX_ISSUE_COMMENT_LIMIT = 500;
 const updateIssueRouteSchema = updateIssueSchema.extend({
   interrupt: z.boolean().optional(),
+  /**
+   * SPA-8957: explicit override of the unmerged-PR done gate. Requires a
+   * reason; only user/board actors may supply it (enforced in the route —
+   * an agent PATCH carrying it is 403, so an agent can never silently
+   * force a card past its unmerged PR). The override is recorded as an
+   * `issue.done_gate_overridden` activity row on the card.
+   */
+  doneOverride: z.object({
+    reason: z.string().trim().min(1).max(2_000),
+  }).strict().optional(),
 });
 const queuedCommentMutationTargetSchema = z.object({
   queueId: z.string().min(1),
@@ -9383,6 +9393,25 @@ export function issueRoutes(
             ...updateFields,
             actorAgentId: actor.agentId ?? null,
             actorUserId: actor.actorType === "user" ? actor.actorId : null,
+            // SPA-8957: resolving a recovery action as restored→done IS the
+            // human override — the recovery verdict ("this card's work is
+            // complete despite the open PR", e.g. a false-positive recovery
+            // that retires an abandoned PR) is the recorded reason. Board-only
+            // outcomes (false_positive/cancelled) already assertBoard above;
+            // restored keeps the agent's authority confined to its own issue.
+            ...(sourceIssueStatus === "done"
+              ? {
+                doneGateOverride: {
+                  reason: resolutionNote?.trim()
+                    ? `Recovery action resolved (${outcome}): ${resolutionNote.trim()}`
+                    : `Recovery action resolved (${outcome}).`,
+                  actorType: actor.actorType,
+                  actorId: actor.actorId,
+                  agentId: actor.agentId ?? null,
+                  runId: actor.runId ?? null,
+                },
+              }
+              : {}),
           };
           const updatedIssue =
             sourceIssueStatus === "done" || sourceIssueStatus === "cancelled"
@@ -12759,8 +12788,17 @@ export function issueRoutes(
         deferWakeForGoal,
         hiddenAt: hiddenAtRaw,
         onBehalfOfUserId: _requestedOnBehalfOfUserId,
+        doneOverride: doneOverrideRequested,
         ...updateFields
       } = req.body;
+      // SPA-8957: an agent may never supply the done-gate override — a card
+      // whose PR is unmerged closes only by merge or by a human decision.
+      if (doneOverrideRequested && req.actor.type === "agent") {
+        res.status(403).json({
+          error: "Agents cannot override the unmerged-pull-request done gate; the merge or a board user must close this card",
+        });
+        return;
+      }
       if (existing.conversationAgentId && req.actor.type === "board" && commentBody) {
         throw unprocessable("Send conversation messages through the comments endpoint with a clientRequestId");
       }
@@ -13477,6 +13515,19 @@ export function issueRoutes(
         ...updateFields,
         actorAgentId: actor.agentId ?? null,
         actorUserId: actor.actorType === "user" ? actor.actorId : null,
+        // SPA-8957: route-minted override reaches the service only for
+        // user/board actors (agents were rejected above).
+        ...(doneOverrideRequested
+          ? {
+            doneGateOverride: {
+              reason: doneOverrideRequested.reason,
+              actorType: actor.actorType,
+              actorId: actor.actorId,
+              agentId: actor.agentId ?? null,
+              runId: actor.runId ?? null,
+            },
+          }
+          : {}),
       };
       const shouldCollectCompletionPublication =
         actor.actorType === "user" &&
