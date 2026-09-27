@@ -1,0 +1,2 @@
+-- paperclip:migration-safety-ignore large-create-index-not-concurrently: Drizzle migrations run transactionally, so CONCURRENTLY is unavailable and this partial index atomically bounds C1 across workers and restarts. Skipped requests do not consume a continuation.
+CREATE UNIQUE INDEX "agent_wakeup_requests_handoff_bounded_continuation_uq" ON "agent_wakeup_requests" USING btree ("company_id","agent_id","idempotency_key") WHERE "agent_wakeup_requests"."idempotency_key" LIKE 'handoff_bounded_continuation:%' AND "agent_wakeup_requests"."status" <> 'skipped';

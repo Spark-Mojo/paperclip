@@ -1,13 +1,53 @@
 #!/usr/bin/env node
 
 import { execFileSync } from "node:child_process";
-import { cpSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { cpSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const repoRoot = resolve(fileURLToPath(new URL("..", import.meta.url)));
 
-export function materializePublishManifest(pkg) {
+function readWorkspaceVersions(startDir) {
+  // Map every workspace package name to its real version. workspace:* deps must
+  // resolve to the DEPENDENCY's version, not the parent's: @paperclipai/plugin-sdk
+  // is 1.0.0 while the rest of the workspace is 0.3.1, so rewriting to the parent
+  // version produced an unresolvable @paperclipai/plugin-sdk@0.3.1.
+  const versions = new Map();
+  let dir = startDir;
+  for (let depth = 0; depth < 6; depth += 1) {
+    const workspaceFile = resolve(dir, "pnpm-workspace.yaml");
+    if (existsSync(workspaceFile)) {
+      const globs = readFileSync(workspaceFile, "utf8")
+        .split("\n")
+        .map((line) => line.match(/^\s*-\s*["']?([^"'#]+?)["']?\s*$/))
+        .filter(Boolean)
+        .map((match) => match[1].trim());
+      for (const glob of globs) {
+        const base = glob.replace(/\/\*+$/, "");
+        const baseDir = resolve(dir, base);
+        if (!existsSync(baseDir)) continue;
+        const candidates = glob.includes("*")
+          ? readdirSync(baseDir, { withFileTypes: true }).filter((e) => e.isDirectory()).map((e) => resolve(baseDir, e.name))
+          : [baseDir];
+        for (const candidate of candidates) {
+          const manifestPath = resolve(candidate, "package.json");
+          if (!existsSync(manifestPath)) continue;
+          try {
+            const manifest = JSON.parse(readFileSync(manifestPath, "utf8"));
+            if (manifest.name && manifest.version) versions.set(manifest.name, manifest.version);
+          } catch {}
+        }
+      }
+      break;
+    }
+    const parent = resolve(dir, "..");
+    if (parent === dir) break;
+    dir = parent;
+  }
+  return versions;
+}
+
+export function materializePublishManifest(pkg, workspaceVersions) {
   const publishConfig = pkg.publishConfig ?? {};
   const publishManifest = { ...pkg };
 
@@ -22,18 +62,31 @@ export function materializePublishManifest(pkg) {
         if (typeof specifier !== "string" || !specifier.startsWith("workspace:")) return [name, specifier];
         const range = specifier.slice("workspace:".length);
         const prefix = range === "^" || range === "~" ? range : "";
-        return [name, `${prefix}${pkg.version}`];
+        const resolvedVersion = workspaceVersions?.get(name) ?? pkg.version;
+        return [name, `${prefix}${resolvedVersion}`];
       }),
     );
   }
 
   delete publishManifest.publishConfig;
+  // The staged directory is not a workspace and its artifacts are already built,
+  // so build lifecycle scripts must not re-run there: npm pack would invoke
+  // prepack (prepare:ui-dist && build) and fail to resolve workspace: deps.
+  if (publishManifest.scripts) {
+    const stagedScripts = { ...publishManifest.scripts };
+    for (const lifecycle of ["prepack", "postpack", "prepare", "prepublishOnly"]) {
+      delete stagedScripts[lifecycle];
+    }
+    publishManifest.scripts = stagedScripts;
+  }
   return publishManifest;
 }
 
 export function createBundledInstallManifest(publishManifest, bundledDependencies) {
   const bundledDependencyNames = new Set(bundledDependencies);
   const installManifest = structuredClone(publishManifest);
+
+  delete installManifest.devDependencies;
 
   for (const section of ["dependencies", "optionalDependencies", "peerDependencies"]) {
     if (!installManifest[section]) continue;
@@ -48,30 +101,93 @@ export function createBundledInstallManifest(publishManifest, bundledDependencie
 
 function patchedDependencyPackageName(specifier) {
   const versionSeparator = specifier.lastIndexOf("@");
-  return versionSeparator > 0 ? specifier.slice(0, versionSeparator) : specifier;
+  const packageNameEnd = specifier.startsWith("@") ? specifier.indexOf("/") : 0;
+  if (packageNameEnd < 0) return specifier;
+  return versionSeparator > packageNameEnd ? specifier.slice(0, versionSeparator) : specifier;
 }
 
-export function applyBundledDependencyPatches(destinationDir, bundledDependencies) {
-  const rootPackage = JSON.parse(readFileSync(resolve(repoRoot, "package.json"), "utf8"));
-  const patchedDependencies = rootPackage.pnpm?.patchedDependencies ?? {};
-  const bundledDependencyNames = new Set(bundledDependencies);
-
+export function selectBundledDependencyPatches(
+  destinationDir,
+  bundledDependencies,
+  patchedDependencies,
+) {
+  const patchesByPackageName = new Map();
   for (const [specifier, patchPath] of Object.entries(patchedDependencies)) {
     const packageName = patchedDependencyPackageName(specifier);
-    if (!bundledDependencyNames.has(packageName)) continue;
+    const packagePatches = patchesByPackageName.get(packageName) ?? new Map();
+    packagePatches.set(specifier, patchPath);
+    patchesByPackageName.set(packageName, packagePatches);
+  }
 
+  const selectedPatches = [];
+  for (const packageName of new Set(bundledDependencies)) {
+    const packagePatches = patchesByPackageName.get(packageName);
+    if (!packagePatches) continue;
+
+    const installedManifestPath = resolve(
+      destinationDir,
+      "node_modules",
+      packageName,
+      "package.json",
+    );
+    let installedManifest;
+    try {
+      installedManifest = JSON.parse(readFileSync(installedManifestPath, "utf8"));
+    } catch (cause) {
+      throw new Error(
+        `Cannot select a patch for bundled dependency ${packageName}: failed to read ${installedManifestPath}`,
+        { cause },
+      );
+    }
+
+    if (
+      installedManifest.name !== packageName ||
+      typeof installedManifest.version !== "string" ||
+      installedManifest.version.length === 0
+    ) {
+      throw new Error(
+        `Cannot select a patch for bundled dependency ${packageName}: installed package manifest must declare the expected name and a version`,
+      );
+    }
+
+    const installedSpecifier = `${packageName}@${installedManifest.version}`;
+    const patchPath = packagePatches.get(installedSpecifier);
+    if (patchPath === undefined) {
+      const configuredSpecifiers = [...packagePatches.keys()].sort().join(", ");
+      throw new Error(
+        `Cannot select a patch for bundled dependency ${packageName}: installed ${installedSpecifier}, but configured patches are ${configuredSpecifiers}`,
+      );
+    }
+    if (typeof patchPath !== "string" || patchPath.length === 0) {
+      throw new Error(`Patch path for ${installedSpecifier} must be a non-empty string`);
+    }
+    selectedPatches.push({ packageName, specifier: installedSpecifier, patchPath });
+  }
+
+  return selectedPatches;
+}
+
+export function applyBundledDependencyPatches(destinationDir, bundledDependencies, sourceRoot = repoRoot) {
+  const rootPackage = JSON.parse(readFileSync(resolve(sourceRoot, "package.json"), "utf8"));
+  const patchedDependencies = rootPackage.pnpm?.patchedDependencies ?? {};
+
+  for (const { packageName, patchPath } of selectBundledDependencyPatches(
+    destinationDir,
+    bundledDependencies,
+    patchedDependencies,
+  )) {
     execFileSync(
       "patch",
       ["-p1", "--forward", "-d", resolve(destinationDir, "node_modules", packageName)],
       {
-        input: readFileSync(resolve(repoRoot, patchPath)),
+        input: readFileSync(resolve(sourceRoot, patchPath)),
         stdio: ["pipe", "inherit", "inherit"],
       },
     );
   }
 }
 
-export function prepareBundledPackage(sourceDir, destinationDir) {
+export function prepareBundledPackage(sourceDir, destinationDir, { sourceRoot = repoRoot } = {}) {
   const sourcePackagePath = resolve(sourceDir, "package.json");
   const sourcePackage = JSON.parse(readFileSync(sourcePackagePath, "utf8"));
   const bundledDependencies = sourcePackage.bundleDependencies ?? sourcePackage.bundledDependencies ?? [];
@@ -83,7 +199,12 @@ export function prepareBundledPackage(sourceDir, destinationDir) {
   rmSync(destinationDir, { recursive: true, force: true });
   mkdirSync(destinationDir, { recursive: true });
   for (const entry of sourcePackage.files ?? []) {
-    cpSync(resolve(sourceDir, entry), resolve(destinationDir, entry), { recursive: true });
+    const entrySource = resolve(sourceDir, entry);
+    // Publish-only artifacts (server/skills, and ui-dist on a git checkout) do not
+    // exist in a plain source tree. Skip them the same way README/LICENSE are
+    // skipped below, instead of throwing ENOENT and failing the whole install.
+    if (!existsSync(entrySource)) continue;
+    cpSync(entrySource, resolve(destinationDir, entry), { recursive: true });
   }
   for (const entry of ["README.md", "LICENSE", "LICENSE.md"]) {
     const sourcePath = resolve(sourceDir, entry);
@@ -91,7 +212,7 @@ export function prepareBundledPackage(sourceDir, destinationDir) {
   }
 
   const deployedPackagePath = resolve(destinationDir, "package.json");
-  const publishManifest = materializePublishManifest(sourcePackage);
+  const publishManifest = materializePublishManifest(sourcePackage, readWorkspaceVersions(sourceDir));
   const installManifest = createBundledInstallManifest(publishManifest, bundledDependencies);
   writeFileSync(deployedPackagePath, `${JSON.stringify(installManifest, null, 2)}\n`);
 
@@ -101,15 +222,25 @@ export function prepareBundledPackage(sourceDir, destinationDir) {
     { cwd: destinationDir, stdio: "inherit" },
   );
   writeFileSync(deployedPackagePath, `${JSON.stringify(publishManifest, null, 2)}\n`);
-  applyBundledDependencyPatches(destinationDir, bundledDependencies);
+  applyBundledDependencyPatches(destinationDir, bundledDependencies, sourceRoot);
 
-  if (
-    bundledDependencies.includes("acpx") &&
-    !readFileSync(resolve(destinationDir, "node_modules/acpx/dist/runtime.js"), "utf8").includes(
-      "onAgentStderr",
-    )
-  ) {
-    throw new Error("staged acpx runtime is missing the repository patch");
+  if (bundledDependencies.includes("acpx")) {
+    const acpxPackage = JSON.parse(
+      readFileSync(resolve(destinationDir, "node_modules/acpx/package.json"), "utf8"),
+    );
+    const expectedPatchMarker = {
+      "0.12.0": "onAgentStderr",
+      "0.13.1": "spawnEnvironment",
+    }[acpxPackage.version];
+    const acpxRuntime = readFileSync(
+      resolve(destinationDir, "node_modules/acpx/dist/runtime.js"),
+      "utf8",
+    );
+    if (!expectedPatchMarker || !acpxRuntime.includes(expectedPatchMarker)) {
+      throw new Error(
+        `staged acpx@${acpxPackage.version} runtime is missing the repository patch`,
+      );
+    }
   }
 
   if (bundledDependencies.includes("embedded-postgres")) {

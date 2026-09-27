@@ -9,7 +9,7 @@ export interface IssueReviewVerdictActor {
   id: string;
 }
 
-interface IssueReviewRequester extends IssueReviewVerdictActor {
+export interface IssueReviewRequester extends IssueReviewVerdictActor {
   reviewInteractionId: string | null;
 }
 
@@ -21,7 +21,7 @@ interface ReviewPolicyIssue {
   createdByUserId?: string | null;
 }
 
-async function findReviewRequester(
+export async function resolveIssueReviewRequester(
   db: Db,
   issue: ReviewPolicyIssue,
 ): Promise<IssueReviewRequester | null> {
@@ -81,8 +81,18 @@ export async function isIssueReviewVerdictInteraction(
     };
   },
 ): Promise<boolean> {
-  const requester = await findReviewRequester(db, input.issue);
-  if (!requester?.reviewInteractionId || requester.reviewInteractionId !== input.interaction.id) return false;
+  const requester = await resolveIssueReviewRequester(db, input.issue);
+  if (!requester) return false;
+  if (requester.reviewInteractionId && requester.reviewInteractionId !== input.interaction.id) return false;
+  // Older review transitions did not persist the interaction binding. In that
+  // case, an unattributed confirmation is ambiguous and must fail closed.
+  // Confirmations attributed to an unrelated writer remain independently
+  // resolvable, while requester-created confirmations inherit the issue policy.
+  if (!requester.reviewInteractionId
+    && !input.interaction.createdByAgentId
+    && !input.interaction.createdByUserId) {
+    return true;
+  }
   return requester.type === "agent"
     ? input.interaction.createdByAgentId === requester.id
     : input.interaction.createdByUserId === requester.id;
@@ -107,12 +117,12 @@ export async function assertIssueReviewVerdictActorAllowed(
         code: "review_policy_denied",
         policy,
         allowedActor: "authenticated_user_with_issue_write_access",
-        remediation: "Have an authenticated user with issue write access submit the verdict, or change reviewPolicy to `anyone`.",
+        remediation: "Have an authenticated user with issue write access submit the verdict.",
       },
     );
   }
 
-  const requester = await findReviewRequester(db, input.issue);
+  const requester = await resolveIssueReviewRequester(db, input.issue);
   if (!requester) {
     throw forbidden(
       "Review policy `not_creator` requires a different writer, but the review requester could not be determined.",
@@ -120,7 +130,7 @@ export async function assertIssueReviewVerdictActorAllowed(
         code: "review_policy_denied",
         policy,
         allowedActor: "writer_other_than_review_requester",
-        remediation: "Change reviewPolicy to `anyone`, or move the issue out of and back into `in_review` to record a requester before another writer submits the verdict.",
+        remediation: "Move the issue out of and back into `in_review` to record a requester before another writer submits the verdict.",
       },
     );
   }
@@ -132,7 +142,7 @@ export async function assertIssueReviewVerdictActorAllowed(
       code: "review_policy_denied",
       policy,
       allowedActor: "writer_other_than_review_requester",
-      remediation: "Have another writer with issue write access submit the verdict, or change reviewPolicy to `anyone`.",
+      remediation: "Have another writer with issue write access submit the verdict.",
     },
   );
 }

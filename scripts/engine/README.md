@@ -18,14 +18,15 @@ single-active-install self-updater does not do.
 |---|---|---|
 | Versioned install prefix | `$ENGINE_ROOT/paperclip-<version>` (npm source) or `paperclip-fork-<sha12>` (fork source) | this script's own convention |
 | Active-version symlink | `$ENGINE_ROOT/paperclip-current` | this script's own convention |
-| Paperclip home / instance state | `$PAPERCLIP_HOME` = `$ENGINE_ROOT/.paperclip-831` | `PAPERCLIP_HOME` env var, `packages/shared/src/home-paths.ts` `resolvePaperclipHomeDir()` |
+| Engine label | `$ENGINE_LABEL` = `831` | `ENGINE_LABEL` env var, `lib.sh` — the one knob `PAPERCLIP_HOME`/`UNIT_NAME`/`EXPECTED_DB` all derive from; override it (and, if the unit file differs, `UNIT_NAME`) to point these scripts at a different engine line without editing `lib.sh` |
+| Paperclip home / instance state | `$PAPERCLIP_HOME` = `$ENGINE_ROOT/.paperclip-$ENGINE_LABEL` | `PAPERCLIP_HOME` env var, `packages/shared/src/home-paths.ts` `resolvePaperclipHomeDir()` |
 | Instance root (config, db info, logs, secrets) | `$PAPERCLIP_HOME/instances/$PAPERCLIP_INSTANCE_ID/` | `resolvePaperclipInstanceRoot()`, same file |
 | Instance config | `.../config.json` | `resolvePaperclipConfigPathForInstance()` |
 | Postgres connection | `config.database.connectionString` (mode must be `"postgres"`) | `packages/shared/src/config-schema.ts` `databaseConfigSchema` |
 | HTTP port | `config.server.port` (default 3100 in schema; bigbox uses 3101 — set in the instance's config.json, not by these scripts) | same file, `serverConfigSchema` |
 | Health endpoint | `GET http://<server.host>:<server.port>/api/health` | `server/src/app.ts` (`api.use("/health", healthRoutes(...))` mounted under `app.use("/api", api)`), `cli/src/utils/health-url.ts` |
 | Migration table | `"drizzle"."__drizzle_migrations"` | `packages/db/src/client.ts` |
-| systemd unit | `~/.config/systemd/user/paperclip-831.service`, `ExecStart="$CURRENT_LINK/bin/paperclipai" run --instance "$PAPERCLIP_INSTANCE_ID"` | `scripts/engine/systemd/paperclip-831.service`, modeled on `cli/src/services/service-manager.ts` `renderSystemdUnit()` |
+| systemd unit | `~/.config/systemd/user/$UNIT_NAME` (default `paperclip-831.service`), `ExecStart="$CURRENT_LINK/bin/paperclipai" run --instance "$PAPERCLIP_INSTANCE_ID"` | `scripts/engine/systemd/paperclip-831.service`, modeled on `cli/src/services/service-manager.ts` `renderSystemdUnit()` — this checked-in unit filename stays literal per engine line by convention and is not renamed by `$ENGINE_LABEL`; a later line ships its own unit file and sets `UNIT_NAME` to match |
 
 **ASSUMPTION, not verified against bigbox:** the handoff described the
 instance dir as literally `/home/jamesilsley/.paperclip-831`. The real CLI
@@ -127,24 +128,6 @@ top of `lib.sh` (`ENGINE_ROOT`, `PAPERCLIP_HOME`, `PAPERCLIP_INSTANCE_ID`,
    symlink back to the previous prefix, restarts, and waits for health
    again. Exits non-zero either way (success only means the rollback itself
    worked; the install still failed).
-9. **Pointer safety (SPA-7564, root cause of the SPA-7223 incident):** the
-   live `paperclip-current` pointer is guarded by a trap-based restore on
-   every exit path. A **dry-run always restores the pointer to its
-   pre-install target before exiting — including on success** — so a dry-run
-   never leaves the live pointer moved (on 2026-09-14 a dry-run left the
-   pointer on a stub overlay, the real install that followed died in
-   preflight and restored nothing, and any engine restart during that window
-   would have crash-looped the board). A real install keeps the pointer on
-   the new prefix only after health passes; any failure after the flip —
-   explicit rollback, unexpected `set -e` death, or an interrupt
-   (INT/TERM/HUP) — restores the previous target and restarts the unit on
-   it, logging loudly if that restart fails. **Known residual (accepted
-   scope):** the guard cannot catch `SIGKILL`/OOM/power-loss — a dry-run
-   killed exactly inside its multi-second flip-to-restore window could still
-   leave the pointer on the stub. That window is bounded by the run itself
-   (SPA-7223's harm came from the unbounded post-exit window this fix
-   closes); a dry-run that ends in any orderly way always leaves the pointer
-   exactly where it found it.
 
 ## Rollback semantics — read this before running `rollback.sh`
 
@@ -199,15 +182,11 @@ Runs `install.sh` / `rollback.sh` under `PAPERCLIP_ENGINE_DRY_RUN=1` in an
 isolated sandbox root (`ENGINE_ROOT` pointed at a temp dir, stub
 `systemctl`/`pg_dump`/`pg_restore`/`psql` on `PATH` that log invocations
 instead of touching real infrastructure, and a real local HTTP server acting
-as the fake `/api/health` endpoint). It asserts: the symlink flip happens
-during the run and the pointer is **restored to its pre-install target when
-the dry-run ends, on every exit path** (SPA-7564: success, failed health
-check with automatic rollback, and an injected unexpected death after the
-flip — tests 25-28 also cover real-mode `DRY_RUN=0` installs with stubbed
-`systemctl`/`npm`/`pg_dump`); a failed health check triggers an automatic
-rollback to the previous prefix with a non-zero exit code; and `rollback.sh`
-with no argument reads the recorded previous-prefix state file and flips
-back to it, restarting and passing health.
+as the fake `/api/health` endpoint). It asserts: the symlink is created and
+points at the new prefix; a failed health check triggers an automatic
+rollback of the symlink to the previous prefix with a non-zero exit code; and
+`rollback.sh` with no argument reads the recorded previous-prefix state file
+and flips back to it, restarting and passing health.
 
 No step in the test touches bigbox, npmjs.org, or GitHub, and no step touches
 the laptop's real Paperclip install.
