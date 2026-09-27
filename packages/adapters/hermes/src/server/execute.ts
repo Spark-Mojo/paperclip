@@ -439,9 +439,25 @@ export async function execute(
   }
 
   // ── Build command args ─────────────────────────────────────────────────
-  // Use -Q (quiet) to get clean output: just response + session_id line
+  // Use -Q (quiet) to get clean output: just response + session_id line.
+  //
+  // SPA-8967: stop putting the prompt in argv. A card whose comment
+  // history passes ~117KB used to fail spawn with E2BIG (Linux
+  // posix_spawn enforces ARG_MAX; the run never started). The durable
+  // fix is the engine's promptFileBody handoff
+  // (see `runChildProcess` / `runAdapterExecutionTargetProcess` option
+  // `promptFileBody`). The engine wires two transports so neither adapter
+  // nor CLI flag work is required to pick the prompt up:
+  //   1. writes the body to a run-owned path under PAPERCLIP_PROMPTS_DIR
+  //      and exposes it via PAPERCLIP_RUN_PROMPT_FILE — so any future
+  //      adapter with a `--prompt-file <path>` CLI flag can adopt it; and
+  //   2. pipes the body onto the child's stdin (sourced from
+  //      promptFileBody when no explicit `stdin` is passed) — so Hermes's
+  //      existing `chat -q -` stdin-placeholder convention picks it up.
+  // Hermes's CLI accepts `-` as the prompt slot and reads stdin, so we
+  // point the slot at `-` and let the engine handle both transports.
   const useQuiet = cfgBoolean(config.quiet) === true; // default false
-  const args: string[] = ["chat", "-q", prompt];
+  const args: string[] = ["chat", "-q", "-"];
   if (useQuiet) args.push("-Q");
 
   if (model) {
@@ -560,6 +576,15 @@ export async function execute(
   const result = await runChildProcess(ctx.runId, hermesCmd, args, {
     cwd,
     env,
+    // SPA-8967: hand the prompt body to the engine via promptFileBody.
+    // runChildProcess does two things with it: writes it to a run-owned
+    // path under PAPERCLIP_PROMPTS_DIR, sets PAPERCLIP_RUN_PROMPT_FILE on
+    // the child env (so a future `--prompt-file <path>` adapter can adopt
+    // it), AND pipes the body onto the child's stdin (so the existing
+    // `chat -q -` stdin-placeholder convention picks it up). Either
+    // transport on its own ends the SPA-8607 / SPA-8898 E2BIG class;
+    // running both keeps every live adapter's transport contract intact.
+    promptFileBody: prompt,
     timeoutSec,
     graceSec,
     onLog: wrappedOnLog,

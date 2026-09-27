@@ -204,4 +204,62 @@ describe("hermes-local adapter onSpawn forwarding", () => {
       else process.env.PAPERCLIP_API_KEY = previousApiKey;
     }
   });
+
+  // SPA-8967: hermes used to put the assembled prompt in argv, which on
+  // Linux fails spawn with E2BIG once the prompt passes ~128KB. The fix
+  // hands the prompt via runChildProcess's promptFileBody option. The
+  // engine writes the body to a run-owned file (so any future adapter
+  // that grows a `--prompt-file <path>` flag can adopt it) AND pipes the
+  // body on stdin (so hermes CLI's existing `chat -q -` stdin placeholder
+  // picks it up). The body must NEVER ride in argv.
+  it("forwards the assembled prompt via promptFileBody and never via argv (SPA-8967)", async () => {
+    vi.mocked(serverUtils.runChildProcess).mockResolvedValueOnce({
+      exitCode: 0,
+      signal: null,
+      timedOut: false,
+      stdout: "",
+      stderr: "",
+      pid: null,
+      startedAt: null,
+    });
+
+    const { ctx } = makeCtx();
+    try {
+      await execute(ctx as any);
+    } catch {
+      // ignore — we only care about the runChildProcess call shape
+    }
+
+    const mocked = vi.mocked(serverUtils.runChildProcess);
+    const lastCall = mocked.mock.calls[mocked.mock.calls.length - 1];
+    const cmd = lastCall[1];
+    const args = lastCall[2] as string[];
+    const opts = lastCall[3] as {
+      promptFileBody?: string;
+      stdin?: string;
+    };
+
+    // Args must point at the stdin placeholder, never at a real prompt body.
+    // A regression to the old shape would show the prompt itself appearing
+    // somewhere in `args`, which is exactly the argv E2BIG site.
+    expect(cmd).toBe("hermes");
+    expect(args[0]).toBe("chat");
+    expect(args[1]).toBe("-q");
+    expect(args[2]).toBe("-"); // stdin placeholder, NOT a prompt body
+    // No element of args may be a real prompt body. The adapter's job is to
+    // move large bodies off argv; doing the migration but leaving a copy in
+    // args would defeat the entire fix.
+    for (const value of args) {
+      if (typeof value !== "string") continue;
+      expect(value.length).toBeLessThan(1024);
+    }
+    // Hermes must hand the body via the engine's promptFileBody option.
+    // The engine wires both transports (file path in env, body on stdin);
+    // neither adapter code nor any CLI flag support outside the engine is
+    // required for the prompt to reach hermes. Stdin is intentionally NOT
+    // set by the adapter — the engine derives it from promptFileBody.
+    expect(typeof opts.promptFileBody).toBe("string");
+    expect((opts.promptFileBody as string).length).toBeGreaterThan(0);
+    expect(opts.stdin).toBeUndefined();
+  });
 });

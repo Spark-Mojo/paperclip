@@ -274,6 +274,19 @@ export interface AdapterExecutionTargetProcessOptions {
   cwd: string;
   env: Record<string, string>;
   stdin?: string;
+  /**
+   * Optional run-prompt body to hand the child by FILE rather than by
+   * stdin/argv. When set, the local-Node lane writes the body to a run-owned
+   * path under PAPERCLIP_PROMPTS_DIR (default os.tmpdir()/paperclip-prompts),
+   * exposes it via opts.promptFilePathEnvName (default PAPERCLIP_RUN_PROMPT_FILE)
+   * in the spawned env, and leaves the child's stdin ignored. Sandbox lane
+   * passthrough is wired today only for local proxy runs (the durable site of
+   * SPA-8607/SPA-8898 E2BIG was a local spawn); sandbox targets continue to
+   * receive the body over stdin (sandbox runners handle up to ~96MB single-
+   * stream base64 today) and may forward it themselves in a follow-up.
+   */
+  promptFileBody?: string;
+  promptFilePathEnvName?: string;
   timeoutSec: number;
   graceSec: number;
   onLog: (stream: "stdout" | "stderr", chunk: string) => Promise<void>;
@@ -915,6 +928,15 @@ export async function runAdapterExecutionTargetProcess(
     cwd: options.cwd,
     env,
     stdin: options.stdin,
+    // Mirror the prompt-by-file handoff into the local Node spawn (this is
+    // the SPA-8607/SPA-8898 failure site — the durable fix). The sandbox
+    // lane keeps its stdin path because (a) SPA-8967's reported incidents
+    // were both local spawns and (b) today's sandbox base64 transport
+    // already handles bodies up to 96MB single-stream, well above the
+    // 117-200KB E2BIG window. A follow-up can wire base64 syncOut for
+    // prompt-file parity in the sandbox lane.
+    promptFileBody: options.promptFileBody,
+    promptFilePathEnvName: options.promptFilePathEnvName,
     timeoutSec: options.timeoutSec,
     graceSec: options.graceSec,
     onLog: options.onLog,
