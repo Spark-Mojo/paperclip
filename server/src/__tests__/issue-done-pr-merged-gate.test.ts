@@ -19,7 +19,18 @@ import {
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
 import { issueService } from "../services/issues.js";
-import { issueDoneGateService } from "../services/issue-done-gate.js";
+let issueDoneGateServiceImport: typeof import("../services/issue-done-gate.js").issueDoneGateService | null = null;
+try {
+  // Optional at the pre-change tree so the same file doubles as the
+  // before-fix repro (SPA-8957 gate 1): the done-refusal cases must FAIL.
+  issueDoneGateServiceImport = (await import("../services/issue-done-gate.js")).issueDoneGateService;
+} catch {
+  issueDoneGateServiceImport = null;
+}
+const issueDoneGateService = (...args: Parameters<NonNullable<typeof issueDoneGateServiceImport>>) => {
+  if (!issueDoneGateServiceImport) throw new Error("issue-done-gate module absent at pre-change tree");
+  return issueDoneGateServiceImport(...args);
+};
 import { issueRoutes } from "../routes/issues.js";
 import { errorHandler } from "../middleware/index.js";
 import { normalizeIssueExecutionPolicy } from "../services/issue-execution-policy.js";
