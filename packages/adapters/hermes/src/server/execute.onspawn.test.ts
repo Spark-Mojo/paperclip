@@ -207,8 +207,11 @@ describe("hermes-local adapter onSpawn forwarding", () => {
 
   // SPA-8967: hermes used to put the assembled prompt in argv, which on
   // Linux fails spawn with E2BIG once the prompt passes ~128KB. The fix
-  // passes the prompt by file/stdin via the engine's promptFileBody handoff
-  // and points hermes's CLI prompt slot at `-`. Both halves are covered:
+  // hands the prompt via runChildProcess's promptFileBody option. The
+  // engine writes the body to a run-owned file (so any future adapter
+  // that grows a `--prompt-file <path>` flag can adopt it) AND pipes the
+  // body on stdin (so hermes CLI's existing `chat -q -` stdin placeholder
+  // picks it up). The body must NEVER ride in argv.
   it("forwards the assembled prompt via promptFileBody and never via argv (SPA-8967)", async () => {
     vi.mocked(serverUtils.runChildProcess).mockResolvedValueOnce({
       exitCode: 0,
@@ -250,16 +253,13 @@ describe("hermes-local adapter onSpawn forwarding", () => {
       if (typeof value !== "string") continue;
       expect(value.length).toBeLessThan(1024);
     }
-    // The prompt body travels via the engine contract, not stdin (stdin is
-    // reserved for the adapter's steady-state transport choice; today we
-    // route the body through the file handoff and let the engine wire stdin
-    // when the body fits). Either is acceptable as long as the body NEVER
-    // rides in argv. We assert the body is present in exactly one of:
-    if (typeof opts.promptFileBody === "string") {
-      expect(opts.promptFileBody.length).toBeGreaterThan(0);
-    } else {
-      expect(typeof opts.stdin).toBe("string");
-      expect((opts.stdin as string).length).toBeGreaterThan(0);
-    }
+    // Hermes must hand the body via the engine's promptFileBody option.
+    // The engine wires both transports (file path in env, body on stdin);
+    // neither adapter code nor any CLI flag support outside the engine is
+    // required for the prompt to reach hermes. Stdin is intentionally NOT
+    // set by the adapter — the engine derives it from promptFileBody.
+    expect(typeof opts.promptFileBody).toBe("string");
+    expect((opts.promptFileBody as string).length).toBeGreaterThan(0);
+    expect(opts.stdin).toBeUndefined();
   });
 });
