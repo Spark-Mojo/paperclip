@@ -923,6 +923,25 @@ function isUnsuccessfulTerminalIssueRun(latestRun: LatestIssueRun) {
   );
 }
 
+// SPA-9001: a `server_shutdown_interrupted` run is an infrastructure event,
+// never evidence that an automatic recovery attempt failed. didAutomaticRecoveryFail
+// keys on retryReason === expectedRetryReason && status ∈ unsuccessful-terminal
+// statuses; a retry-of-a-retry that was itself interrupted (e.g. SPA-8965/8966/
+// 8969/8970/8971 after the 09-27 08:42 restart) satisfies both predicates and
+// short-circuits straight to escalation, which then SPA-7105-skip-paths because
+// of empty blocker edges, leaving the card stranded with no live wake. A run
+// whose errorCode is `server_shutdown_interrupted` must always be treated as
+// retriable, regardless of the retryReason it carries.
+function isServerShutdownInterruptedRun(latestRun: LatestIssueRun | null) {
+  return Boolean(
+    latestRun &&
+      latestRun.errorCode === "server_shutdown_interrupted" &&
+      UNSUCCESSFUL_HEARTBEAT_RUN_TERMINAL_STATUSES.includes(
+        latestRun.status as (typeof UNSUCCESSFUL_HEARTBEAT_RUN_TERMINAL_STATUSES)[number],
+      ),
+  );
+}
+
 function isSuccessfulInProgressContinuationRun(
   latestRun: LatestIssueRun,
 ): latestRun is SuccessfulLatestIssueRun {
@@ -2054,7 +2073,20 @@ export function recoveryService(
         // Failure recovery shares the durable incident budget and delay. It
         // cannot fall through into the productive-work continuation queue.
         if (predecessor.runtimeMode === "native") return null;
-        if (legacyExecutionNeedsReconciliation(predecessor)) {
+        // SPA-9001: a graceful-shutdown-interrupted predecessor is retriable
+        // infrastructure, never a legacy execution needing board
+        // reconciliation, and never a bounded transient retry (whose own
+        // legacy gate refuses an unknown-outcome interruption). Fall through
+        // to the plain stranded-issue wake below.
+        // SPA-9001: a graceful-shutdown-interrupted predecessor is retriable
+        // infrastructure, never a legacy execution needing board
+        // reconciliation. It keeps the durable incident budget: when the
+        // bounded transient retry is already exhausted there is no automatic
+        // retry left, exactly like any other terminal predecessor.
+        if (
+          legacyExecutionNeedsReconciliation(predecessor) &&
+          !isServerShutdownInterruptedRun(predecessor)
+        ) {
           await terminalizeLegacyExecution({
             db,
             run: predecessor,
@@ -4625,7 +4657,19 @@ export function recoveryService(
               eq(heartbeatRuns.id, executionRecoverySource.id),
             ),
           );
-        if (source && legacyExecutionNeedsReconciliation(source)) {
+        // SPA-9001: in the periodic stranded-work sweep, a graceful-shutdown
+        // interruption is an infrastructure event, never a legacy execution
+        // that needs board reconciliation — the run already promised "retry
+        // queued for restart recovery". Parking it behind a board-owned
+        // recovery action here is exactly the stranding this card fixes
+        // (SPA-8965/8966/8969/8970/8971 sat 3.5h after the 09-27 08:42
+        // restart). The shutdown-time speculative-replay guard in
+        // enqueueProcessLossRetry keeps its own stricter view.
+        if (
+          source &&
+          legacyExecutionNeedsReconciliation(source) &&
+          !isServerShutdownInterruptedRun(source)
+        ) {
           await terminalizeLegacyExecution({
             db,
             run: source,
@@ -5036,10 +5080,21 @@ export function recoveryService(
         }
 
         if (
+          // SPA-9001: a retry-of-a-retry that was interrupted by a server
+          // shutdown is an infrastructure event, not evidence the review
+          // participant recovery itself failed. didAutomaticRecoveryFail
+          // keys on retryReason === expectedRetryReason && status ∈
+          // unsuccessful-terminal statuses, so an interrupted retry run
+          // (SPA-8669 12:55Z, SPA-8983) satisfies both predicates and
+          // short-circuits to escalation. The escalation then
+          // SPA-7105-skip-paths because of empty blocker edges, leaving
+          // the review-stage card parked `in_review` with no live wake.
+          // Override the guard when errorCode is server_shutdown_interrupted
+          // and fall through to enqueueStrandedIssueRecovery.
           didAutomaticRecoveryFail(
             participantLatestRun,
             EXECUTION_REVIEW_PARTICIPANT_RECOVERY_REASON,
-          )
+          ) && !isServerShutdownInterruptedRun(participantLatestRun)
         ) {
           const updated = await escalateStrandedAssignedIssue({
             issue,
@@ -5140,7 +5195,15 @@ export function recoveryService(
           continue;
         }
 
-        if (didAutomaticRecoveryFail(latestRun, "assignment_recovery")) {
+        // SPA-9001: same server-shutdown-interrupted override as the in_progress /
+        // in_review branches. A retry-of-a-retry that was interrupted by a
+        // server shutdown is an infrastructure event, not evidence the
+        // assignment recovery itself failed; the periodic sweep must still
+        // re-enqueue the assignee instead of escalating to blocked.
+        if (
+          didAutomaticRecoveryFail(latestRun, "assignment_recovery") &&
+          !isServerShutdownInterruptedRun(latestRun)
+        ) {
           const updated = await escalateStrandedAssignedIssue({
             issue,
             previousStatus: "todo",
@@ -5382,7 +5445,14 @@ export function recoveryService(
           continue;
         }
 
-        if (didAutomaticRecoveryFail(latestRun, "issue_continuation_needed")) {
+        // SPA-9001: server-shutdown-interrupted override for the in_progress
+        // continuation branch — the interrupted retry run is an
+        // infrastructure event, never evidence the continuation itself
+        // failed, so the sweep re-enqueues instead of escalating.
+        if (
+          didAutomaticRecoveryFail(latestRun, "issue_continuation_needed") &&
+          !isServerShutdownInterruptedRun(latestRun)
+        ) {
           const { consecutive, latestFinishedAt } =
             await summarizeRecentContinuationRetries(
               issue.companyId,
