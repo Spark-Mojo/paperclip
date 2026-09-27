@@ -1,0 +1,337 @@
+name: requirements-signoff
+
+# ---------------------------------------------------------------------------
+# FORK COPY — Spark-Mojo/paperclip (SPA-8996, 2026-09-27)
+#
+# This file was COPIED from the source-of-record in `sparkmojo-internal` at commit
+# `f2a70073b` (`:.github/workflows/requirements-signoff.yml`) and adapted for this
+# fork by EXACTLY TWO authorized substitutions, both recorded inline below and
+# both listed here so the next reader never has to diff the whole file to find them:
+#
+#   1. `runs-on: self-hosted` -> `runs-on: ubuntu-latest` (in the `evaluate` job).
+#      This fork has ZERO self-hosted runners -- `gh api
+#      repos/Spark-Mojo/paperclip/actions/runners` returns `total_runners: 0`.
+#   2. The `Ensure gh CLI` bootstrap STEP is dropped entirely, with no replacement.
+#      It only defends against a heterogeneous self-hosted pool; `gh` and `jq` are
+#      both pre-installed on the `ubuntu-latest` image.
+#
+# NOTHING else was changed. Triggers, concurrency group, permissions, the
+# TRUSTED_SIGNOFF_AUTHORS allowlist (`sparkmojo-verify[bot]:333096900`), the marker
+# shape, the `requirements-signoff/verdict` status context, the SPA-8565 v3
+# pre-POST-LATEST JOB-conclusion correction, and the default-branch checkout of the
+# trusted checker are all byte-preserved from `f2a70073b`.
+#
+# DO NOT hand-edit this file to re-sync from upstream. Re-copy from the
+# source-of-record and re-apply the two substitutions above, so the diff stays
+# reviewable.
+#
+# `scripts/ci/requirements-signoff-check.sh` and its offline test
+# `scripts/ci/requirements-signoff-check.test.sh` are BYTE-VERBATIM copies of
+# `sparkmojo-internal@086a0d071` and `sparkmojo-internal@8315b3e96` respectively.
+# ---------------------------------------------------------------------------
+
+# 2026-09-23 (SPA-8506, post-audit wording fix): `requirements-signoff/verdict`
+# is a REQUIRED status check on this repo's default branch — branch protection
+# lists it among the required contexts (verified via the branch-protection API,
+# 2026-09-23). This header previously called the check "ADVISORY / NOT yet
+# added to branch protection"; that was stale (2026-09-21/22 wording).
+#
+# Break-glass (the ONLY override while the context is required): an org owner
+# (James) may temporarily remove `requirements-signoff/verdict` from branch
+# protection's required contexts — nothing else, no agent path, bypasses the
+# gate.
+#
+# The marker this job looks for is produced by the builder's in-session requirements
+# sign-off step (opencode workflow: build -> verify -> sign-off against the card
+# requirements). This job makes that artifact mechanical to check so an orchestrator
+# cannot silently skip its own verifier and merge a PR that never ran it. The
+# producer side (the sign-off step that posts the marker comment) was thin on
+# day one, which is why the check was born advisory -- it is required on this
+# repo now (see the note at the top of this file).
+#
+# Marker shape (mirrors the sign-off step's own output, may appear anywhere in a PR
+# comment body): `<!-- requirements-signoff:v1 head=<40-hex-sha> verdict=pass -->`
+#
+# 2026-09-22: re-evaluate on the sign-off marker comment itself (issue_comment), not just
+# on PR pushes -- previously the marker could post AFTER the last pull_request-triggered
+# run, and nothing re-ran this check to pick it up (same class of gap codex-pr-head-clean.yml
+# closed for Codex's own verdict comment; see that workflow's issue_comment trigger and its
+# job-level `if`, whose mechanics this file copies). The verdict is now posted as a commit
+# STATUS (`requirements-signoff/verdict`, statuses API) rather than left to the job's own
+# conclusion, because a job's conclusion is scoped to the run that produced it -- a status
+# is the one artifact that every trigger (push, comment, dispatch, merge_group) converges on
+# refreshing for the SAME head SHA, which is what makes an issue_comment-triggered
+# re-evaluation visible as an updated PR check at all.
+#
+# Mirrors draft-guard.yml's shape: same self-hosted runner label, same fail-closed-on-
+# missing-evidence stance, same use of the `gh` CLI for GitHub API calls (see
+# codex-pr-head-clean.yml for the `gh`-via-API pattern this follows).
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review, converted_to_draft]
+  # Mira review on PR #999 / PR #668 lesson: a context that may become required
+  # must also report on merge_group refs or the merge queue deadlocks. A merge
+  # group carries the already-signed-off head, so it passes trivially there.
+  merge_group:
+    types: [checks_requested]
+  # The sign-off marker is posted as a PR comment AFTER the build session's last push, so
+  # a push-only trigger can leave a signed-off head stuck on a stale failing verdict. Only
+  # the trusted-author check in the job-level `if` below lets this event refresh anything.
+  issue_comment:
+    types: [created, edited]
+  # Manual re-evaluation (e.g. a marker posted, or edited, without GitHub replaying the
+  # event, or an operator recovering a stuck verdict). github.event.pull_request.* is empty
+  # here, so the PR must be identified explicitly.
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: "PR number to re-evaluate"
+        required: true
+        type: string
+
+env:
+  # Single source of truth for GitHub accounts trusted to post a requirements sign-off
+  # marker comment (login:id pairs; id from `gh api users/<login> --jq .id`, so a same-named
+  # impersonating account can't gain trust -- same lesson as codex-pr-head-clean.mjs's
+  # CODEX_LOGINS, canary PR #671 finding). Passed straight through to the checker script.
+  # The job-level `if` below ALSO needs this list (to gate which issue_comment events even
+  # run the job) but GitHub Actions does not expose the `env` context to `jobs.<job_id>.if`
+  # (only to steps) -- codex-pr-head-clean.yml hits the same limitation and hardcodes its
+  # trusted logins directly in the `if:` for the same reason. So the login (not the id --
+  # the `if` is only a coarse pre-filter; the checker script is the authoritative check that
+  # verifies login AND id) is duplicated below. Keep both in sync when this list changes.
+  #
+  # 2026-09-23 (SPA-8506): only the `sparkmojo-verify[bot]` GitHub App is trusted.
+  # The App's key is held by the verify subagent (no other agent has it), and the
+  # sign-off comment is posted via a helper that mints an App JWT + installation
+  # token from that key. A sign-off from any other account (e.g. `JamesSparkMojo`,
+  # which all builders previously used via `gh pr comment`) is now IGNORED by the
+  # checker. The bot's numeric id is 333096900, looked up via
+  # `gh api users/sparkmojo-verify[bot] --jq .id` and verified against the App
+  # `sparkmojo-verify` (id 5052512, slug `sparkmojo-verify`, owned by Spark-Mojo).
+  # The check script's regression test covers both halves of this allowlist
+  # (bot pass, JamesSparkMojo fail). See SPA-8505 for the App itself.
+  TRUSTED_SIGNOFF_AUTHORS: "sparkmojo-verify[bot]:333096900"
+
+concurrency:
+  # issue_comment/workflow_dispatch runs must NOT share a concurrency group with
+  # pull_request/merge_group runs: GitHub Actions cancels the rest of a group when a new
+  # run starts in it, and a comment-triggered re-evaluation landing mid-way through a
+  # pull_request-triggered run would cancel that run instead of just superseding it (the
+  # cancelled run would still count as this check's last word). Give the comment/dispatch
+  # path its own group, keyed by the same PR number so repeated comments on one PR still
+  # serialize sanely.
+  group: >-
+    ${{
+      github.event_name == 'issue_comment' && format('requirements-signoff-comment-{0}', github.event.issue.number) ||
+      github.event_name == 'workflow_dispatch' && format('requirements-signoff-comment-{0}', inputs.pr_number) ||
+      format('{0}-{1}', github.workflow, github.event.pull_request.number || github.ref)
+    }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  pull-requests: read
+  issues: read
+  # Post the requirements-signoff/verdict commit status (statuses API).
+  statuses: write
+
+jobs:
+  # Job id/name is what the PR check list shows alongside the posted commit status. Keep
+  # the job NAME distinct from the `requirements-signoff/verdict` status context: a run
+  # cancelled by the concurrency group above (a newer comment/push superseded it) would
+  # otherwise show as a failed check with the same name as the gate itself, reading like
+  # the gate failing when only a stale refresh was dropped (codex-pr-head-clean.yml
+  # comment, same reasoning).
+  evaluate:
+    name: post requirements-signoff verdict
+    # issue_comment fires on every comment on every issue; only a PR comment from a
+    # trusted account can move this verdict, so run for nothing else.
+    # 2026-09-23 (SPA-8506): only the sparkmojo-verify[bot] GitHub App is trusted.
+    # See TRUSTED_SIGNOFF_AUTHORS above for the canonical id-paired list and the
+    # reason for the App path. The `if:` is only a coarse pre-filter; the checker
+    # script (`requirements-signoff-check.sh`) is the authoritative check that
+    # verifies login AND numeric id match.
+    if: >-
+      ${{
+        github.event_name != 'issue_comment' ||
+        (github.event.issue.pull_request && github.event.comment.user.login == 'sparkmojo-verify[bot]')
+      }}
+    # 2026-09-27 (SPA-8996, paperclip fork): `ubuntu-latest`, NOT `self-hosted`.
+    # Verified on the dispatch date -- `gh api repos/Spark-Mojo/paperclip/actions/runners`
+    # returns `total_runners: 0`. A self-hosted label here would queue forever. This is
+    # authorized substitution #1 of exactly two; the source-of-record copy (sparkmojo-internal
+    # `f2a70073b`) reads `self-hosted` and is otherwise byte-preserved by this file.
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      # Pin the checkout to the default branch: on pull_request/issue_comment/workflow_dispatch,
+      # an unpinned checkout would run the PR's OWN (possibly tampered) copy of the checker
+      # script with a token that can post the passing status -- the same "trusted revision"
+      # finding codex-pr-head-clean.yml's checkout step documents. The evaluator that runs is
+      # always the protected, trusted copy, regardless of what the PR under review contains.
+      - name: Checkout (trusted default-branch revision of the check script)
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+
+      # 2026-09-27 (SPA-8996, paperclip fork): the source-of-record copy's
+      # `Ensure gh CLI` bootstrap step is DROPPED HERE IN ITS ENTIRETY, and no
+      # replacement is added. Authorized substitution #2 of exactly two.
+      #
+      # Why: that step exists only to defend against a heterogeneous SELF-HOSTED pool
+      # where `gh` may be absent from PATH (measured on the platform's own runner
+      # sm-runner-org-05a: `gh: command not found`, exit 127). On `ubuntu-latest`
+      # the runner image ships a pinned, pre-installed `gh` on PATH -- there is no
+      # heterogeneous pool to defend against, so the bootstrap is dead weight that
+      # only adds an unpinned-network-fetch failure mode.
+      #
+      # Everything the step produced is provided by the hosted runner instead:
+      #   - `gh` on PATH      -> pre-installed on the ubuntu-latest image
+      #   - `jq` on PATH      -> pre-installed on the ubuntu-latest image
+      #   - `curl`/`tar`      -> not used anywhere in this job once the step is gone
+      #
+      # Note for the next reader: the two source-of-record comment blocks that
+      # REFERENCE this step are left byte-intact on purpose, so this file still
+      # diffs cleanly against `f2a70073b` (the `check` step's reference to the dropped
+      # gh-bootstrap step's PATH injection, and the header's
+      # "same self-hosted runner label" line). Those two references are stale on
+      # this fork and are the only known divergences beyond the two authorized
+      # substitutions above.
+
+      - name: Resolve PR number, head SHA, and draft status
+        id: resolve
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          EVENT_NAME: ${{ github.event_name }}
+          PR_FROM_EVENT: ${{ github.event.pull_request.number || github.event.issue.number || inputs.pr_number }}
+          HEAD_FROM_EVENT: ${{ github.event.pull_request.head.sha }}
+          DRAFT_FROM_EVENT: ${{ github.event.pull_request.draft }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT_NAME" = "merge_group" ]; then
+            echo "merge_group event -- the queued head was already signed off on its PR; passes trivially."
+            echo "skip=merge_group" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          pr="$PR_FROM_EVENT"
+          if [ -z "$pr" ]; then
+            echo "::error::could not resolve a PR number from this event" >&2
+            exit 1
+          fi
+          head_sha="$HEAD_FROM_EVENT"
+          draft="$DRAFT_FROM_EVENT"
+          if [ -z "$head_sha" ] || [ -z "$draft" ]; then
+            # issue_comment / workflow_dispatch: the event payload carries no (or an
+            # incomplete) pull_request object -- resolve the CURRENT head SHA and draft
+            # state from the PR API, same pattern as codex-pr-head-clean.mjs's
+            # workflow_dispatch path. Resolution failure = fail closed (no status posted).
+            payload="$(gh api "repos/${REPO}/pulls/${pr}")"
+            head_sha="$(jq -r '.head.sha' <<<"$payload")"
+            draft="$(jq -r '.draft' <<<"$payload")"
+          fi
+          if ! [[ "$head_sha" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::could not resolve a 40-hex head SHA for PR #${pr}" >&2
+            exit 1
+          fi
+          echo "pr=$pr" >> "$GITHUB_OUTPUT"
+          echo "head_sha=$head_sha" >> "$GITHUB_OUTPUT"
+          echo "draft=$draft" >> "$GITHUB_OUTPUT"
+          echo "skip=false" >> "$GITHUB_OUTPUT"
+
+      - name: Skip while draft (drafts are not checked)
+        if: steps.resolve.outputs.skip == 'false' && steps.resolve.outputs.draft == 'true'
+        run: echo "::notice::Draft PR -- requirements sign-off is not checked until the PR is marked ready for review."
+
+      - name: Post trivial pass for merge_group
+        if: steps.resolve.outputs.skip == 'merge_group'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          gh api -X POST "repos/${REPO}/statuses/${{ github.sha }}" \
+            -f context=requirements-signoff/verdict \
+            -f state=success \
+            -f description="merge_group: queued head was already signed off on its PR"
+
+      - name: Check for a trusted requirements sign-off marker, post verdict status
+        if: steps.resolve.outputs.skip == 'false' && steps.resolve.outputs.draft != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR: ${{ steps.resolve.outputs.pr }}
+          HEAD_SHA: ${{ steps.resolve.outputs.head_sha }}
+          TRUSTED_SIGNOFF_AUTHORS: ${{ env.TRUSTED_SIGNOFF_AUTHORS }}
+        run: |
+          # SPA-8528: GitHub invokes `run:` blocks under the default `bash -e {0}`, so the
+          # ambient errexit would abort this step the moment the checker returns rc=1 (the
+          # rejected-head case) -- before the requirements-signoff/verdict=failure status
+          # could ever be posted -- and the POST-capture guard below has the same hole
+          # (`post_output="$(gh api ...)"` aborts before `post_rc=$?`). This block manages
+          # its own rc handling explicitly below, so turn errexit OFF for the block instead
+          # of embedding `set +e` around each rc-capture site.
+          set +e
+          set -uo pipefail
+          # 2026-09-24 (SPA-8565, Mira PR #1032 review): capture the pre-POST status
+          # trail so the JOB-conclusion correction below can detect a PRIOR success
+          # (gate already satisfied) without confusing it with this run's POST (which
+          # is the LATEST entry by the time the correction runs). The statuses API
+          # returns entries newest-first; the LATEST pre-POST verdict is the first
+          # matching entry. v2 used `[any(state=="success")]` which incorrectly
+          # returned true for an older success hidden behind a newer failure
+          # (Mira round 2); use the first matching entry's state instead, so a
+          # currently-failing gate (latest=failure) is not masked by a stale
+          # historical success. Pipe through jq on the host (NOT --jq on gh) so
+          # the filter still applies when the runner's `gh` is missing (the
+          # Ensure gh CLI step's PATH injection is already in scope here, but a
+          # host-side jq keeps the filter readable from a unit test that stubs
+          # `gh`).
+          prior_latest_state="$(gh api "repos/${REPO}/commits/${HEAD_SHA}/statuses" \
+            | jq -r '[.[] | select(.context=="requirements-signoff/verdict")] | first | .state // "missing"')"
+          bash scripts/ci/requirements-signoff-check.sh
+          rc=$?
+          if [ "$rc" -eq 0 ]; then
+            state=success
+            description="requirements sign-off found for head ${HEAD_SHA:0:7}"
+          else
+            state=failure
+            description="requirements sign-off missing or failed for head ${HEAD_SHA:0:7}"
+          fi
+          # The checker's rc alone is not evidence the verdict was ever posted --
+          # a silently-failing status POST (e.g. missing gh, bad token, API error)
+          # previously masked itself behind whatever rc the checker returned,
+          # leaving the commit with no updated status at all. Capture the POST's
+          # own outcome and fail loudly, regardless of the checker's rc, if the
+          # status never made it onto the head SHA.
+          post_output="$(gh api --silent -X POST "repos/${REPO}/statuses/${HEAD_SHA}" \
+            -f context=requirements-signoff/verdict \
+            -f state="$state" \
+            -f description="$description" 2>&1)"
+          post_rc=$?
+          if [ "$post_rc" -ne 0 ]; then
+            echo "::error::verdict status POST failed: ${post_output}"
+            exit 1
+          fi
+          echo "posted requirements-signoff/verdict=${state} for ${HEAD_SHA:0:7}"
+          # 2026-09-24 (SPA-8565): the JOB conclusion must track the gate (the
+          # requirements-signoff/verdict StatusContext), not this run's own checker rc.
+          # A PRIOR successful verdict POSTed on the SAME head SHA means the gate is
+          # already satisfied -- this run's re-check can fail without un-satisfying it,
+          # and propagating that rc as the JOB conclusion surfaces a stale failed
+          # CheckRun that `gh pr checks` displays in front of the newer success, with
+          # `mergeable_state` following suit. Use the PRE-POST LATEST verdict captured
+          # above (not the post-POST latest, which is this run's own POST) so a
+          # satisfied gate is recognised even on a fresh re-check, AND a currently-
+          # failing gate (older success hidden behind a newer failure) is not masked
+          # (Mira round 2). The StatusContext POST itself still honors the checker
+          # (state="$state"), so the gate is never weakened -- only the JOB
+          # conclusion is corrected here.
+          if [ "$prior_latest_state" = "success" ]; then
+            echo "pre-POST latest requirements-signoff/verdict=success on ${HEAD_SHA:0:7} -- JOB exits success regardless of this run's checker rc (${rc}) and POST state (${state})"
+            exit 0
+          fi
+          exit "$rc"
