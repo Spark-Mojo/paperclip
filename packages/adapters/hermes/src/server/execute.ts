@@ -439,9 +439,20 @@ export async function execute(
   }
 
   // ── Build command args ─────────────────────────────────────────────────
-  // Use -Q (quiet) to get clean output: just response + session_id line
+  // Use -Q (quiet) to get clean output: just response + session_id line.
+  //
+  // SPA-8967: stop putting the prompt in argv. A card whose comment history
+  // passes ~117KB used to fail spawn with E2BIG (Linux posix_spawn enforces
+  // ARG_MAX; the run never started). The durable fix is the engine's
+  // prompt-by-file handoff (see `runChildProcess` / `runAdapterExecutionTargetProcess`
+  // options.promptFileBody). The engine writes the body to a run-owned path,
+  // exposes it via PAPERCLIP_RUN_PROMPT_FILE, and leaves the child's stdin
+  // ignored — so a long prompt can never drive the argv/string-table limit.
+  // Hermes's CLI accepts `-` as the prompt slot and reads stdin, so we point
+  // the slot at `-` and let the engine feed the file-derived body through
+  // stdin.
   const useQuiet = cfgBoolean(config.quiet) === true; // default false
-  const args: string[] = ["chat", "-q", prompt];
+  const args: string[] = ["chat", "-q", "-"];
   if (useQuiet) args.push("-Q");
 
   if (model) {
@@ -560,6 +571,14 @@ export async function execute(
   const result = await runChildProcess(ctx.runId, hermesCmd, args, {
     cwd,
     env,
+    // SPA-8967: hand the prompt body to the engine by file. runChildProcess
+    // writes it to a run-owned path under PAPERCLIP_PROMPTS_DIR, sets
+    // PAPERCLIP_RUN_PROMPT_FILE on the child env, and pipes the body onto the
+    // child's stdin via the file (so the failure mode of passing it in argv
+    // — E2BIG above ~128KB on Linux — is gone for good, regardless of which
+    // thread reads it). Hermes CLI accepts the placeholder `-` for the prompt
+    // slot and reads stdin.
+    promptFileBody: prompt,
     timeoutSec,
     graceSec,
     onLog: wrappedOnLog,
