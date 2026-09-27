@@ -357,7 +357,10 @@ export function createPostgresWatchdogAdapter(db: Db): WatchdogRunReader & Watch
       if (input.existingEvaluation && !isTerminalIssueStatus(input.existingEvaluation.status)) {
         const updatedEvaluation = await issuesSvc.update(
           input.existingEvaluation.id,
-          { status: "done" },
+          // doneGateBypass: this fold closes a WATCHDOG evaluation card whose
+          // source run already reached a terminal disposition — it is not a
+          // card completion gated on a PR merge (SPA-8957).
+          { status: "done", doneGateBypass: true },
           tx,
           undefined,
           postCommitIssueActions,
