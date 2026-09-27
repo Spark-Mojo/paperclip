@@ -937,15 +937,12 @@ describe("runChildProcess — prompt-by-file handoff (SPA-8967)", () => {
     const runId = `rca-${randomUUID()}`;
     const promptBody = "x".repeat(LARGE_PROMPT_BYTES);
     const probe = [
-      "-e",
-      [
-        "const fs = require('node:fs');",
-        "const path = process.env.PAPERCLIP_RUN_PROMPT_FILE;",
-        "if (!path) { process.stderr.write('NO_PROMPT_FILE_ENV'); process.exit(2); }",
-        "const stat = fs.statSync(path);",
-        "const data = fs.readFileSync(path, 'utf8');",
-        "process.stdout.write(JSON.stringify({ size: stat.size, length: data.length, envPath: path }));",
-      ].join(" "),
+      "const fs = require('node:fs');",
+      "const path = process.env.PAPERCLIP_RUN_PROMPT_FILE;",
+      "if (!path) { process.stderr.write('NO_PROMPT_FILE_ENV'); process.exit(2); }",
+      "const stat = fs.statSync(path);",
+      "const data = fs.readFileSync(path, 'utf8');",
+      "process.stdout.write(JSON.stringify({ size: stat.size, length: data.length, envPath: path }));",
     ].join(" ");
 
     const result = await runChildProcess(
@@ -978,18 +975,15 @@ describe("runChildProcess — prompt-by-file handoff (SPA-8967)", () => {
     const runId = `rdb-${randomUUID()}`;
     const promptBody = "y".repeat(LARGE_PROMPT_BYTES);
     const probe = [
-      "-e",
-      [
-        "const fs = require('node:fs');",
-        "const path = process.env.PAPERCLIP_RUN_PROMPT_FILE;",
-        "let readFromStdin = '';",
-        "process.stdin.on('data', c => (readFromStdin += String(c)));",
-        "process.stdin.on('end', () => {",
-        "  const fileData = path ? fs.readFileSync(path, 'utf8') : '';",
-        "  process.stdout.write(JSON.stringify({ fileBytes: fileData.length, stdinBytes: readFromStdin.length, envPath: path }));",
-        "});",
-      ].join(" "),
-    ].join("");
+      "const fs = require('node:fs');",
+      "const path = process.env.PAPERCLIP_RUN_PROMPT_FILE;",
+      "let readFromStdin = '';",
+      "process.stdin.on('data', c => (readFromStdin += String(c)));",
+      "process.stdin.on('end', () => {",
+      "  const fileData = path ? fs.readFileSync(path, 'utf8') : '';",
+      "  process.stdout.write(JSON.stringify({ fileBytes: fileData.length, stdinBytes: readFromStdin.length, envPath: path }));",
+      "});",
+    ].join(" ");
 
     const result = await runChildProcess(
       runId,
@@ -1022,18 +1016,15 @@ describe("runChildProcess — prompt-by-file handoff (SPA-8967)", () => {
     const promptBody = "P".repeat(64);
     const explicitStdin = "S".repeat(32);
     const probe = [
-      "-e",
-      [
-        "const fs = require('node:fs');",
-        "const p = process.env.PAPERCLIP_RUN_PROMPT_FILE;",
-        "const fileBytes = fs.readFileSync(p, 'utf8').length;",
-        "let readFromStdin = '';",
-        "process.stdin.on('data', c => (readFromStdin += String(c)));",
-        "process.stdin.on('end', () => {",
-        "  process.stdout.write(JSON.stringify({ fileBytes, stdinBytes: readFromStdin.length, stdinFirstChar: readFromStdin[0] || '' }));",
-        "});",
-      ].join(" "),
-    ].join("");
+      "const fs = require('node:fs');",
+      "const p = process.env.PAPERCLIP_RUN_PROMPT_FILE;",
+      "const fileBytes = fs.readFileSync(p, 'utf8').length;",
+      "let readFromStdin = '';",
+      "process.stdin.on('data', c => (readFromStdin += String(c)));",
+      "process.stdin.on('end', () => {",
+      "  process.stdout.write(JSON.stringify({ fileBytes, stdinBytes: readFromStdin.length, stdinFirstChar: readFromStdin[0] || '' }));",
+      "});",
+    ].join(" ");
 
     const result = await runChildProcess(
       runId,
