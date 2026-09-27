@@ -167,6 +167,62 @@ export function isPaperclipRuntimeEnvKey(key: string): boolean {
 export function isForbiddenConfigEnvKey(key: string): boolean {
   return key === "PAPERCLIP_API_KEY";
 }
+
+// Default directory holding the run-owned prompt files the engine writes when
+// the harness hands an oversized prompt to a child process. Each run gets its
+// own file so different runs can't race over a shared prompt body. Operators
+// may override via PAPERCLIP_PROMPTS_DIR (e.g. for a tmpfs or a quieter
+// location than the system tmp).
+export const DEFAULT_PAPERCLIP_PROMPTS_DIRNAME = "paperclip-prompts";
+export function resolvePaperclipPromptsDir(): string {
+  const configured = process.env.PAPERCLIP_PROMPTS_DIR?.trim();
+  if (configured) {
+    if (configured === "/dev/null" || configured === "off") return "";
+    return path.resolve(configured);
+  }
+  return path.resolve(os.tmpdir(), DEFAULT_PAPERCLIP_PROMPTS_DIRNAME);
+}
+
+// Env var name advertised to the child so an adapter can pick up the run
+// prompt by path instead of receiving it in argv. Stable name; adapters read
+// this verbatim. Set by runChildProcess / runAdapterExecutionTargetProcess when
+// the caller uses the promptFileBody handoff; never set by adapter config.
+export const PAPERCLIP_RUN_PROMPT_FILE_ENV = "PAPERCLIP_RUN_PROMPT_FILE";
+
+// Write a run prompt to its own file under the prompts dir and return the
+// absolute path. The caller is responsible for deciding when to invoke this
+// (e.g. only above a byte threshold); the writer does NOT enforce any threshold
+// itself. Best-effort delete on process exit prevents prompt text from
+// outliving the run on the operator's disk.
+export async function writeRunPromptToFile(input: {
+  runId: string;
+  body: string;
+}): Promise<string> {
+  const dir = resolvePaperclipPromptsDir();
+  if (!dir) throw new Error("PAPERCLIP_PROMPTS_DIR is disabled; cannot write run prompt file.");
+  await fs.mkdir(dir, { recursive: true, mode: 0o700 });
+  const sanitizedRunId = input.runId.replace(/[^a-zA-Z0-9_-]/g, "_").slice(0, 64) || "run";
+  const fileName = `${sanitizedRunId}-${randomUUID()}.md`;
+  const fullPath = path.join(dir, fileName);
+  await fs.writeFile(fullPath, input.body, { encoding: "utf8", mode: 0o600 });
+  scheduleRunPromptCleanup(fullPath);
+  return fullPath;
+}
+
+// Best-effort cleanup queue. We deliberately do NOT await unlink on exit: the
+// child has long since read the file, and a sync unlink from a SIGTERM handler
+// is more likely to crash the parent process than to deliver cleaner disk.
+const runPromptCleanupHandles = new Map<string, NodeJS.Timeout>();
+function scheduleRunPromptCleanup(fullPath: string): void {
+  const delayMs = 5 * 60 * 1000; // 5 min — generous so very long runs still see their file
+  const timer = setTimeout(() => {
+    runPromptCleanupHandles.delete(fullPath);
+    fs.unlink(fullPath).catch(() => undefined);
+  }, delayMs);
+  if (typeof timer.unref === "function") timer.unref();
+  runPromptCleanupHandles.set(fullPath, timer);
+}
+
 const PAPERCLIP_SKILL_ROOT_RELATIVE_CANDIDATES = [
   "../../skills",
   "../../../../../skills",
@@ -4575,6 +4631,29 @@ export async function runChildProcess(
     }) => Promise<void>;
     terminalResultCleanup?: TerminalResultCleanupOptions;
     stdin?: string;
+/**
+     * Optional run-prompt body to hand the child by FILE and (transparently)
+     * by STDIN. When set, runChildProcess:
+     *   1. writes the body to a run-owned file under PAPERCLIP_PROMPTS_DIR
+     *      (default `os.tmpdir()/paperclip-prompts`);
+     *   2. exposes the absolute path via opts.promptFilePathEnvName
+     *      (default PAPERCLIP_RUN_PROMPT_FILE) in the spawned env so
+     *      adapters that grow a `--prompt-file <path>` flag can adopt it;
+     *   3. ALSO pipes the body on the child's stdin, so adapters whose CLI
+     *      reads stdin for the prompt slot — Hermes via `chat -q -`, Codex
+     *      via `exec --json -`, and any adapter already on stdin — stay
+     *      working unchanged.
+     *
+     * The pipe is what ends SPA-8607 / SPA-8898 today; the file is the
+     * durability handoff that lets a future adapter decide body-by-path
+     * without ARG_MAX fighting it. If the caller passes both `stdin` and
+     * `promptFileBody`, the explicit `stdin` wins on the pipe (the file
+     * path is still exposed); a missing `stdin` falls back to the prompt
+     * file body on the pipe. The caller decides when to opt in (typically
+     * above a byte threshold); the writer does not enforce one.
+     */
+    promptFileBody?: string;
+    promptFilePathEnvName?: string;
     remoteExecution?: RemoteExecutionSpec | null;
     localProcessSandbox?: LocalProcessSandboxOptions | null;
   },
@@ -4607,22 +4686,66 @@ export async function runChildProcess(
     if (opts.localProcessSandbox?.homeDir) {
       mergedEnv.HOME = opts.localProcessSandbox.homeDir;
     }
+
+    // Resolve the prompt-file handoff eagerly. The run owns its own file
+    // under PAPERCLIP_PROMPTS_DIR (default os.tmpdir()/paperclip-prompts);
+    // the path is exposed via opts.promptFilePathEnvName (default
+    // PAPERCLIP_RUN_PROMPT_FILE). The actual write happens inside the same
+    // .then() as the spawn so a write failure surfaces as a spawn error
+    // (no half-configured child runs without the file).
+    //
+    // Both transports fire when the caller hands the engine a promptFileBody:
+    //   - the body is written to a file and the path lands in the env, so
+    //     adapters that grow a `--prompt-file <path>` flag can adopt it; and
+    //   - the body is also piped to the child's stdin, so adapters whose
+    //     CLI reads stdin for the prompt slot (Hermes via `chat -q -`,
+    //     Codex and the others whose contract is stdin-first) keep working
+    //     unchanged. The pipe transport is what keeps the SPA-8607 /
+    //     SPA-8898 hermes runs alive today; the file transport is the
+    //     durability handoff that ends the argv E2BIG class for any future
+    //     adapter that decides to take the prompt by path.
+    const promptFileEnvName =
+      opts.promptFilePathEnvName ?? PAPERCLIP_RUN_PROMPT_FILE_ENV;
+    let resolvedPromptFilePath: string | null = null;
+    const promptFileBody: string | undefined =
+      typeof opts.promptFileBody === "string" && opts.promptFileBody.length > 0
+        ? opts.promptFileBody
+        : undefined;
+    // Stdin defaults to the caller's explicit stdin. When the engine is
+    // also handed a promptFileBody that IS longer than the caller's stdin
+    // (or the caller passed no stdin at all), the promptFileBody travels
+    // over stdin too — adapters that already read stdin for the prompt
+    // stay intact without the caller wiring a second body through.
+    let stdinToPipe: string | undefined;
+    if (promptFileBody !== undefined) {
+      stdinToPipe = opts.stdin ?? promptFileBody;
+    } else {
+      stdinToPipe = opts.stdin;
+    }
+
     void resolveSpawnTarget(command, args, opts.cwd, mergedEnv, {
       remoteExecution: opts.remoteExecution ?? null,
       remoteEnv: opts.remoteExecution ? opts.env : null,
       localProcessSandbox: opts.localProcessSandbox ?? null,
     })
-      .then((target) => {
+      .then(async (target) => {
         const childEnv = { ...mergedEnv, ...target.env };
         for (const [key, value] of Object.entries(childEnv)) {
           if (value === undefined) delete childEnv[key];
+        }
+        if (promptFileBody !== undefined) {
+          resolvedPromptFilePath = await writeRunPromptToFile({
+            runId,
+            body: promptFileBody,
+          });
+          childEnv[promptFileEnvName] = resolvedPromptFilePath;
         }
         const child = spawn(target.command, target.args, {
           cwd: target.cwd ?? opts.cwd,
           env: childEnv,
           detached: process.platform !== "win32",
           shell: false,
-          stdio: [opts.stdin != null ? "pipe" : "ignore", "pipe", "pipe"],
+          stdio: [stdinToPipe != null ? "pipe" : "ignore", "pipe", "pipe"],
         }) as ChildProcessWithEvents;
         const startedAt = new Date().toISOString();
         const processGroupId = resolveProcessGroupId(child);
@@ -4776,10 +4899,10 @@ export async function runChildProcess(
         });
 
         const stdin = child.stdin;
-        if (opts.stdin != null && stdin) {
+        if (stdinToPipe != null && stdin) {
           void spawnPersistPromise.finally(() => {
             if (child.killed || stdin.destroyed) return;
-            stdin.write(opts.stdin as string);
+            stdin.write(stdinToPipe as string);
             stdin.end();
           });
         }
