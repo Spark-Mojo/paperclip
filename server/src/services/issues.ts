@@ -10469,6 +10469,23 @@ export function issueService(db: Db) {
         actorAgentId?: string | null;
         actorUserId?: string | null;
         companyGuard?: string;
+        /**
+         * SPA-8957: explicit, observable override of the unmerged-PR done
+         * gate. Only the PATCH route mints this and only for user/board
+         * actors; recorded as an `issue.done_gate_overridden` activity row.
+         */
+        doneGateOverride?: {
+          reason: string;
+          actorType: "agent" | "user" | "board";
+          actorId: string | null;
+          agentId: string | null;
+          runId: string | null;
+        };
+        /**
+         * SPA-8957: internal-caller bypass for done-writes that are not card
+         * completions (watchdog evaluation folds). Never settable from HTTP.
+         */
+        doneGateBypass?: boolean;
       },
       dbOrTx: any = db,
       postCommitActivityPublications?: ActivityPublication[],
@@ -10514,6 +10531,8 @@ export function issueService(db: Db) {
         actorAgentId,
         actorUserId,
         companyGuard,
+        doneGateOverride,
+        doneGateBypass,
         ...issueData
       } = data;
       if (
@@ -10575,6 +10594,40 @@ export function issueService(db: Db) {
 
       if (issueData.status) {
         assertTransition(existing.status, issueData.status);
+      }
+
+      // SPA-8957 card-close DoD gate: refuse a first entry into `done` while
+      // the card's pull_request work products are unmerged (or unverifiable).
+      // Skipped entirely when the caller carries an explicit override (only
+      // the PATCH route can mint one, and only for a user/board actor) or a
+      // system-supplied bypass for internal callers whose done-write is not a
+      // card completion (e.g. the watchdog evaluation fold).
+      if (
+        existing.status !== "done" &&
+        issueData.status === "done" &&
+        !doneGateOverride &&
+        !doneGateBypass
+      ) {
+        const { issueDoneGateService } = await import("./issue-done-gate.js");
+        const gate = issueDoneGateService(db);
+        const decision = await gate.evaluateDoneGate({
+          id: existing.id,
+          companyId: existing.companyId,
+        });
+        if (decision.outcome === "refuse") {
+          throw gate.refusalError(decision.reason);
+        }
+      }
+      if (doneGateOverride) {
+        const { issueDoneGateService } = await import("./issue-done-gate.js");
+        await issueDoneGateService(db).recordOverride({
+          issue: {
+            id: existing.id,
+            companyId: existing.companyId,
+            identifier: existing.identifier,
+          },
+          override: doneGateOverride,
+        });
       }
 
       const patch: Partial<typeof issues.$inferInsert> = {
