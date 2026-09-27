@@ -9393,6 +9393,25 @@ export function issueRoutes(
             ...updateFields,
             actorAgentId: actor.agentId ?? null,
             actorUserId: actor.actorType === "user" ? actor.actorId : null,
+            // SPA-8957: resolving a recovery action as restored→done IS the
+            // human override — the recovery verdict ("this card's work is
+            // complete despite the open PR", e.g. a false-positive recovery
+            // that retires an abandoned PR) is the recorded reason. Board-only
+            // outcomes (false_positive/cancelled) already assertBoard above;
+            // restored keeps the agent's authority confined to its own issue.
+            ...(sourceIssueStatus === "done"
+              ? {
+                doneGateOverride: {
+                  reason: resolutionNote?.trim()
+                    ? `Recovery action resolved (${outcome}): ${resolutionNote.trim()}`
+                    : `Recovery action resolved (${outcome}).`,
+                  actorType: actor.actorType,
+                  actorId: actor.actorId,
+                  agentId: actor.agentId ?? null,
+                  runId: actor.runId ?? null,
+                },
+              }
+              : {}),
           };
           const updatedIssue =
             sourceIssueStatus === "done" || sourceIssueStatus === "cancelled"

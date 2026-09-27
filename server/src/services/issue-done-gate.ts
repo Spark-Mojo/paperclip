@@ -41,6 +41,13 @@ import {
  * sanctioned escapes: wait for the merge sha on main, or an explicit
  * board override (see `doneOverride` on the PATCH route — agents may never
  * supply it).
+ *
+ * Verdicts are snapshot-bound: the merge state is read through the same
+ * resolver seam (and cache convention) as execution-workspace delivery
+ * assessment — a short TTL, never a live re-check on refusal. A reviewer who
+ * re-approves within the TTL after the merge lands may see one stale refusal;
+ * re-approving is cheap, intentional, and rate-limit friendly. Do not add a
+ * "re-check on refuse" path.
  */
 
 export const DONE_GATE_OPEN_PR_REFUSAL = "issue_done_with_unmerged_pull_request";
