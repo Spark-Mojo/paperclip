@@ -211,6 +211,17 @@ install_from_fork() {
   # changes (e.g. SPA-6057's recovery service) are what gets packed, not
   # whatever is on the npm registry.
   (cd "$checkout" && run corepack pnpm -r --filter '@paperclipai/server...' --if-present run build)
+  # Git-ref installs package @paperclipai/server via pnpm pack, which runs the
+  # upstream `prepack` (prepare:ui-dist && build) SERIALIZED. Upstream's server
+  # `build` deliberately does NOT rebuild the ui: root `pnpm -r build` runs the
+  # ui and server lanes concurrently, and two vite builds racing in the same
+  # ui/dist make serviceWorkerBuildIdPlugin stamp sw.js twice — the second
+  # closeBundle reads a file whose __PAPERCLIP_BUILD_ID__ placeholder is already
+  # consumed and fails CI's Build/Canary jobs (SPA-8995 defect 1; fork commit
+  # cdcbcfd8f originally moved this step into `build`). Run prepare:ui-dist
+  # here instead, serialized after the server build, so server/ui-dist exists
+  # for the pack loop below without ever racing the ui lane.
+  (cd "$checkout/server" && run corepack pnpm run prepare:ui-dist)
 
   local cli_version
   cli_version="$(node -e 'console.log(JSON.parse(require("fs").readFileSync(process.argv[1],"utf8")).version)' "$checkout/cli/package.json")"
