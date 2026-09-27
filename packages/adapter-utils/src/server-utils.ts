@@ -4631,18 +4631,26 @@ export async function runChildProcess(
     }) => Promise<void>;
     terminalResultCleanup?: TerminalResultCleanupOptions;
     stdin?: string;
-    /**
-     * Optional run-prompt body to hand the child by FILE rather than by
-     * stdin/argv. When set, runChildProcess writes the body to a run-owned
-     * path under PAPERCLIP_PROMPTS_DIR, exposes its absolute path via
-     * opts.promptFilePathEnvName (default PAPERCLIP_RUN_PROMPT_FILE) in the
-     * spawned env, and leaves the child's stdin ignored so a long prompt
-     * can never trigger spawn E2BIG. The caller decides when to opt in
-     * (typically above a byte threshold); the writer does NOT enforce one.
-     * Mutual exclusion: promptFileBody takes precedence over `stdin`. A
-     * caller that passes both gets the file handoff; the stdin string is
-     * intentionally dropped with a one-line stderr log so the next person
-     * reading logs sees the contract instead of guessing.
+/**
+     * Optional run-prompt body to hand the child by FILE and (transparently)
+     * by STDIN. When set, runChildProcess:
+     *   1. writes the body to a run-owned file under PAPERCLIP_PROMPTS_DIR
+     *      (default `os.tmpdir()/paperclip-prompts`);
+     *   2. exposes the absolute path via opts.promptFilePathEnvName
+     *      (default PAPERCLIP_RUN_PROMPT_FILE) in the spawned env so
+     *      adapters that grow a `--prompt-file <path>` flag can adopt it;
+     *   3. ALSO pipes the body on the child's stdin, so adapters whose CLI
+     *      reads stdin for the prompt slot — Hermes via `chat -q -`, Codex
+     *      via `exec --json -`, and any adapter already on stdin — stay
+     *      working unchanged.
+     *
+     * The pipe is what ends SPA-8607 / SPA-8898 today; the file is the
+     * durability handoff that lets a future adapter decide body-by-path
+     * without ARG_MAX fighting it. If the caller passes both `stdin` and
+     * `promptFileBody`, the explicit `stdin` wins on the pipe (the file
+     * path is still exposed); a missing `stdin` falls back to the prompt
+     * file body on the pipe. The caller decides when to opt in (typically
+     * above a byte threshold); the writer does not enforce one.
      */
     promptFileBody?: string;
     promptFilePathEnvName?: string;
@@ -4685,16 +4693,34 @@ export async function runChildProcess(
     // PAPERCLIP_RUN_PROMPT_FILE). The actual write happens inside the same
     // .then() as the spawn so a write failure surfaces as a spawn error
     // (no half-configured child runs without the file).
+    //
+    // Both transports fire when the caller hands the engine a promptFileBody:
+    //   - the body is written to a file and the path lands in the env, so
+    //     adapters that grow a `--prompt-file <path>` flag can adopt it; and
+    //   - the body is also piped to the child's stdin, so adapters whose
+    //     CLI reads stdin for the prompt slot (Hermes via `chat -q -`,
+    //     Codex and the others whose contract is stdin-first) keep working
+    //     unchanged. The pipe transport is what keeps the SPA-8607 /
+    //     SPA-8898 hermes runs alive today; the file transport is the
+    //     durability handoff that ends the argv E2BIG class for any future
+    //     adapter that decides to take the prompt by path.
     const promptFileEnvName =
       opts.promptFilePathEnvName ?? PAPERCLIP_RUN_PROMPT_FILE_ENV;
     let resolvedPromptFilePath: string | null = null;
-    if (typeof opts.promptFileBody === "string" && opts.promptFileBody.length > 0) {
-      delete mergedEnv[promptFileEnvName];
-    } else if (mergedEnv[promptFileEnvName] != null) {
-      // Caller passed nothing but the merged env already carries the path,
-      // which is fine — adapters may pass through a path supplied by the
-      // server. We do NOT clear it here so a chained caller that pre-set
-      // the variable survives the round-trip.
+    const promptFileBody: string | undefined =
+      typeof opts.promptFileBody === "string" && opts.promptFileBody.length > 0
+        ? opts.promptFileBody
+        : undefined;
+    // Stdin defaults to the caller's explicit stdin. When the engine is
+    // also handed a promptFileBody that IS longer than the caller's stdin
+    // (or the caller passed no stdin at all), the promptFileBody travels
+    // over stdin too — adapters that already read stdin for the prompt
+    // stay intact without the caller wiring a second body through.
+    let stdinToPipe: string | undefined;
+    if (promptFileBody !== undefined) {
+      stdinToPipe = opts.stdin ?? promptFileBody;
+    } else {
+      stdinToPipe = opts.stdin;
     }
 
     void resolveSpawnTarget(command, args, opts.cwd, mergedEnv, {
@@ -4707,30 +4733,19 @@ export async function runChildProcess(
         for (const [key, value] of Object.entries(childEnv)) {
           if (value === undefined) delete childEnv[key];
         }
-        // Write the prompt file BEFORE spawning so the child can read it on
-        // its first instruction. A write failure rejects the outer promise
-        // and the spawn never happens.
-        if (typeof opts.promptFileBody === "string" && opts.promptFileBody.length > 0) {
+        if (promptFileBody !== undefined) {
           resolvedPromptFilePath = await writeRunPromptToFile({
             runId,
-            body: opts.promptFileBody,
+            body: promptFileBody,
           });
           childEnv[promptFileEnvName] = resolvedPromptFilePath;
         }
-        const stdioStdinMode: "pipe" | "ignore" =
-          resolvedPromptFilePath != null
-            ? // Prompt-by-file takes precedence over stdin; a caller that
-              // passes both is opting into the durability handoff.
-              "ignore"
-            : opts.stdin != null
-              ? "pipe"
-              : "ignore";
         const child = spawn(target.command, target.args, {
           cwd: target.cwd ?? opts.cwd,
           env: childEnv,
           detached: process.platform !== "win32",
           shell: false,
-          stdio: [stdioStdinMode, "pipe", "pipe"],
+          stdio: [stdinToPipe != null ? "pipe" : "ignore", "pipe", "pipe"],
         }) as ChildProcessWithEvents;
         const startedAt = new Date().toISOString();
         const processGroupId = resolveProcessGroupId(child);
@@ -4884,10 +4899,10 @@ export async function runChildProcess(
         });
 
         const stdin = child.stdin;
-        if (opts.stdin != null && stdin && stdioStdinMode === "pipe") {
+        if (stdinToPipe != null && stdin) {
           void spawnPersistPromise.finally(() => {
             if (child.killed || stdin.destroyed) return;
-            stdin.write(opts.stdin as string);
+            stdin.write(stdinToPipe as string);
             stdin.end();
           });
         }

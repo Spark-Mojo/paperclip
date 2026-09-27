@@ -918,13 +918,24 @@ describe("runChildProcess — prompt-by-file handoff (SPA-8967)", () => {
   // SPA-8967 regression: a card whose comment history passes ~117KB used to
   // fail spawn with E2BIG when the adapter placed the prompt in argv. The
   // engine now writes the prompt to a run-owned file under the prompts dir
-  // and hands the child the absolute path via PAPERCLIP_RUN_PROMPT_FILE.
-  // The child's stdin is left ignored, so a run prompt of any size can no
-  // longer drive the argv/string-table limit.
+  // (so adapters can adopt a `--prompt-file <path>` flag without touching
+  // argv) AND pipes the body on the child's stdin (so adapters whose CLI
+  // reads stdin for the prompt slot — Hermes `chat -q -`, Codex `exec -`,
+  // and the existing opencode / claude / codex lanes — keep working
+  // unchanged). Either transport is enough to end the E2BIG class; both
+  // run side-by-side so adapters can adopt the file transport later without
+  // a behavior change for the runtime transport.
+
+  // 256 KB > James's required regression threshold (~200 KB). Anywhere above
+  // ~128 KB the old shape used to fail posix_spawn; anywhere above the
+  // engine's own 64 KB threshold would start to benefit from the file path
+  // being sized off disk. Test at 256 KB so a 117 KB card stops being a
+  // lucky escape and a 200 KB card stops being a guessed fixture.
+  const LARGE_PROMPT_BYTES = 256 * 1024;
 
   it("writes the prompt body to a run-owned file and exposes the path via PAPERCLIP_RUN_PROMPT_FILE", async () => {
     const runId = `rca-${randomUUID()}`;
-    const promptBody = "x".repeat(2048);
+    const promptBody = "x".repeat(LARGE_PROMPT_BYTES);
     const probe = [
       "-e",
       [
@@ -940,11 +951,11 @@ describe("runChildProcess — prompt-by-file handoff (SPA-8967)", () => {
     const result = await runChildProcess(
       runId,
       process.execPath,
-      ["-e", probe.split("").join("") === probe ? probe : probe],
+      ["-e", probe],
       {
         cwd: process.cwd(),
         env: {},
-        timeoutSec: 5,
+        timeoutSec: 10,
         graceSec: 1,
         promptFileBody: promptBody,
         onLog: async () => {},
@@ -956,17 +967,16 @@ describe("runChildProcess — prompt-by-file handoff (SPA-8967)", () => {
     expect(observed.size).toBe(promptBody.length);
     expect(observed.length).toBe(promptBody.length);
     expect(observed.envPath.startsWith(resolvePaperclipPromptsDir())).toBe(true);
-    // Path env name is the documented constant; caller can override via opts.
     expect(observed.envPath).toContain(runId.replace(/[^a-zA-Z0-9_-]/g, "_").slice(0, 64));
   });
 
-  it("ignores the prompt-by-file child's stdin (no deadlocks on large prompts)", async () => {
-    // Read PAPERCLIP_RUN_PROMPT_FILE and verify the prompt body is delivered
-    // in full even when stdin would have been closed-without-write. This is
-    // the property that ends the E2BIG class: large prompt bodies never
-    // touch argv or a closed stdin pipe.
+  it("delivers the prompt body on stdin as well (Hermes / Codex / opencode / claude adapters)", async () => {
+    // Read both PAPERCLIP_RUN_PROMPT_FILE and stdin; if BOTH deliver the
+    // full body, then a CLI that reads either transport works without
+    // adapter changes. This is the SPA-8967 contract: large bodies never
+    // touch argv, and any in-flight adapter keeps its stdin contract.
     const runId = `rdb-${randomUUID()}`;
-    const promptBody = "y".repeat(1024);
+    const promptBody = "y".repeat(LARGE_PROMPT_BYTES);
     const probe = [
       "-e",
       [
@@ -975,8 +985,8 @@ describe("runChildProcess — prompt-by-file handoff (SPA-8967)", () => {
         "let readFromStdin = '';",
         "process.stdin.on('data', c => (readFromStdin += String(c)));",
         "process.stdin.on('end', () => {",
-        "  const data = fs.readFileSync(path, 'utf8');",
-        "  process.stdout.write(JSON.stringify({ fileBytes: data.length, stdinBytes: readFromStdin.length }));",
+        "  const fileData = path ? fs.readFileSync(path, 'utf8') : '';",
+        "  process.stdout.write(JSON.stringify({ fileBytes: fileData.length, stdinBytes: readFromStdin.length, envPath: path }));",
         "});",
       ].join(" "),
     ].join("");
@@ -988,6 +998,51 @@ describe("runChildProcess — prompt-by-file handoff (SPA-8967)", () => {
       {
         cwd: process.cwd(),
         env: {},
+        timeoutSec: 10,
+        graceSec: 1,
+        promptFileBody: promptBody,
+        onLog: async () => {},
+      },
+    );
+
+    expect(result.exitCode).toBe(0);
+    const observed = JSON.parse(result.stdout.trim());
+    expect(observed.fileBytes).toBe(promptBody.length);
+    expect(observed.stdinBytes).toBe(promptBody.length);
+    expect(observed.envPath).not.toBeNull();
+  });
+
+  it("an explicit `stdin` payload takes precedence over `promptFileBody` on the pipe (file path still surfaced)", async () => {
+    // Use case: an adapter wants to feed a NORMAL tail-prefix on stdin
+    // (e.g. shell preamble, terminal-clear sequence) and the prompt body
+    // exclusively by file. The file path env is always set when
+    // promptFileBody is set; the pipe carries the caller's stdin if
+    // provided, falling back to the prompt body.
+    const runId = `rcm-${randomUUID()}`;
+    const promptBody = "P".repeat(64);
+    const explicitStdin = "S".repeat(32);
+    const probe = [
+      "-e",
+      [
+        "const fs = require('node:fs');",
+        "const p = process.env.PAPERCLIP_RUN_PROMPT_FILE;",
+        "const fileBytes = fs.readFileSync(p, 'utf8').length;",
+        "let readFromStdin = '';",
+        "process.stdin.on('data', c => (readFromStdin += String(c)));",
+        "process.stdin.on('end', () => {",
+        "  process.stdout.write(JSON.stringify({ fileBytes, stdinBytes: readFromStdin.length, stdinFirstChar: readFromStdin[0] || '' }));",
+        "});",
+      ].join(" "),
+    ].join("");
+
+    const result = await runChildProcess(
+      runId,
+      process.execPath,
+      ["-e", probe],
+      {
+        cwd: process.cwd(),
+        env: {},
+        stdin: explicitStdin,
         timeoutSec: 5,
         graceSec: 1,
         promptFileBody: promptBody,
@@ -998,8 +1053,8 @@ describe("runChildProcess — prompt-by-file handoff (SPA-8967)", () => {
     expect(result.exitCode).toBe(0);
     const observed = JSON.parse(result.stdout.trim());
     expect(observed.fileBytes).toBe(promptBody.length);
-    // No stdin was written — prompt is delivered entirely via file.
-    expect(observed.stdinBytes).toBe(0);
+    expect(observed.stdinBytes).toBe(explicitStdin.length);
+    expect(observed.stdinFirstChar).toBe("S");
   });
 
   it("still works when no promptFileBody is passed (legacy stdin behavior preserved)", async () => {
@@ -1026,7 +1081,7 @@ describe("runChildProcess — prompt-by-file handoff (SPA-8967)", () => {
   });
 
   it("writeRunPromptToFile round-trips the body byte-for-byte", async () => {
-    const body = "agent-instructions-content\n";
+    const body = "agent-instructions-content\n".repeat(2048); // 50KB
     const path_ = await writeRunPromptToFile({ runId: `wrt-${randomUUID()}`, body });
     try {
       expect(path_.startsWith(resolvePaperclipPromptsDir())).toBe(true);
