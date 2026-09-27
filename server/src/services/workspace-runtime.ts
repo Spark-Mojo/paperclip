@@ -3923,11 +3923,15 @@ export async function ensurePersistedExecutionWorkspaceAvailable(input: {
       ) {
         throw error;
       }
-      if (!realized.branchCreatedByRuntime) {
-        throw new Error(
-          `Execution workspace "${worktreePath}" cannot be restored because its operator-owned branch "${branchName}" no longer exists.`,
-        );
-      }
+      // SPA-8870 (carry onto rebuild/v2026.916.0-survivors): the
+      // operator-owned-branch guard below only fires when the branch is gone
+      // from BOTH the local refs AND origin. Restore-from-origin must be
+      // attempted first — on a survivors branch the persisted workspace's
+      // branch is normally operator-owned (`branchCreatedByRuntime: false`),
+      // so a guard placed before this check made the origin-restore path
+      // unreachable and the fix dead on arrival. The guard is therefore
+      // applied to the base-ref fallback arm, where the only remaining source
+      // of work is a local tip that no longer exists anywhere.
       // SPA-8870: before silently recreating the branch off the base ref, check
       // whether the branch still exists on origin. If it does, restore from
       // origin/<branch> — a persisted execution workspace whose local branch
@@ -3970,6 +3974,11 @@ export async function ensurePersistedExecutionWorkspaceAvailable(input: {
           restoreRefreshWarnings.push(...originFetchWarnings);
         }
       } else {
+        if (!realized.branchCreatedByRuntime) {
+          throw new Error(
+            `Execution workspace "${worktreePath}" cannot be restored because its operator-owned branch "${branchName}" no longer exists.`,
+          );
+        }
         const baseRef = input.workspace.baseRef ?? await detectDefaultBranch(repoRoot) ?? "HEAD";
         const recreatedBaseRefSha = await resolveBaseRefSha(repoRoot, baseRef);
         freshOffBaseRefFallback = true;

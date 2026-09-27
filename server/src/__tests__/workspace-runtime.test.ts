@@ -2893,6 +2893,10 @@ describe("realizeExecutionWorkspace", () => {
         repoUrl: null,
         baseRef: "HEAD",
         branchName,
+        metadata: {
+          createdByRuntime: true,
+          gitBranchOwnershipVersion: 1,
+        },
       },
       issue: {
         id: "issue-8870-c2",
@@ -2916,6 +2920,75 @@ describe("realizeExecutionWorkspace", () => {
     expect(newTip).not.toBe(priorTip);
     const newBranch = (await execFileAsync("git", ["rev-parse", "--abbrev-ref", "HEAD"], { cwd: initial.cwd })).stdout.trim();
     expect(newBranch).toBe(branchName);
+  }, 20_000);
+
+  // SPA-8960: regression net for the survivors-only operator-owned-branch
+  // guard when SPA-8870's origin-restore was carried onto this branch. The
+  // guard used to sit upstream of the origin check, which made the whole
+  // SPA-8870 fix unreachable for the operator-owned workspaces this line
+  // creates (every runtime-created harness branch is operator-owned here).
+  // It is now scoped to the base-ref fallback arm; this test pins that the
+  // fallback arm still refuses to recreate a branch the engine cannot prove
+  // it owns, on both the local refs and origin.
+  it("still refuses to recreate an operator-owned persisted branch gone from BOTH local and origin (SPA-8960 carry)", async () => {
+    const sourceRepo = await createTempRepo("master");
+    const remoteDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-operator-owned-remote-"));
+    const remotePath = path.join(remoteDir, "paperclip.git");
+    await execFileAsync("git", ["clone", "--bare", sourceRepo, remotePath]);
+
+    const cloneRoot = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-operator-owned-clone-"));
+    const repoRoot = path.join(cloneRoot, "paperclip");
+    await execFileAsync("git", ["clone", remotePath, repoRoot]);
+    await runGit(repoRoot, ["config", "user.email", "paperclip@example.com"]);
+    await runGit(repoRoot, ["config", "user.name", "Paperclip Test"]);
+
+    const branchName = "feature/operator-owned-gone-everywhere";
+    await runGit(repoRoot, ["checkout", "-b", branchName]);
+    await fs.writeFile(path.join(repoRoot, "operator-owned-gone.txt"), "operator-owned\n", "utf8");
+    await runGit(repoRoot, ["add", "operator-owned-gone.txt"]);
+    await runGit(repoRoot, ["commit", "-m", "Add operator-owned-gone.txt"]);
+    await runGit(repoRoot, ["checkout", "master"]);
+    const legacyPath = path.join(repoRoot, ".paperclip", "worktrees", "operator-owned-gone-everywhere");
+    await runGit(repoRoot, ["worktree", "add", legacyPath, branchName]);
+
+    await fs.rm(legacyPath, { recursive: true, force: true });
+    await runGit(repoRoot, ["update-ref", "-d", `refs/heads/${branchName}`]);
+    await runGit(repoRoot, ["update-ref", "-d", `refs/remotes/origin/${branchName}`]);
+    await runGit(repoRoot, ["worktree", "prune"]);
+
+    // No ownership metadata -> `isRuntimeOwnedGitBranch()` is false -> the
+    // workspace is operator-owned and the engine must not recreate the branch.
+    await expect(ensurePersistedExecutionWorkspaceAvailable({
+      base: {
+        baseCwd: repoRoot,
+        source: "project_primary",
+        projectId: "project-1",
+        workspaceId: "workspace-1",
+        repoUrl: null,
+        repoRef: "HEAD",
+      },
+      workspace: {
+        mode: "isolated_workspace",
+        strategyType: "git_worktree",
+        cwd: legacyPath,
+        providerRef: legacyPath,
+        projectId: "project-1",
+        projectWorkspaceId: "workspace-1",
+        repoUrl: null,
+        baseRef: "HEAD",
+        branchName,
+      },
+      issue: {
+        id: "issue-8960-guard",
+        identifier: "PAP-8960-GUARD",
+        title: "Operator-owned branch guard still rejects",
+      },
+      agent: {
+        id: "agent-1",
+        name: "Codex Coder",
+        companyId: "company-1",
+      },
+    })).rejects.toThrow(/operator-owned branch/);
   }, 20_000);
 
   it("repairs a clean persisted git worktree branch mismatch when both branches point at the same commit", async () => {
