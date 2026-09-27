@@ -9476,7 +9476,13 @@ export function heartbeatService(
       if (!run) return null;
       const agent = await getAgent(run.agentId);
       if (!agent || agent.companyId !== run.companyId) return null;
-      const result = await scheduleBoundedRetryForRun(run, agent);
+      const result = await scheduleBoundedRetryForRun(run, agent, {
+        // SPA-9001: a graceful-shutdown interruption is an infrastructure
+        // event, not a failed provider attempt — restart recovery must be
+        // able to schedule the retry the shutdown already promised. The
+        // run-level evidence gate stays intact for every other cause.
+        skipLegacyReconciliationGuard: run.errorCode === "server_shutdown_interrupted",
+      });
       return result.outcome === "scheduled" ? result.run : null;
     },
   });
@@ -15161,6 +15167,7 @@ export function heartbeatService(
       wakeReason?: string;
       maxAttempts?: number;
       delayMs?: number;
+      skipLegacyReconciliationGuard?: boolean;
     },
   ) {
     const now = opts?.now ?? new Date();
@@ -15253,7 +15260,10 @@ export function heartbeatService(
       };
     }
 
-    if (legacyExecutionNeedsReconciliation(run)) {
+    if (
+      legacyExecutionNeedsReconciliation(run) &&
+      !opts?.skipLegacyReconciliationGuard
+    ) {
       return {
         outcome: "not_scheduled" as const,
         reason:
