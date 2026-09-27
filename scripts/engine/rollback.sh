@@ -26,8 +26,8 @@ Usage: rollback.sh [prefix] [--restore <dump-file> --yes]
 With no [prefix], rolls back to the prefix recorded by the last install.sh
 run (scripts/engine/.paperclip-engine/previous-prefix under ENGINE_ROOT).
 
---restore <dump-file>   validate, then pg_restore the given dump into the
-                         instance database. Destructive; requires --yes.
+--restore <dump-file>   pg_restore the given dump into the instance database
+                         AFTER the symlink flip. Destructive; requires --yes.
 EOF
 }
 
@@ -80,43 +80,20 @@ fi
 
 assert_expected_database "$INSTANCE_CONFIG"
 
-if [ -n "$RESTORE_DUMP" ]; then
-  if [ ! -f "$RESTORE_DUMP" ]; then
-    die "Restore dump does not exist: $RESTORE_DUMP. Service and symlink left unchanged."
-  fi
-  if ! pg_restore --list "$RESTORE_DUMP" >/dev/null 2>&1; then
-    die "Restore dump is not a readable PostgreSQL archive: $RESTORE_DUMP. Service and symlink left unchanged."
-  fi
-  if [ ! -f "$INSTANCE_CONFIG" ]; then
-    die "No instance config at $INSTANCE_CONFIG — cannot resolve a connection string to restore into. Service and symlink left unchanged."
-  fi
-fi
-
 before="$(current_target)"
 log "Rolling back paperclip-current: $before -> $TARGET_PREFIX"
 
 unit_stop
+flip_symlink "$TARGET_PREFIX"
 
 if [ -n "$RESTORE_DUMP" ]; then
+  if [ ! -f "$INSTANCE_CONFIG" ]; then
+    die "No instance config at $INSTANCE_CONFIG — cannot resolve a connection string to restore into."
+  fi
   connection_string="$(connection_string_from_config "$INSTANCE_CONFIG")"
   log "Restoring database from $RESTORE_DUMP (--yes confirmed)"
-  restore_ok=1
-  secure_database_command "$connection_string" pg_restore --clean --if-exists --exit-on-error --single-transaction "$RESTORE_DUMP" || restore_ok=0
-  if [ "$restore_ok" != "1" ]; then
-    log "ERROR: database restore failed. Restarting original service with symlink unchanged at $before."
-    original_started=1
-    unit_start || original_started=0
-    original_url="$(health_url "$INSTANCE_CONFIG")"
-    if [ "$original_started" = "1" ] && original_body="$(wait_for_health "$original_url")"; then
-      log "Original service recovered after failed restore: $original_body"
-    else
-      log "ERROR: original service did not recover after failed restore. Manual intervention required."
-    fi
-    exit 1
-  fi
+  run pg_restore --clean --if-exists -d "$connection_string" "$RESTORE_DUMP"
 fi
-
-flip_symlink "$TARGET_PREFIX"
 
 # See install.sh for why this can't be a bare `unit_start` under `set -e`.
 started=1
