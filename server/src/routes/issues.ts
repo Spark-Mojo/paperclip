@@ -2162,7 +2162,7 @@ function diffExecutionParticipants(
   };
 }
 
-function buildExecutionStageWakeup(input: {
+export function buildExecutionStageWakeup(input: {
   issueId: string;
   previousState: ParsedExecutionState | null;
   nextState: ParsedExecutionState | null;
@@ -2176,10 +2176,19 @@ function buildExecutionStageWakeup(input: {
   if (nextState.status === "pending") {
     const agentId =
       nextState.currentParticipant?.type === "agent" ? (nextState.currentParticipant.agentId ?? null) : null;
+    // SPA-9001: a same-stage / same-participant re-entry (reviewer sends back
+    // via request_changes, executor resubmits) leaves stageChanged=false if we
+    // only compare stageId + participant, so the reviewer never gets woken for
+    // the resubmission. lastDecisionId is the durable signal that a fresh
+    // decision (changes_requested, then pending again with a new review cycle)
+    // has re-entered the same stage. Mirror the predicate that the
+    // changes_requested branch already uses (lastDecisionId differs OR
+    // returnAssignee changed OR status left changes_requested).
     const stageChanged =
       previousState?.status !== "pending" ||
       previousState?.currentStageId !== nextState.currentStageId ||
-      !executionPrincipalsEqual(previousState?.currentParticipant ?? null, nextState.currentParticipant ?? null);
+      !executionPrincipalsEqual(previousState?.currentParticipant ?? null, nextState.currentParticipant ?? null) ||
+      previousState?.lastDecisionId !== nextState.lastDecisionId;
     if (!agentId || !stageChanged) return null;
 
     const reason =
