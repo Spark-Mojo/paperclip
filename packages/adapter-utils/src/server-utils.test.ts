@@ -21,10 +21,12 @@ import {
   isPaperclipExternalChatTurn,
   materializePaperclipSkillCopy,
   PAPERCLIP_OPERATIONAL_SKILL_KEY,
+  PAPERCLIP_RUN_PROMPT_FILE_ENV,
   refreshPaperclipWorkspaceEnvForExecution,
   renderPaperclipWakePrompt,
   resolveLegacyPaperclipDesiredSkillNames,
   resolvePaperclipDesiredSkillNames,
+  resolvePaperclipPromptsDir,
   selectPaperclipTaskMarkdown,
   runningProcesses,
   runChildProcess,
@@ -36,6 +38,7 @@ import {
   UNMANAGED_BACKGROUND_TASK_LIVENESS_REASON,
   UNMANAGED_BACKGROUND_TASK_STOP_REASON,
   WATCHDOG_DEFAULT_MANDATE,
+  writeRunPromptToFile,
 } from "./server-utils.js";
 
 describe("runtime connection tool delivery", () => {
@@ -909,6 +912,143 @@ describe("runChildProcess", () => {
       }
     },
   );
+});
+
+describe("runChildProcess — prompt-by-file handoff (SPA-8967)", () => {
+  // SPA-8967 regression: a card whose comment history passes ~117KB used to
+  // fail spawn with E2BIG when the adapter placed the prompt in argv. The
+  // engine now writes the prompt to a run-owned file under the prompts dir
+  // and hands the child the absolute path via PAPERCLIP_RUN_PROMPT_FILE.
+  // The child's stdin is left ignored, so a run prompt of any size can no
+  // longer drive the argv/string-table limit.
+
+  it("writes the prompt body to a run-owned file and exposes the path via PAPERCLIP_RUN_PROMPT_FILE", async () => {
+    const runId = `rca-${randomUUID()}`;
+    const promptBody = "x".repeat(2048);
+    const probe = [
+      "-e",
+      [
+        "const fs = require('node:fs');",
+        "const path = process.env.PAPERCLIP_RUN_PROMPT_FILE;",
+        "if (!path) { process.stderr.write('NO_PROMPT_FILE_ENV'); process.exit(2); }",
+        "const stat = fs.statSync(path);",
+        "const data = fs.readFileSync(path, 'utf8');",
+        "process.stdout.write(JSON.stringify({ size: stat.size, length: data.length, envPath: path }));",
+      ].join(" "),
+    ].join(" ");
+
+    const result = await runChildProcess(
+      runId,
+      process.execPath,
+      ["-e", probe.split("").join("") === probe ? probe : probe],
+      {
+        cwd: process.cwd(),
+        env: {},
+        timeoutSec: 5,
+        graceSec: 1,
+        promptFileBody: promptBody,
+        onLog: async () => {},
+      },
+    );
+
+    expect(result.exitCode).toBe(0);
+    const observed = JSON.parse(result.stdout.trim());
+    expect(observed.size).toBe(promptBody.length);
+    expect(observed.length).toBe(promptBody.length);
+    expect(observed.envPath.startsWith(resolvePaperclipPromptsDir())).toBe(true);
+    // Path env name is the documented constant; caller can override via opts.
+    expect(observed.envPath).toContain(runId.replace(/[^a-zA-Z0-9_-]/g, "_").slice(0, 64));
+  });
+
+  it("ignores the prompt-by-file child's stdin (no deadlocks on large prompts)", async () => {
+    // Read PAPERCLIP_RUN_PROMPT_FILE and verify the prompt body is delivered
+    // in full even when stdin would have been closed-without-write. This is
+    // the property that ends the E2BIG class: large prompt bodies never
+    // touch argv or a closed stdin pipe.
+    const runId = `rdb-${randomUUID()}`;
+    const promptBody = "y".repeat(1024);
+    const probe = [
+      "-e",
+      [
+        "const fs = require('node:fs');",
+        "const path = process.env.PAPERCLIP_RUN_PROMPT_FILE;",
+        "let readFromStdin = '';",
+        "process.stdin.on('data', c => (readFromStdin += String(c)));",
+        "process.stdin.on('end', () => {",
+        "  const data = fs.readFileSync(path, 'utf8');",
+        "  process.stdout.write(JSON.stringify({ fileBytes: data.length, stdinBytes: readFromStdin.length }));",
+        "});",
+      ].join(" "),
+    ].join("");
+
+    const result = await runChildProcess(
+      runId,
+      process.execPath,
+      ["-e", probe],
+      {
+        cwd: process.cwd(),
+        env: {},
+        timeoutSec: 5,
+        graceSec: 1,
+        promptFileBody: promptBody,
+        onLog: async () => {},
+      },
+    );
+
+    expect(result.exitCode).toBe(0);
+    const observed = JSON.parse(result.stdout.trim());
+    expect(observed.fileBytes).toBe(promptBody.length);
+    // No stdin was written — prompt is delivered entirely via file.
+    expect(observed.stdinBytes).toBe(0);
+  });
+
+  it("still works when no promptFileBody is passed (legacy stdin behavior preserved)", async () => {
+    const runId = `rlegacy-${randomUUID()}`;
+    const result = await runChildProcess(
+      runId,
+      process.execPath,
+      [
+        "-e",
+        "let d='';process.stdin.on('data',c=>d+=c);process.stdin.on('end',()=>{process.stdout.write(d);});",
+      ],
+      {
+        cwd: process.cwd(),
+        env: {},
+        stdin: "legacy-stdin-payload",
+        timeoutSec: 5,
+        graceSec: 1,
+        onLog: async () => {},
+      },
+    );
+
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toBe("legacy-stdin-payload");
+  });
+
+  it("writeRunPromptToFile round-trips the body byte-for-byte", async () => {
+    const body = "agent-instructions-content\n";
+    const path_ = await writeRunPromptToFile({ runId: `wrt-${randomUUID()}`, body });
+    try {
+      expect(path_.startsWith(resolvePaperclipPromptsDir())).toBe(true);
+      const read = await fs.readFile(path_, "utf8");
+      expect(read).toBe(body);
+    } finally {
+      await fs.unlink(path_).catch(() => undefined);
+    }
+  });
+
+  it("rejects promptFileBody when PAPERCLIP_PROMPTS_DIR is disabled (off)", async () => {
+    const previous = process.env.PAPERCLIP_PROMPTS_DIR;
+    process.env.PAPERCLIP_PROMPTS_DIR = "off";
+    try {
+      await expect(
+        writeRunPromptToFile({ runId: `off-${randomUUID()}`, body: "x" }),
+      ).rejects.toThrow(/PAPERCLIP_PROMPTS_DIR is disabled/);
+    } finally {
+      if (previous == null) delete process.env.PAPERCLIP_PROMPTS_DIR;
+      else process.env.PAPERCLIP_PROMPTS_DIR = previous;
+    }
+  });
 });
 
 describe("renderPaperclipWakePrompt", () => {

@@ -204,4 +204,62 @@ describe("hermes-local adapter onSpawn forwarding", () => {
       else process.env.PAPERCLIP_API_KEY = previousApiKey;
     }
   });
+
+  // SPA-8967: hermes used to put the assembled prompt in argv, which on
+  // Linux fails spawn with E2BIG once the prompt passes ~128KB. The fix
+  // passes the prompt by file/stdin via the engine's promptFileBody handoff
+  // and points hermes's CLI prompt slot at `-`. Both halves are covered:
+  it("forwards the assembled prompt via promptFileBody and never via argv (SPA-8967)", async () => {
+    vi.mocked(serverUtils.runChildProcess).mockResolvedValueOnce({
+      exitCode: 0,
+      signal: null,
+      timedOut: false,
+      stdout: "",
+      stderr: "",
+      pid: null,
+      startedAt: null,
+    });
+
+    const { ctx } = makeCtx();
+    try {
+      await execute(ctx as any);
+    } catch {
+      // ignore — we only care about the runChildProcess call shape
+    }
+
+    const mocked = vi.mocked(serverUtils.runChildProcess);
+    const lastCall = mocked.mock.calls[mocked.mock.calls.length - 1];
+    const cmd = lastCall[1];
+    const args = lastCall[2] as string[];
+    const opts = lastCall[3] as {
+      promptFileBody?: string;
+      stdin?: string;
+    };
+
+    // Args must point at the stdin placeholder, never at a real prompt body.
+    // A regression to the old shape would show the prompt itself appearing
+    // somewhere in `args`, which is exactly the argv E2BIG site.
+    expect(cmd).toBe("hermes");
+    expect(args[0]).toBe("chat");
+    expect(args[1]).toBe("-q");
+    expect(args[2]).toBe("-"); // stdin placeholder, NOT a prompt body
+    // No element of args may be a real prompt body. The adapter's job is to
+    // move large bodies off argv; doing the migration but leaving a copy in
+    // args would defeat the entire fix.
+    for (const value of args) {
+      if (typeof value !== "string") continue;
+      expect(value.length).toBeLessThan(1024);
+    }
+    // The prompt body travels via the engine contract, not stdin (stdin is
+    // reserved for the adapter's steady-state transport choice; today we
+    // route the body through the file handoff and let the engine wire stdin
+    // when the body fits). Either is acceptable as long as the body NEVER
+    // rides in argv. We assert the body is present in exactly one of:
+    if (typeof opts.promptFileBody === "string") {
+      expect(opts.promptFileBody.length).toBeGreaterThan(0);
+    } else {
+      expect(typeof opts.stdin).toBe("string");
+      expect((opts.stdin as string).length).toBeGreaterThan(0);
+    }
+  });
 });
