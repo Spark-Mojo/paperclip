@@ -1503,6 +1503,18 @@ async function startServerWithDatabaseTeardown(
           }
         }
 
+        // SPA-9270 fix 3: reap orphaned run scratch dirs and any process
+        // trees still living under them (cancelled runs whose tree escaped
+        // termination before a restart). Never touches live runs' scratch.
+        try {
+          const swept = await heartbeat.sweepOrphanedRunScratch();
+          if (swept.killedProcessGroups > 0 || swept.removedDirs > 0) {
+            logger.warn(swept, "startup run-scratch orphan sweep reclaimed leaked run scratch state");
+          }
+        } catch (err) {
+          logger.error({ err }, "startup run-scratch orphan sweep failed");
+        }
+
         const promotion = await heartbeat.promoteDueScheduledRetries();
         await heartbeat.resumeQueuedRuns();
         const recoveredGoalActions = await heartbeat.recoverPendingSessionGoalActions();
@@ -1759,6 +1771,15 @@ async function startServerWithDatabaseTeardown(
           // persisted queued work is still being driven forward.
           trackHeartbeatSchedulerWork(heartbeat
             .reapOrphanedRuns({ staleThresholdMs: 5 * 60 * 1000 })
+            .then(async (reaped) => {
+              // SPA-9270 fix 3: ride the same tick to reclaim run scratch
+              // dirs orphaned by cancelled runs.
+              const swept = await heartbeat.sweepOrphanedRunScratch();
+              if (swept.killedProcessGroups > 0 || swept.removedDirs > 0) {
+                logger.warn(swept, "periodic run-scratch orphan sweep reclaimed leaked run scratch state");
+              }
+              return reaped;
+            })
             .then(() => heartbeat.promoteDueScheduledRetries())
             .then(async (promotion) => {
               await heartbeat.resumeQueuedRuns();

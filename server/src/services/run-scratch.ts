@@ -4,6 +4,11 @@ import path from "node:path";
 
 export const HEARTBEAT_RUN_SCRATCH_MARKER = ".paperclip-run-scratch.json";
 
+// SPA-9270: orphaned scratch sweep bound. A scratch dir whose marker is older
+// than this is eligible for orphan cleanup even when its owning run row is
+// missing entirely; it also bounds the pid-recycling window for kill(-pgid).
+export const RUN_SCRATCH_ORPHAN_MAX_AGE_MS = 24 * 60 * 60 * 1000;
+
 export interface HeartbeatRunScratchMetadata {
   version: 1;
   companyId: string;
@@ -154,4 +159,100 @@ export async function cleanupHeartbeatRunScratch(input: {
 
   await fs.rm(dir, { recursive: true, force: true });
   return { removed: true, dir };
+}
+
+export interface OrphanedRunScratchSweepResult {
+  swept: number;
+  killedProcessGroups: number;
+  removedDirs: number;
+  skipped: number;
+  errors: number;
+}
+
+/**
+ * SPA-9270 fix 3: sweep orphaned run scratch directories and the process
+ * trees still living under them. A cancelled run whose process tree escaped
+ * the termination path leaves descendants reparented to the init system with
+ * TMPDIR still pointing inside the run's scratch dir; nothing else reaps
+ * them. This sweep runs at server startup and on the periodic scheduler
+ * tick. It is filesystem-driven (the run row is often already terminal, so
+ * the DB cannot enumerate the leak) but DB-guarded: a scratch dir is only
+ * reclaimed when its owning run row is terminal or missing, or when the
+ * marker itself is older than the orphan age bound. A live run's scratch
+ * tree — including a live process group — is never touched.
+ */
+export async function sweepOrphanedRunScratch(input: {
+  tmpRoot?: string;
+  now?: Date;
+  isProcessGroupAlive?: (processGroupId: number | null | undefined) => boolean;
+  killProcessGroup?: (processGroupId: number) => void;
+  loadRun: (runId: string) => Promise<
+    | { status: string; processGroupId: number | null; processPid: number | null }
+    | null
+  >;
+}): Promise<OrphanedRunScratchSweepResult> {
+  const tmpRoot = path.resolve(input.tmpRoot ?? os.tmpdir());
+  const now = input.now ?? new Date();
+  const isProcessGroupAlive =
+    input.isProcessGroupAlive ?? (() => false);
+  const killProcessGroup =
+    input.killProcessGroup ??
+    ((pgid: number) => {
+      try {
+        process.kill(-pgid, "SIGTERM");
+      } catch {
+        // Already gone or not ours.
+      }
+    });
+
+  const entries = await fs.readdir(tmpRoot, { withFileTypes: true }).catch(() => []);
+  const result: OrphanedRunScratchSweepResult = {
+    swept: 0,
+    killedProcessGroups: 0,
+    removedDirs: 0,
+    skipped: 0,
+    errors: 0,
+  };
+
+  for (const entry of entries) {
+    if (!entry.isDirectory() || !entry.name.startsWith("paperclip-run-")) continue;
+    const dir = path.join(tmpRoot, entry.name);
+    result.swept += 1;
+    try {
+      const marker = await readMarker(path.join(dir, HEARTBEAT_RUN_SCRATCH_MARKER));
+      if (!marker) {
+        // No marker: not a run scratch dir (or already wiped); leave it to
+        // the OS tmp reaper rather than deleting unknown content.
+        result.skipped += 1;
+        continue;
+      }
+      const run = await input.loadRun(marker.runId).catch(() => null);
+      const markerAgeMs =
+        now.getTime() - (Date.parse(marker.createdAt) || 0);
+      const runTerminal = !!run && !["queued", "running", "scheduled_retry"].includes(run.status);
+      const runMissing = !run;
+      const agedOut =
+        !Number.isNaN(markerAgeMs) && markerAgeMs > RUN_SCRATCH_ORPHAN_MAX_AGE_MS;
+      if (!runTerminal && !runMissing && !agedOut) {
+        result.skipped += 1;
+        continue;
+      }
+
+      // Kill the surviving process tree when one is still attributable. Only
+      // a process group recorded on the (terminal/missing) run row counts —
+      // never a group guessed from the filesystem.
+      const processGroupId = run?.processGroupId ?? null;
+      if (processGroupId && isProcessGroupAlive(processGroupId)) {
+        killProcessGroup(processGroupId);
+        result.killedProcessGroups += 1;
+      }
+
+      await fs.rm(dir, { recursive: true, force: true });
+      result.removedDirs += 1;
+    } catch {
+      result.errors += 1;
+    }
+  }
+
+  return result;
 }
