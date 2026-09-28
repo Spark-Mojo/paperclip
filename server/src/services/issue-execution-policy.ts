@@ -691,6 +691,22 @@ function applyIssueExecutionStageTransition(input: TransitionInput): TransitionR
     requestedStatus !== "done" &&
     requestedStatus !== "cancelled"
   ) {
+    // SPA-9215: refuse to wipe executionState when it already represents a
+    // terminal review/approval decision. A stale queued assignment run whose
+    // cancellation triggers the assignment-recovery sweep PATCHes the card
+    // back to a non-terminal status; this branch used to unconditionally
+    // null out executionState on every such transition, destroying the
+    // reviewer's durable close record (lastDecisionOutcome, completedStageIds,
+    // returnAssignee) without any human decision. The same precondition
+    // applies to a cancelled queue for the prior assignee: preserving
+    // returnAssignee here means the follow-up queue resolves to the same
+    // assignee the original execution closed with — a no-op for the prior
+    // owner, not a state machine wipe. Existing states with no recorded
+    // terminal decision (lastDecisionOutcome === null) are not protected;
+    // they have nothing durable to lose and still clear cleanly.
+    if (existingState?.lastDecisionOutcome) {
+      return { patch };
+    }
     patch.executionState = null;
     return { patch };
   }
