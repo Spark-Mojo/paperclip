@@ -71,6 +71,7 @@ tests/storybook-visual/.snapshots/
 tests/storybook-visual/baseline-review/
 tests/storybook-visual/test-results/
 tests/storybook-visual/playwright-report/
+.paperclip-repositories/
 .superset/
 .superpowers/
 .claude/worktrees/

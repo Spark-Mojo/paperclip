@@ -200,14 +200,119 @@ describeEmbeddedPostgres("issue done gate — unmerged PR refuses done (SPA-8957
     expect(decision).toMatchObject({ outcome: "refuse", reason: { kind: "unknown_pull_request_state" } });
   });
 
-  it("prose PR mentions are not a binding: comments never wedge the card", async () => {
+  it("prose PR mentions of FOREIGN repos are not a binding: a foreign comment link never wedges the card", async () => {
     const card = await createCard(db, companyId, { assigneeAgentId: agentId });
-    await issueService(db).addComment(card.id, "Related: https://github.com/Spark-Mojo/paperclip/pull/9999", {});
+    await issueService(db).addComment(card.id, "Related: https://github.com/someone/else/pull/9999", {});
     const gate = issueDoneGateService(db, {
       resolvePullRequestDetails: async () => { throw new Error("must not be called — no binding PRs"); },
     });
     const decision = await gate.evaluateDoneGate({ id: card.id, companyId });
     expect(decision).toEqual({ outcome: "allow" });
+  });
+
+  // SPA-9038 (James ruled option 1, 2026-09-27): PR links in the card's
+  // description/comments for Spark-Mojo repos bind the gate exactly like an
+  // attached pull_request work product. Live gap: SPA-9036 closed done with
+  // PR #1140 open — linked in a comment only, no work product.
+  it("comment-only Spark-Mojo PR link (open) refuses done — the SPA-9036 shape", async () => {
+    const card = await createCard(db, companyId, { assigneeAgentId: agentId });
+    await issueService(db).addComment(card.id, "PR up: https://github.com/Spark-Mojo/paperclip/pull/1140", {});
+
+    const gate = issueDoneGateService(db, {
+      resolvePullRequestDetails: async () => details("open", "open"),
+    });
+    const decision = await gate.evaluateDoneGate({ id: card.id, companyId });
+    expect(decision).toMatchObject({
+      outcome: "refuse",
+      reason: {
+        kind: "open_pull_requests",
+        pullRequests: [expect.objectContaining({ state: "open", reference: expect.objectContaining({ number: 1140 }) })],
+      },
+    });
+
+    // End-to-end through the update path with the default resolver: unknown
+    // (no GitHub credentials in tests) is also a refusal — 409, card stays.
+    await expect(
+      issueService(db).update(card.id, { status: "done" }),
+    ).rejects.toMatchObject({
+      status: 409,
+      details: { code: "issue_done_with_unmerged_pull_request" },
+    });
+    const after = await db.select().from(issues).where(eq(issues.id, card.id)).then((rows) => rows[0]!);
+    expect(after.status).toBe("in_progress");
+  });
+
+  it("comment-only Spark-Mojo PR link (merged) allows done", async () => {
+    const card = await createCard(db, companyId, { assigneeAgentId: agentId });
+    await issueService(db).addComment(card.id, "Merged: https://github.com/Spark-Mojo/paperclip/pull/1140", {});
+    const gate = issueDoneGateService(db, {
+      resolvePullRequestDetails: async () => details("merged"),
+    });
+    const decision = await gate.evaluateDoneGate({ id: card.id, companyId });
+    expect(decision).toEqual({ outcome: "allow" });
+  });
+
+  it("comment-only Spark-Mojo PR link (closed-unmerged) allows done — deliberately closed", async () => {
+    const card = await createCard(db, companyId, { assigneeAgentId: agentId });
+    await issueService(db).addComment(card.id, "Closed without merge: https://github.com/Spark-Mojo/paperclip/pull/1140", {});
+    const gate = issueDoneGateService(db, {
+      resolvePullRequestDetails: async () => details("open", "closed"),
+    });
+    const decision = await gate.evaluateDoneGate({ id: card.id, companyId });
+    expect(decision).toEqual({ outcome: "allow" });
+  });
+
+  it("description-only Spark-Mojo PR link (open) refuses done", async () => {
+    const card = await createCard(db, companyId, {
+      assigneeAgentId: agentId,
+      description: "Build card. PR: https://github.com/Spark-Mojo/paperclip/pull/1150",
+    });
+    const gate = issueDoneGateService(db, {
+      resolvePullRequestDetails: async () => details("open", "open"),
+    });
+    const decision = await gate.evaluateDoneGate({ id: card.id, companyId, description: card.description });
+    expect(decision).toMatchObject({ outcome: "refuse" });
+  });
+
+  it("Spark-Mojo PR shorthand in a comment binds (owner/repo#N)", async () => {
+    const card = await createCard(db, companyId, { assigneeAgentId: agentId });
+    await issueService(db).addComment(card.id, "Review Spark-Mojo/paperclip#1160 please", {});
+    const gate = issueDoneGateService(db, {
+      resolvePullRequestDetails: async () => details("open", "open"),
+    });
+    const decision = await gate.evaluateDoneGate({ id: card.id, companyId });
+    expect(decision).toMatchObject({
+      outcome: "refuse",
+      reason: { pullRequests: [expect.objectContaining({ reference: expect.objectContaining({ number: 1160 }) })] },
+    });
+  });
+
+  it("a deleted comment's PR link does not bind", async () => {
+    const card = await createCard(db, companyId, { assigneeAgentId: agentId });
+    const added = await issueService(db).addComment(card.id, "PR: https://github.com/Spark-Mojo/paperclip/pull/1170", {});
+    const commentId = added?.id ?? (await db.select().from(issueComments).where(eq(issueComments.issueId, card.id)))[0]!.id;
+    await db.update(issueComments)
+      .set({ deletedAt: new Date() })
+      .where(eq(issueComments.id, commentId));
+    const gate = issueDoneGateService(db, {
+      resolvePullRequestDetails: async () => { throw new Error("must not be called — no binding PRs"); },
+    });
+    const decision = await gate.evaluateDoneGate({ id: card.id, companyId });
+    expect(decision).toEqual({ outcome: "allow" });
+  });
+
+  it("work product and comment link to the same PR bind once (dedup), and either alone refuses", async () => {
+    const card = await createCard(db, companyId, { assigneeAgentId: agentId });
+    await attachPullRequestWorkProduct(db, card, 1180);
+    await issueService(db).addComment(card.id, "Same PR: https://github.com/Spark-Mojo/paperclip/pull/1180", {});
+    const gate = issueDoneGateService(db, {
+      resolvePullRequestDetails: async () => details("open", "open"),
+    });
+    const decision = await gate.evaluateDoneGate({ id: card.id, companyId });
+    expect(decision).toMatchObject({
+      outcome: "refuse",
+      reason: { pullRequests: [expect.objectContaining({ reference: expect.objectContaining({ number: 1180 }) })] },
+    });
   });
 
   it("override_by_board_recorded: doneOverride closes the card and writes an activity row", async () => {
