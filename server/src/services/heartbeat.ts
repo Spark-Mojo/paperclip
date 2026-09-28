@@ -27393,6 +27393,83 @@ export function heartbeatService(
             if (legacyRun) {
               if (await cancelStaleScheduledRetry(legacyRun)) {
                 activeExecutionRun = null;
+              } else if (
+                legacyRun.status !== "running" &&
+                issue.assigneeAgentId &&
+                legacyRun.agentId !== issue.assigneeAgentId &&
+                source === "assignment" &&
+                reason === "issue_assigned"
+              ) {
+                // The executionRunId-named run above was already stale-cleared;
+                // a legacy run found by context scan gets the same rule — but
+                // only for a plain assignment wake, the SPA-8511 shape. When a
+                // reassignment cleared issues.executionRunId, the former owner's
+                // queued run row survives the clear and a context-scan re-attach
+                // would re-lock the issue to the old agent — parking the new
+                // owner's assignment wake in deferred_issue_execution forever.
+                // Queued-comment/interaction wakes keep the legacy preserve
+                // semantics (a concurrent third-agent holder must keep the
+                // lock), so this is scoped to assignment wakes only.
+                const staleCancelled = await tx
+                  .update(heartbeatRuns)
+                  .set({
+                    status: "cancelled",
+                    finishedAt: new Date(),
+                    error:
+                      "Execution lock released after issue reassigned to a different agent",
+                    errorCode: "lock_released_on_reassignment",
+                    updatedAt: new Date(),
+                  })
+                  .where(
+                    and(
+                      eq(heartbeatRuns.id, legacyRun.id),
+                      eq(heartbeatRuns.status, legacyRun.status),
+                    ),
+                  )
+                  .returning();
+                if (staleCancelled.length > 0) {
+                  cancelledRunsToEmit.push(staleCancelled[0]);
+                  if (legacyRun.wakeupRequestId) {
+                    await tx
+                      .update(agentWakeupRequests)
+                      .set({
+                        status: "cancelled",
+                        finishedAt: new Date(),
+                        error:
+                          "Execution lock released after issue reassigned to a different agent",
+                        updatedAt: new Date(),
+                      })
+                      .where(
+                        eq(
+                          agentWakeupRequests.id,
+                          legacyRun.wakeupRequestId,
+                        ),
+                      );
+                  }
+                  activeExecutionRun = null;
+                } else {
+                  // A worker claimed the run between the scan and the cancel
+                  // (queued → running). The freshly-claimed run is the live
+                  // execution now — re-attach and let the deferred path gate
+                  // this wake normally.
+                  activeExecutionRun = legacyRun;
+                  const legacyAgent = await tx
+                    .select({ name: agents.name })
+                    .from(agents)
+                    .where(eq(agents.id, legacyRun.agentId))
+                    .then((rows) => rows[0] ?? null);
+                  await tx
+                    .update(issues)
+                    .set({
+                      executionRunId: legacyRun.id,
+                      executionAgentNameKey: normalizeAgentNameKey(
+                        legacyAgent?.name,
+                      ),
+                      executionLockedAt: new Date(),
+                      updatedAt: new Date(),
+                    })
+                    .where(eq(issues.id, issue.id));
+                }
               } else {
                 activeExecutionRun = legacyRun;
                 const legacyAgent = await tx

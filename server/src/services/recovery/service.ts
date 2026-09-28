@@ -5576,8 +5576,20 @@ export function recoveryService(
     const useCursor = !opts?.blockerIssueId;
 
     const queryCandidates = (afterIssueId: string | null) => {
+      // The blocker-scoped re-fire (the heartbeat workspace_finalize hook)
+      // must heal the same wakeable dependents the route-time emission admits:
+      // any assigned dependent not in a terminal/backlog status. `listWakeable
+      // BlockedDependents` filters `["backlog","done","cancelled"]`, so a
+      // `todo` dependent whose blocker resolved while its sync-back was still
+      // in flight would never re-fire if the finalize-time query only matched
+      // `blocked` issues (SPA-8580 / SPA-7489 / SPA-7490). The periodic
+      // all-issues sweep keeps its `blocked`-only filter so it only heals
+      // dependents that are still in the blocked state.
+      const statusFilter = opts?.blockerIssueId
+        ? notInArray(issues.status, ["backlog", "done", "cancelled"])
+        : eq(issues.status, "blocked");
       const filters = [
-        eq(issues.status, "blocked"),
+        statusFilter,
         isNull(issues.conversationAgentId),
         visibleIssueCondition(),
         sql`${issues.assigneeAgentId} is not null`,
