@@ -7009,7 +7009,12 @@ export function issueService(db: Db) {
                 mode: executionWorkspaces.mode,
               })
               .from(executionWorkspaces)
-              .where(eq(executionWorkspaces.id, workspaceSource.executionWorkspaceId))
+              .where(
+                and(
+                  eq(executionWorkspaces.id, workspaceSource.executionWorkspaceId),
+                  eq(executionWorkspaces.status, "active"),
+                ),
+              )
               .then((rows) => rows[0] ?? null);
             if (sourceWorkspace) {
               executionWorkspaceId = sourceWorkspace.id;
