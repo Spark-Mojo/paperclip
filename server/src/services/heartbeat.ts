@@ -5582,6 +5582,17 @@ export function mergeCoalescedContextSnapshot(
   if (existing.forceFreshSession === true || incoming.forceFreshSession === true) {
     merged.forceFreshSession = true;
   }
+  // Once an initiator is stamped on the snapshot, preserve it across
+  // coalesced wakes (SPA-9035). A later wake with a different initiator
+  // (e.g. an agent wake coalescing into a previously system-stamped run)
+  // must NOT be able to clobber the original attribution -- the cancel
+  // route and recovery decisions read these fields authoritatively.
+  const existingInitiatorType = readNonEmptyString(existing.requestedByActorType);
+  if (existingInitiatorType) {
+    merged.requestedByActorType = existingInitiatorType;
+    merged.requestedByActorId =
+      existing.requestedByActorId === undefined ? incoming.requestedByActorId : existing.requestedByActorId;
+  }
   const mergedCommentIds = mergeWakeCommentIds(existing, incoming);
   if (mergedCommentIds.length > 0) {
     const latestCommentId = mergedCommentIds[mergedCommentIds.length - 1];

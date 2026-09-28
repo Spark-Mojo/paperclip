@@ -220,6 +220,48 @@ describe("mergeCoalescedContextSnapshot", () => {
       selectedOptions: [{ id: "file-b", label: "b.txt", description: "Generated build output" }],
     });
   });
+
+  it("preserves the existing wake initiator across a coalesced wake (SPA-9035)", () => {
+    // A system-initiated wake is followed by an agent wake that
+    // coalesces into the same queued run. The original attribution must
+    // survive: cancel-route auth and recovery decisions read
+    // requestedByActorType/Id off the snapshot to know who queued the
+    // run, and an agent coalesce must NOT silently rebadge the run.
+    const merged = mergeCoalescedContextSnapshot(
+      {
+        issueId: "issue-1",
+        requestedByActorType: "system",
+        requestedByActorId: null,
+      },
+      {
+        issueId: "issue-1",
+        requestedByActorType: "agent",
+        requestedByActorId: "agent-self-1",
+      },
+    );
+
+    expect(merged.requestedByActorType).toBe("system");
+    expect(merged.requestedByActorId).toBeNull();
+  });
+
+  it("still stamps the initiator when the existing snapshot has none (SPA-9035)", () => {
+    // The INSERT path stamps before merging; if for any reason the
+    // existing snapshot lacks an initiator (legacy run, hand-edited
+    // fixture), the incoming wake should still be able to stamp it.
+    const merged = mergeCoalescedContextSnapshot(
+      {
+        issueId: "issue-1",
+      },
+      {
+        issueId: "issue-1",
+        requestedByActorType: "agent",
+        requestedByActorId: "agent-self-1",
+      },
+    );
+
+    expect(merged.requestedByActorType).toBe("agent");
+    expect(merged.requestedByActorId).toBe("agent-self-1");
+  });
 });
 
 describe("summarizeHeartbeatRunContextSnapshot", () => {
