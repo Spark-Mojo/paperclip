@@ -1,48 +1,59 @@
-import { execFileSync } from "node:child_process";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
 import type { ServerGitInfo, ServerGitLocalChanges, ServerInfoSnapshot } from "@paperclipai/shared";
 import { parseBuildCommit, readBuildCommit } from "./build-commit.js";
 
 export type { ServerGitInfo, ServerInfoSnapshot };
 
-type GitCommand = () => string;
+const execFileAsync = promisify(execFile);
+
+type GitCommand = () => Promise<string>;
 type BuildCommitCommand = () => string | null;
 
 const SHORT_SHA_RE = /^[0-9a-f]{7,40}$/i;
 
-function defaultGitCommand() {
-  return execFileSync(
+// SPA-9270 fix 4: git reads run OFF the request path. The previous
+// implementation called execFileSync three times per TTL refresh directly
+// inside request handling; on a saturated disk each call blocked the entire
+// event loop for up to its 1.5s timeout, so /api/health and every other
+// request stalled 4-5s while the process stayed "healthy". The async
+// commands below spawn git without blocking, and a background refresh keeps
+// the module cache warm. getServerInfoSnapshot stays synchronous: it only
+// reads the cache, which is seeded from the static build commit at boot.
+async function defaultGitCommand() {
+  const { stdout } = await execFileAsync(
     "git",
     ["show", "-s", "--format=%H%n%h%n%s%n%cI", "HEAD"],
     {
       encoding: "utf8",
-      stdio: ["ignore", "pipe", "ignore"],
       timeout: 1500,
     },
   );
+  return stdout;
 }
 
-function defaultGitStatusCommand() {
-  return execFileSync(
+async function defaultGitStatusCommand() {
+  const { stdout } = await execFileAsync(
     "git",
     ["status", "--porcelain=v1", "--untracked-files=normal"],
     {
       encoding: "utf8",
-      stdio: ["ignore", "pipe", "ignore"],
       timeout: 1500,
     },
   );
+  return stdout;
 }
 
-function defaultGitBranchCommand() {
-  return execFileSync(
+async function defaultGitBranchCommand() {
+  const { stdout } = await execFileAsync(
     "git",
     ["symbolic-ref", "--quiet", "--short", "HEAD"],
     {
       encoding: "utf8",
-      stdio: ["ignore", "pipe", "ignore"],
       timeout: 1500,
     },
   );
+  return stdout;
 }
 
 function parseGitLocalChanges(output: string): ServerGitLocalChanges {
@@ -72,9 +83,9 @@ function parseGitLocalChanges(output: string): ServerGitLocalChanges {
   };
 }
 
-function getGitLocalChanges(gitStatusCommand: GitCommand): ServerGitLocalChanges {
+function getGitLocalChanges(output: string): ServerGitLocalChanges {
   try {
-    return parseGitLocalChanges(gitStatusCommand());
+    return parseGitLocalChanges(output);
   } catch {
     return { available: false, unavailableReason: "git_status_unavailable" };
   }
@@ -106,44 +117,56 @@ function parseGitInfo(
   };
 }
 
-function readGitInfo(
-  gitCommand: GitCommand = defaultGitCommand,
-  gitStatusCommand: GitCommand = defaultGitStatusCommand,
-  gitBranchCommand: GitCommand = defaultGitBranchCommand,
-  buildCommitCommand: BuildCommitCommand = readBuildCommit,
-): ServerGitInfo {
-  try {
-    const output = gitCommand();
-    const localChanges = getGitLocalChanges(gitStatusCommand);
-    let branchName: string | null = null;
-    try {
-      branchName = gitBranchCommand().trim() || null;
-    } catch {
-      branchName = null;
-    }
-    return parseGitInfo(output, branchName, localChanges);
-  } catch {
-    const buildCommit = parseBuildCommit(buildCommitCommand());
-    if (!buildCommit) {
-      return { available: false, unavailableReason: "git_unavailable" };
-    }
-
-    return {
-      available: true,
-      fullSha: buildCommit,
-      shortSha: buildCommit.slice(0, 7),
-      branchName: null,
-      subject: "Source build",
-      committedAt: null,
-      localChanges: {
-        available: false,
-        unavailableReason: "git_status_unavailable",
-      },
-    };
+function buildCommitFallback(buildCommitCommand: BuildCommitCommand): ServerGitInfo {
+  const buildCommit = parseBuildCommit(buildCommitCommand());
+  if (!buildCommit) {
+    return { available: false, unavailableReason: "git_unavailable" };
   }
+
+  return {
+    available: true,
+    fullSha: buildCommit,
+    shortSha: buildCommit.slice(0, 7),
+    branchName: null,
+    subject: "Source build",
+    committedAt: null,
+    localChanges: {
+      available: false,
+      unavailableReason: "git_status_unavailable",
+    },
+  };
 }
 
-export function createServerInfoSnapshot(
+async function readGitInfo(
+  gitCommand: GitCommand,
+  gitStatusCommand: GitCommand,
+  gitBranchCommand: GitCommand,
+  buildCommitCommand: BuildCommitCommand,
+): Promise<ServerGitInfo> {
+  let output: string;
+  try {
+    output = await gitCommand();
+  } catch {
+    return buildCommitFallback(buildCommitCommand);
+  }
+  let localChanges: ServerGitLocalChanges;
+  try {
+    localChanges = parseGitLocalChanges(await gitStatusCommand());
+  } catch {
+    localChanges = { available: false, unavailableReason: "git_status_unavailable" };
+  }
+  let branchName: string | null = null;
+  try {
+    branchName = (await gitBranchCommand()).trim() || null;
+  } catch {
+    branchName = null;
+  }
+  const parsed = parseGitInfo(output, branchName, localChanges);
+  if (!parsed.available) return buildCommitFallback(buildCommitCommand);
+  return parsed;
+}
+
+export async function createServerInfoSnapshot(
   opts: {
     now?: Date;
     gitCommand?: GitCommand;
@@ -151,51 +174,66 @@ export function createServerInfoSnapshot(
     gitBranchCommand?: GitCommand;
     buildCommitCommand?: BuildCommitCommand;
   } = {},
-): ServerInfoSnapshot {
+): Promise<ServerInfoSnapshot> {
   return {
     processStartedAt: (opts.now ?? new Date()).toISOString(),
-    git: readGitInfo(
-      opts.gitCommand,
-      opts.gitStatusCommand,
-      opts.gitBranchCommand,
-      opts.buildCommitCommand,
+    git: await readGitInfo(
+      opts.gitCommand ?? defaultGitCommand,
+      opts.gitStatusCommand ?? defaultGitStatusCommand,
+      opts.gitBranchCommand ?? defaultGitBranchCommand,
+      opts.buildCommitCommand ?? readBuildCommit,
     ),
   };
 }
 
 // processStartedAt is a true boot constant, but the running commit can change
-// without the Node process restarting: a managed dev-server restart re-runs the
-// code while keeping this module alive, so a commit captured once at boot goes
-// stale. Re-read git HEAD on demand, throttled by a short TTL so frequent health
-// polls don't spawn git on every request.
-const GIT_INFO_CACHE_TTL_MS = 3000;
+// without the Node process restarting: a managed dev-server restart re-runs
+// the code while keeping this module alive, so a commit captured once at boot
+// goes stale. A background refresh loop re-reads git HEAD asynchronously and
+// updates this cache; request handling only READS the cache and never spawns
+// git itself (SPA-9270 fix 4).
+const GIT_INFO_REFRESH_INTERVAL_MS = 3_000;
 const processStartedAt = new Date().toISOString();
-let gitInfoCache: { value: ServerGitInfo; expiresAt: number } | null = null;
+let gitInfoCache: ServerGitInfo | null = null;
 
-export function getServerInfoSnapshot(
+async function refreshGitInfoCache(): Promise<void> {
+  gitInfoCache = await readGitInfo(
+    defaultGitCommand,
+    defaultGitStatusCommand,
+    defaultGitBranchCommand,
+    readBuildCommit,
+  );
+}
+
+// Seed the cache synchronously from the static build commit so the first
+// request never sees an empty snapshot, then keep it warm in the background.
+gitInfoCache = buildCommitFallback(readBuildCommit);
+const gitInfoRefreshTimer = setInterval(() => {
+  void refreshGitInfoCache().catch(() => undefined);
+}, GIT_INFO_REFRESH_INTERVAL_MS);
+gitInfoRefreshTimer.unref?.();
+
+/** Test seam: run one explicit refresh cycle (async git reads). */
+export async function refreshServerInfoForTests(
   opts: {
-    now?: number;
     gitCommand?: GitCommand;
     gitStatusCommand?: GitCommand;
     gitBranchCommand?: GitCommand;
     buildCommitCommand?: BuildCommitCommand;
   } = {},
-): ServerInfoSnapshot {
-  const now = opts.now ?? Date.now();
-  if (!gitInfoCache || now >= gitInfoCache.expiresAt) {
-    gitInfoCache = {
-      value: readGitInfo(
-        opts.gitCommand,
-        opts.gitStatusCommand,
-        opts.gitBranchCommand,
-        opts.buildCommitCommand,
-      ),
-      expiresAt: now + GIT_INFO_CACHE_TTL_MS,
-    };
-  }
-  return { processStartedAt, git: gitInfoCache.value };
+): Promise<void> {
+  gitInfoCache = await readGitInfo(
+    opts.gitCommand ?? defaultGitCommand,
+    opts.gitStatusCommand ?? defaultGitStatusCommand,
+    opts.gitBranchCommand ?? defaultGitBranchCommand,
+    opts.buildCommitCommand ?? readBuildCommit,
+  );
+}
+
+export function getServerInfoSnapshot(): ServerInfoSnapshot {
+  return { processStartedAt, git: gitInfoCache ?? buildCommitFallback(readBuildCommit) };
 }
 
 export function resetServerInfoCacheForTests(): void {
-  gitInfoCache = null;
+  gitInfoCache = buildCommitFallback(readBuildCommit);
 }
