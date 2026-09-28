@@ -183,7 +183,9 @@ function renderSqlAst(ast: SQL): RenderedSql {
 // ---------------------------------------------------------------------------
 // Tiny SQL interpreter — supports exactly the clause shapes the service
 // emits on this path: AND/OR with parens, `col = val`, `col <> val`,
-// `col in (list)`, `col ->> 'key' = val`, and bare true/false.
+// `col in (list)`, `col ->> 'key' = val`, `coalesce(<expr>, ..., <default>)`
+// (Postgres first-non-null semantics, used by
+// `nativeRunnerOwnershipNotHeldCondition`), `not`, and bare true/false.
 // Anything unparseable fails CLOSED (row excluded) so the mock can never
 // silently over-select.
 // ---------------------------------------------------------------------------
@@ -362,9 +364,41 @@ class SqlInterpreter {
         this.next();
         return !this.parseAtom();
       }
+      if (lower === "coalesce") {
+        return this.parseCoalesce();
+      }
       return this.parseComparison();
     }
     throw new Error(`spa-7585 mock: unexpected token ${JSON.stringify(tok)}`);
+  }
+
+  // Postgres `coalesce(a, b, c, ..., default)`: returns the first non-null
+  // argument. Booleans (`true`/`false`) are NOT null, so `coalesce(false, true)`
+  // returns `false` — only `null`/`undefined` advance to the next argument.
+  // This matches `nativeRunnerOwnershipNotHeldCondition()` (`coalesce(<bool>,
+  // false)`) and any future `coalesce(${col}, <default>)` filter that survives
+  // `and`/`or` reductions to a boolean.
+  private parseCoalesce(): boolean {
+    this.next();
+    this.expectOp("(");
+    const args: boolean[] = [];
+    while (true) {
+      args.push(this.parseOr());
+      const sep = this.peek();
+      if (sep?.t === "op" && sep.v === ",") {
+        this.next();
+        continue;
+      }
+      if (sep?.t === "op" && sep.v === ")") {
+        this.next();
+        break;
+      }
+      throw new Error(`spa-7585 mock: coalesce expected ',' or ')' got ${JSON.stringify(sep)}`);
+    }
+    for (const arg of args) {
+      if (arg !== null && arg !== undefined) return arg;
+    }
+    return null as unknown as boolean;
   }
 
   private parseComparison(): boolean {
@@ -429,7 +463,11 @@ class SqlInterpreter {
     }
     const rhsTok = this.next();
     if (!rhsTok) throw new Error("spa-7585 mock: missing comparison rhs");
-    const rhsValue = this.tokenValue(rhsTok, jsonbPath);
+    // Allow on both the jsonb-arrow path and any normal RHS comparison:
+    // the service's `sql` template renders raw string constants (issueIds,
+    // errorCode identifiers inside `not coalesce(...)`) as plain StringChunks
+    // that lex as idents.
+    const rhsValue = this.tokenValue(rhsTok, jsonbPath || true);
     switch (op) {
       case "=":
         return lhsValue === rhsValue;
@@ -459,9 +497,22 @@ class SqlInterpreter {
     if (marker) return this.params[Number(marker[1])];
     if (tok.t === "ident" && tok.v.toLowerCase() === "null") return null;
     // The service's `sql` template emits raw string values (e.g. the issueId
-    // in the jsonb comparison) as plain StringChunks; on the unambiguous
-    // jsonb-arrow path those arrive as bare idents.
-    if (allowBareIdent && tok.t === "ident") return tok.v;
+    // in the jsonb comparison, or constant errorCode identifiers inside
+    // `not coalesce(...)` clauses) as plain StringChunks. Those arrive as
+    // bare idents on both the jsonb-arrow path and any normal RHS comparison
+    // (the keyword check below keeps `and`/`or`/`not`/`true`/`false`/`null`/
+    // `in`/`is`/`coalesce` reserved for the parser to handle up front).
+    if (allowBareIdent && tok.t === "ident") {
+      const lower = tok.v.toLowerCase();
+      if (
+        lower === "and" || lower === "or" || lower === "not" ||
+        lower === "true" || lower === "false" || lower === "null" ||
+        lower === "in" || lower === "is" || lower === "coalesce"
+      ) {
+        throw new Error(`spa-7585 mock: unsupported rhs token ${JSON.stringify(tok)}`);
+      }
+      return tok.v;
+    }
     throw new Error(`spa-7585 mock: unsupported rhs token ${JSON.stringify(tok)}`);
   }
 }
@@ -548,7 +599,7 @@ function orderByComparator(arg: unknown): (a: AnyRow, b: AnyRow) => number {
 
 function makeSelectChain(): Record<string, unknown> & PromiseLike<AnyRow[]> {
   const state: SortState = {};
-  const chain = {
+  const chain: Record<string, unknown> & PromiseLike<AnyRow[]> = {
     from(table: unknown) {
       state.tableKey = tablesByIdentity.get(table);
       if (!state.tableKey) throw new Error("spa-7585 mock: select from unknown table");
@@ -571,6 +622,13 @@ function makeSelectChain(): Record<string, unknown> & PromiseLike<AnyRow[]> {
       state.limit = n;
       return chain;
     },
+    // `terminalizeLegacyExecution` calls `tx.select(...).for("update")` to
+    // take a row lock on the parent issue. The mock never persists rows
+    // (it operates on the in-memory `dbState`), so a lock is meaningless —
+    // accept the call and stay on the same chain.
+    for(_lock: unknown) {
+      return chain;
+    },
     then<T>(
       onFulfilled: (rows: AnyRow[]) => T,
       onRejected?: (reason: unknown) => T,
@@ -584,7 +642,7 @@ function makeSelectChain(): Record<string, unknown> & PromiseLike<AnyRow[]> {
       return Promise.resolve(executeSelect(state)).finally(fn);
     },
   };
-  return chain as unknown as Record<string, unknown> & PromiseLike<AnyRow[]>;
+  return chain;
 }
 
 function makeUpdateChain(table?: unknown): Record<string, unknown> {
@@ -627,10 +685,23 @@ function makeUpdateChain(table?: unknown): Record<string, unknown> {
 function makeInsertChain(): Record<string, unknown> {
   const chain = {
     values(input: unknown) {
-      return Promise.resolve(input);
+      return {
+        returning() {
+          // `appendRunEvent` requires a returned row carrying `id`; the mock
+          // never persists rows, so hand back a stub that satisfies the
+          // shape without touching dbState.
+          return Promise.resolve([{ id: `run-event-${counter()}`, ...(input as object) }]);
+        },
+      };
     },
   };
   return chain as unknown as Record<string, unknown>;
+}
+
+let counterSeq = 0;
+function counter(): number {
+  counterSeq += 1;
+  return counterSeq;
 }
 
 function makeQueryExecutor(): Record<string, unknown> {
