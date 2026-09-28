@@ -872,6 +872,19 @@ const CASE_DOCUMENT_ANNOTATION_ACTIVITY_ACTIONS = new Set([
 ]);
 const AGENT_TOAST_STATUSES = new Set(["error"]);
 const RUN_TOAST_STATUSES = new Set(["failed", "timed_out", "cancelled"]);
+// A run-status toast is only shown for a "fresh" terminal event. The live-events
+// socket is an in-memory emitter with no replay backlog, so an old `createdAt`
+// can only mean a delayed/replayed terminal event (reconnect storm, plugin
+// replay, long-lived tab refetch); re-toasting days-old run errors (James,
+// SPA-9258: "it is resurfacing the old log") is noise, not signal.
+const STALE_EVENT_CUTOFF_MS = 10 * 60_000;
+
+function isStaleEventCreatedAt(createdAt: string | null | undefined): boolean {
+  if (!createdAt) return false;
+  const ts = Date.parse(createdAt);
+  if (Number.isNaN(ts)) return false;
+  return Date.now() - ts > STALE_EVENT_CUTOFF_MS;
+}
 
 function describeIssueUpdate(
   details: Record<string, unknown> | null,
@@ -1065,7 +1078,11 @@ function buildAgentStatusToast(
 function buildRunStatusToast(
   payload: Record<string, unknown>,
   nameOf: (id: string) => string | null,
+  eventCreatedAt?: string | null,
 ): ToastInput | null {
+  // Stale terminal events (delayed/replayed) must never re-toast old errors.
+  if (isStaleEventCreatedAt(eventCreatedAt)) return null;
+
   const runId = readString(payload.runId);
   const agentId = readString(payload.agentId);
   const status = readString(payload.status);
@@ -1074,6 +1091,16 @@ function buildRunStatusToast(
 
   const error = readString(payload.error);
   const errorCode = readString(payload.errorCode);
+  // SPA-9258: a cancelled run is control-plane intent, never a real failure.
+  // Normal machine operation cancels runs constantly (issue_reassigned,
+  // issue_assignee_changed, issue_terminal_status,
+  // issue_continuation_waiting_on_review, issue_cancelled,
+  // server_shutdown_interrupted, issue_dependencies_blocked, workspace_busy,
+  // operator_interrupted, board/user-initiated cancels) and toasting each one
+  // as an error is the "flood of agent errors" James sees all day. Real
+  // failures are surfaced as `failed`/`timed_out` — cancelled runs stay
+  // visible in run lists and activity feeds, never as toasts.
+  if (status === "cancelled") return null;
   // Interrupt is an intentional conversation control. Its caller gives
   // feedback; the terminal event must not announce a cancelled/failed run.
   if (errorCode === "operator_interrupted") return null;
@@ -1577,7 +1604,15 @@ function invalidateActivityQueries(
 interface ToastGate {
   cooldownHits: Map<string, number[]>;
   suppressUntil: number;
+  // SPA-9258: real run failures coalesce per agent — one error toast per agent
+  // per burst, not one per run. Map of agentId → timestamp of the last failure
+  // toast actually shown for that agent.
+  runErrorBursts: Map<string, number>;
 }
+
+// A burst is 5 minutes: an agent in a start/error loop (Steve's pattern) shows
+// ONE error toast per window; the runs stay inspectable in run lists.
+const RUN_ERROR_BURST_WINDOW_MS = 5 * 60_000;
 
 function shouldSuppressToast(gate: ToastGate, category: string): boolean {
   const now = Date.now();
@@ -1589,6 +1624,17 @@ function shouldSuppressToast(gate: ToastGate, category: string): boolean {
   const recent = hits.filter((t) => now - t < TOAST_COOLDOWN_WINDOW_MS);
   gate.cooldownHits.set(category, recent);
   return recent.length >= TOAST_COOLDOWN_MAX;
+}
+
+function shouldSuppressRunErrorBurst(
+  gate: ToastGate,
+  agentId: string,
+): boolean {
+  const now = Date.now();
+  const last = gate.runErrorBursts.get(agentId);
+  if (last !== undefined && now - last < RUN_ERROR_BURST_WINDOW_MS) return true;
+  gate.runErrorBursts.set(agentId, now);
+  return false;
 }
 
 function recordToastHit(gate: ToastGate, category: string) {
@@ -1662,9 +1708,10 @@ function handleLiveEvent(
     }
     invalidateVisibleIssueRunQueries(queryClient, pathname, payload);
     if (event.type === "heartbeat.run.status") {
-      const toast = buildRunStatusToast(payload, nameOf);
-      if (toast && !suppressRunToast) {
-        gatedPushToast(gate, pushToast, "run-status", toast);
+      const toast = buildRunStatusToast(payload, nameOf, event.createdAt);
+      const agentId = readString(payload.agentId) ?? "unknown";
+      if (toast && !suppressRunToast && !shouldSuppressRunErrorBurst(gate, agentId)) {
+        gatedPushToast(gate, pushToast, `run-status:${agentId}`, toast);
       }
     }
     return;
@@ -1811,6 +1858,7 @@ export const __liveUpdatesTestUtils = {
   shouldSuppressActivityToastForVisibleIssue,
   shouldSuppressRunStatusToastForVisibleIssue,
   shouldSuppressAgentStatusToastForVisibleIssue,
+  shouldSuppressRunErrorBurst,
 };
 
 function canUseLiveSession(sessionStatus: string, hasSession: boolean, deploymentMode?: string) {
@@ -1827,6 +1875,7 @@ export function LiveUpdatesProvider({ children }: { children: ReactNode }) {
   const gateRef = useRef<ToastGate>({
     cooldownHits: new Map(),
     suppressUntil: 0,
+    runErrorBursts: new Map(),
   });
   const pathnameRef = useRef(location.pathname);
   const { data: session, status: sessionStatus } = useQuery({
