@@ -133,6 +133,23 @@ describe("managed install commands", () => {
           const packageName = packageDir === "server" ? "paperclipai-server" : "paperclipai-shared";
           fs.writeFileSync(path.join(destination, `${packageName}-0.3.1.tgz`), "package");
         }
+        if (args.includes("prepare:ui-dist")) {
+          const checkout = (() => {
+            for (const arg of args) {
+              const match = arg.match(/^--filter=(.+)$/);
+              if (match) return null;
+            }
+            return _options && typeof _options === "object" && "cwd" in _options ? (_options as { cwd?: string }).cwd ?? null : null;
+          })();
+          // SPA-9160: simulate prepare-server-ui-dist.sh's effect by writing
+          // server/ui-dist/index.html into the checkout. Tests that need to
+          // exercise the post-install guard (see below) keep this stub but
+          // drop the write so the install must fail.
+          if (checkout) {
+            fs.mkdirSync(path.join(checkout, "server", "ui-dist"), { recursive: true });
+            fs.writeFileSync(path.join(checkout, "server", "ui-dist", "index.html"), "<html>test</html>");
+          }
+        }
         return { stdout: "", stderr: "" };
       }
       if (file === "bash") return { stdout: "", stderr: "" };
@@ -141,7 +158,20 @@ describe("managed install commands", () => {
         fs.writeFileSync(path.join(args[args.indexOf("--pack-destination") + 1], `${packageName}-0.3.1.tgz`), "package");
         return { stdout: "", stderr: "" };
       }
-      if (file === "npm" && args[0] === "install") { const prefix = args[args.indexOf("--prefix") + 1]; const packageRoot = path.join(prefix, "node_modules", "paperclipai"); fs.mkdirSync(path.join(packageRoot, "dist"), { recursive: true }); fs.writeFileSync(path.join(packageRoot, "package.json"), JSON.stringify({ version: "0.3.1" })); fs.writeFileSync(path.join(packageRoot, "dist", "index.js"), "#!/usr/bin/env node\n"); return { stdout: "", stderr: "" }; }
+      if (file === "npm" && args[0] === "install") {
+        const prefix = args[args.indexOf("--prefix") + 1];
+        const packageRoot = path.join(prefix, "node_modules", "paperclipai");
+        fs.mkdirSync(path.join(packageRoot, "dist"), { recursive: true });
+        fs.writeFileSync(path.join(packageRoot, "package.json"), JSON.stringify({ version: "0.3.1" }));
+        fs.writeFileSync(path.join(packageRoot, "dist", "index.js"), "#!/usr/bin/env node\n");
+        // SPA-9160: simulate the server tarball carrying ui-dist so the
+        // post-install guard does not fire. The dedicated missing-ui-dist
+        // test uses a separate mock that skips the write.
+        const serverRoot = path.join(prefix, "node_modules", "@paperclipai", "server");
+        fs.mkdirSync(path.join(serverRoot, "ui-dist"), { recursive: true });
+        fs.writeFileSync(path.join(serverRoot, "ui-dist", "index.html"), "<html>test</html>");
+        return { stdout: "", stderr: "" };
+      }
       if (file === process.execPath && args[0]?.endsWith("prepare-bundled-package.mjs")) {
         fs.mkdirSync(args[2], { recursive: true });
         fs.writeFileSync(path.join(args[2], "package.json"), JSON.stringify({ name: "@paperclipai/db", version: "0.3.1" }));
@@ -178,7 +208,7 @@ describe("managed install commands", () => {
       file === "corepack" ||
       (file === "npm" && args[0] === "pack") ||
       (file === process.execPath && args[0]?.endsWith("prepare-bundled-package.mjs")));
-    expect(buildCalls).toHaveLength(9);
+    expect(buildCalls).toHaveLength(10);
     for (const call of buildCalls) {
       const env = call[2]?.env;
       expect(env, `${call[0]} ${call[1].join(" ")} must run with an explicit env`).toBeDefined();
@@ -186,6 +216,84 @@ describe("managed install commands", () => {
     }
     const uiPackCall = buildCalls.find(([file, , options]) => file === "corepack" && options?.env?.PAPERCLIP_RELEASE_REUSE_UI_DIST === "1");
     expect(uiPackCall).toBeDefined();
+    // SPA-9160: the install path must run pnpm --filter @paperclipai/server
+    // prepare:ui-dist explicitly with reuse=0 so the published server tarball
+    // always ships server/ui-dist — relying on `pnpm pack`'s prepack was
+    // unreliable once 17a81879f3 dropped prepare:ui-dist from server's build
+    // script and pnpm pack strips prepack/postpack from the packed manifest.
+    const prepareUiDistCall = buildCalls.find(
+      ([file, args, options]) =>
+        file === "corepack" &&
+        args.includes("prepare:ui-dist") &&
+        options?.env?.PAPERCLIP_RELEASE_REUSE_UI_DIST === "0",
+    );
+    expect(prepareUiDistCall).toBeDefined();
+  });
+
+  it("refuses to flip the install symlink when the staged server tarball omits ui-dist", async () => {
+    // SPA-9160 regression: the 2026-09-27 20:44Z git install produced a node_modules
+    // tree whose @paperclipai/server had no ui-dist/index.html, so GET / returned
+    // "Cannot GET /" for ~10h. Simulate the failure mode (npm install wrote the
+    // server package but no ui-dist) and assert the install throws — never
+    // silently flips the live symlink onto a UI-less payload.
+    const sha = "e".repeat(40);
+    const runCommand = vi.fn(async (file: string, args: string[], _options?: Parameters<CommandRunner>[2]) => {
+      if (file === "curl" && !args.includes("--output")) return { stdout: JSON.stringify({ sha }), stderr: "" };
+      if (file === "curl") { fs.writeFileSync(args[args.indexOf("--output") + 1], "archive"); return { stdout: "", stderr: "" }; }
+      if (file === "tar") {
+        const checkout = args[args.indexOf("-C") + 1];
+        const packages = [
+          { dir: "packages/shared", name: "@paperclipai/shared", packageJson: { name: "@paperclipai/shared", version: "0.3.1" } },
+          { dir: "server", name: "@paperclipai/server", packageJson: { name: "@paperclipai/server", version: "0.3.1", dependencies: {} } },
+        ];
+        fs.mkdirSync(path.join(checkout, "cli"), { recursive: true });
+        fs.writeFileSync(path.join(checkout, "cli", "package.json"), JSON.stringify({ version: "0.3.1" }));
+        fs.mkdirSync(path.join(checkout, "scripts"), { recursive: true });
+        fs.writeFileSync(path.join(checkout, "scripts", "release-package-manifest.json"), JSON.stringify(packages.map(({ dir, name }) => ({ dir, name }))));
+        for (const workspacePackage of packages) {
+          fs.mkdirSync(path.join(checkout, workspacePackage.dir), { recursive: true });
+          fs.writeFileSync(path.join(checkout, workspacePackage.dir, "package.json"), JSON.stringify(workspacePackage.packageJson));
+        }
+        return { stdout: "", stderr: "" };
+      }
+      if (file === "corepack" && args.includes("enable")) return { stdout: "", stderr: "" };
+      if (file === "corepack" && args[1] === "install") return { stdout: "", stderr: "" };
+      if (file === "corepack" && args.includes("-r")) return { stdout: "", stderr: "" };
+      if (file === "corepack" && args.includes("pack")) {
+        const destination = args[args.indexOf("--pack-destination") + 1];
+        const packageDir = args[args.indexOf("--dir") + 1];
+        const packageName = packageDir === "server" ? "paperclipai-server" : "paperclipai-shared";
+        fs.writeFileSync(path.join(destination, `${packageName}-0.3.1.tgz`), "package");
+        return { stdout: "", stderr: "" };
+      }
+      if (file === "corepack" && args.includes("prepare:ui-dist")) {
+        // Simulate the bug: prepare:ui-dist "ran" but produced no ui-dist.
+        return { stdout: "", stderr: "" };
+      }
+      if (file === "bash") return { stdout: "", stderr: "" };
+      if (file === "npm" && args[0] === "pack") {
+        fs.writeFileSync(path.join(args[args.indexOf("--pack-destination") + 1], `paperclipai-0.3.1.tgz`), "package");
+        return { stdout: "", stderr: "" };
+      }
+      if (file === "npm" && args[0] === "install") {
+        const prefix = args[args.indexOf("--prefix") + 1];
+        const packageRoot = path.join(prefix, "node_modules", "paperclipai");
+        fs.mkdirSync(path.join(packageRoot, "dist"), { recursive: true });
+        fs.writeFileSync(path.join(packageRoot, "package.json"), JSON.stringify({ version: "0.3.1" }));
+        fs.writeFileSync(path.join(packageRoot, "dist", "index.js"), "#!/usr/bin/env node\n");
+        const serverRoot = path.join(prefix, "node_modules", "@paperclipai", "server");
+        fs.mkdirSync(serverRoot, { recursive: true });
+        fs.writeFileSync(path.join(serverRoot, "package.json"), JSON.stringify({ name: "@paperclipai/server", version: "0.3.1" }));
+        // Deliberately NO ui-dist/ — this is the SPA-9160 regression shape.
+        return { stdout: "", stderr: "" };
+      }
+      if (file === process.execPath) return { stdout: "0.3.1\n", stderr: "" };
+      throw new Error(`Unexpected command: ${file} ${args.join(" ")}`);
+    });
+    await expect(installGitPayload("paperclipai/paperclip", sha, runCommand, resolveInstallStorePaths())).rejects.toThrow(/server\/ui-dist\/index\.html/);
+    // Manifest must NOT have been written — refusing to leave a half-installed
+    // manifest on disk that a later flipCurrentAtomic could promote.
+    expect(readInstallManifest(resolveInstallStorePaths())).toBeNull();
   });
 
   it("resolves the complete server workspace dependency closure in dependency order", () => {
