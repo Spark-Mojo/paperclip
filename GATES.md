@@ -215,3 +215,15 @@ Head: `ty/SPA-8998` @ `0ed1d16536`. PR: https://github.com/Spark-Mojo/paperclip/
   pipe when child closes stdin early). Reproduced on base `6adedbf27b` without
   this PR. Out of scope; a separate fix would be a defensive `.on('error')`
   on the stdin write at `server-utils.ts:4905`.
+- `execution-control-reconciliation.test.ts:114` "reports zero events for a
+  repeated sweep over the same already-failed run" failed in CI run
+  36390812506 (job 108826005828, server 12/12) on identical code that passed
+  in run 36387265410 (job 108815200511). Re-verified locally
+  `timeout 120 node node_modules/vitest/vitest.mjs run --pool=forks --isolate
+  --project @paperclipai/server server/src/services/execution-control-reconciliation.test.ts`
+  → 2/2 PASS. Genuine flake (the mock `vi.fn()` is hoisted; the test relies
+  on the assertion `expect(result.surfaced).toBe(1)` AND `mock.calls.length
+  === 0` for the SECOND call — if the first call's transaction commit isn't
+  visible when the second call's read happens, the second call re-writes
+  status=failed and re-captures. Not introduced by this PR; not fixed by
+  this PR.)
