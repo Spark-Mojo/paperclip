@@ -6,6 +6,7 @@ import { aiConnectionService } from "../services/ai-connections.js";
 import { defaultAiConnectionForHire } from "../services/agent-ai-connection-default.js";
 import { assertAiConnectionCreateAccess, canInstallSharedAiConnectionForNewAgent, responsibleUserForAiRequest, validateAiApiKey } from "./ai-connections.js";
 import { isAiConnectionCompatible } from "@paperclipai/shared";
+import { readNonEmptyString } from "../modules/wake-queue/domain/values.js";
 import { applyConnectorSkills, resolveConnectorAssignments, annotateConnectorSkills, isConnectorSkill } from "../services/connector-runtime.js";
 import { getExecutionBlocker } from "../services/execution-blocker.js";
 import { paperclipRunnerTransitionConfig, normalizeLegacyRunnerProvider, isPaperclipRunnerProvider } from "@paperclipai/adapter-utils";
@@ -299,6 +300,93 @@ function readRunIssueId(context: Record<string, unknown> | null) {
   const nestedIssueId = paperclipIssue?.id;
   return typeof nestedIssueId === "string" && isUuidLike(nestedIssueId) ? nestedIssueId : null;
 }
+
+/**
+ * Authorization decision for `POST /api/heartbeat-runs/:runId/cancel`.
+ *
+ * Board operators cancel any run. The run's own agent can also cancel
+ * `automation` or `on_demand` wakes it started itself, so a stuck-pinned run
+ * doesn't have to wait for the board to free it. Timer / assignment wakes
+ * stay board-only — those are work units the board owns and the assigned
+ * agent has no authority to revoke.
+ *
+ * Exported so the auth surface can be unit-tested without the full Express
+ * router in the loop.
+ */
+export function decideCancelAuth(
+  actor: { type: "agent"; agentId: string | null } | { type: "user"; userId: string | null },
+  run: {
+    agentId: string;
+    invocationSource: string;
+    status: string;
+    // Authoritative wake initiator stamped onto the run row at enqueue time.
+    // `requestedByActorType === "agent"` plus `requestedByActorId === actor.agentId`
+    // is the only path that grants the assigned agent self-cancel authority —
+    // proxying on `invocationSource` lets the assigned agent terminate
+    // system- or user-created runs that happen to land on the same agent id.
+    requestedByActorType: string | null;
+    requestedByActorId: string | null;
+  },
+): {
+    ok: true;
+    cancelledByActorType: "user" | "agent";
+    cancelReason: string;
+    resultJsonPatch: Record<string, unknown>;
+    activityActorId: string;
+    activityActorType: "user" | "agent";
+  }
+  | { ok: false; status: 403 | 409; error: string } {
+  if (actor.type === "agent") {
+    if (
+      actor.agentId !== run.agentId ||
+      run.requestedByActorType !== "agent" ||
+      run.requestedByActorId !== actor.agentId
+    ) {
+      return {
+        ok: false,
+        status: 403,
+        error: "Only the agent that initiated this run may cancel it.",
+      };
+    }
+    if (run.status !== "queued" && run.status !== "running") {
+      return {
+        ok: false,
+        status: 409,
+        error: `Run is in terminal state ${run.status}; cannot cancel.`,
+      };
+    }
+    return {
+      ok: true,
+      cancelledByActorType: "agent",
+      cancelReason: "Cancelled by the owning agent",
+      resultJsonPatch: {
+        cancelledByActorType: "agent",
+        cancelledByAgentId: actor.agentId,
+      },
+      activityActorId: actor.agentId ?? "agent",
+      activityActorType: "agent",
+    };
+  }
+  if (run.status !== "queued" && run.status !== "running") {
+    return {
+      ok: false,
+      status: 409,
+      error: `Run is in terminal state ${run.status}; cannot cancel.`,
+    };
+  }
+  return {
+    ok: true,
+    cancelledByActorType: "user",
+    cancelReason: "Cancelled by a board operator",
+    resultJsonPatch: {
+      cancelledByActorType: "user",
+      cancelledByUserId: actor.userId ?? null,
+    },
+    activityActorId: actor.userId ?? "board",
+    activityActorType: "user",
+  };
+}
+
 
 // Confirms a pre-existing `CODEX_HOME_<handle>` secret still names this
 // account's own home before a device login treats the secret's presence as a
@@ -6683,25 +6771,44 @@ export function agentRoutes(
   });
 
   router.post("/heartbeat-runs/:runId/cancel", async (req, res) => {
-    assertBoard(req);
     const runId = req.params.runId as string;
     const existing = await getAccessibleResource(req, res, heartbeat.getRun(runId), "Heartbeat run not found");
     if (!existing) return;
-    // Stamp the cancellation as operator-initiated (this route is board-only).
-    // Recovery reads this to stand down instead of classifying the cancelled
-    // run as agent stranding and re-waking the agent the operator just stopped.
-    const run = await heartbeat.cancelRun(runId, "Cancelled by a board operator", {
-      resultJson: {
-        cancelledByActorType: "user",
-        cancelledByUserId: req.actor.userId ?? null,
-      },
+    // Authorization: see decideCancelAuth above for the policy. The wake
+    // initiator lives on the run's contextSnapshot (stamped at enqueue time
+    // by enqueueWakeup) — the auth decision reads those fields, not a join
+    // against agent_wakeup_requests.
+    const snapshot = parseObject(existing.contextSnapshot);
+    const actor = req.actor.type === "agent"
+      ? { type: "agent" as const, agentId: req.actor.agentId ?? null }
+      : { type: "user" as const, userId: req.actor.userId ?? null };
+    const decision = decideCancelAuth(actor, {
+      agentId: existing.agentId,
+      invocationSource: existing.invocationSource,
+      status: existing.status,
+      requestedByActorType: readNonEmptyString(snapshot.requestedByActorType),
+      requestedByActorId:
+        snapshot.requestedByActorId === undefined ? null : snapshot.requestedByActorId === null ? null : String(snapshot.requestedByActorId),
+    });
+    if (!decision.ok) {
+      res.status(decision.status).json({ error: decision.error });
+      return;
+    }
+    if (req.actor.type !== "agent") {
+      assertBoard(req);
+    }
+    // Stamp the cancellation as the actor who initiated it. Recovery reads
+    // this to stand down instead of classifying the cancelled run as agent
+    // stranding and re-waking the agent the operator just stopped.
+    const run = await heartbeat.cancelRun(runId, decision.cancelReason, {
+      resultJson: decision.resultJsonPatch,
     });
 
     if (run) {
       await logActivity(db, {
         companyId: run.companyId,
-        actorType: "user",
-        actorId: req.actor.userId ?? "board",
+        actorType: decision.activityActorType,
+        actorId: decision.activityActorId,
         action: "heartbeat.cancelled",
         entityType: "heartbeat_run",
         entityId: run.id,
