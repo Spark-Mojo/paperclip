@@ -188,9 +188,9 @@ const FALLBACK_SUMMARIZER_INSTRUCTIONS = [
 ].join("\n");
 
 const FALLBACK_SUMMARIZER_ROUTINE = [
-  "Regenerate summary slots whose scope has changed since their last revision.",
+  "Kick a fresh generation for summary slots whose scope has changed since their last revision — never write the slot directly; the linked generation task does the write.",
   "",
-  "Paused by default; spends no tokens until an operator enables the schedule or runs it manually. Read-and-report only — the only write is the summary revision.",
+  "Paused by default; spends no tokens until an operator enables the schedule or runs it manually. Read-and-report only, except the one generate-kick call per stale slot.",
   "",
 ].join("\n");
 

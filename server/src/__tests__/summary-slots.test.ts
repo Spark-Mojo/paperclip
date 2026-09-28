@@ -205,6 +205,39 @@ describeEmbeddedPostgres("summary slot service", () => {
     });
   });
 
+  describe("summarizerBuiltInCheck", () => {
+    it("admits the company's built-in Summarizer agent", async () => {
+      const companyId = await seedCompany();
+      const summarizerAgentId = await seedSummarizer(companyId);
+      const svc = summarySlotService(db);
+      await expect(svc.isSummarizerBuiltInAgent(companyId, summarizerAgentId)).resolves.toBe(true);
+    });
+
+    it("refuses a plain agent in the same company", async () => {
+      const companyId = await seedCompany();
+      await seedSummarizer(companyId);
+      const plainAgentId = await seedPlainAgent(companyId);
+      const svc = summarySlotService(db);
+      await expect(svc.isSummarizerBuiltInAgent(companyId, plainAgentId)).resolves.toBe(false);
+    });
+
+    it("refuses a Summarizer from another company", async () => {
+      const companyId = await seedCompany();
+      const otherCompanyId = await seedCompany();
+      const foreignSummarizerId = await seedSummarizer(otherCompanyId);
+      const svc = summarySlotService(db);
+      await expect(svc.isSummarizerBuiltInAgent(companyId, foreignSummarizerId)).resolves.toBe(false);
+    });
+
+    it("refuses a missing agent id", async () => {
+      const companyId = await seedCompany();
+      await seedSummarizer(companyId);
+      const svc = summarySlotService(db);
+      await expect(svc.isSummarizerBuiltInAgent(companyId, null)).resolves.toBe(false);
+      await expect(svc.isSummarizerBuiltInAgent(companyId, randomUUID())).resolves.toBe(false);
+    });
+  });
+
   describe("generate", () => {
     it("fails when the Summarizer built-in is not configured", async () => {
       const companyId = await seedCompany();
