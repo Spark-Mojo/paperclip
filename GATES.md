@@ -67,7 +67,14 @@ scope: A (drizzle snapshots 0280/0281) + B (serialized shard 2/9 terminal-recomp
 mock). Out of scope: secrets-service AWS IAM WARN-level noise (passed latest run,
 env-dependent); two 15s-timeout flakes (compact-payload, codex-present, pre-existing).
 
-Head: `ty/SPA-8998` @ `0ed1d16536`. PR: https://github.com/Spark-Mojo/paperclip/pull/90
+Head: `ty/SPA-8998` @ current PR head (rebased onto `frozen/ty-SPA-8998-base` @ `429fd1c6` after pre-landing Defect A via PR #95, Defect C via PR #96, and the SPA-9139 carry via PR #97 — all three merged on the frozen base). PR: https://github.com/Spark-Mojo/paperclip/pull/90.
+
+Net diff against `frozen/ty-SPA-8998-base` @ `429fd1c6`:
+- `GATES.md` (this file, +173/-0) — gate definitions + CI evidence
+- `server/src/__tests__/heartbeat-cancel-live-runs-for-issue.test.ts` (+42/-0) — Defect D
+- `server/src/__tests__/issue-dependency-wakeups-routes.test.ts` (+7/-0) — Defect B
+
+No binary content. Defect A (renumber + snapshots) is on the frozen base via PR #95. Defect C (cascade migration) is on the frozen base via PR #96. The SPA-9139 opencode_local agent_default carry is on the frozen base via PR #97 (pre-existing on the live line, mirrored here so PR #90's diff stays purely the four SPA-8998 defects' test changes).
 
 ## Gate A1 — drizzle snapshot drift test green (workspaces-b, Defect A)
   CHECK: pnpm --filter @paperclipai/db exec vitest run src/migration-snapshot-drift.test.ts 2>&1 | tail -3
@@ -183,12 +190,14 @@ Head: `ty/SPA-8998` @ `0ed1d16536`. PR: https://github.com/Spark-Mojo/paperclip/
   in this worktree). CI run 36387265410 job 108815200511 ("ci / General tests
   (server (12/12))") SUCCESS.
 
-## Gate D2 — D is test-only, no production change
-  CHECK: git diff origin/rebuild/v2026.916.0-survivors --stat -- server/src/services/heartbeat.ts server/src/services/heartbeat | head -3
+## Gate D2 — D is test-only in PR #90's net diff against the frozen base
+  CHECK: git diff frozen/ty-SPA-8998-base..ty/SPA-8998 --stat -- server/src/services/heartbeat.ts | head -3
   EXPECT: empty diff. The four mock-gap additions are scoped to the test file
-  only.
+  only. (The SPA-9139 `heartbeat.ts` carry is on the frozen base via PR #97,
+  so it appears on both sides of the diff and contributes 0 net lines.)
 
-  Result on head: empty. PASS.
+  Result on head (current PR head): empty (SPA-9139 on both sides of the
+  diff). PASS.
 
 ## Gate E1 — typecheck clean on changed surface
   CHECK: pnpm --filter @paperclipai/server exec tsc --noEmit 2>&1 | grep -E "heartbeat-cancel-live-runs-for-issue|issue-dependency-wakeups-routes|heartbeat_run_events|migrations" | wc -l
