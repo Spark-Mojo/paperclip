@@ -353,6 +353,103 @@ describe("assertGitSensitiveAdapterWorkspaceValid", () => {
     );
   });
 
+  // SPA-9139: a non-code card that deliberately requested the `agent_default`
+  // bypass must NOT trip the `fallback_agent_home_cwd` guard — that cwd IS the
+  // intended state for `agent_default` (no worktree, run from agent home).
+  // Regression proof: the guard still fires for every other mode (covered by
+  // the test above and the isolated_workspace assertion below).
+  it("allows a workspace-linked agent_default issue to launch from the agent fallback cwd", async () => {
+    const input = buildWorkspaceValidationInput();
+    const fallbackCwd = resolveDefaultAgentWorkspaceDir("agent-1");
+
+    await expect(
+      assertGitSensitiveAdapterWorkspaceValid(
+        buildWorkspaceValidationInput({
+          executionWorkspace: {
+            ...input.executionWorkspace,
+            cwd: fallbackCwd,
+          },
+          persistedExecutionWorkspace: {
+            ...input.persistedExecutionWorkspace!,
+            cwd: fallbackCwd,
+          },
+          requestedExecutionWorkspaceMode: "agent_default",
+        }),
+      ),
+    ).resolves.toBeUndefined();
+  });
+
+  it("allows a workspace-linked agent_default issue to launch from a cwd that has no .git metadata", async () => {
+    const input = buildWorkspaceValidationInput();
+    const fallbackCwd = resolveDefaultAgentWorkspaceDir("agent-1");
+
+    await expect(
+      assertGitSensitiveAdapterWorkspaceValid(
+        buildWorkspaceValidationInput({
+          executionWorkspace: {
+            ...input.executionWorkspace,
+            cwd: fallbackCwd,
+          },
+          persistedExecutionWorkspace: {
+            ...input.persistedExecutionWorkspace!,
+            cwd: fallbackCwd,
+          },
+          requestedExecutionWorkspaceMode: "agent_default",
+        }),
+      ),
+    ).resolves.toBeUndefined();
+  });
+
+  // Regression-proof companion: the `fallback_agent_home_cwd` guard's REAL job is
+  // catching a code card that would commit into the agent home. An
+  // `isolated_workspace` card with the same inputs MUST still fail.
+  it("still rejects a workspace-linked isolated_workspace issue from the agent fallback cwd", async () => {
+    const input = buildWorkspaceValidationInput();
+    const fallbackCwd = resolveDefaultAgentWorkspaceDir("agent-1");
+
+    await expectWorkspaceValidationFailure(
+      buildWorkspaceValidationInput({
+        executionWorkspace: {
+          ...input.executionWorkspace,
+          cwd: fallbackCwd,
+        },
+        persistedExecutionWorkspace: {
+          ...input.persistedExecutionWorkspace!,
+          cwd: fallbackCwd,
+        },
+        requestedExecutionWorkspaceMode: "isolated_workspace",
+      }),
+      "fallback_agent_home_cwd",
+      "would launch from agent fallback cwd",
+    );
+  });
+
+  it("still rejects a workspace-linked shared_workspace issue from a cwd that has no .git metadata", async () => {
+    const input = buildWorkspaceValidationInput();
+    const fallbackCwd = resolveDefaultAgentWorkspaceDir("agent-1");
+
+    // The `fallback_agent_home_cwd` guard fires first because the cwd IS the
+    // agent fallback dir; that's the correct ordering — the agent fallback
+    // mismatch is the more specific defect. `missing_git_metadata` would also
+    // fire (the fallback dir has no `.git`), but it is downstream of the
+    // mismatch guard, which is the right priority.
+    await expectWorkspaceValidationFailure(
+      buildWorkspaceValidationInput({
+        executionWorkspace: {
+          ...input.executionWorkspace,
+          cwd: fallbackCwd,
+        },
+        persistedExecutionWorkspace: {
+          ...input.persistedExecutionWorkspace!,
+          cwd: fallbackCwd,
+        },
+        // requestedExecutionWorkspaceMode omitted — defaults to shared_workspace.
+      }),
+      "fallback_agent_home_cwd",
+      "would launch from agent fallback cwd",
+    );
+  });
+
   it("rejects a git worktree persisted workspace when cwd differs from providerRef", async () => {
     const input = buildWorkspaceValidationInput();
 

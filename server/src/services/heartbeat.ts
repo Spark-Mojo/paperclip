@@ -195,6 +195,7 @@ import {
   resolveExecutionWorkspaceMode,
   resolveSharedWorkspaceConcurrency,
   selectEnvironmentExecutionWorkspaceSettings,
+  type ParsedExecutionWorkspaceMode,
   WORKSPACE_WORKTREE_REQUIRES_PROJECT_CODE,
   WORKSPACE_WORKTREE_REQUIRES_PROJECT_MESSAGE,
   WORKSPACE_WORKTREE_REQUIRES_PROJECT_REMEDIATION,
@@ -2033,6 +2034,18 @@ export async function assertGitSensitiveAdapterWorkspaceValid(input: {
   executionTarget: unknown;
   environmentDriver?: string | null;
   leaseMetadata?: unknown;
+  /**
+   * Optional explicit execution-workspace mode the issue (or its caller) requested
+   * (see `resolveExecutionWorkspaceMode`). When `"agent_default"` and the issue
+   * carries a `projectWorkspaceId` only because the create flow auto-derived it
+   * from the project row (`issues.ts:7230-7248`), two guards below intentionally
+   * skip their fail path: `agent_default` runs the agent from its fallback cwd
+   * (no worktree is created — `execution-workspace-policy.ts:73-74`) and the
+   * fallback dir has no `.git`. For any other mode (`isolated_workspace`,
+   * `operator_branch`, `shared_workspace`) the guards still fire — that is the
+   * guard's real job: catching a code card whose workspace is missing.
+   */
+  requestedExecutionWorkspaceMode?: ParsedExecutionWorkspaceMode | null;
 }) {
   if (!GIT_SENSITIVE_LOCAL_ADAPTER_TYPES.has(input.adapterType)) return;
 
@@ -2041,6 +2054,12 @@ export async function assertGitSensitiveAdapterWorkspaceValid(input: {
 
   const issue = input.issue;
   if (!issue) return;
+
+  // SPA-9139: a deliberate `agent_default` request means the caller opted out of
+  // a project worktree. Two of the guards below would otherwise fire on the very
+  // cwd that the bypass is supposed to allow — track that explicitly so we can
+  // prove the regression later.
+  const agentDefaultBypassRequested = input.requestedExecutionWorkspaceMode === "agent_default";
 
   const environmentDriver = readNonEmptyString(input.environmentDriver) ?? "local";
   const leaseMetadata = parseObject(input.leaseMetadata);
@@ -2143,7 +2162,12 @@ export async function assertGitSensitiveAdapterWorkspaceValid(input: {
     );
   }
 
-  if (workspaceExpectation && effectiveCwd && sameResolvedPath(effectiveCwd, agentFallbackCwd)) {
+  if (
+    workspaceExpectation &&
+    effectiveCwd &&
+    !agentDefaultBypassRequested &&
+    sameResolvedPath(effectiveCwd, agentFallbackCwd)
+  ) {
     fail(
       "fallback_agent_home_cwd",
       `Issue ${issue.identifier ?? issue.id} expected a project workspace, but ${input.adapterType} would launch from agent fallback cwd "${effectiveCwd}".`,
@@ -2162,7 +2186,12 @@ export async function assertGitSensitiveAdapterWorkspaceValid(input: {
     );
   }
 
-  if (workspaceExpectation && effectiveCwd && !await hasGitMetadata(effectiveCwd)) {
+  if (
+    workspaceExpectation &&
+    effectiveCwd &&
+    !agentDefaultBypassRequested &&
+    !await hasGitMetadata(effectiveCwd)
+  ) {
     fail(
       "missing_git_metadata",
       `Issue ${issue.identifier ?? issue.id} expected a git workspace for ${input.adapterType}, but "${effectiveCwd}" has no .git metadata.`,
@@ -15799,6 +15828,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         executionTarget,
         environmentDriver: selectedEnvironment.driver,
         leaseMetadata: activeEnvironmentLease.lease.metadata,
+        requestedExecutionWorkspaceMode,
       });
       await assertPushCapabilityCheckoutValid({
         enabled: pushCapabilityPreflightRequired && executionTarget?.kind === "local",
