@@ -27396,16 +27396,20 @@ export function heartbeatService(
               } else if (
                 legacyRun.status !== "running" &&
                 issue.assigneeAgentId &&
-                legacyRun.agentId !== issue.assigneeAgentId
+                legacyRun.agentId !== issue.assigneeAgentId &&
+                source === "assignment" &&
+                reason === "issue_assigned"
               ) {
                 // The executionRunId-named run above was already stale-cleared;
-                // a legacy run found by context scan gets the same rule. When a
+                // a legacy run found by context scan gets the same rule — but
+                // only for a plain assignment wake, the SPA-8511 shape. When a
                 // reassignment cleared issues.executionRunId, the former owner's
                 // queued run row survives the clear and a context-scan re-attach
                 // would re-lock the issue to the old agent — parking the new
-                // owner's wake in deferred_issue_execution forever (SPA-8511).
-                // The new assignee's wake must admit, so cancel the stale
-                // non-running holder and leave the lock released.
+                // owner's assignment wake in deferred_issue_execution forever.
+                // Queued-comment/interaction wakes keep the legacy preserve
+                // semantics (a concurrent third-agent holder must keep the
+                // lock), so this is scoped to assignment wakes only.
                 const staleCancelled = await tx
                   .update(heartbeatRuns)
                   .set({
