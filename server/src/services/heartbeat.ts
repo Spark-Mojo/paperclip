@@ -10175,6 +10175,98 @@ export function heartbeatService(
       );
     }
     await acknowledgeRemoteStop(input.runId, input.companyId);
+    await retryWakesSuppressedByThisRunLease(input.runId, input.companyId);
+  }
+
+  /**
+   * SPA-9001 (reopen, 2026-09-28): a wake whose admission raced THIS run's
+   * lease release can be terminally skipped as `execution_reconciliation_required`
+   * ("previous execution has not released its environment lease") milliseconds
+   * before the lease flips to released. The receipt is diagnostic-only, so the
+   * new assignee's card is left with no wake at all (SPA-5893: wake skipped at
+   * 02:21:41.119, lease released 02:21:41.177). This run's lease release is the
+   * authoritative "ownership over" moment: find skipped reconciliation waits
+   * that name this run and re-enqueue them for the same agent through normal
+   * admission, which now sees no blocker.
+   */
+  async function retryWakesSuppressedByThisRunLease(
+    runId: string,
+    companyId: string,
+  ) {
+    try {
+      const suppressed = await db
+        .select({
+          id: agentWakeupRequests.id,
+          agentId: agentWakeupRequests.agentId,
+          source: agentWakeupRequests.source,
+          triggerDetail: agentWakeupRequests.triggerDetail,
+          payload: agentWakeupRequests.payload,
+          requestedByActorType: agentWakeupRequests.requestedByActorType,
+          requestedByActorId: agentWakeupRequests.requestedByActorId,
+        })
+        .from(agentWakeupRequests)
+        .where(
+          and(
+            eq(agentWakeupRequests.companyId, companyId),
+            eq(agentWakeupRequests.status, "skipped"),
+            eq(agentWakeupRequests.reason, "execution_reconciliation_required"),
+            sql`${agentWakeupRequests.payload} ->> 'interruptedRunId' = ${runId}`,
+            // Only receipts that were suppressed by THIS run's lease, not by
+            // any older blocker recorded in the same executionWait slot.
+            sql`coalesce(${agentWakeupRequests.payload} -> 'executionWait' ->> 'runId', ${runId}) = ${runId}`,
+            // Cap the retry window: receipts older than a day are stale
+            // diagnostics from long-gone state, not this release's race.
+            gte(agentWakeupRequests.requestedAt, new Date(Date.now() - 24 * 60 * 60 * 1000)),
+          ),
+        )
+        .limit(10);
+      for (const wake of suppressed) {
+        const issueId = readNonEmptyString(
+          parseObject(wake.payload).issueId,
+        );
+        if (!issueId) continue;
+        const retried = await enqueueWakeup(wake.agentId, {
+          source: "automation",
+          triggerDetail: "system",
+          reason: readNonEmptyString(
+            parseObject(wake.payload).wakeReason,
+          ) ?? "issue_assigned",
+          payload: {
+            issueId,
+            mutation: "update",
+            leaseReleaseRetryOfWakeId: wake.id,
+            leaseReleaseRetryOfRunId: runId,
+          },
+          contextSnapshot: {
+            issueId,
+            taskId: issueId,
+            wakeReason: readNonEmptyString(
+              parseObject(wake.payload).wakeReason,
+            ) ?? "issue_assigned",
+            source: "issue.lease_release_retry",
+          },
+          requestedByActorType: "system",
+          requestedByActorId: "lease-release-retry",
+        }).catch((err) => {
+          logger.warn(
+            { err, wakeId: wake.id, runId },
+            "failed to re-enqueue wake suppressed by this run's lease release",
+          );
+          return null;
+        });
+        if (retried) {
+          logger.warn(
+            { wakeId: wake.id, runId, retryRunId: retried.id, agentId: wake.agentId },
+            "re-enqueued wake that raced this run's lease release (SPA-9001)",
+          );
+        }
+      }
+    } catch (err) {
+      logger.warn(
+        { err, runId },
+        "failed to scan for wakes suppressed by this run's lease release",
+      );
+    }
   }
 
   async function acknowledgeRemoteStop(runId: string, companyId: string) {

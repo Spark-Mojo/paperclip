@@ -1251,6 +1251,19 @@ export function recoveryService(
             eq(agentWakeupRequests.status, "deferred_issue_execution"),
             sql`${agentWakeupRequests.payload} ->> 'issueId' = ${issueId}`,
             agentId ? eq(agentWakeupRequests.agentId, agentId) : sql`true`,
+            // SPA-9001 (reopen, 2026-09-28): a deferred wake parked for a
+            // FORMER assignee is dead work, not an execution path. Without
+            // this predicate one stale wake for the old owner blinded the
+            // stranded sweep for the new owner's card (SPA-5893 sat `todo`
+            // 30 min with no hold and no blocker). Mirror the SPA-8655
+            // former-assignee semantics: only a deferred wake whose agent
+            // still matches the issue's current assignee counts.
+            sql`exists (
+              select 1 from ${issues}
+              where ${issues.companyId} = ${companyId}
+                and ${issues.id} = ${issueId}
+                and ${issues.assigneeAgentId} = ${agentWakeupRequests.agentId}
+            )`,
           ),
         )
         .limit(1)

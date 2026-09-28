@@ -10895,6 +10895,44 @@ export function issueService(db: Db) {
         if (updated.assigneeAgentId !== existing.assigneeAgentId || updated.assigneeUserId !== existing.assigneeUserId) {
           const { issueThreadInteractionService } = await import("./issue-thread-interactions.js");
           await issueThreadInteractionService(tx).expireConnectionIntentsForOwnershipChange(updated);
+          // SPA-9001 (reopen, 2026-09-28): a deferred wake parked for the
+          // former agent is dead work for the new owner — it can never start
+          // (admission drops former-assignee execution wakes, SPA-8655) but it
+          // still counted as an "active execution path", blinding the stranded
+          // sweep (SPA-5893 sat `todo` 30 min behind one such wake). Re-route
+          // instead of dropping: the wake may carry board intent (a manual
+          // on_demand wake), so hand it to the new assignee, keeping the
+          // payload and stamping the original agent for the audit trail.
+          // Payloads may opt out with agentSpecific: true.
+          if (
+            existing.assigneeAgentId &&
+            updated.assigneeAgentId &&
+            updated.assigneeAgentId !== existing.assigneeAgentId
+          ) {
+            await tx
+              .update(agentWakeupRequests)
+              .set({
+                agentId: updated.assigneeAgentId,
+                payload: sql`jsonb_set(
+                  coalesce(${agentWakeupRequests.payload}, '{}'::jsonb),
+                  '{reassignment}',
+                  ${JSON.stringify({
+                    originalAgentId: existing.assigneeAgentId,
+                    reassignedAt: new Date().toISOString(),
+                  })}::jsonb
+                )`,
+                updatedAt: new Date(),
+              })
+              .where(
+                and(
+                  eq(agentWakeupRequests.companyId, updated.companyId),
+                  eq(agentWakeupRequests.agentId, existing.assigneeAgentId),
+                  eq(agentWakeupRequests.status, "deferred_issue_execution"),
+                  sql`${agentWakeupRequests.payload} ->> 'issueId' = ${updated.id}`,
+                  sql`coalesce((${agentWakeupRequests.payload} ->> 'agentSpecific')::boolean, false) = false`,
+                ),
+              );
+          }
         }
         if (existing.status !== updated.status) {
           if (
