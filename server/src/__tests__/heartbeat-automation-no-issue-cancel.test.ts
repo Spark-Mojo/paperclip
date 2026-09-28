@@ -131,11 +131,14 @@ describeEmbeddedPostgres("automation-source wake without issue binding (SPA-9035
     });
   });
 
-  it("skips a user-initiated automation-source wake with no issue binding", async () => {
+  it("does NOT skip a user-initiated automation wake without an issue (approval-resume regression)", async () => {
+    // User-originated wakes (approval resumes, comment-driven wakes) must
+    // continue to queue even when no issue is bound. The guard targets
+    // agent-initiated automation wakes only.
     const { agentId, ownerUserId } = await seedAgent();
 
     const heartbeat = heartbeatService(db);
-    const run = await heartbeat.wakeup(agentId, {
+    await heartbeat.wakeup(agentId, {
       source: "automation",
       triggerDetail: "callback",
       reason: "user_automation_probe",
@@ -144,12 +147,11 @@ describeEmbeddedPostgres("automation-source wake without issue binding (SPA-9035
       requestedByActorId: ownerUserId,
     });
 
-    expect(run).toBeNull();
-    const wakeupRequest = await db
+    const skippedForOurGuard = await db
       .select({ reason: agentWakeupRequests.reason })
       .from(agentWakeupRequests)
-      .then((rows) => rows.find((row) => row.reason === "automation_wake_no_issue_binding") ?? null);
-    expect(wakeupRequest).not.toBeNull();
+      .then((rows) => rows.some((row) => row.reason === "automation_wake_no_issue_binding"));
+    expect(skippedForOurGuard).toBe(false);
   });
 
   it("does NOT skip a system-originated automation wake without an issue (legitimate pattern)", async () => {
@@ -213,5 +215,35 @@ describeEmbeddedPostgres("automation-source wake without issue binding (SPA-9035
       .from(agentWakeupRequests)
       .then((rows) => rows.some((row) => row.reason === "automation_wake_no_issue_binding"));
     expect(skippedForOurGuard).toBe(false);
+  });
+
+  it("stamps the wake initiator onto the run's contextSnapshot", async () => {
+    const { companyId, agentId } = await seedAgent();
+    const issueId = randomUUID();
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Bound automation issue",
+      status: "in_progress",
+      assigneeAgentId: agentId,
+      createdByUserId: `user-${randomUUID()}`,
+    });
+
+    const heartbeat = heartbeatService(db);
+    const run = await heartbeat.wakeup(agentId, {
+      source: "automation",
+      triggerDetail: "callback",
+      reason: "issue_assigned",
+      payload: { issueId },
+      requestedByActorType: "agent",
+      requestedByActorId: agentId,
+    });
+
+    expect(run).not.toBeNull();
+    if (run) {
+      const snapshot = (run.contextSnapshot ?? {}) as Record<string, unknown>;
+      expect(snapshot.requestedByActorType).toBe("agent");
+      expect(snapshot.requestedByActorId).toBe(agentId);
+    }
   });
 });

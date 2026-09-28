@@ -301,15 +301,27 @@ function readRunLogLimitBytes(value: unknown) {
  */
 export function decideCancelAuth(
   actor: { type: "agent"; agentId: string | null } | { type: "user"; userId: string | null },
-  run: { agentId: string; invocationSource: string; status: string },
+  run: {
+    agentId: string;
+    invocationSource: string;
+    status: string;
+    // Authoritative wake initiator stamped onto the run row at enqueue time.
+    // `requestedByActorType === "agent"` plus `requestedByActorId === actor.agentId`
+    // is the only path that grants the assigned agent self-cancel authority —
+    // proxying on `invocationSource` lets the assigned agent terminate
+    // system- or user-created runs that happen to land on the same agent id.
+    requestedByActorType: string | null;
+    requestedByActorId: string | null;
+  },
 ): { ok: true; cancelledByActorType: "user" | "agent"; cancelReason: string; resultJsonPatch: Record<string, unknown>; activityActorId: string; activityActorType: "user" | "agent" }
   | { ok: false; status: 403 | 409; error: string } {
   if (actor.type === "agent") {
     if (
       actor.agentId !== run.agentId ||
-      !["automation", "on_demand"].includes(run.invocationSource)
+      run.requestedByActorType !== "agent" ||
+      run.requestedByActorId !== actor.agentId
     ) {
-      return { ok: false, status: 403, error: "Agent can only cancel its own automation or on-demand runs" };
+      return { ok: false, status: 403, error: "Agent can only cancel a run it itself started" };
     }
     if (!["queued", "running"].includes(run.status)) {
       return { ok: false, status: 409, error: `Cannot cancel a run in '${run.status}' state` };
@@ -6859,7 +6871,11 @@ export function agentRoutes(
     const runId = readHeartbeatRunId(req);
     const existing = await getAccessibleResource(req, res, heartbeat.getRun(runId), "Heartbeat run not found");
     if (!existing) return;
-    // Authorization: see decideCancelAuth above for the policy.
+    // Authorization: see decideCancelAuth above for the policy. The wake
+    // initiator lives on the run's contextSnapshot (stamped at enqueue time
+    // by enqueueWakeup) — the auth decision reads those fields, not a join
+    // against agent_wakeup_requests.
+    const snapshot = parseObject(existing.contextSnapshot);
     const actor = req.actor.type === "agent"
       ? { type: "agent" as const, agentId: req.actor.agentId ?? null }
       : { type: "user" as const, userId: req.actor.userId ?? null };
@@ -6867,6 +6883,12 @@ export function agentRoutes(
       agentId: existing.agentId,
       invocationSource: existing.invocationSource,
       status: existing.status,
+      requestedByActorType: typeof snapshot.requestedByActorType === "string"
+        ? snapshot.requestedByActorType
+        : null,
+      requestedByActorId: typeof snapshot.requestedByActorId === "string"
+        ? snapshot.requestedByActorId
+        : null,
     });
     if (!decision.ok) {
       res.status(decision.status).json({ error: decision.error });

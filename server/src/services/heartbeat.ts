@@ -26209,21 +26209,31 @@ export function heartbeatService(
     let agent = await getAgent(agentId);
     if (!agent) throw notFound("Agent not found");
 
-    // Automation-source wakes initiated by an agent or user (i.e. an
-    // external caller) must carry an issue binding. An external automation
+    // Stamp the wake initiator onto the snapshot so downstream consumers
+    // (cancel-route auth, recovery decision policy) can authoritatively
+    // attribute the run to the actor that queued it without a separate
+    // join against agent_wakeup_requests.
+    const wakeInitiatorType =
+      opts.requestedByActorType ?? "system";
+    const wakeInitiatorId = opts.requestedByActorId ?? null;
+    enrichedContextSnapshot.requestedByActorType = wakeInitiatorType;
+    enrichedContextSnapshot.requestedByActorId = wakeInitiatorId;
+
+    // Automation-source wakes initiated by an agent (i.e. an external
+    // caller reaching in via the API) must carry an issue binding. An agent
     // wake with no issueId (e.g. an agent calling /api/agents/{id}/wakeup
     // with source=automation and no issueId in payload or context) has no
     // dispatch target — without this guard the run is queued, the dispatcher
     // claims it, and it sits pinned in 'dispatching' forever because there is
     // nothing to dispatch against.
     //
-    // System-originated automation wakes (requestedByActorType="system")
-    // bypass this guard — internal callers legitimately run no-issue wakes
-    // (e.g. productivity_review, board-review probes).
+    // System-originated and user-originated automation wakes bypass this
+    // guard — internal callers (productivity review, board-review probes)
+    // and approval-resume callers legitimately run no-issue wakes.
     if (
       source === "automation" &&
       !issueId &&
-      opts.requestedByActorType !== "system"
+      wakeInitiatorType === "agent"
     ) {
       await db.insert(agentWakeupRequests).values({
         companyId: agent.companyId,
