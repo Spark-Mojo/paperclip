@@ -8,7 +8,7 @@ import path from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import type { AdapterRuntimeServiceReport } from "@paperclipai/adapter-utils";
 import type { Db } from "@paperclipai/db";
-import { executionWorkspaces, issueComments, issues, projectWorkspaces, workspaceRuntimeServices } from "@paperclipai/db";
+import { executionWorkspaces, heartbeatRuns, issueComments, issues, projectWorkspaces, workspaceRuntimeServices } from "@paperclipai/db";
 import {
   listWorkspaceServiceCommandDefinitions,
   type GitWorktreeBranchAncestryVerdict,
@@ -4121,11 +4121,14 @@ export async function reapOrphanedRunWorktrees(input: {
 /**
  * SPA-9275 — one-time sweep.
  *
- * Walk every worktree registered against `repoRoot` whose path ends with
- * `/runs/<runId>/` (ephemeral shape) AND whose `executionWorkspaces.sourceIssueId`
- * issue is `done`/`cancelled`, AND whose run id is NOT in `liveRunIds`. For each:
- * confirm the branch is reachable from origin (rescue to a dated branch if
- * not), force-remove the worktree dir, and mark the workspace `archived`.
+ * Walk every `git_worktree` execution workspace whose path lives under the
+ * configured `<worktreeParentDir>/runs/<runId>/` (ephemeral shape) OR whose
+ * path lives under `<worktreeParentDir>/<branch>/` (legacy per-card shape)
+ * AND whose source issue is `done`/`cancelled`, AND whose run id is NOT in
+ * `liveRunIds`. For each: confirm the branch is reachable from origin (rescue
+ * to a dated branch if not), force-remove the worktree dir, and mark the
+ * workspace `archived`. Includes `cleanup_failed` rows — those are exactly
+ * the 717 stuck teardowns the card names, and they are the primary target.
  *
  * Idempotent: re-running against a clean tree is a no-op.
  */
@@ -4148,14 +4151,16 @@ export async function sweepTerminalIssueRunWorktrees(input: {
   let archived = 0;
   let rescued = 0;
   const now = input.now ?? (() => new Date());
-  const runsParent = path.join(input.worktreeParentDir, "runs");
 
-  if (!await directoryExists(runsParent)) {
+  if (!await directoryExists(input.worktreeParentDir)) {
     return { scanned: 0, archived: 0, rescued: 0, errors };
   }
 
-  // Find the sourceIssueIds of workspaces whose path is under /runs/.
-  // Filter to terminal issues (done/cancelled).
+  // SPA-9275: include `cleanup_failed` rows — that is the population the card
+  // targets (the 717 stuck teardowns). Filter on providerRef/cwd living under
+  // the configured worktree parent dir (both ephemeral /runs/<runId>/ and
+  // legacy /<branch>/ shapes qualify; the reaper in the same module handles
+  // orphans that have no DB row at all).
   const candidateRows = await input.db
     .select({
       id: executionWorkspaces.id,
@@ -4169,7 +4174,7 @@ export async function sweepTerminalIssueRunWorktrees(input: {
     .from(executionWorkspaces)
     .where(and(
       eq(executionWorkspaces.providerType, "git_worktree"),
-      inArray(executionWorkspaces.status, ["active", "idle", "in_review"]),
+      inArray(executionWorkspaces.status, ["active", "idle", "in_review", "cleanup_failed"]),
     ));
 
   const worktreePathRows = candidateRows.filter((row) => {
@@ -4177,7 +4182,8 @@ export async function sweepTerminalIssueRunWorktrees(input: {
     const cwd = readNullableString(row.cwd);
     const candidate = providerRef ?? cwd;
     if (!candidate) return false;
-    return candidate.startsWith(`${runsParent}${path.sep}`);
+    return candidate === input.worktreeParentDir
+      || candidate.startsWith(`${input.worktreeParentDir}${path.sep}`);
   });
 
   if (worktreePathRows.length === 0) {
@@ -4198,15 +4204,18 @@ export async function sweepTerminalIssueRunWorktrees(input: {
     if (!row.sourceIssueId || !terminalIssueIds.has(row.sourceIssueId)) continue;
     const workspacePath = readNullableString(row.providerRef) ?? readNullableString(row.cwd);
     if (!workspacePath) continue;
-    const runIdSegment = path.basename(workspacePath);
-    if (input.liveRunIds.has(runIdSegment)) continue;
+    // Live-run guard applies to /runs/<runId>/ shape only; the legacy
+    // /<branch>/ shape has no run-id component to gate against.
+    const isEphemeralShape = path.basename(path.dirname(workspacePath)) === "runs";
+    const runIdSegment = isEphemeralShape ? path.basename(workspacePath) : null;
+    if (runIdSegment && input.liveRunIds.has(runIdSegment)) continue;
     scanned += 1;
 
     const rescue = await rescueUnpushedRunWorktreeState({
       repoRoot: input.repoRoot,
       worktreePath: workspacePath,
       branchName: row.branchName ?? null,
-      runId: runIdSegment,
+      runId: runIdSegment ?? "legacy",
       timestamp: now().toISOString().replace(/[:.]/g, "-"),
       recorder: input.recorder ?? null,
     });
@@ -4216,7 +4225,7 @@ export async function sweepTerminalIssueRunWorktrees(input: {
       repoRoot: input.repoRoot,
       worktreePath: workspacePath,
       branchName: row.branchName ?? null,
-      runId: runIdSegment,
+      runId: runIdSegment ?? "legacy",
       resolveGitAuth: input.resolveGitAuth ?? null,
       recorder: input.recorder ?? null,
       now,
@@ -4239,6 +4248,107 @@ export async function sweepTerminalIssueRunWorktrees(input: {
   }
 
   return { scanned, archived, rescued, errors };
+}
+
+/**
+ * SPA-9275 — startup reconciliation.
+ *
+ * Walks every `git_worktree` execution workspace, groups by repo root
+ * (resolved from the project workspace cwd), and runs both the orphan
+ * reaper and the terminal-issue sweep against each repo. Live runs are
+ * excluded from both passes via the heartbeat SELECT against `heartbeatRuns`.
+ *
+ * The intent is that one function call, on engine boot, recovers the bulk
+ * of the 203 GB / 168-worktree backlog AND keeps the on-disk worktree count
+ * aligned with `live_run_count` going forward (the reaper handles orphan
+ * `/runs/<runId>/` directories created by past crashes).
+ */
+export async function reconcileEphemeralWorktreesOnStartup(input: {
+  db: Db;
+  liveRunIds?: ReadonlySet<string>;
+  resolveGitAuth?: GitRemoteAuthProvider | null;
+  recorder?: WorkspaceOperationRecorder | null;
+  now?: () => Date;
+}): Promise<{
+  reposScanned: number;
+  reaper: { scanned: number; removed: number; rescued: number; errors: string[] };
+  sweep: { scanned: number; archived: number; rescued: number; errors: string[] };
+  totalErrors: string[];
+}> {
+  const errors: string[] = [];
+  const liveRunIds = input.liveRunIds ?? await loadLiveHeartbeatRunIds(input.db);
+  const grouped = await groupWorktreeParentDirs(input.db);
+  const summary = {
+    reposScanned: 0,
+    reaper: { scanned: 0, removed: 0, rescued: 0, errors: [] as string[] },
+    sweep: { scanned: 0, archived: 0, rescued: 0, errors: [] as string[] },
+    totalErrors: errors,
+  };
+  for (const [parentDir, repoRoots] of grouped) {
+    summary.reposScanned += 1;
+    for (const repoRoot of repoRoots) {
+      const reaper = await reapOrphanedRunWorktrees({
+        repoRoot,
+        worktreeParentDir: parentDir,
+        liveRunIds,
+        resolveGitAuth: input.resolveGitAuth ?? null,
+        recorder: input.recorder ?? null,
+        now: input.now,
+      });
+      summary.reaper.scanned += reaper.scanned;
+      summary.reaper.removed += reaper.removed;
+      summary.reaper.rescued += reaper.rescued;
+      summary.reaper.errors.push(...reaper.errors.map((e) => `[${repoRoot}] ${e}`));
+
+      const sweep = await sweepTerminalIssueRunWorktrees({
+        db: input.db,
+        repoRoot,
+        worktreeParentDir: parentDir,
+        liveRunIds,
+        resolveGitAuth: input.resolveGitAuth ?? null,
+        recorder: input.recorder ?? null,
+        now: input.now,
+      });
+      summary.sweep.scanned += sweep.scanned;
+      summary.sweep.archived += sweep.archived;
+      summary.sweep.rescued += sweep.rescued;
+      summary.sweep.errors.push(...sweep.errors.map((e) => `[${repoRoot}] ${e}`));
+    }
+  }
+  errors.push(...summary.reaper.errors, ...summary.sweep.errors);
+  return summary;
+}
+
+async function loadLiveHeartbeatRunIds(db: Db): Promise<Set<string>> {
+  const rows = await db
+    .select({ id: heartbeatRuns.id })
+    .from(heartbeatRuns)
+    .where(inArray(heartbeatRuns.status, ["queued", "running"]));
+  return new Set(rows.map((row) => row.id));
+}
+
+async function groupWorktreeParentDirs(db: Db): Promise<Map<string, Set<string>>> {
+  const rows = await db
+    .select({
+      cwd: projectWorkspaces.cwd,
+      providerRef: executionWorkspaces.providerRef,
+    })
+    .from(executionWorkspaces)
+    .innerJoin(projectWorkspaces, eq(projectWorkspaces.id, executionWorkspaces.projectWorkspaceId))
+    .where(eq(executionWorkspaces.providerType, "git_worktree"));
+  const grouped = new Map<string, Set<string>>();
+  for (const row of rows) {
+    const providerRef = readNullableString(row.providerRef);
+    if (!providerRef) continue;
+    const parent = path.dirname(providerRef);
+    if (!parent) continue;
+    const repoRoot = readNullableString(row.cwd);
+    if (!repoRoot) continue;
+    const set = grouped.get(parent) ?? new Set<string>();
+    set.add(repoRoot);
+    grouped.set(parent, set);
+  }
+  return grouped;
 }
 
 /**
@@ -4267,6 +4377,54 @@ export async function releaseRunExecutionWorkspaceForHeartbeat(input: {
     resolveGitAuth: input.resolveGitAuth ?? null,
     recorder: input.recorder ?? null,
   });
+}
+
+/**
+ * SPA-9275 — heartbeat finally block composite.
+ *
+ * Combines push-then-remove (releaseRunExecutionWorkspace) with archive of the
+ * execution workspace row. The heartbeat finally block is the only caller;
+ * exposing this as a single testable function lets a regression test assert
+ * the FULL finally semantics (directory gone + row archived) end-to-end
+ * without spinning up an actual heartbeat run.
+ *
+ * Returns the release result PLUS a flag indicating whether the workspace
+ * row was archived (only when removal succeeded AND an id was provided).
+ */
+export async function releaseEphemeralRunWorkspaceForHeartbeatFinally(input: {
+  db: Db;
+  repoRoot: string;
+  worktreePath: string;
+  branchName: string | null;
+  runId: string;
+  executionWorkspaceId: string | null;
+  resolveGitAuth?: GitRemoteAuthProvider | null;
+  recorder?: WorkspaceOperationRecorder | null;
+  now?: () => Date;
+}): Promise<Awaited<ReturnType<typeof releaseRunExecutionWorkspace>> & { archived: boolean }> {
+  const release = await releaseRunExecutionWorkspace({
+    repoRoot: input.repoRoot,
+    worktreePath: input.worktreePath,
+    branchName: input.branchName,
+    runId: input.runId,
+    resolveGitAuth: input.resolveGitAuth ?? null,
+    recorder: input.recorder ?? null,
+    now: input.now,
+  });
+  if (!release.removed || !input.executionWorkspaceId) {
+    return { ...release, archived: false };
+  }
+  const closedAt = (input.now ?? (() => new Date()))();
+  await input.db
+    .update(executionWorkspaces)
+    .set({
+      status: "archived",
+      closedAt,
+      cleanupReason: "ephemeral_run_release",
+      updatedAt: closedAt,
+    })
+    .where(eq(executionWorkspaces.id, input.executionWorkspaceId));
+  return { ...release, archived: true };
 }
 
 async function allocatePort(): Promise<number> {

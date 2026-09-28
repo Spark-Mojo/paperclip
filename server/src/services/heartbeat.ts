@@ -139,6 +139,7 @@ import {
   inspectManagedGitWorktreeBranch,
   persistAdapterManagedRuntimeServices,
   realizeExecutionWorkspace,
+  releaseEphemeralRunWorkspaceForHeartbeatFinally,
   releaseRunExecutionWorkspaceForHeartbeat,
   resolveGitOwnerRepoRoot,
   releaseRuntimeServicesForRun,
@@ -14147,6 +14148,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       worktreePath: string;
       branchName: string | null;
       repoRoot: string;
+      executionWorkspaceId: string | null;
     } | null = null;
     // SPA-9275: the workspace git-auth provider and operation recorder are
     // declared inside the workspace-realization inner try; the outer finally
@@ -15314,6 +15316,12 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             worktreePath: executionWorkspace.worktreePath,
             branchName: executionWorkspace.branchName ?? null,
             repoRoot,
+            // The execution workspace row id is needed so the outer finally
+            // can archive the row when the local dir is removed — without
+            // this every ephemeral run leaves an `active` row pointing at a
+            // deleted directory, which a later `reuse_existing` run would
+            // then try to restore.
+            executionWorkspaceId: persistedExecutionWorkspace?.id ?? null,
           };
         }
       } catch (resolveErr) {
@@ -17053,11 +17061,17 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           // warnings and surfaced through the run's result JSON.
           if (ephemeralRunCleanup && latestRun && isHeartbeatRunTerminalStatus(latestRun.status)) {
             try {
-              const releaseResult = await releaseRunExecutionWorkspaceForHeartbeat({
+              // SPA-9275: heartbeat finally composite — pushes branch, force-removes
+              // the worktree dir, and archives the execution workspace row. The
+              // composite is the same code path the regression test exercises,
+              // so the test stays a faithful simulation of the finally block.
+              const releaseResult = await releaseEphemeralRunWorkspaceForHeartbeatFinally({
+                db,
                 repoRoot: ephemeralRunCleanup.repoRoot,
                 worktreePath: ephemeralRunCleanup.worktreePath,
                 branchName: ephemeralRunCleanup.branchName,
                 runId: run.id,
+                executionWorkspaceId: ephemeralRunCleanup.executionWorkspaceId,
                 resolveGitAuth: ephemeralRunGitAuth,
                 recorder: ephemeralRunRecorder,
               });
@@ -17088,6 +17102,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
                     pushed: releaseResult.pushed,
                     removed: releaseResult.removed,
                     retriedRemoval: releaseResult.retriedRemoval,
+                    archived: releaseResult.archived,
                     errors: releaseResult.errors,
                   },
                 }).catch(() => undefined);
