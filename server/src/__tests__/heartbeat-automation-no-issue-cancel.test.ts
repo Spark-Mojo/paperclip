@@ -7,6 +7,7 @@ import {
   agents,
   companies,
   companyMemberships,
+  companySkillVersions,
   companySkills,
   createDb,
   heartbeatRunEvents,
@@ -46,6 +47,7 @@ describeEmbeddedPostgres("automation-source wake without issue binding (SPA-9035
     await db.delete(issues);
     await db.delete(agents);
     await db.delete(companyMemberships);
+    await db.delete(companySkillVersions);
     await db.delete(companySkills);
     await db.delete(companies);
   }, 30_000);
