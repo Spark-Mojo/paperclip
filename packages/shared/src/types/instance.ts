@@ -101,6 +101,16 @@ export interface InstanceExperimentalSettings {
    * from another instance fail closed.
    */
   worktreeRunExecutionActivationInstanceId: string | null;
+  /**
+   * SPA-9275: ephemeral worktree mode. When enabled, the engine provisions one
+   * git worktree PER RUN (under `<worktreeParentDir>/runs/<runId>/`) instead of
+   * one per card; the run pushes its branch and force-removes the directory at
+   * terminal status (success/failure/cancel/process-lost). A startup reaper
+   * sweeps any `/runs/<runId>/` directory whose owning run is no longer live,
+   * rescuing unpushed branches first. Default OFF — the per-card persistent
+   * worktree behavior is unchanged until an operator opts in.
+   */
+  enableEphemeralWorktreePerRun: boolean;
   issueGraphLivenessAutoRecoveryLookbackHours: number;
 }
 
