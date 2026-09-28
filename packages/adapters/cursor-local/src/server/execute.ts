@@ -51,6 +51,7 @@ import {
   DEFAULT_PAPERCLIP_CONVERSATION_PROMPT_TEMPLATE,
   joinPromptSections,
 } from "@paperclipai/adapter-utils/server-utils";
+import { applyPaperclipWakePayloadEnv } from "@paperclipai/adapter-utils/wake-payload-env";
 import { DEFAULT_CURSOR_LOCAL_MODEL, SANDBOX_INSTALL_COMMAND } from "../index.js";
 import { parseCursorJsonl, isCursorUnknownSessionError } from "./parse.js";
 import { prepareCursorSandboxCommand } from "./remote-command.js";
@@ -297,9 +298,6 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   if (linkedIssueIds.length > 0) {
     env.PAPERCLIP_LINKED_ISSUE_IDS = linkedIssueIds.join(",");
   }
-  if (wakePayloadJson) {
-    env.PAPERCLIP_WAKE_PAYLOAD_JSON = wakePayloadJson;
-  }
   refreshPaperclipWorkspaceEnvForExecution({
     env,
     envConfig,
@@ -313,6 +311,24 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     executionTargetIsRemote,
     executionCwd: effectiveExecutionCwd,
   });
+  // SPA-9259: cap the inline env copy of the wake payload; oversized
+  // payloads are staged to a file (local) or dropped in favor of the wake
+  // prompt (remote) so spawn never hits E2BIG. Runs AFTER env assembly so
+  // the run scratch dir from envConfig is present for file staging.
+  const wakePayloadEnv = await applyPaperclipWakePayloadEnv(env, {
+    runId,
+    wakePayloadJson,
+    executionTargetIsRemote,
+  });
+  if (wakePayloadEnv.mode !== "inline") {
+    await onLog(
+      "stdout",
+      `[paperclip] Wake payload (${wakePayloadEnv.byteLength} bytes) exceeds the inline env limit; ` +
+        (wakePayloadEnv.mode === "file"
+          ? `staged to ${wakePayloadEnv.filePath} via PAPERCLIP_WAKE_PAYLOAD_FILE.\n`
+          : "env copy dropped (remote execution target); the wake prompt in stdin still carries the payload content.\n"),
+    );
+  }
   if (authToken) {
     env.PAPERCLIP_API_KEY = authToken;
   }
