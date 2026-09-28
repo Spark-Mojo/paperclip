@@ -509,7 +509,12 @@ describe("issue dependency wakeups in issue routes", () => {
     ]);
 
     const res = await request(await createApp()).patch(`/api/issues/${reviewIssueId}`).send({ status: "done" });
-    expect(res.status).toBe(200);
+    // SPA-5916 fork carry: a routine PATCH that re-asserts the terminal status
+    // the issue already holds is rejected with 409 (issue_write_terminal_recomplete,
+    // FINAL-SPEC §11.7) before any wake side effect. Rejection still proves the
+    // title's intent — no second wake is enqueued on an already-done blocker.
+    expect(res.status).toBe(409);
+    expect(res.body.details?.code).toBe("issue_write_terminal_recomplete");
     await new Promise((resolve) => setTimeout(resolve, 50));
     expect(mockWakeup).not.toHaveBeenCalled();
     expect(mockIssueService.listWakeableBlockedDependents).not.toHaveBeenCalled();

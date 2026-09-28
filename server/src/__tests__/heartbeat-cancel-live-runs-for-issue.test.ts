@@ -683,16 +683,18 @@ function makeUpdateChain(table?: unknown): Record<string, unknown> {
 }
 
 function makeInsertChain(): Record<string, unknown> {
+  let pendingValues: unknown;
   const chain = {
     values(input: unknown) {
-      return {
-        returning() {
-          // `appendRunEvent` requires a returned row carrying `id`; the mock
-          // never persists rows, so hand back a stub that satisfies the
-          // shape without touching dbState.
-          return Promise.resolve([{ id: `run-event-${counter()}`, ...(input as object) }]);
-        },
-      };
+      pendingValues = input;
+      return chain;
+    },
+    // drizzle's `.returning()` resolves to the inserted row(s). The mock
+    // doesn't actually persist anything — return the captured values wrapped
+    // so `const [row] = await tx.insert(...).values(...).returning()`
+    // destructures to a single row object.
+    returning() {
+      return Promise.resolve([pendingValues]);
     },
   };
   return chain as unknown as Record<string, unknown>;
