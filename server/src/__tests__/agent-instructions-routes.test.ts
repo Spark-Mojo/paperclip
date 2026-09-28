@@ -415,7 +415,67 @@ describe("agent instructions bundle routes", () => {
           instructionsFilePath: "/tmp/agent-1/AGENTS.md",
         }),
       }),
+      expect.objectContaining({
+        recordRevision: expect.objectContaining({
+          source: "instructions_bundle_file_put",
+          force: true,
+        }),
+      }),
+    );
+  });
+
+  it("forces a config revision on bundle file PUT even when adapterConfig is unchanged", async () => {
+    // SPA-5925 regression: writing the same file content again produced no
+    // agent_config_revisions row because the diff against the existing
+    // adapterConfig snapshot was empty. The audit trail must be unconditional
+    // for the file system of record.
+    mockAgentService.getById.mockResolvedValue({
+      ...makeAgent(),
+      adapterConfig: {
+        instructionsBundleMode: "managed",
+        instructionsRootPath: "/tmp/agent-1",
+        instructionsEntryFile: "AGENTS.md",
+        instructionsFilePath: "/tmp/agent-1/AGENTS.md",
+      },
+    });
+    mockAgentInstructionsService.writeFile.mockResolvedValue({
+      bundle: null,
+      file: {
+        path: "AGENTS.md",
+        size: 12,
+        language: "markdown",
+        markdown: true,
+        isEntryFile: true,
+        editable: true,
+        deprecated: false,
+        virtual: false,
+        content: "# Agent\n",
+      },
+      adapterConfig: {
+        instructionsBundleMode: "managed",
+        instructionsRootPath: "/tmp/agent-1",
+        instructionsEntryFile: "AGENTS.md",
+        instructionsFilePath: "/tmp/agent-1/AGENTS.md",
+      },
+    });
+
+    const res = await requestApp(await createApp(), (baseUrl) => request(baseUrl)
+      .put("/api/agents/11111111-1111-4111-8111-111111111111/instructions-bundle/file?companyId=company-1")
+      .send({
+        path: "AGENTS.md",
+        content: "# Agent\n",
+      }));
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(mockAgentService.update).toHaveBeenCalledWith(
+      "11111111-1111-4111-8111-111111111111",
       expect.any(Object),
+      expect.objectContaining({
+        recordRevision: expect.objectContaining({
+          source: "instructions_bundle_file_put",
+          force: true,
+        }),
+      }),
     );
   });
 

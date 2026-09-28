@@ -67,6 +67,15 @@ interface RevisionMetadata {
   createdByUserId?: string | null;
   source?: string;
   rolledBackFromRevisionId?: string | null;
+  /**
+   * When true, a revision row is always written whenever the request asked
+   * for a revision (even if the config snapshot is byte-for-byte identical).
+   * Used by instructions-bundle/file handlers: the file on disk is the system
+   * of record, adapterConfig is just the denormalized cache, and a content
+   * edit can be semantically meaningful even when adapterConfig normalizes
+   * to the same shape.
+   */
+  force?: boolean;
 }
 
 interface UpdateAgentOptions {
@@ -94,7 +103,24 @@ function isPlainRecord(value: unknown): value is Record<string, unknown> {
 }
 
 function jsonEqual(left: unknown, right: unknown): boolean {
-  return JSON.stringify(left) === JSON.stringify(right);
+  return stableStringify(left) === stableStringify(right);
+}
+
+// Postgres JSON columns do not preserve key insertion order across a
+// round-trip, so a JSON.stringify compare sees spurious diffs between
+// structurally identical snapshots. Recursively sort object keys before
+// serializing to make equality order-independent.
+function stableStringify(value: unknown): string {
+  if (value === null || typeof value !== "object") return JSON.stringify(value);
+  if (Array.isArray(value)) {
+    return `[${value.map((item) => stableStringify(item)).join(",")}]`;
+  }
+  const entries = Object.entries(value as Record<string, unknown>).sort(([a], [b]) =>
+    a < b ? -1 : a > b ? 1 : 0,
+  );
+  return `{${entries
+    .map(([key, entry]) => `${JSON.stringify(key)}:${stableStringify(entry)}`)
+    .join(",")}}`;
 }
 
 function buildConfigSnapshot(
@@ -527,7 +553,10 @@ export function agentService(db: Db) {
       );
     }
 
-    const shouldRecordRevision = Boolean(options?.recordRevision) && hasConfigPatchFields(normalizedPatch);
+    const revisionRequested = Boolean(options?.recordRevision);
+    const forceRevision = revisionRequested && options?.recordRevision?.force === true;
+    const shouldRecordRevision =
+      revisionRequested && (hasConfigPatchFields(normalizedPatch) || forceRevision);
     const beforeConfig = shouldRecordRevision ? buildConfigSnapshot(existing) : null;
 
     type AgentUpdateResult = Awaited<ReturnType<typeof getById>>;
@@ -552,7 +581,11 @@ export function agentService(db: Db) {
       if (shouldRecordRevision && beforeConfig) {
         const afterConfig = buildConfigSnapshot(normalizedUpdated);
         const changedKeys = diffConfigSnapshot(beforeConfig, afterConfig);
-        if (changedKeys.length > 0) {
+        if (changedKeys.length > 0 || forceRevision) {
+          const recordedChangedKeys =
+            changedKeys.length > 0
+              ? changedKeys
+              : ["instructionsFileContent"];
           await txDb.insert(agentConfigRevisions).values({
             companyId: normalizedUpdated.companyId,
             agentId: normalizedUpdated.id,
@@ -560,7 +593,7 @@ export function agentService(db: Db) {
             createdByUserId: options?.recordRevision?.createdByUserId ?? null,
             source: options?.recordRevision?.source ?? "patch",
             rolledBackFromRevisionId: options?.recordRevision?.rolledBackFromRevisionId ?? null,
-            changedKeys,
+            changedKeys: recordedChangedKeys,
             beforeConfig: beforeConfig as unknown as Record<string, unknown>,
             afterConfig: afterConfig as unknown as Record<string, unknown>,
           });
