@@ -1702,13 +1702,14 @@ describe("effective run execution workspace config freshness", () => {
       resolveAllocatorExecutionWorkspaceReuseDecision({
         issueExecutionWorkspaceId: "workspace-1",
         issueExecutionWorkspacePreference: "reuse_existing",
-        existingExecutionWorkspaceStatus: "ready",
+        existingExecutionWorkspaceStatus: "active",
         executionWorkspaceHeldByAnotherOpenIssue: false,
       }),
     ).toEqual({
       requestedExecutionWorkspaceId: "workspace-1",
       shouldRestoreExistingWorkspace: true,
       refusedCrossIssueBinding: false,
+      refusedDeadWorkspaceReuse: false,
     });
   });
 
@@ -1717,13 +1718,14 @@ describe("effective run execution workspace config freshness", () => {
       resolveAllocatorExecutionWorkspaceReuseDecision({
         issueExecutionWorkspaceId: "workspace-1",
         issueExecutionWorkspacePreference: "reuse_existing",
-        existingExecutionWorkspaceStatus: "ready",
+        existingExecutionWorkspaceStatus: "active",
         executionWorkspaceHeldByAnotherOpenIssue: true,
       }),
     ).toEqual({
       requestedExecutionWorkspaceId: "workspace-1",
       shouldRestoreExistingWorkspace: false,
       refusedCrossIssueBinding: true,
+      refusedDeadWorkspaceReuse: false,
     });
   });
 
@@ -1732,14 +1734,111 @@ describe("effective run execution workspace config freshness", () => {
       resolveAllocatorExecutionWorkspaceReuseDecision({
         issueExecutionWorkspaceId: "workspace-1",
         issueExecutionWorkspacePreference: "reuse_existing",
-        existingExecutionWorkspaceStatus: "ready",
+        existingExecutionWorkspaceStatus: "active",
         executionWorkspaceHeldByAnotherOpenIssue: false,
       }),
     ).toEqual({
       requestedExecutionWorkspaceId: "workspace-1",
       shouldRestoreExistingWorkspace: true,
       refusedCrossIssueBinding: false,
+      refusedDeadWorkspaceReuse: false,
     });
+  });
+
+  it.each(["cleanup_failed", "closed", "archived", null] as const)(
+    "allocator refuses a reuse binding whose workspace row is %s and provisions fresh (SPA-7090)",
+    (deadStatus) => {
+      const decision = resolveAllocatorExecutionWorkspaceReuseDecision({
+        issueExecutionWorkspaceId: "workspace-dead",
+        issueExecutionWorkspacePreference: "reuse_existing",
+        existingExecutionWorkspaceStatus: deadStatus,
+        executionWorkspaceHeldByAnotherOpenIssue: false,
+      });
+
+      expect(decision).toEqual({
+        requestedExecutionWorkspaceId: "workspace-dead",
+        shouldRestoreExistingWorkspace: false,
+        refusedCrossIssueBinding: false,
+        refusedDeadWorkspaceReuse: true,
+      });
+    },
+  );
+
+  it("allocator reuse path stays refusal-free for an active workspace (SPA-7090 flag invariant)", () => {
+    const decision = resolveAllocatorExecutionWorkspaceReuseDecision({
+      issueExecutionWorkspaceId: "workspace-1",
+      issueExecutionWorkspacePreference: "reuse_existing",
+      existingExecutionWorkspaceStatus: "active",
+      executionWorkspaceHeldByAnotherOpenIssue: false,
+    });
+
+    expect(decision.refusedDeadWorkspaceReuse).toBe(false);
+    expect(decision.shouldRestoreExistingWorkspace).toBe(true);
+  });
+
+  it("dead reuse binding falls through to fresh provisioning with a named warning (SPA-7090)", async () => {
+    const metadata = buildWorkspaceConfigMetadata();
+    const decision = resolveExecutionWorkspaceConfigFreshness({
+      hasExistingWorkspace: false,
+      existingWorkspaceMetadata: null,
+      nextMetadata: metadata,
+    });
+    const restoreExistingWorkspace = vi.fn(async () => ({ id: "workspace-dead", warnings: [] }));
+    const realizeWorkspace = vi.fn(async () => ({ id: "workspace-fresh", warnings: [] }));
+
+    const allocatorDecision = resolveAllocatorExecutionWorkspaceReuseDecision({
+      issueExecutionWorkspaceId: "workspace-dead",
+      issueExecutionWorkspacePreference: "reuse_existing",
+      existingExecutionWorkspaceStatus: "cleanup_failed",
+      executionWorkspaceHeldByAnotherOpenIssue: false,
+    });
+    expect(allocatorDecision.shouldRestoreExistingWorkspace).toBe(false);
+
+    const result = await provisionExecutionWorkspaceForFreshnessDecision({
+      requestedShouldReuseExisting: allocatorDecision.shouldRestoreExistingWorkspace,
+      existingExecutionWorkspaceId: allocatorDecision.requestedExecutionWorkspaceId,
+      issueRef: { id: "issue-1", identifier: "PAP-42" },
+      runId: "run-1",
+      workspaceConfigFreshness: decision,
+      staleReuseFallback: allocatorDecision.refusedDeadWorkspaceReuse
+        ? { executionWorkspaceId: allocatorDecision.requestedExecutionWorkspaceId, workspaceStatus: "cleanup_failed" }
+        : null,
+      restoreExistingWorkspace: allocatorDecision.shouldRestoreExistingWorkspace
+        ? restoreExistingWorkspace
+        : null,
+      realizeWorkspace,
+    });
+
+    expect(restoreExistingWorkspace).not.toHaveBeenCalled();
+    expect(realizeWorkspace).toHaveBeenCalledTimes(1);
+    expect(result.executionWorkspace.id).toBe("workspace-fresh");
+    expect(result.reusedExecutionWorkspace).toBeNull();
+    expect(result.freshFallbackForStaleReuse).toBe(true);
+    expect(result.freshFallbackWarning).toContain("workspace-dead");
+    expect(result.freshFallbackWarning).toContain("cleanup_failed");
+  });
+
+  it("active reuse restore still throws on restore failure (SPA-7090 fail-fast invariant kept)", async () => {
+    const metadata = buildWorkspaceConfigMetadata();
+    const decision = resolveExecutionWorkspaceConfigFreshness({
+      hasExistingWorkspace: true,
+      existingWorkspaceMetadata: persistedWorkspaceConfigFingerprint(metadata),
+      nextMetadata: metadata,
+    });
+    const realizeWorkspace = vi.fn(async () => ({ id: "workspace-fresh", warnings: [] }));
+
+    await expect(provisionExecutionWorkspaceForFreshnessDecision({
+      requestedShouldReuseExisting: true,
+      existingExecutionWorkspaceId: "workspace-live",
+      issueRef: { id: "issue-1", identifier: "PAP-42" },
+      runId: "run-1",
+      workspaceConfigFreshness: decision,
+      restoreExistingWorkspace: async () => {
+        throw new Error("restore command failed");
+      },
+      realizeWorkspace,
+    })).rejects.toThrow(/restore command failed/);
+    expect(realizeWorkspace).not.toHaveBeenCalled();
   });
 
   it("cross-issue refuse flows into provisionExecutionWorkspaceForFreshnessDecision and calls realizeWorkspace fresh", async () => {
@@ -1755,7 +1854,7 @@ describe("effective run execution workspace config freshness", () => {
     const allocatorDecision = resolveAllocatorExecutionWorkspaceReuseDecision({
       issueExecutionWorkspaceId: "workspace-1",
       issueExecutionWorkspacePreference: "reuse_existing",
-      existingExecutionWorkspaceStatus: "ready",
+      existingExecutionWorkspaceStatus: "active",
       executionWorkspaceHeldByAnotherOpenIssue: true,
     });
     expect(allocatorDecision.shouldRestoreExistingWorkspace).toBe(false);
@@ -1766,6 +1865,9 @@ describe("effective run execution workspace config freshness", () => {
       issueRef: { id: "issue-1", identifier: "PAP-42" },
       runId: "run-1",
       workspaceConfigFreshness: decision,
+      staleReuseFallback: allocatorDecision.refusedDeadWorkspaceReuse
+        ? { executionWorkspaceId: allocatorDecision.requestedExecutionWorkspaceId, workspaceStatus: "ready" }
+        : null,
       restoreExistingWorkspace: allocatorDecision.shouldRestoreExistingWorkspace
         ? restoreExistingWorkspace
         : null,
@@ -1776,6 +1878,8 @@ describe("effective run execution workspace config freshness", () => {
     expect(realizeWorkspace).toHaveBeenCalledTimes(1);
     expect(result.executionWorkspace.id).toBe("workspace-fresh");
     expect(result.reusedExecutionWorkspace).toBeNull();
+    expect(result.freshFallbackForStaleReuse).toBe(false);
+    expect(result.freshFallbackWarning).toBeNull();
   });
 
   it("formats a safe workspace operation payload for config drift decisions", () => {
