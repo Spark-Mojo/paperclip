@@ -139,6 +139,8 @@ import {
   inspectManagedGitWorktreeBranch,
   persistAdapterManagedRuntimeServices,
   realizeExecutionWorkspace,
+  releaseRunExecutionWorkspaceForHeartbeat,
+  resolveGitOwnerRepoRoot,
   releaseRuntimeServicesForRun,
   type ExecutionWorkspaceInput,
   type RealizedExecutionWorkspace,
@@ -1335,6 +1337,13 @@ export function mergeExecutionWorkspaceMetadataForPersistence(input: {
   workspaceConfigMetadata?: EffectiveRunWorkspaceConfigMetadata | null;
   baseRef: string | null | undefined;
   baseRefSha: string | null | undefined;
+  /**
+   * SPA-9275: persists the ephemeral run-lifecycle flag so the heartbeat
+   * finally block can read it back from `executionWorkspaces.metadata`
+   * without re-deriving it from the worktree path shape (which is also a
+   * sufficient signal, but a stored flag is authoritative).
+   */
+  ephemeralLifecycle?: boolean;
 }) {
   const base = {
     ...(input.existingMetadata ?? {}),
@@ -1361,6 +1370,10 @@ export function mergeExecutionWorkspaceMetadataForPersistence(input: {
       categoryFingerprints: input.workspaceConfigMetadata.categoryFingerprints,
       lastEvaluatedAt: input.workspaceConfigMetadata.evaluatedAt,
     };
+  }
+
+  if (input.ephemeralLifecycle !== undefined) {
+    base.ephemeralLifecycle = input.ephemeralLifecycle;
   }
 
   if ((input.shouldReuseExisting && !input.shouldRefreshConfigSnapshot) || !input.configSnapshot) {
@@ -14126,6 +14139,21 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
     activeRunExecutions.add(run.id);
     let runScratch: HeartbeatRunScratch | null = null;
+    // SPA-9275: captured at workspace-realize time so the outer finally block
+    // can push-then-remove the run's ephemeral worktree on terminal status
+    // (success, failure, cancel, process-loss) regardless of which path landed
+    // us in finally.
+    let ephemeralRunCleanup: {
+      worktreePath: string;
+      branchName: string | null;
+      repoRoot: string;
+    } | null = null;
+    // SPA-9275: the workspace git-auth provider and operation recorder are
+    // declared inside the workspace-realization inner try; the outer finally
+    // needs both to invoke `releaseRunExecutionWorkspaceForHeartbeat`. Hoist
+    // them so the finally block can read the same instances.
+    let ephemeralRunGitAuth: GitRemoteAuthProvider | null = null;
+    let ephemeralRunRecorder: WorkspaceOperationRecorder | null = null;
 
     try {
     const agent = await getAgent(run.agentId);
@@ -15034,6 +15062,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         : null,
       issueId,
     });
+    ephemeralRunRecorder = workspaceOperationRecorder;
     // One credential provider per run: base-ref refreshes during workspace realization and
     // restore authenticate against private GitHub remotes with the same company-secret token
     // the managed clone uses.
@@ -15041,6 +15070,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       issueId,
       heartbeatRunId: run.id,
     });
+    ephemeralRunGitAuth = workspaceGitAuthProvider;
     const {
       executionWorkspace,
       reusedExecutionWorkspace,
@@ -15118,6 +15148,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             resolvedInstanceSettings.experimental.enableWorkspaceBranchReconcileForward,
           enableWorkspaceDirtyQuarantineRepair:
             resolvedInstanceSettings.experimental.enableWorkspaceDirtyQuarantineRepair,
+          ephemeralLifecycle:
+            resolvedInstanceSettings.experimental.enableEphemeralWorktreePerRun === true,
           recorder: workspaceOperationRecorder,
           resolveGitAuth: workspaceGitAuthProvider,
         }),
@@ -15139,6 +15171,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         : null,
       baseRef: executionWorkspace.repoRef,
       baseRefSha: executionWorkspace.baseRefSha ?? null,
+      ephemeralLifecycle: executionWorkspace.ephemeralLifecycle,
     });
     let persistedWorktreeInstanceRoot =
       resolvedWorkspaceReusePolicy.shouldRestoreExistingWorkspace
@@ -15259,6 +15292,37 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       throw error;
     }
     await workspaceOperationRecorder.attachExecutionWorkspaceId(persistedExecutionWorkspace?.id ?? null);
+    // SPA-9275: capture ephemeral workspace info for the outer finally cleanup.
+    // The branch is the durable identifier on the remote; only the local dir
+    // shape changes between persistent and ephemeral lifecycles.
+    if (
+      executionWorkspace.ephemeralLifecycle === true
+      && executionWorkspace.strategy === "git_worktree"
+      && executionWorkspace.worktreePath
+      && executionWorkspace.worktreePath.startsWith(`${path.join(resolvedWorkspace.cwd ?? "", ".paperclip", "worktrees", "runs")}`)
+      || (
+        executionWorkspace.ephemeralLifecycle === true
+        && executionWorkspace.strategy === "git_worktree"
+        && executionWorkspace.worktreePath
+        && path.basename(path.dirname(executionWorkspace.worktreePath)) === "runs"
+      )
+    ) {
+      try {
+        const repoRoot = await resolveGitOwnerRepoRoot(resolvedWorkspace.cwd ?? executionWorkspace.cwd);
+        if (repoRoot) {
+          ephemeralRunCleanup = {
+            worktreePath: executionWorkspace.worktreePath,
+            branchName: executionWorkspace.branchName ?? null,
+            repoRoot,
+          };
+        }
+      } catch (resolveErr) {
+        logger.warn(
+          { err: resolveErr, runId: run.id },
+          "failed to resolve repo root for ephemeral run cleanup",
+        );
+      }
+    }
     await recordWorkspaceConfigFreshnessOperation({
       recorder: workspaceOperationRecorder,
       runId: run.id,
@@ -16981,6 +17045,60 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             failureReason: latestRun?.error ?? undefined,
           });
           await releaseRuntimeServicesForRun(run.id).catch(() => undefined);
+          // SPA-9275: ephemeral run-lifecycle cleanup. Pushes the branch to
+          // origin and force-removes the per-run worktree directory, retrying
+          // once on a stale git lock. Runs on every terminal outcome
+          // (succeeded / failed / cancelled / timed_out / process-lost) AND
+          // on the late-failure path. Never throws — failures are recorded as
+          // warnings and surfaced through the run's result JSON.
+          if (ephemeralRunCleanup && latestRun && isHeartbeatRunTerminalStatus(latestRun.status)) {
+            try {
+              const releaseResult = await releaseRunExecutionWorkspaceForHeartbeat({
+                repoRoot: ephemeralRunCleanup.repoRoot,
+                worktreePath: ephemeralRunCleanup.worktreePath,
+                branchName: ephemeralRunCleanup.branchName,
+                runId: run.id,
+                resolveGitAuth: ephemeralRunGitAuth,
+                recorder: ephemeralRunRecorder,
+              });
+              if (!releaseResult.removed || releaseResult.errors.length > 0) {
+                logger.warn(
+                  {
+                    runId: run.id,
+                    worktreePath: ephemeralRunCleanup.worktreePath,
+                    pushed: releaseResult.pushed,
+                    removed: releaseResult.removed,
+                    retriedRemoval: releaseResult.retriedRemoval,
+                    errors: releaseResult.errors,
+                  },
+                  "ephemeral run worktree cleanup did not finish cleanly",
+                );
+              }
+              if (latestRun) {
+                await appendRunEvent(latestRun, await nextRunEventSeq(latestRun.id), {
+                  eventType: "lifecycle",
+                  stream: "system",
+                  level: releaseResult.removed ? "info" : "warn",
+                  message: releaseResult.removed
+                    ? "ephemeral run worktree cleaned"
+                    : `ephemeral run worktree cleanup incomplete: ${releaseResult.errors.join(" | ")}`,
+                  payload: {
+                    worktreePath: ephemeralRunCleanup.worktreePath,
+                    branchName: ephemeralRunCleanup.branchName,
+                    pushed: releaseResult.pushed,
+                    removed: releaseResult.removed,
+                    retriedRemoval: releaseResult.retriedRemoval,
+                    errors: releaseResult.errors,
+                  },
+                }).catch(() => undefined);
+              }
+            } catch (releaseErr) {
+              logger.warn(
+                { err: releaseErr, runId: run.id, worktreePath: ephemeralRunCleanup.worktreePath },
+                "ephemeral run worktree release threw",
+              );
+            }
+          }
           if (runScratch && latestRun && isHeartbeatRunTerminalStatus(latestRun.status)) {
             const scratchForCleanup = runScratch;
             let scratchCleanup: Awaited<ReturnType<typeof cleanupHeartbeatRunScratch>> | null = null;

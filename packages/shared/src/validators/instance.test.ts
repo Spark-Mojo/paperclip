@@ -32,6 +32,21 @@ describe("instance experimental settings validators", () => {
     expect(settings.worktreeRunExecutionActivationInstanceId).toBeNull();
   });
 
+  it("defaults ephemeral worktree per run off (SPA-9275)", () => {
+    const settings = instanceExperimentalSettingsSchema.parse({});
+    expect(settings.enableEphemeralWorktreePerRun).toBe(false);
+  });
+
+  it("accepts an ephemeral worktree per run patch (SPA-9275)", () => {
+    expect(
+      patchInstanceExperimentalSettingsSchema.parse({
+        enableEphemeralWorktreePerRun: true,
+      }),
+    ).toEqual({
+      enableEphemeralWorktreePerRun: true,
+    });
+  });
+
   it("strips server-managed worktree run execution fields from patches", () => {
     expect(
       patchInstanceExperimentalSettingsSchema.parse({

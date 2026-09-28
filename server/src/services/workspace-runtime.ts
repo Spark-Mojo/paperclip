@@ -119,6 +119,13 @@ export interface RealizedExecutionWorkspace extends ExecutionWorkspaceInput {
   freshOffBaseRefFallback?: boolean;
   dataLossSuspected?: boolean;
   priorRecordedBaseRefSha?: string | null;
+  /**
+   * SPA-9275: ephemeral run-lifecycle flag, propagated from the realize call.
+   * The heartbeat finally block uses it to decide whether to push-then-remove
+   * the worktree on terminal status, and the startup reaper uses it to identify
+   * orphan `/runs/<runId>/` directories that should be rescued+removed.
+   */
+  ephemeralLifecycle?: boolean;
 }
 
 export class WorkspaceRuntimeValidationFailure extends Error {
@@ -470,6 +477,12 @@ function sanitizeBranchName(value: string): string {
     .replace(/-+/g, "-")
     .replace(/^[-/.]+|[-/.]+$/g, "")
     .slice(0, 120) || "paperclip-work";
+}
+
+function readNullableString(value: unknown): string | null {
+  if (typeof value !== "string") return null;
+  const trimmed = value.trim();
+  return trimmed.length > 0 ? trimmed : null;
 }
 
 function isAbsolutePath(value: string) {
@@ -2242,7 +2255,7 @@ function parseGitWorktreeListPorcelain(raw: string): GitWorktreeListEntry[] {
   return entries;
 }
 
-async function resolveGitOwnerRepoRoot(cwd: string): Promise<string> {
+export async function resolveGitOwnerRepoRoot(cwd: string): Promise<string> {
   const checkoutRoot = path.resolve(await runGit(["rev-parse", "--show-toplevel"], cwd));
   const commonDir = await runGit(["rev-parse", "--git-common-dir"], checkoutRoot).catch(() => null);
   if (!commonDir) return checkoutRoot;
@@ -2791,6 +2804,15 @@ export async function realizeExecutionWorkspace(input: {
   heartbeatRunId?: string | null;
   enableWorkspaceBranchReconcileForward?: boolean;
   enableWorkspaceDirtyQuarantineRepair?: boolean;
+  /**
+   * SPA-9275: ephemeral lifecycle. When true, the worktree is placed under
+   * `${worktreeParentDir}/runs/<runId>/` instead of `${worktreeParentDir}/<branch>/`,
+   * the run takes ownership of the directory for its duration, and the heartbeat
+   * finally block (or the reaper, if the run is gone) pushes the branch and
+   * force-removes the directory at terminal status. Pass `heartbeatRunId` for
+   * the path to be deterministic.
+   */
+  ephemeralLifecycle?: boolean;
   recorder?: WorkspaceOperationRecorder | null;
   resolveGitAuth?: GitRemoteAuthProvider | null;
 }): Promise<RealizedExecutionWorkspace> {
@@ -2822,7 +2844,18 @@ export async function realizeExecutionWorkspace(input: {
   const worktreeParentDir = configuredParentDir
     ? resolveConfiguredPath(configuredParentDir, repoRoot)
     : path.join(repoRoot, ".paperclip", "worktrees");
-  const worktreePath = path.join(worktreeParentDir, branchName);
+  // SPA-9275: ephemeral lifecycle (one worktree per run, NOT per card) names
+  // the directory by heartbeat run id so concurrent runs of the same card do
+  // not collide and the run owns the dir for its whole lifetime. The branch
+  // is still derived from the template — it is the durable identifier on the
+  // remote; only the local directory shape changes.
+  const ephemeral = input.ephemeralLifecycle === true;
+  const runIdSegment = ephemeral
+    ? sanitizeBranchName(asString(input.heartbeatRunId, "") || `run-${randomUUID()}`)
+    : null;
+  const worktreePath = ephemeral && runIdSegment
+    ? path.join(worktreeParentDir, "runs", runIdSegment)
+    : path.join(worktreeParentDir, branchName);
   let pendingForwardBranchReconcile: PendingForwardBranchReconcile | null = null;
   const configuredBaseRef = typeof rawStrategy.baseRef === "string" && rawStrategy.baseRef.length > 0
     ? rawStrategy.baseRef
@@ -2839,6 +2872,38 @@ export async function realizeExecutionWorkspace(input: {
   const currentBaseRefSha = await resolveBaseRefSha(repoRoot, baseRef);
 
   await fs.mkdir(worktreeParentDir, { recursive: true });
+
+  // SPA-9275: in ephemeral mode the directory is keyed by run id; a stale
+  // directory from a crashed previous run blocks the fresh `git worktree add`,
+  // so the realize path force-removes the existing path before creating the
+  // new one — same crash-tolerance contract as a finally block, applied at
+  // realize-time. The branch is still tracked on the remote; this only clears
+  // the local directory.
+  if (ephemeral && await directoryExists(worktreePath)) {
+    try {
+      await recordGitOperation(input.recorder, {
+        phase: "worktree_cleanup",
+        args: ["worktree", "remove", "--force", worktreePath],
+        cwd: repoRoot,
+        metadata: {
+          repoRoot,
+          worktreePath,
+          branchName,
+          cleanupAction: "ephemeral_stale_worktree_remove",
+        },
+        successMessage: `Cleared stale ephemeral run worktree ${worktreePath}\n`,
+        failureLabel: `git worktree remove --force ${worktreePath}`,
+      });
+    } catch (removeErr) {
+      // Fall through: a leftover non-worktree dir is harmless for `git worktree add`,
+      // and the subsequent error is more informative than a swallowed one.
+      const message = removeErr instanceof Error ? removeErr.message : String(removeErr);
+      try { await fs.rm(worktreePath, { recursive: true, force: true }); } catch { /* best effort */ }
+      // Surface the original failure as a warning, not a throw — the create
+      // path below will produce a clearer error if the directory still exists.
+      baseRefreshWarnings.push(`Cleared stale ephemeral worktree at ${worktreePath} before recreate: ${message}`);
+    }
+  }
 
   async function reuseExistingWorktree(reusablePath: string, effectiveBranchName = branchName, extraWarnings: string[] = []) {
     const refresh = currentBaseRefSha
@@ -2902,6 +2967,7 @@ export async function realizeExecutionWorkspace(input: {
       created: false,
       baseRefSha: refresh.baseRefSha ?? baseDrift.branchBaseRefSha ?? baseDrift.currentBaseRefSha,
       pendingForwardBranchReconcile,
+      ephemeralLifecycle: ephemeral,
     };
   }
 
@@ -3037,6 +3103,7 @@ export async function realizeExecutionWorkspace(input: {
     warnings: baseRefreshWarnings,
     created: true,
     baseRefSha: currentBaseRefSha,
+    ephemeralLifecycle: ephemeral,
   };
 }
 
@@ -3682,6 +3749,524 @@ export async function cleanupExecutionWorkspaceArtifacts(input: {
     cleaned,
     warnings,
   };
+}
+
+/**
+ * SPA-9275 — release a single ephemeral run worktree.
+ *
+ * Push the branch the run produced to `origin` (best-effort; never blocks
+ * removal), then `git worktree remove --force`, then `git worktree prune`,
+ * then `fs.rm` if anything is still on disk. Retries `worktree remove --force`
+ * once after a 200ms backoff when a stale git lock blocks the first attempt —
+ * the engine's standing rule is that a removal failure must NEVER be `|| true`'d
+ * (SPA-7354 / doc/FORK-PATCHES.md row 12 / 717 workspaces stuck `cleanup_failed`
+ * today). Failures are returned, never thrown — the caller decides what to do.
+ *
+ * The function is also invoked by the startup reaper (`reapOrphanedRunWorktrees`)
+ * when it finds an `/runs/<runId>/` directory whose owning run is no longer
+ * live. The reaper rescues unpushed branches first so this push-attempt may
+ * see no-op success on a reaped run whose branch was already rescued.
+ */
+export async function releaseRunExecutionWorkspace(input: {
+  repoRoot: string;
+  worktreePath: string;
+  branchName: string | null;
+  runId: string;
+  resolveGitAuth?: GitRemoteAuthProvider | null;
+  recorder?: WorkspaceOperationRecorder | null;
+  now?: () => Date;
+}): Promise<{
+  pushed: boolean;
+  removed: boolean;
+  retriedRemoval: boolean;
+  errors: string[];
+}> {
+  const errors: string[] = [];
+  let pushed = false;
+  let removed = false;
+  let retriedRemoval = false;
+
+  if (!await directoryExists(input.worktreePath)) {
+    return { pushed: false, removed: true, retriedRemoval: false, errors: [] };
+  }
+
+  const remoteUrl = input.branchName
+    ? await runGit(["remote", "get-url", "origin"], input.repoRoot)
+      .then((value) => value.trim() || null)
+      .catch(() => null)
+    : null;
+
+  if (input.branchName) {
+    try {
+      const auth = remoteUrl && input.resolveGitAuth
+        ? await input.resolveGitAuth(remoteUrl).catch(() => null)
+        : null;
+      // The push uses the worker's own git config; auth configArgs are spliced
+      // into the args list and the credential-helper env is passed through to
+      // executeProcess via a custom recorder run. We deliberately avoid the
+      // generic recordGitOperation helper because it does not accept an env
+      // override — the auth env must not leak into the rest of the engine.
+      const pushArgs = [
+        ...(auth?.configArgs ?? []),
+        "push",
+        "origin",
+        `${input.branchName}:${input.branchName}`,
+      ];
+      const pushEnv: NodeJS.ProcessEnv | undefined = auth
+        ? { ...process.env, ...auth.env }
+        : undefined;
+      let pushResult: { code: number | null; stdout: string; stderr: string } | null = null;
+      if (input.recorder) {
+        await input.recorder.recordOperation({
+          phase: "worktree_cleanup",
+          cwd: input.repoRoot,
+          command: formatCommandForDisplay("git", pushArgs),
+          metadata: {
+            repoRoot: input.repoRoot,
+            worktreePath: input.worktreePath,
+            branchName: input.branchName,
+            runId: input.runId,
+            cleanupAction: "ephemeral_run_push",
+          },
+          run: async () => {
+            const result = await executeProcess({
+              command: "git",
+              args: pushArgs,
+              cwd: input.repoRoot,
+              env: pushEnv,
+            });
+            pushResult = { code: result.code, stdout: result.stdout, stderr: result.stderr };
+            return {
+              status: result.code === 0 ? "succeeded" : "failed",
+              exitCode: result.code,
+              stdout: result.stdout,
+              stderr: result.stderr,
+              system: result.code === 0
+                ? `Pushed ephemeral run branch ${input.branchName}\n`
+                : null,
+            };
+          },
+        });
+      } else {
+        pushResult = await executeProcess({
+          command: "git",
+          args: pushArgs,
+          cwd: input.repoRoot,
+          env: pushEnv,
+        });
+      }
+      if (!pushResult || pushResult.code !== 0) {
+        const message = pushResult?.stderr.trim() || pushResult?.stdout.trim() || `git push origin ${input.branchName} failed`;
+        throw new Error(message);
+      }
+      pushed = true;
+    } catch (pushErr) {
+      const message = pushErr instanceof Error ? pushErr.message : String(pushErr);
+      errors.push(`ephemeral run push failed: ${message}`);
+    }
+  }
+
+  async function attemptWorktreeRemove(): Promise<boolean> {
+    try {
+      await recordGitOperation(input.recorder, {
+        phase: "worktree_cleanup",
+        args: ["worktree", "remove", "--force", input.worktreePath],
+        cwd: input.repoRoot,
+        metadata: {
+          repoRoot: input.repoRoot,
+          worktreePath: input.worktreePath,
+          branchName: input.branchName,
+          runId: input.runId,
+          cleanupAction: "ephemeral_run_worktree_remove",
+        },
+        successMessage: `Removed ephemeral run worktree ${input.worktreePath}\n`,
+        failureLabel: `git worktree remove --force ${input.worktreePath}`,
+      });
+      return true;
+    } catch (err) {
+      errors.push(err instanceof Error ? err.message : String(err));
+      return false;
+    }
+  }
+
+  let removedOk = await attemptWorktreeRemove();
+  if (!removedOk && await directoryExists(input.worktreePath)) {
+    retriedRemoval = true;
+    await delay(200);
+    removedOk = await attemptWorktreeRemove();
+  }
+  removed = removedOk && !(await directoryExists(input.worktreePath));
+
+  // Final fallback: if git still refuses, blow away the directory tree.
+  // The branch on the remote is the source of truth at this point; the local
+  // dir is a workspace for a run that no longer exists.
+  if (!removed && await directoryExists(input.worktreePath)) {
+    try {
+      await fs.rm(input.worktreePath, { recursive: true, force: true });
+      await runGit(["worktree", "prune"], input.repoRoot).catch(() => null);
+      removed = true;
+    } catch (rmErr) {
+      errors.push(`fs.rm fallback failed: ${rmErr instanceof Error ? rmErr.message : String(rmErr)}`);
+    }
+  } else if (removedOk) {
+    // Best-effort prune; never blocks the response.
+    await runGit(["worktree", "prune"], input.repoRoot).catch(() => null);
+  }
+
+  return { pushed, removed, retriedRemoval, errors };
+}
+
+/**
+ * SPA-9275 — rescue any unpushed commits/working-tree state in a run worktree
+ * to a `paperclip/rescue/<runId>/<ts>` branch BEFORE removal. Returns the
+ * rescue branch name (or null when the worktree was clean / no branch).
+ *
+ * The function is intentionally strict: a dirty state with unpushed commits
+ * the reaper has not rescued is a real data-loss scenario, so we record the
+ * branch name and commit sha in the operation metadata for the run log and
+ * for any postmortem.
+ */
+async function rescueUnpushedRunWorktreeState(input: {
+  repoRoot: string;
+  worktreePath: string;
+  branchName: string | null;
+  runId: string;
+  timestamp: string;
+  recorder?: WorkspaceOperationRecorder | null;
+}): Promise<{ rescueBranch: string | null; rescueCommitSha: string | null }> {
+  if (!input.branchName) return { rescueBranch: null, rescueCommitSha: null };
+  const exists = await directoryExists(input.worktreePath);
+  if (!exists) return { rescueBranch: null, rescueCommitSha: null };
+
+  // Verify the branch still resolves and the worktree is registered.
+  const branchExists = await runGit(
+    ["rev-parse", "--verify", input.branchName],
+    input.worktreePath,
+  ).then(() => true).catch(() => false);
+  if (!branchExists) return { rescueBranch: null, rescueCommitSha: null };
+
+  // A clean, in-sync branch needs no rescue; the caller has already pushed it.
+  const status = await runGit(["status", "--porcelain", "--untracked-files=all"], input.worktreePath)
+    .catch(() => "");
+  const unpushedCount = await runGit(["rev-list", "--count", `${input.branchName}..@{u}`], input.worktreePath)
+    .then((value) => Number.parseInt(value.trim(), 10) || 0)
+    .catch(() => 0);
+  // The local branch's remote-tracking ref (origin/<branch>) may not exist
+  // even when @{u} resolves to something else — an orphan / never-pushed
+  // branch is exactly what the rescue is here to preserve. Detect that case
+  // explicitly so the reaper fires when the run finished without pushing.
+  const originRefExists = await runGit(
+    ["rev-parse", "--verify", `--quiet`, `refs/remotes/origin/${input.branchName}`],
+    input.repoRoot,
+  ).then(() => true).catch(() => false);
+  const branchIsAheadOfOrigin = !originRefExists || unpushedCount > 0;
+  if (!status.trim() && !branchIsAheadOfOrigin) {
+    return { rescueBranch: null, rescueCommitSha: null };
+  }
+
+  const rescueBranch = `paperclip/rescue/${input.runId}/${input.timestamp}`;
+  const safeRescue = sanitizeBranchName(rescueBranch);
+
+  try {
+    await runGit(["checkout", "-B", safeRescue, input.branchName], input.worktreePath);
+    if (status.trim()) {
+      // Add + commit any dirty working tree so the rescue branch captures it.
+      await runGit(["add", "-A"], input.worktreePath);
+      const authorEmail = await runGit(["config", "user.email"], input.worktreePath)
+        .then((value) => value.trim())
+        .catch(() => "paperclip@localhost");
+      await runGit(
+        [
+          "-c", `user.email=${authorEmail || "paperclip@localhost"}`,
+          "-c", "user.name=Paperclip Reaper",
+          "commit",
+          "-m",
+          `Rescue unpushed state for run ${input.runId} (${safeRescue})`,
+        ],
+        input.worktreePath,
+      );
+    }
+    const rescueCommitSha = await runGit(["rev-parse", safeRescue], input.worktreePath)
+      .then((value) => value.trim())
+      .catch(() => null);
+    if (input.recorder) {
+      await input.recorder.recordOperation({
+        phase: "worktree_cleanup",
+        cwd: input.worktreePath,
+        metadata: {
+          repoRoot: input.repoRoot,
+          worktreePath: input.worktreePath,
+          branchName: input.branchName,
+          runId: input.runId,
+          cleanupAction: "ephemeral_reaper_rescue",
+          rescueBranch: safeRescue,
+          rescueCommitSha,
+          dirtyFileCount: status.trim().split("\n").length,
+          unpushedCommitCount: unpushedCount,
+          branchAheadOfOrigin: branchIsAheadOfOrigin,
+        },
+        run: async () => ({
+          status: "succeeded",
+          system: `Rescued run ${input.runId} state to ${safeRescue}\n`,
+        }),
+      });
+    }
+    return { rescueBranch: safeRescue, rescueCommitSha };
+  } catch (err) {
+    if (input.recorder) {
+      const message = err instanceof Error ? err.message : String(err);
+      await input.recorder.recordOperation({
+        phase: "worktree_cleanup",
+        cwd: input.worktreePath,
+        metadata: {
+          repoRoot: input.repoRoot,
+          worktreePath: input.worktreePath,
+          branchName: input.branchName,
+          runId: input.runId,
+          cleanupAction: "ephemeral_reaper_rescue_failed",
+          error: message,
+        },
+        run: async () => ({ status: "failed", stderr: message }),
+      }).catch(() => null);
+    }
+    return { rescueBranch: null, rescueCommitSha: null };
+  }
+}
+
+/**
+ * SPA-9275 — startup/periodic reaper.
+ *
+ * Walk every worktree registered against `repoRoot` whose path ends with
+ * `/runs/<runId>/` (ephemeral lifecycle directory shape), confirm none of
+ * those run ids are in `liveRunIds` (passed by the caller from a heartbeat
+ * SELECT), and for each orphan: rescue any unpushed state to a dedicated
+ * rescue branch, then release the worktree (push + force-remove + prune).
+ *
+ * The function is additive and safe to call repeatedly: a clean tree reports
+ * `removed: 0, rescued: 0`.
+ */
+export async function reapOrphanedRunWorktrees(input: {
+  repoRoot: string;
+  worktreeParentDir: string;
+  liveRunIds: ReadonlySet<string>;
+  resolveGitAuth?: GitRemoteAuthProvider | null;
+  recorder?: WorkspaceOperationRecorder | null;
+  now?: () => Date;
+}): Promise<{
+  scanned: number;
+  removed: number;
+  rescued: number;
+  errors: string[];
+}> {
+  const errors: string[] = [];
+  let scanned = 0;
+  let removed = 0;
+  let rescued = 0;
+  const now = input.now ?? (() => new Date());
+  const runsParent = path.join(input.worktreeParentDir, "runs");
+
+  if (!await directoryExists(runsParent)) {
+    return { scanned: 0, removed: 0, rescued: 0, errors };
+  }
+
+  const listedWorktrees = await runGit(["worktree", "list", "--porcelain"], input.repoRoot)
+    .then((output) => output.split("\n").filter((line) => line.startsWith("worktree ")).map((line) => line.slice("worktree ".length).trim()))
+    .catch(() => []);
+  const worktreesByPath = new Map<string, string>();
+  for (const wt of listedWorktrees) {
+    const branchLine = await runGit(["-C", wt, "symbolic-ref", "--quiet", "--short", "HEAD"], input.repoRoot)
+      .then((value) => value.trim() || null)
+      .catch(() => null);
+    if (branchLine) worktreesByPath.set(wt, branchLine);
+  }
+
+  const entries = await fs.readdir(runsParent, { withFileTypes: true }).catch(() => []);
+  for (const entry of entries) {
+    if (!entry.isDirectory()) continue;
+    const runId = entry.name;
+    scanned += 1;
+    if (input.liveRunIds.has(runId)) continue;
+    const worktreePath = path.join(runsParent, runId);
+    const branchName = worktreesByPath.get(worktreePath) ?? null;
+
+    const rescue = await rescueUnpushedRunWorktreeState({
+      repoRoot: input.repoRoot,
+      worktreePath,
+      branchName,
+      runId,
+      timestamp: now().toISOString().replace(/[:.]/g, "-"),
+      recorder: input.recorder ?? null,
+    });
+    if (rescue.rescueBranch) rescued += 1;
+
+    const release = await releaseRunExecutionWorkspace({
+      repoRoot: input.repoRoot,
+      worktreePath,
+      branchName,
+      runId,
+      resolveGitAuth: input.resolveGitAuth ?? null,
+      recorder: input.recorder ?? null,
+      now,
+    });
+    if (release.removed) {
+      removed += 1;
+    } else {
+      errors.push(`run ${runId}: removal incomplete — ${release.errors.join(" | ")}`);
+    }
+  }
+
+  return { scanned, removed, rescued, errors };
+}
+
+/**
+ * SPA-9275 — one-time sweep.
+ *
+ * Walk every worktree registered against `repoRoot` whose path ends with
+ * `/runs/<runId>/` (ephemeral shape) AND whose `executionWorkspaces.sourceIssueId`
+ * issue is `done`/`cancelled`, AND whose run id is NOT in `liveRunIds`. For each:
+ * confirm the branch is reachable from origin (rescue to a dated branch if
+ * not), force-remove the worktree dir, and mark the workspace `archived`.
+ *
+ * Idempotent: re-running against a clean tree is a no-op.
+ */
+export async function sweepTerminalIssueRunWorktrees(input: {
+  db: Db;
+  repoRoot: string;
+  worktreeParentDir: string;
+  liveRunIds: ReadonlySet<string>;
+  resolveGitAuth?: GitRemoteAuthProvider | null;
+  recorder?: WorkspaceOperationRecorder | null;
+  now?: () => Date;
+}): Promise<{
+  scanned: number;
+  archived: number;
+  rescued: number;
+  errors: string[];
+}> {
+  const errors: string[] = [];
+  let scanned = 0;
+  let archived = 0;
+  let rescued = 0;
+  const now = input.now ?? (() => new Date());
+  const runsParent = path.join(input.worktreeParentDir, "runs");
+
+  if (!await directoryExists(runsParent)) {
+    return { scanned: 0, archived: 0, rescued: 0, errors };
+  }
+
+  // Find the sourceIssueIds of workspaces whose path is under /runs/.
+  // Filter to terminal issues (done/cancelled).
+  const candidateRows = await input.db
+    .select({
+      id: executionWorkspaces.id,
+      sourceIssueId: executionWorkspaces.sourceIssueId,
+      companyId: executionWorkspaces.companyId,
+      providerRef: executionWorkspaces.providerRef,
+      cwd: executionWorkspaces.cwd,
+      branchName: executionWorkspaces.branchName,
+      metadata: executionWorkspaces.metadata,
+    })
+    .from(executionWorkspaces)
+    .where(and(
+      eq(executionWorkspaces.providerType, "git_worktree"),
+      inArray(executionWorkspaces.status, ["active", "idle", "in_review"]),
+    ));
+
+  const worktreePathRows = candidateRows.filter((row) => {
+    const providerRef = readNullableString(row.providerRef);
+    const cwd = readNullableString(row.cwd);
+    const candidate = providerRef ?? cwd;
+    if (!candidate) return false;
+    return candidate.startsWith(`${runsParent}${path.sep}`);
+  });
+
+  if (worktreePathRows.length === 0) {
+    return { scanned: 0, archived: 0, rescued: 0, errors };
+  }
+
+  const issueRows = await input.db
+    .select({ id: issues.id, status: issues.status })
+    .from(issues)
+    .where(inArray(issues.id, worktreePathRows
+      .map((row) => row.sourceIssueId)
+      .filter((id): id is string => Boolean(id))));
+  const terminalIssueIds = new Set(
+    issueRows.filter((row) => row.status === "done" || row.status === "cancelled").map((row) => row.id),
+  );
+
+  for (const row of worktreePathRows) {
+    if (!row.sourceIssueId || !terminalIssueIds.has(row.sourceIssueId)) continue;
+    const workspacePath = readNullableString(row.providerRef) ?? readNullableString(row.cwd);
+    if (!workspacePath) continue;
+    const runIdSegment = path.basename(workspacePath);
+    if (input.liveRunIds.has(runIdSegment)) continue;
+    scanned += 1;
+
+    const rescue = await rescueUnpushedRunWorktreeState({
+      repoRoot: input.repoRoot,
+      worktreePath: workspacePath,
+      branchName: row.branchName ?? null,
+      runId: runIdSegment,
+      timestamp: now().toISOString().replace(/[:.]/g, "-"),
+      recorder: input.recorder ?? null,
+    });
+    if (rescue.rescueBranch) rescued += 1;
+
+    const release = await releaseRunExecutionWorkspace({
+      repoRoot: input.repoRoot,
+      worktreePath: workspacePath,
+      branchName: row.branchName ?? null,
+      runId: runIdSegment,
+      resolveGitAuth: input.resolveGitAuth ?? null,
+      recorder: input.recorder ?? null,
+      now,
+    });
+    if (release.removed) {
+      const closedAt = now();
+      await input.db
+        .update(executionWorkspaces)
+        .set({
+          status: "archived",
+          closedAt,
+          cleanupReason: "issue_terminal_sweep",
+          updatedAt: closedAt,
+        })
+        .where(eq(executionWorkspaces.id, row.id));
+      archived += 1;
+    } else {
+      errors.push(`workspace ${row.id}: removal incomplete — ${release.errors.join(" | ")}`);
+    }
+  }
+
+  return { scanned, archived, rescued, errors };
+}
+
+/**
+ * SPA-9275 — reaper integration called from the heartbeat finally block.
+ *
+ * Resolves the ephemeral workspace's path/branch from the persisted execution
+ * workspace row (if it carries `ephemeralLifecycle === true` in its metadata
+ * OR its path ends with `/runs/<runId>/`) and calls `releaseRunExecutionWorkspace`.
+ * Idempotent and non-throwing: a missing or already-cleaned workspace is a
+ * no-op, with `removed: true`.
+ */
+export async function releaseRunExecutionWorkspaceForHeartbeat(input: {
+  db?: Db | null;
+  repoRoot: string;
+  worktreePath: string;
+  branchName: string | null;
+  runId: string;
+  resolveGitAuth?: GitRemoteAuthProvider | null;
+  recorder?: WorkspaceOperationRecorder | null;
+}): ReturnType<typeof releaseRunExecutionWorkspace> {
+  return releaseRunExecutionWorkspace({
+    repoRoot: input.repoRoot,
+    worktreePath: input.worktreePath,
+    branchName: input.branchName,
+    runId: input.runId,
+    resolveGitAuth: input.resolveGitAuth ?? null,
+    recorder: input.recorder ?? null,
+  });
 }
 
 async function allocatePort(): Promise<number> {
