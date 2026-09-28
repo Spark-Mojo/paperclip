@@ -4356,9 +4356,16 @@ export function resolveExecutionWorkspaceReuseRequestForIssue(input: {
   const requestedShouldReuseExisting =
     input.issueExecutionWorkspacePreference === "reuse_existing" && requestedExecutionWorkspaceId !== null;
 
-  const baseAvailable =
-    requestedShouldReuseExisting &&
-    input.existingExecutionWorkspaceStatus === "active";
+  // SPA-7090: a binding is restorable only when the referenced row's status is
+  // in the platform's own live set — execution-workspaces.ts list/build
+  // filters use exactly ["active", "idle", "in_review"]. Anything else
+  // (archived / cleanup_failed / closed / missing row) is a dead binding:
+  // restore can never succeed, so the allocator refuses and provisions fresh.
+  const liveStatus =
+    input.existingExecutionWorkspaceStatus === "active" ||
+    input.existingExecutionWorkspaceStatus === "idle" ||
+    input.existingExecutionWorkspaceStatus === "in_review";
+  const baseAvailable = requestedShouldReuseExisting && liveStatus;
 
   return {
     requestedExecutionWorkspaceId,
@@ -4484,6 +4491,7 @@ export async function provisionExecutionWorkspaceForFreshnessDecision<T extends 
   staleReuseFallback?: {
     executionWorkspaceId: string | null;
     workspaceStatus: string | null;
+    branchName: string | null;
   } | null;
   restoreExistingWorkspace?: (() => Promise<T | null>) | null;
   realizeWorkspace: () => Promise<T>;
@@ -4510,6 +4518,7 @@ export async function provisionExecutionWorkspaceForFreshnessDecision<T extends 
           issueRef: input.issueRef,
           executionWorkspaceId: staleReuseFallback.executionWorkspaceId,
           workspaceStatus: staleReuseFallback.workspaceStatus,
+          branchName: staleReuseFallback.branchName,
         })
       : null;
     return {
@@ -4567,14 +4576,19 @@ function formatStaleReuseFallbackWarning(input: {
   issueRef: WorkspaceReuseIssueRef;
   executionWorkspaceId: string | null | undefined;
   workspaceStatus: string | null | undefined;
+  branchName: string | null | undefined;
 }) {
   const issueLabel = input.issueRef?.identifier ?? input.issueRef?.id ?? "unknown issue";
   const workspaceLabel = input.executionWorkspaceId ?? "unknown workspace";
   const statusLabel = input.workspaceStatus ?? "missing row";
+  const branchLine = input.branchName
+    ? ` The dead binding's operator branch was \`${input.branchName}\`.`
+    : "";
   return (
     `Execution workspace \`${workspaceLabel}\` (status: ${statusLabel}) is no longer active, so its ` +
     `reuse_existing binding on issue ${issueLabel} was refused and a fresh execution workspace was ` +
-    `provisioned instead of failing setup (SPA-7090). The stale binding is inert; no action needed.`
+    `provisioned instead of failing setup (SPA-7090). The stale binding is inert; no action needed.` +
+    branchLine
   );
 }
 
@@ -15042,6 +15056,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           ? {
               executionWorkspaceId: allocatorDecision.requestedExecutionWorkspaceId,
               workspaceStatus: existingExecutionWorkspace?.status ?? null,
+              branchName: existingExecutionWorkspace?.branchName ?? null,
             }
           : null,
         restoreExistingWorkspace: reusableExistingExecutionWorkspace
@@ -15511,11 +15526,15 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     // line so repeated fallbacks never spam the board.
     if (staleReuseFallbackWarning && issueRef?.id) {
       const staleReuseCommentFirstLine = "**STALE EXECUTION WORKSPACE BINDING (SPA-7090)**";
+      const staleReuseBranchLine = existingExecutionWorkspace?.branchName
+        ? `The dead binding's operator branch was \`${existingExecutionWorkspace.branchName}\`.`
+        : "The dead binding recorded no branch name.";
       const staleReuseCommentBody = [
         staleReuseCommentFirstLine,
         ``,
         `This card's \`reuse_existing\` binding pointed at execution workspace \`${allocatorDecision.requestedExecutionWorkspaceId ?? "unknown"}\` (status: ${existingExecutionWorkspace?.status ?? "missing row"}), which is no longer active.`,
-        `The run provisioned a fresh execution workspace instead of restoring the dead binding (prior behavior: silent \`setup_failed\` retry loop — SPA-7075 burned 12 runs this way).`,
+        staleReuseBranchLine,
+        `The run provisioned a fresh execution workspace instead of restoring the dead binding (prior behavior: silent \`setup_failed\` retry loop — 12 runs burned this way before the dead branch surfaced).`,
         ``,
         `No action needed — the stale binding is inert and the fresh workspace is in use. If the old worktree still exists on disk, inspect it before the reaper removes it.`,
       ].join("\n");
