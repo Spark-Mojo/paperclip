@@ -80,13 +80,16 @@ No binary content. Defect A (renumber + snapshots) is on the frozen base via PR 
   CHECK: pnpm --filter @paperclipai/db exec vitest run src/migration-snapshot-drift.test.ts 2>&1 | tail -3
   EXPECT: "Tests 1 passed" (was "ENOENT: .../meta/0281_snapshot.json").
 
-  Result on head: NOT RUN LOCALLY (db package depends on embedded Postgres + drizzle
-  fixture unavailable in this worktree's no-internet sandbox). CI run 36387265410
-  job 108815200576 ("ci / General tests (workspaces-b)") reports "Test Files 58
-  passed (58)" / "Tests 1223 passed | 5 skipped" / "1 unhandled error: write
-  EPIPE" (out of scope; reproducible on `origin/rebuild/v2026.916.0-survivors`
-  base without this PR — verified locally against base-check worktree
-  6adedbf27b). The drift test passed within that 1223.
+  Result on head `768c12beb0` (current PR head): NOT RUN LOCALLY (sandbox lacks
+  embedded postgres fixtures). **CI evidence at the current head**: CI run
+  36397514920 (rerun) job 108855074767 ("ci / General tests (workspaces-b)")
+  log line at 2026-09-28T08:54:49Z: `✓ @paperclipai/db
+  src/migration-snapshot-drift.test.ts (1 test) 669ms` — the drift test
+  PASSED on this exact head. Lane exited 1 due to an unrelated stderr EPIPE
+  from `runChildProcess` (`packages/adapter-utils/src/server-utils.test.ts`
+  test code writes 256KB to child stdin; child closes stdin early; Node
+  fires EPIPE on the unhandled write). 1223 other tests in the lane
+  passed; only the lane step's exit code is red.
 
 ## Gate A2 — check:migrations exits 0 (Defect A)
   CHECK: pnpm --filter @paperclipai/db check:migrations 2>&1 | tail -3; echo "EXIT=$?"
@@ -144,9 +147,9 @@ No binary content. Defect A (renumber + snapshots) is on the frozen base via PR 
   `details.code=issue_write_terminal_recomplete` per SPA-5916 FORK-PATCHES
   row 3). Test now asserts the guard, matching fork behaviour.
 
-  Result on head: NOT RUN LOCALLY (server test depends on fixtures not available
-  in this worktree). CI run 36387265410 job 108815200252 ("ci / Verify
-  serialized server suites (2/9)") SUCCESS.
+  Result on head `768c12beb0` (current PR head): NOT RUN LOCALLY. **CI
+  evidence at the current head**: CI run 36397514920 (rerun) job 108847553991
+  ("ci / Verify serialized server suites (2/9)") SUCCESS.
 
 ## Gate B2 — fork guard still present (Defect B intent)
   CHECK: grep -n "issue_write_terminal_recomplete" server/src/routes/issues.ts
@@ -162,9 +165,9 @@ No binary content. Defect A (renumber + snapshots) is on the frozen base via PR 
   `heartbeat_run_events.run_id -> heartbeat_runs.id` now carries
   `ON DELETE CASCADE` via new migration `9282_cascade_heartbeat_run_events_fk.sql`.
 
-  Result on head: NOT RUN LOCALLY (server test depends on fixtures not available
-  in this worktree). CI run 36387265410 job 108815200279 ("ci / Verify
-  serialized server suites (7/9)") SUCCESS.
+  Result on head `768c12beb0` (current PR head): NOT RUN LOCALLY. **CI
+  evidence at the current head**: CI run 36397514920 (rerun) job 108847554068
+  ("ci / Verify serialized server suites (7/9)") SUCCESS.
 
 ## Gate C2 — cascade migration present (Defect C intent)
   CHECK: cat packages/db/src/migrations/9282_cascade_heartbeat_run_events_fk.sql
@@ -186,9 +189,9 @@ No binary content. Defect A (renumber + snapshots) is on the frozen base via PR 
   (verified identical 6/2 failure at SPA-7585's original commit `2dc6f4355`
   and at `origin/rebuild/v2026.916.0-survivors`).
 
-  Result on head: NOT RUN LOCALLY (server test depends on fixtures not available
-  in this worktree). CI run 36387265410 job 108815200511 ("ci / General tests
-  (server (12/12))") SUCCESS.
+  Result on head `768c12beb0` (current PR head): NOT RUN LOCALLY. **CI
+  evidence at the current head**: CI run 36397514920 (rerun) job 108847554184
+  ("ci / General tests (server (12/12))") SUCCESS.
 
 ## Gate D2 — D is test-only in PR #90's net diff against the frozen base
   CHECK: git diff frozen/ty-SPA-8998-base..ty/SPA-8998 --stat -- server/src/services/heartbeat.ts | head -3
@@ -203,9 +206,9 @@ No binary content. Defect A (renumber + snapshots) is on the frozen base via PR 
   CHECK: pnpm --filter @paperclipai/server exec tsc --noEmit 2>&1 | grep -E "heartbeat-cancel-live-runs-for-issue|issue-dependency-wakeups-routes|heartbeat_run_events|migrations" | wc -l
   EXPECT: 0 — no errors mentioning the files this change touched.
 
-  Result on head: NOT RUN LOCALLY (server tsc depends on server fixtures). CI
-  run 36387265410 job 108815199955 ("ci / Typecheck + Release Registry")
-  SUCCESS.
+  Result on head `768c12beb0` (current PR head): NOT RUN LOCALLY. **CI
+  evidence at the current head**: CI run 36397514920 (rerun) job 108847553993
+  ("ci / Typecheck + Release Registry") SUCCESS.
 
 ## Gate E2 — no new tsc errors vs base (delta check)
   CHECK: pnpm --filter @paperclipai/server exec tsc --noEmit 2>&1 | grep -c "TS[0-9]"
@@ -236,3 +239,20 @@ No binary content. Defect A (renumber + snapshots) is on the frozen base via PR 
   visible when the second call's read happens, the second call re-writes
   status=failed and re-captures. Not introduced by this PR; not fixed by
   this PR.)
+- `chat-channels.integration.test.ts:14032` `expected length 8 but got 6`
+  intermittent flake in CI run 36397514920 (one job affected, one not, on
+  identical code). PR #90's diff does not touch chat code. The test's
+  `vi.waitFor` polls for 8 `issueComments` rows associated with a chat
+  conversation; on this run the DB query returned 6 rows before the
+  polling deadline.
+
+## Defect A evidence at the current head
+
+The drift test PASSED at `768c12beb0` (CI run 36397514920 job 108855074767
+log line at 2026-09-28T08:54:49Z: `✓ @paperclipai/db
+src/migration-snapshot-drift.test.ts (1 test) 669ms`). The lane exited 1
+on an unrelated EPIPE; the lane's verdict is `failure` but the specific test
+this card requires (Defect A) is `passed`. This is the same
+shape as the pre-existing flake pattern on the survivors line: the lane
+test count is full (1223 / 1223 + 5 skipped), but the step exits non-zero
+on an unhandled stderr error from a different file's test.
