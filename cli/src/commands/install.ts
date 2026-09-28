@@ -278,6 +278,20 @@ export async function installGitPayload(repo: string, sha: string, runCommand: C
     await runCommand("corepack", ["pnpm", "install", "--frozen-lockfile"], { cwd: checkoutPath, env: buildEnv(), maxBuffer: 32 * 1024 * 1024 });
     await runCommand("bash", ["scripts/build-npm.sh", "--skip-checks", "--skip-typecheck"], { cwd: checkoutPath, env: buildEnv(), maxBuffer: 32 * 1024 * 1024 });
     await runCommand("corepack", ["pnpm", "-r", "--filter", "@paperclipai/server...", "--if-present", "run", "build"], { cwd: checkoutPath, env: buildEnv(), maxBuffer: 32 * 1024 * 1024 });
+    // SPA-9160: the server's build script no longer chains `prepare:ui-dist &&`
+    // (reverted in 17a81879f3 to unblock `pnpm -r build` from racing two vite
+    // builds against the same ui/dist), and pnpm pack strips prepack/postpack
+    // from the produced tarball's package.json before packing, so the only
+    // reliable way to guarantee server/ui-dist is to run the prepare script
+    // explicitly here, the same way scripts/engine/install.sh:336 does for
+    // the fork's engine installer. Force a rebuild (reuse=0) so a stale
+    // ui/dist left over from a previous attempt can never satisfy the
+    // post-pack assertion below.
+    await runCommand("corepack", ["pnpm", "--filter", "@paperclipai/server", "run", "prepare:ui-dist"], { cwd: checkoutPath, env: buildEnv({ PAPERCLIP_RELEASE_REUSE_UI_DIST: "0" }), maxBuffer: 32 * 1024 * 1024 });
+    const serverUiDistIndex = path.join(checkoutPath, "server", "ui-dist", "index.html");
+    if (!fs.existsSync(serverUiDistIndex)) {
+      throw new Error(`Git install did not produce ${serverUiDistIndex}; the server tarball would lack the board UI.`);
+    }
     const metadata = JSON.parse(fs.readFileSync(path.join(checkoutPath, "cli", "package.json"), "utf8")) as { version: string };
     const workspacePackages = resolveGitInstallWorkspacePackages(checkoutPath);
     for (const [index, workspacePackage] of workspacePackages.entries()) {
@@ -300,6 +314,15 @@ export async function installGitPayload(repo: string, sha: string, runCommand: C
       throw new Error(`Git install packaging produced ${workspaceTarballs.length} workspace tarballs; expected ${workspacePackages.length}.`);
     }
     await runCommand("npm", ["install", "--prefix", stagedPayload, path.join(stagingRoot, cliTarball), ...workspaceTarballs.map((entry) => path.join(stagingRoot, entry)), "--no-audit", "--no-fund"], { cwd: stagingRoot, maxBuffer: 32 * 1024 * 1024 });
+    // SPA-9160: assert the staged payload actually ships server/ui-dist. pnpm
+    // pack is allowed to silently produce a tarball that drops the prepack-
+    // produced ui-dist if the publish manifest rewrite collapses the files
+    // list, and the live 2026-09-27 20:44Z install shipped an installed
+    // server without ui-dist ("Cannot GET /" on the board for ~10h).
+    const installedServerUiDist = path.join(stagedPayload, "node_modules", "@paperclipai", "server", "ui-dist", "index.html");
+    if (!fs.existsSync(installedServerUiDist)) {
+      throw new Error(`Git install completed but the staged payload is missing ${installedServerUiDist}; refusing to flip the managed-install symlink so the running board stays online. Re-run after verifying the source checkout's scripts/prepare-server-ui-dist.sh still produces ui/dist/index.html.`);
+    }
     await smokePayload(stagedPayload, metadata.version, runCommand);
     fs.renameSync(stagedPayload, payloadPath);
     return { payloadPath, reused: false, version: metadata.version };
