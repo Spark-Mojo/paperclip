@@ -300,4 +300,39 @@ describe("external object routes", () => {
       actor: expect.objectContaining({ actorType: "agent", actorId: ownerAgentId }),
     }));
   });
+
+  it("threads force=true through to the service on agent manual refresh", async () => {
+    // SPA-9200: the agent / operator lever to bypass the 5-min backoff on
+    // external-object refresh. Without this, a cache row poisoned by a
+    // transient auth failure (see SPA-9149) stays poisoned for 5 min with no
+    // agent-side way out — the done-transition guard fail-closed on PR-merge
+    // verification then rejects every card linked to that PR. force=true
+    // forces a single immediate re-probe of GitHub.
+    mockExternalObjectsService.refreshIssueObjects.mockClear();
+    const app = await createApp(ownerActor());
+
+    const res = await request(app)
+      .post(`/api/issues/${issueId}/external-objects/refresh`)
+      .send({ force: true });
+
+    expect(res.status).toBe(200);
+    expect(mockExternalObjectsService.refreshIssueObjects).toHaveBeenCalledWith(issueId, expect.objectContaining({
+      companyId,
+      force: true,
+      actor: expect.objectContaining({ actorType: "agent", actorId: ownerAgentId }),
+    }));
+  });
+
+  it("rejects unknown refresh body fields (schema is still strict)", async () => {
+    // SPA-9200 adds `force` but the schema stays `.strict()` so unrelated
+    // fields the agent didn't ask for don't slip through silently.
+    const app = await createApp(ownerActor());
+
+    const res = await request(app)
+      .post(`/api/issues/${issueId}/external-objects/refresh`)
+      .send({ force: true, bypassBackoff: true });
+
+    expect(res.status).toBe(400);
+    expect(mockExternalObjectsService.refreshIssueObjects).not.toHaveBeenCalled();
+  });
 });

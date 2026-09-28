@@ -393,6 +393,7 @@ function prefersMinimalIssueUpdateResponse(req: Request) {
 const refreshExternalObjectsSchema = z
   .object({
     objectIds: z.array(z.string().guid()).max(50).optional(),
+    force: z.boolean().optional(),
   })
   .strict();
 const inboxArchiveBodySchema = z
@@ -9683,6 +9684,7 @@ export function issueRoutes(
       const results = await externalObjectsSvc.refreshIssueObjects(issue.id, {
         companyId: issue.companyId,
         objectIds: req.body.objectIds,
+        force: req.body.force,
         actor,
       });
       await logActivity(db, {

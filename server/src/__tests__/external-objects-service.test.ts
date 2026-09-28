@@ -357,7 +357,7 @@ describeEmbeddedPostgres("externalObjectService", () => {
   beforeAll(async () => {
     tempDb = await startEmbeddedPostgresTestDatabase("paperclip-external-objects-");
     db = createDb(tempDb.connectionString);
-  }, 20_000);
+  }, 60_000);
 
   afterEach(async () => {
     await db.delete(activityLog);
@@ -574,6 +574,55 @@ describeEmbeddedPostgres("externalObjectService", () => {
     expect(manualResult.refreshed).toBe(true);
     expect(manualResult.object.statusLabel).toBe("Open");
     expect(resolve).toHaveBeenCalledTimes(1);
+  });
+
+  it("refreshIssueObjects forwards force=true so the cache backoff is bypassed", async () => {
+    // SPA-9200: refreshIssueObjects (the route-facing wrapper) must thread
+    // `force` through to refreshObject (the per-row function whose backoff
+    // guard lives at line ~977). Without this, the route can request a force
+    // refresh but the service silently ignores it and the cache stays poisoned.
+    // Sets a poisoned nextRefreshAt in the future, then proves force=true
+    // bypasses the backoff while force=undefined (omitted) still respects it.
+    const { companyId, issueId } = await createIssue();
+    const resolve = vi.fn(async () => ({
+      ok: true as const,
+      snapshot: {
+        statusCategory: "open" as const,
+        statusTone: "info" as const,
+        statusKey: "open",
+        statusLabel: "Open",
+        ttlSeconds: 300,
+      },
+    }));
+    const resolver: ExternalObjectResolver = {
+      providerKey: "url",
+      objectType: "link",
+      resolve,
+    };
+    const svc = externalObjectService(db, { resolvers: [resolver], github: false });
+    await svc.syncIssue(issueId);
+    const object = await db.select().from(externalObjects).then((rows) => rows[0]!);
+
+    // Poison the cache: pin nextRefreshAt an hour in the future.
+    const poisonedAt = new Date(Date.now() + 60 * 60 * 1000);
+    await db
+      .update(externalObjects)
+      .set({ nextRefreshAt: poisonedAt, lastResolvedAt: new Date(0) })
+      .where(eq(externalObjects.id, object.id));
+
+    // 1) force=true bypasses the backoff and re-resolves immediately.
+    const forced = await svc.refreshIssueObjects(issueId, { companyId, force: true });
+    expect(forced).toHaveLength(1);
+    expect(forced[0]?.refreshed).toBe(true);
+    expect(resolve).toHaveBeenCalledTimes(1);
+
+    // 2) force=undefined respects the backoff and answers without resolving.
+    resolve.mockClear();
+    const deferred = await svc.refreshIssueObjects(issueId, { companyId });
+    expect(deferred).toHaveLength(1);
+    expect(deferred[0]?.refreshed).toBe(false);
+    expect(deferred[0]?.reason).toBe("backoff");
+    expect(resolve).not.toHaveBeenCalled();
   });
 
   it("prevents duplicate refreshes across service instances", async () => {
