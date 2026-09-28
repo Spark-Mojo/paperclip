@@ -1764,6 +1764,25 @@ describe("effective run execution workspace config freshness", () => {
     },
   );
 
+  it.each(["idle", "in_review"] as const)(
+    "allocator keeps %s rows restorable — the platform's own live set (SPA-7090 live-set invariant)",
+    (liveStatus) => {
+      const decision = resolveAllocatorExecutionWorkspaceReuseDecision({
+        issueExecutionWorkspaceId: "workspace-idle",
+        issueExecutionWorkspacePreference: "reuse_existing",
+        existingExecutionWorkspaceStatus: liveStatus,
+        executionWorkspaceHeldByAnotherOpenIssue: false,
+      });
+
+      expect(decision).toEqual({
+        requestedExecutionWorkspaceId: "workspace-idle",
+        shouldRestoreExistingWorkspace: true,
+        refusedCrossIssueBinding: false,
+        refusedDeadWorkspaceReuse: false,
+      });
+    },
+  );
+
   it("allocator reuse path stays refusal-free for an active workspace (SPA-7090 flag invariant)", () => {
     const decision = resolveAllocatorExecutionWorkspaceReuseDecision({
       issueExecutionWorkspaceId: "workspace-1",
@@ -1801,7 +1820,11 @@ describe("effective run execution workspace config freshness", () => {
       runId: "run-1",
       workspaceConfigFreshness: decision,
       staleReuseFallback: allocatorDecision.refusedDeadWorkspaceReuse
-        ? { executionWorkspaceId: allocatorDecision.requestedExecutionWorkspaceId, workspaceStatus: "cleanup_failed" }
+        ? {
+            executionWorkspaceId: allocatorDecision.requestedExecutionWorkspaceId,
+            workspaceStatus: "cleanup_failed",
+            branchName: "sparkmojo-scheduling/SPA-5066",
+          }
         : null,
       restoreExistingWorkspace: allocatorDecision.shouldRestoreExistingWorkspace
         ? restoreExistingWorkspace
@@ -1816,6 +1839,7 @@ describe("effective run execution workspace config freshness", () => {
     expect(result.freshFallbackForStaleReuse).toBe(true);
     expect(result.freshFallbackWarning).toContain("workspace-dead");
     expect(result.freshFallbackWarning).toContain("cleanup_failed");
+    expect(result.freshFallbackWarning).toContain("sparkmojo-scheduling/SPA-5066");
   });
 
   it("active reuse restore still throws on restore failure (SPA-7090 fail-fast invariant kept)", async () => {
@@ -1866,7 +1890,11 @@ describe("effective run execution workspace config freshness", () => {
       runId: "run-1",
       workspaceConfigFreshness: decision,
       staleReuseFallback: allocatorDecision.refusedDeadWorkspaceReuse
-        ? { executionWorkspaceId: allocatorDecision.requestedExecutionWorkspaceId, workspaceStatus: "ready" }
+        ? {
+            executionWorkspaceId: allocatorDecision.requestedExecutionWorkspaceId,
+            workspaceStatus: "ready",
+            branchName: null,
+          }
         : null,
       restoreExistingWorkspace: allocatorDecision.shouldRestoreExistingWorkspace
         ? restoreExistingWorkspace
