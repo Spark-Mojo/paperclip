@@ -1,4 +1,6 @@
 import { randomUUID } from "node:crypto";
+import express from "express";
+import request from "supertest";
 import { and, eq, inArray, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
@@ -12,6 +14,7 @@ import {
   executionWorkspaces,
   heartbeatRunEvents,
   heartbeatRuns,
+  issueComments,
   issueRelations,
   issues,
   projects,
@@ -23,6 +26,8 @@ import {
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
 import { drainHeartbeatRunsToQuiescence } from "./helpers/drain-heartbeat-runs.js";
+import { errorHandler } from "../middleware/index.js";
+import { issueRoutes } from "../routes/issues.js";
 import { heartbeatService } from "../services/heartbeat.ts";
 
 const mockAdapterExecute = vi.hoisted(() =>
@@ -89,6 +94,7 @@ describeEmbeddedPostgres("SPA-8580 state-change wake-fire", () => {
     await db.delete(heartbeatRunEvents);
     await db.delete(heartbeatRuns);
     await db.delete(agentWakeupRequests);
+    await db.delete(issueComments);
     await db.delete(issueRelations);
     await db.delete(issues);
     await db.delete(workspaceOperations);
@@ -316,7 +322,13 @@ describeEmbeddedPostgres("SPA-8580 state-change wake-fire", () => {
   // Surface (b): an assigneeAgentId flip on a non-backlog card with a stale
   // queued holder from the old owner must admit a queued run for the NEW owner
   // (SPA-8511 — Sable → Abe reassign, run cancelled, new owner never woke).
-  it("reassignment to a new agent wakes the new owner (surface b)", async () => {
+  // This test drives the REAL PATCH route (not a direct service call) so the
+  // wake goes through the same dispatcher path (`assigneeChanged` →
+  // `issue_assigned` → `heartbeat.wakeup` → stale-holder release + admit) that
+  // the board and tooling use. On the live line this surface is repaired by
+  // SPA-8631 (PR #70) and SPA-9001 (PRs #80/#84/#88) — all merged ancestors of
+  // the base — so this pins the full path as a regression guard.
+  it("reassignment via PATCH wakes the new owner (surface b)", async () => {
     const company = await seedCompany();
     const oldAgent = await seedAgent(company.id, "OldOwner");
     const newAgent = await seedAgent(company.id, "NewOwner");
@@ -329,9 +341,9 @@ describeEmbeddedPostgres("SPA-8580 state-change wake-fire", () => {
       sequence: 3,
     });
 
-    // During the handoff the old owner's queued run is still named in
-    // issues.executionRunId (SPA-8511 shape: the run was cancelled but the
-    // new owner's wake still had to cut through the stale holder).
+    // Stale queued holder from the old owner (SPA-8511 shape: the run was
+    // cancelled but the stalled holder still held issues.executionRunId, so
+    // the new owner's wake had to cut through it).
     const holderRunId = randomUUID();
     const holderWakeupId = randomUUID();
     await db.insert(agentWakeupRequests).values({
@@ -362,31 +374,49 @@ describeEmbeddedPostgres("SPA-8580 state-change wake-fire", () => {
       })
       .where(eq(issues.id, issue.id));
 
-    // Assignee flip to the new owner (PATCH status: todo + assigneeAgentId).
-    await db
-      .update(issues)
-      .set({
-        assigneeAgentId: newAgent.id,
-        status: "todo",
-        updatedAt: new Date(),
-      })
-      .where(eq(issues.id, issue.id));
-
-    // The new owner's assignment wake must admit — the dispatcher cancels the
-    // stale holder (`lock_released_on_reassignment`) and routes the run to the
-    // new assignee.
-    const wake = await heartbeat.wakeup(newAgent.id, {
-      source: "assignment",
-      triggerDetail: "system",
-      reason: "issue_assigned",
-      payload: { issueId: issue.id },
-      contextSnapshot: { issueId: issue.id, taskId: issue.id, wakeReason: "issue_assigned" },
-      requestedByActorType: "user",
-      requestedByActorId: "local-board",
+    const app = express();
+    app.use(express.json());
+    app.use((req, _res, next) => {
+      req.actor = {
+        type: "board",
+        userId: "board-user",
+        companyIds: [company.id],
+        memberships: [{ companyId: company.id, membershipRole: "operator", status: "active" }],
+        isInstanceAdmin: true,
+        source: "local_implicit",
+      } as Express.Request["actor"];
+      next();
     });
+    app.use("/api", issueRoutes(db, {} as any));
+    app.use(errorHandler);
 
-    expect(wake).not.toBeNull();
-    expect(wake?.agentId).toBe(newAgent.id);
-    expect(wake?.status).toBe("queued");
+    // Assignee flip to the new owner: PATCH status: todo + assigneeAgentId.
+    const res = await request(app)
+      .patch(`/api/issues/${issue.id}`)
+      .send({ status: "todo", assigneeAgentId: newAgent.id });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+
+    // The dispatcher must route the assignment wake to the NEW owner and admit
+    // it (queued run) once the stale holder is released by the reassignment.
+    // The PATCH dispatches the wake fire-and-forget, so poll for the admitted
+    // wake row.
+    await vi.waitFor(
+      async () => {
+        const admitted = await db
+          .select({ count: sql<number>`count(*)::int` })
+          .from(agentWakeupRequests)
+          .where(
+            and(
+              eq(agentWakeupRequests.agentId, newAgent.id),
+              eq(agentWakeupRequests.reason, "issue_assigned"),
+              inArray(agentWakeupRequests.status, ["queued", "claimed", "completed"]),
+              sql`${agentWakeupRequests.payload}->>'issueId' = ${issue.id}`,
+            ),
+          );
+        expect(Number(admitted[0]?.count ?? 0)).toBeGreaterThan(0);
+      },
+      { timeout: 10_000, interval: 100 },
+    );
   });
 });
