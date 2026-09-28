@@ -362,6 +362,23 @@ class SqlInterpreter {
         this.next();
         return !this.parseAtom();
       }
+      // drizzle renders `sql\`coalesce(X, false)\`` as bare text. The only
+      // shape the service emits under a `not` prefix is
+      // `coalesce(<bool expr>, false)`, used in
+      // `nativeRunnerOwnershipNotHeldCondition()` to gate terminal writes.
+      // Evaluate as a NULL-safe boolean: returns the first arg when it is
+      // non-null, otherwise the second arg. Combined with the surrounding
+      // `not`, this correctly excludes native-running-owned rows.
+      if (lower === "coalesce") {
+        this.next();
+        this.expectOp("(");
+        const first = this.parseOr();
+        this.expectOp(",");
+        const fallback = this.parseOr();
+        this.expectOp(")");
+        const result = first === null || first === undefined ? fallback : first;
+        return Boolean(result);
+      }
       return this.parseComparison();
     }
     throw new Error(`spa-7585 mock: unexpected token ${JSON.stringify(tok)}`);
@@ -462,6 +479,13 @@ class SqlInterpreter {
     // in the jsonb comparison) as plain StringChunks; on the unambiguous
     // jsonb-arrow path those arrive as bare idents.
     if (allowBareIdent && tok.t === "ident") return tok.v;
+    // drizzle inlines raw string interpolations into `sql\`...\`` as plain
+    // text (not as Param bindings), so constant identifiers like
+    // `native_execution_ownership_unverified` arrive here as bare idents.
+    // They are not column references on any mocked table — only run/status
+    // fields exist. Treat snake_case idents that don't match a column on
+    // the current row as string literals.
+    if (tok.t === "ident" && !(tok.v in this.row)) return tok.v;
     throw new Error(`spa-7585 mock: unsupported rhs token ${JSON.stringify(tok)}`);
   }
 }
@@ -571,6 +595,13 @@ function makeSelectChain(): Record<string, unknown> & PromiseLike<AnyRow[]> {
       state.limit = n;
       return chain;
     },
+    // drizzle's `.for("update", ...)` only affects lock semantics — it does
+    // not change the row set, so the mock can no-op while still returning the
+    // chain so `tx.select().from(...).where(...).for("update").limit(1)`
+    // chains parse and resolve like a normal select.
+    for(_action: string, _options?: unknown) {
+      return chain;
+    },
     then<T>(
       onFulfilled: (rows: AnyRow[]) => T,
       onRejected?: (reason: unknown) => T,
@@ -625,9 +656,18 @@ function makeUpdateChain(table?: unknown): Record<string, unknown> {
 }
 
 function makeInsertChain(): Record<string, unknown> {
+  let pendingValues: unknown;
   const chain = {
     values(input: unknown) {
-      return Promise.resolve(input);
+      pendingValues = input;
+      return chain;
+    },
+    // drizzle's `.returning()` resolves to the inserted row(s). The mock
+    // doesn't actually persist anything — return the captured values wrapped
+    // so `const [row] = await tx.insert(...).values(...).returning()`
+    // destructures to a single row object.
+    returning() {
+      return Promise.resolve([pendingValues]);
     },
   };
   return chain as unknown as Record<string, unknown>;
