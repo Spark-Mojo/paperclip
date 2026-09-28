@@ -810,6 +810,22 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     return { environmentId, leaseId };
   }
 
+  // SPA-9270: the reaper starts a 2-minute grace window the first time it
+  // sees a dead recorded pid, and only fails the run once that window has
+  // elapsed. Tests that exercise the post-grace failure path pre-stamp the
+  // observation as if an earlier sweep had already run past the window.
+  async function preStampProcessLoss(runId: string, ageMs = 2 * 60 * 1000 + 5_000) {
+    const observedAt = new Date(Date.now() - ageMs);
+    await db
+      .update(heartbeatRuns)
+      .set({
+        resultJson: { processLossObservedAt: observedAt.toISOString() },
+        updatedAt: observedAt,
+      })
+      .where(eq(heartbeatRuns.id, runId));
+    return observedAt;
+  }
+
   it("does not reap active adapter executions started by another heartbeat service instance", async () => {
     let releaseAdapter: (() => void) | null = null;
     const adapterStarted = new Promise<void>((resolve) => {
@@ -1783,6 +1799,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
 
   it("does not relabel a lost process run when its agent changes to a conversation adapter", async () => {
     const { companyId, agentId, runId } = await seedRunFixture({ adapterType: "process", processPid: 99999999 });
+    await preStampProcessLoss(runId);
     await db.update(agents).set({ adapterType: "codex_local" }).where(eq(agents.id, agentId));
     await heartbeatService(db).reapOrphanedRuns();
     const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
@@ -2467,6 +2484,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       processPid: 999_999_999,
       includeIssue: false,
     });
+    await preStampProcessLoss(runId);
     // The persisted run remains native even after the agent's current adapter
     // changes to one that normally owns a legacy local child.
     await db
@@ -2557,6 +2575,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
         resumeRequiresNormalModel: true,
       },
     });
+    await preStampProcessLoss(runId);
     const heartbeat = heartbeatService(db);
 
     const result = await heartbeat.reapOrphanedRuns();
@@ -3933,6 +3952,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     const { runId, issueId, companyId } = await seedRunFixture({
       processPid: 999_999_999,
     });
+    await preStampProcessLoss(runId);
     const { leaseId } = await seedEnvironmentLeaseFixture({
       companyId,
       runId,
@@ -3997,6 +4017,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       processPid: 999_999_999,
       processLossRetryCount: 1,
     });
+    await preStampProcessLoss(runId);
     const heartbeat = heartbeatService(db);
     await heartbeat.reapOrphanedRuns();
     await heartbeat.reconcileStrandedAssignedIssues();
@@ -4030,6 +4051,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       runErrorCode: "process_lost",
       runError: "Authorization: Bearer sk-test-recovery-secret",
     });
+    await preStampProcessLoss(runId);
     await db
       .update(issues)
       .set({
@@ -4111,6 +4133,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       processPid: 999_999_999,
       processLossRetryCount: 1,
     });
+    await preStampProcessLoss(runId);
     await db.insert(issueTreeHolds).values({
       companyId,
       rootIssueId: issueId,
@@ -15738,5 +15761,219 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       .from(heartbeatRuns)
       .where(eq(heartbeatRuns.id, runId));
     expect(runs).toHaveLength(1);
+  });
+
+  // ------------------------------------------------------------------
+  // SPA-9270 — dead-run liveness grace, pre-launch deadline, cancel-tree
+  //
+  //   (1a) tracked adapter, dead recorded pid, no prior observation →
+  //        stamps processLossObservedAt and stays running (grace started)
+  //   (1b) dead pid, observation stamped > 2 min ago → failed/process_lost
+  //   (1c) pid alive again after an observation → stamp cleared, run stays
+  //        running
+  //   (2a) running, startedAt > 15 min old, no pid, not in-process →
+  //        failed/workspace_prepare_timeout
+  //   (2b) running, startedAt fresh, no pid → NOT reaped by the deadline
+  //   (2c) running with pid recorded → untouched by the pre-launch gate
+  //   (3a) cancelling a running run with no in-memory handle but a recorded
+  //        pgid still signals the recorded process tree
+  // ------------------------------------------------------------------
+
+  it("SPA-9270 (1a): dead recorded pid with no prior observation starts the grace window instead of failing immediately", async () => {
+    const { runId } = await seedRunFixture({
+      adapterType: "claude_local",
+      processPid: 999_999_998,
+      processGroupId: 999_999_998,
+      includeIssue: true,
+    });
+    const heartbeat = heartbeatService(db);
+
+    const result = await heartbeat.reapOrphanedRuns();
+    expect(result).toEqual({ reaped: 0, runIds: [] });
+
+    const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+    expect(run?.status).toBe("running");
+    expect(run?.errorCode).toBeNull();
+    expect(typeof run?.resultJson?.processLossObservedAt).toBe("string");
+
+    const events = await db
+      .select()
+      .from(heartbeatRunEvents)
+      .where(eq(heartbeatRunEvents.runId, runId));
+    expect(events.some((event) =>
+      event.level === "warn" &&
+      (event.message ?? "").includes("process-loss grace window started"),
+    )).toBe(true);
+  });
+
+  it("SPA-9270 (1b): dead recorded pid whose observation is older than the grace window fails as process_lost", async () => {
+    const observedAt = new Date(Date.now() - (2 * 60 * 1000 + 5_000));
+    const { agentId, runId, issueId } = await seedRunFixture({
+      adapterType: "claude_local",
+      agentStatus: "idle",
+      processPid: 999_999_997,
+      processGroupId: 999_999_997,
+      includeIssue: true,
+    });
+    await db
+      .update(heartbeatRuns)
+      .set({ resultJson: { processLossObservedAt: observedAt.toISOString() }, updatedAt: observedAt })
+      .where(eq(heartbeatRuns.id, runId));
+    // Keep the run's issue execution lock pointed at this run.
+    await db
+      .update(issues)
+      .set({ executionRunId: runId })
+      .where(eq(issues.id, issueId));
+    const heartbeat = heartbeatService(db);
+
+    const result = await heartbeat.reapOrphanedRuns();
+    expect(result.reaped).toBe(1);
+    expect(result.runIds).toContain(runId);
+
+    const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+    expect(run?.status).toBe("failed");
+    expect(run?.errorCode).toBe("process_lost");
+
+    // The tracked local child lost its pid, so a bounded retry/continuation
+    // path takes over and the agent's slot is released rather than held.
+    const successorRows = await db
+      .select({ id: heartbeatRuns.id, status: heartbeatRuns.status, retryOfRunId: heartbeatRuns.retryOfRunId })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.agentId, agentId));
+    const successors = successorRows.filter((row) => row.id !== runId);
+    expect(successors.length).toBeGreaterThanOrEqual(1);
+  });
+
+  it("SPA-9270 (1c): a pid that comes back alive clears the pending process-loss observation", async () => {
+    const child = spawnAliveProcess();
+    childProcesses.add(child);
+    expect(child.pid).toBeTypeOf("number");
+
+    const { runId } = await seedRunFixture({
+      adapterType: "claude_local",
+      processPid: child.pid!,
+      processGroupId: child.pid!,
+      includeIssue: false,
+    });
+    const observedAt = new Date(Date.now() - (2 * 60 * 1000 + 5_000));
+    await db
+      .update(heartbeatRuns)
+      .set({ resultJson: { processLossObservedAt: observedAt.toISOString() } })
+      .where(eq(heartbeatRuns.id, runId));
+    const heartbeat = heartbeatService(db);
+
+    const result = await heartbeat.reapOrphanedRuns();
+    expect(result).toEqual({ reaped: 0, runIds: [] });
+
+    const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+    expect(run?.status).toBe("running");
+    expect(run?.resultJson?.processLossObservedAt).toBeUndefined();
+    expect(run?.errorCode).toBe("process_detached");
+    expect(isPidAlive(child.pid!)).toBe(true);
+  });
+
+  it("SPA-9270 (2a): a running run with no pid past the pre-launch deadline fails with workspace_prepare_timeout", async () => {
+    const { runId, issueId } = await seedRunFixture({
+      adapterType: "openclaw_gateway",
+      processPid: null,
+      processGroupId: null,
+      includeIssue: true,
+    });
+    const startedAt = new Date(Date.now() - (15 * 60 * 1000 + 60_000));
+    await db
+      .update(heartbeatRuns)
+      .set({ startedAt, updatedAt: startedAt })
+      .where(eq(heartbeatRuns.id, runId));
+    await db
+      .update(issues)
+      .set({ executionRunId: runId })
+      .where(eq(issues.id, issueId));
+    const heartbeat = heartbeatService(db);
+
+    const result = await heartbeat.reapOrphanedRuns();
+
+    expect(result.reaped).toBe(1);
+    expect(result.runIds).toContain(runId);
+    const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+    expect(run?.status).toBe("failed");
+    expect(run?.errorCode).toBe("workspace_prepare_timeout");
+    expect(run?.error).toContain("workspace preparation");
+  });
+
+  it("SPA-9270 (2b): a fresh pre-launch run with no pid fails as plain process_lost, not workspace_prepare_timeout", async () => {
+    const { runId } = await seedRunFixture({
+      adapterType: "openclaw_gateway",
+      processPid: null,
+      processGroupId: null,
+      includeIssue: true,
+    });
+    const startedAt = new Date(Date.now() - 2 * 60 * 1000);
+    await db
+      .update(heartbeatRuns)
+      .set({ startedAt, updatedAt: startedAt })
+      .where(eq(heartbeatRuns.id, runId));
+    const heartbeat = heartbeatService(db);
+
+    const result = await heartbeat.reapOrphanedRuns();
+
+    // Untracked-adapter null-pid runs are still subject to ordinary orphan
+    // recovery on this line; the point of the pre-launch gate is that a FRESH
+    // launch failure must never be mislabeled workspace_prepare_timeout.
+    expect(result.reaped).toBe(1);
+    const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+    expect(run?.status).toBe("failed");
+    expect(run?.errorCode).toBe("process_lost");
+  });
+
+  it("SPA-9270 (2c): a running run with a recorded pid is never treated as pre-launch", async () => {
+    const child = spawnAliveProcess();
+    childProcesses.add(child);
+
+    const { runId } = await seedRunFixture({
+      adapterType: "claude_local",
+      processPid: child.pid!,
+      processGroupId: child.pid!,
+      includeIssue: false,
+    });
+    // Even with startedAt far past the deadline, a recorded pid means the
+    // launch completed; the pre-launch gate must not fire.
+    const startedAt = new Date(Date.now() - (15 * 60 * 1000 + 60_000));
+    await db
+      .update(heartbeatRuns)
+      .set({ startedAt, updatedAt: startedAt })
+      .where(eq(heartbeatRuns.id, runId));
+    const heartbeat = heartbeatService(db);
+
+    const result = await heartbeat.reapOrphanedRuns();
+
+    expect(result).toEqual({ reaped: 0, runIds: [] });
+    const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+    expect(run?.status).toBe("running");
+    expect(run?.errorCode).toBe("process_detached");
+  });
+
+  it("SPA-9270 (3a): cancelling a run without an in-memory handle still terminates the recorded process group", async () => {
+    const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], {
+      stdio: "ignore",
+      detached: true,
+    });
+    childProcesses.add(child);
+    expect(child.pid).toBeTypeOf("number");
+
+    const { runId } = await seedRunFixture({
+      adapterType: "claude_local",
+      processPid: child.pid!,
+      processGroupId: child.pid!,
+      includeIssue: false,
+    });
+    const heartbeat = heartbeatService(db);
+
+    // No in-memory handle: the run was never dispatched in this process
+    // (restart window). The persisted pgid must still receive the signal.
+    await heartbeat.cancelRun(runId, "SPA-9270 test cancel");
+
+    await waitForPidExit(child.pid!);
+    const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+    expect(run?.status).toBe("cancelled");
   });
 });

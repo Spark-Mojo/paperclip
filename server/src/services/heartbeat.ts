@@ -436,6 +436,7 @@ import {
   buildHeartbeatRunScratchEnv,
   cleanupHeartbeatRunScratch,
   prepareHeartbeatRunScratch,
+  sweepOrphanedRunScratch,
   type HeartbeatRunScratch,
 } from "./run-scratch.js";
 import {
@@ -1224,10 +1225,36 @@ const SESSIONED_LOCAL_ADAPTERS = new Set([
   "cursor",
   "gemini_local",
   "hermes_local",
-  "kimi_local",
   "opencode_local",
   "pi_local",
 ]);
+// SPA-9270: grace window between first observing a dead recorded pid and
+// failing the run as process_lost. The first sweep that sees the recorded
+// pid AND process group gone stamps resultJson.processLossObservedAt; the
+// failure write only fires once that stamp is at least this old. This bounds
+// PID-recycling races (a dead pid reappearing as a different process) and
+// gives a restarting-but-alive child a window to re-register, while a dead
+// run still releases its agent's concurrency slot within minutes instead of
+// holding it for hours.
+export const PROCESS_LOSS_OBSERVED_GRACE_MS = 2 * 60 * 1000;
+// SPA-9270: pre-launch deadline. A running run with startedAt set but no
+// recorded pid whose launch phase exceeds this window fails with
+// workspace_prepare_timeout instead of hanging forever on a saturated disk.
+// In-process executions (activeRunExecutions/runningProcesses) are exempt:
+// their own clone/scan timeouts govern; this deadline exists for runs whose
+// executor died mid-prepare (server restart) and for wedged pre-dispatch
+// states no other guard covers.
+export const WORKSPACE_PREPARE_TIMEOUT_MS = 15 * 60 * 1000;
+export const WORKSPACE_PREPARE_TIMEOUT_ERROR_CODE = "workspace_prepare_timeout";
+
+function readProcessLossObservedAt(
+  run: Pick<typeof heartbeatRuns.$inferSelect, "resultJson">,
+): number | null {
+  const raw = parseObject(run.resultJson).processLossObservedAt;
+  if (typeof raw !== "string") return null;
+  const parsed = Date.parse(raw);
+  return Number.isFinite(parsed) ? parsed : null;
+}
 // Routes and the scheduler construct separate heartbeatService instances, but
 // they must agree on in-process adapter executions when reaping stale runs.
 const activeRunExecutions = new Set<string>();
@@ -8975,6 +9002,30 @@ async function terminateHeartbeatRunProcess(input: {
     },
     { forceAfterMs: input.graceMs, signal: input.signal },
   );
+}
+
+// SPA-9270 fix 3: ownership proof for terminating a persisted process tree
+// after the in-memory handle is gone (server restart window). A numeric
+// pid/pgid alone is NOT proof — the OS recycles ids, and the live line
+// deliberately refuses to signal unowned persisted ids. The recorded
+// processStartedAt is the start-time identity captured at spawn; the tree is
+// only signable when the current holder of the pid reports the same start
+// time (same source: /proc stat ctime), within a small clock tolerance.
+async function isPersistedRunProcessOwned(input: {
+  processPid: number | null;
+  processGroupId: number | null;
+  processStartedAt: Date | null;
+}): Promise<boolean> {
+  const pid = input.processPid ?? input.processGroupId;
+  if (typeof pid !== "number" || !Number.isInteger(pid) || pid <= 0) return false;
+  if (!input.processStartedAt) return false;
+  const observedAt = await readProcessStartedAt(pid).catch(() => null);
+  if (!observedAt) return false;
+  const observedMs = Date.parse(observedAt);
+  const recordedMs = input.processStartedAt.getTime();
+  if (!Number.isFinite(observedMs) || !Number.isFinite(recordedMs)) return false;
+  // ctime granularity plus scheduling skew tolerance.
+  return Math.abs(observedMs - recordedMs) <= 2_000;
 }
 
 function buildProcessLossMessage(
@@ -19105,6 +19156,30 @@ export function heartbeatService(
         continue;
       }
       if (processPidAlive || processGroupAlive) {
+        // SPA-9270 fix 1: the child is alive — any pending process-loss
+        // observation is stale (pid came back / transient /proc miss) and
+        // must be cleared so a later genuine disappearance restarts the
+        // grace window from zero.
+        if (readProcessLossObservedAt(run) !== null) {
+          await db
+            .update(heartbeatRuns)
+            .set({
+              resultJson: (() => {
+                const next = parseObject(run.resultJson);
+                delete next.processLossObservedAt;
+                return next;
+              })(),
+              updatedAt: now,
+            })
+            .where(
+              and(
+                eq(heartbeatRuns.id, run.id),
+                eq(heartbeatRuns.companyId, run.companyId),
+                eq(heartbeatRuns.status, "running"),
+              ),
+            )
+            .catch(() => undefined);
+        }
         if (run.errorCode !== DETACHED_PROCESS_ERROR_CODE) {
           const detachedMessage = processPidAlive
             ? `Lost in-memory process handle, but child pid ${run.processPid} is still alive`
@@ -19130,6 +19205,55 @@ export function heartbeatService(
         continue;
       }
 
+      // SPA-9270 fix 1: a recorded child pid that is gone is not instantly
+      // fatal — stamp the first observation and require the grace window to
+      // elapse before the terminal process_lost write. The stamp lives in
+      // resultJson (not updatedAt, which too many writers touch) and is
+      // written with a status-preserving compare-and-set so a concurrent
+      // terminal write still wins. A pid that comes back alive clears the
+      // stamp so a later disappearance restarts the window.
+      const hadRecordedChildIdentity =
+        !!run.processPid || !!run.processGroupId;
+      if (hadRecordedChildIdentity) {
+        const observedAt = readProcessLossObservedAt(run);
+        if (observedAt === null) {
+          const stamped = await db
+            .update(heartbeatRuns)
+            .set({
+              resultJson: {
+                ...parseObject(run.resultJson),
+                processLossObservedAt: now.toISOString(),
+              },
+              updatedAt: now,
+            })
+            .where(
+              and(
+                eq(heartbeatRuns.id, run.id),
+                eq(heartbeatRuns.companyId, run.companyId),
+                eq(heartbeatRuns.status, "running"),
+              ),
+            )
+            .returning()
+            .then((rows) => rows[0] ?? null);
+          if (stamped) {
+            await appendRunEvent(stamped, {
+              eventType: "lifecycle",
+              stream: "system",
+              level: "warn",
+              message: `Recorded child process identity is gone (pid ${run.processPid ?? "unknown"}, pgid ${run.processGroupId ?? "unknown"}); process-loss grace window started`,
+              payload: {
+                processPid: run.processPid ?? null,
+                processGroupId: run.processGroupId ?? null,
+                processLossObservedAt: now.toISOString(),
+                graceMs: PROCESS_LOSS_OBSERVED_GRACE_MS,
+              },
+            }).catch(() => undefined);
+          }
+          continue;
+        }
+        if (now.getTime() - observedAt < PROCESS_LOSS_OBSERVED_GRACE_MS) continue;
+      }
+
       const runContext = parseObject(run.contextSnapshot);
       const monitorIssueId = readNonEmptyString(runContext.issueId);
       const monitorNextCheckAt = monitorIssueId
@@ -19144,8 +19268,39 @@ export function heartbeatService(
         ((tracksLegacyLocalChild &&
           (!!run.processPid || !!run.processGroupId)) ||
           monitorDispatchLostWithoutFutureWake);
+      // SPA-9270 fix 2 (reaper side): a running run that never recorded a
+      // process identity and whose launch phase exceeds the pre-launch
+      // deadline fails with the specific workspace_prepare_timeout code
+      // instead of the generic process_lost, so operators can tell "the
+      // executor died mid-prepare" from "a live child disappeared". Runs
+      // still inside this process (activeRunExecutions) are exempt above
+      // (locallyTracked); their own executor watchdog owns that case.
+      // A run with explicit bootstrap evidence (provider work never started)
+      // is not a mid-prepare stall either — it is a queued run that lost
+      // its dispatch slot, and the recovery lane routes that as process_lost
+      // with a bounded retry, not a pre-launch timeout.
+      const executionRecovery = parseObject(run.resultJson).executionRecovery;
+      const executionRecoveryRecord =
+        executionRecovery && typeof executionRecovery === "object" && !Array.isArray(executionRecovery)
+          ? (executionRecovery as Record<string, unknown>)
+          : null;
+      const isBootstrapEvidence =
+        executionRecoveryRecord?.kind === "bootstrap" &&
+        executionRecoveryRecord.providerWorkStarted === false;
+      const launchPhaseExceededDeadline =
+        !run.processPid &&
+        !run.processGroupId &&
+        !!run.startedAt &&
+        !isBootstrapEvidence &&
+        now.getTime() - new Date(run.startedAt).getTime() >
+          WORKSPACE_PREPARE_TIMEOUT_MS;
       if (!(await revokeExpiredLegacyController(db, run))) continue;
-      const baseMessage = buildProcessLossMessage(run);
+      const baseMessage = launchPhaseExceededDeadline
+        ? `Pre-launch deadline exceeded: workspace preparation produced no process for more than ${WORKSPACE_PREPARE_TIMEOUT_MS}ms since startedAt`
+        : buildProcessLossMessage(run);
+      const failureErrorCode = launchPhaseExceededDeadline
+        ? WORKSPACE_PREPARE_TIMEOUT_ERROR_CODE
+        : "process_lost";
       const conversationContinuationEligible = await runUsedConversationAdapter(db, run);
 
       const failureWrite = await setRunStatusFromLive(
@@ -19154,7 +19309,7 @@ export function heartbeatService(
         ["running"],
         {
           error: shouldRetry ? `${baseMessage}; retrying once` : baseMessage,
-          errorCode: "process_lost",
+          errorCode: failureErrorCode,
           finishedAt: now,
           resultJson: (() => {
             const result = mergeRunStopMetadataForAgent(
@@ -19163,7 +19318,7 @@ export function heartbeatService(
               {
                 conversationContinuationEligible,
                 resultJson: parseObject(run.resultJson),
-                errorCode: "process_lost",
+                errorCode: failureErrorCode,
                 errorMessage: shouldRetry
                   ? `${baseMessage}; retrying once`
                   : baseMessage,
@@ -20036,6 +20191,79 @@ export function heartbeatService(
     activeRunExecutions.add(run.id);
     const executionControl = createAdapterExecutionControl();
     const controllerLease = watchLegacyControllerLease(db, run, executionControl.controller);
+    // SPA-9270 fix 2: pre-launch deadline watchdog. Workspace preparation
+    // (managed checkout, git scans, environment realization) runs against
+    // real disks that can saturate for hours. Before the adapter's first
+    // onSpawn there is no pid, no output, and no other guard: a wedged
+    // prepare held the run `running` (and the agent's concurrency slot)
+    // indefinitely while looking exactly like a live run. This watchdog
+    // fails the run with `workspace_prepare_timeout` once the launch phase
+    // (from startedAt, before any pid is recorded) exceeds the deadline,
+    // aborts the execution controller so in-flight prepare work can bail,
+    // and lets normal failure teardown release the slot. It disarms itself
+    // the moment a pid lands (markDispatchStarted persists process
+    // metadata) or the run leaves `running`.
+    let prepareDeadlineFired = false;
+    const prepareDeadlineBaseMs = run.startedAt
+      ? new Date(run.startedAt).getTime()
+      : Date.now();
+    const prepareDeadlineDelayMs = Math.max(
+      1_000,
+      prepareDeadlineBaseMs + WORKSPACE_PREPARE_TIMEOUT_MS - Date.now(),
+    );
+    const prepareDeadlineTimer = setTimeout(() => {
+      void (async () => {
+        const current = await getRun(run.id).catch(() => null);
+        if (!current || current.status !== "running") return;
+        if (current.processPid || current.processGroupId) return;
+        // A bootstrap-evidenced run (provider work never started) is not a
+        // mid-prepare stall; its own retry lane handles it as process_lost.
+        const executionRecovery = parseObject(current.resultJson).executionRecovery;
+        const executionRecoveryRecord =
+          executionRecovery && typeof executionRecovery === "object" && !Array.isArray(executionRecovery)
+            ? (executionRecovery as Record<string, unknown>)
+            : null;
+        if (
+          executionRecoveryRecord?.kind === "bootstrap" &&
+          executionRecoveryRecord.providerWorkStarted === false
+        ) {
+          return;
+        }
+        prepareDeadlineFired = true;
+        const message =
+          "Run failed to launch within the pre-launch deadline: workspace preparation or adapter startup produced no process after " +
+          `${Math.round((Date.now() - prepareDeadlineBaseMs) / 1000)}s (deadline ${WORKSPACE_PREPARE_TIMEOUT_MS}ms)`;
+        const failed = await setRunStatusIfRunning(run.id, "failed", {
+          finishedAt: new Date(),
+          error: message,
+          errorCode: WORKSPACE_PREPARE_TIMEOUT_ERROR_CODE,
+        }).catch(() => null);
+        if (failed?.updated) {
+          await setWakeupStatus(run.wakeupRequestId, "failed", {
+            finishedAt: new Date(),
+            error: message,
+          }).catch(() => undefined);
+          await appendRunEvent(failed.run!, {
+            eventType: "lifecycle",
+            stream: "system",
+            level: "error",
+            message,
+            payload: {
+              startedAt: current.startedAt?.toISOString() ?? null,
+              deadlineMs: WORKSPACE_PREPARE_TIMEOUT_MS,
+            },
+          }).catch(() => undefined);
+        }
+        // Abort the controller even if the DB write lost a race: the adapter
+        // dispatch honors the signal and its guard stops the launch.
+        executionControl.controller.abort(new Error(message));
+        logger.error(
+          { runId: run.id, startedAt: current.startedAt ?? null },
+          "run exceeded pre-launch workspace preparation deadline",
+        );
+      })();
+    }, prepareDeadlineDelayMs);
+    prepareDeadlineTimer.unref?.();
     let runScratch: HeartbeatRunScratch | null = null;
     let githubLauncherLocation:
       Parameters<typeof cleanupGitHubOperationLaunchers>[0] | null = null;
@@ -25884,6 +26112,7 @@ export function heartbeatService(
         }
       }
     } finally {
+      clearTimeout(prepareDeadlineTimer);
       if (managedAiRuntime) await managedAiRuntime.cleanup().catch(() => logger.warn({ runId: run.id }, "AI connection refresh or cleanup failed"));
       let latestRun = await getRun(run.id).catch(() => null);
       try {
@@ -28941,6 +29170,28 @@ export function heartbeatService(
                   options.terminationGraceMs,
                 ),
               });
+            } else if (
+              // SPA-9270 fix 3: after a server restart the in-memory child
+              // handle is gone, but the persisted tree may still be ours.
+              // A numeric id alone is not ownership (the live line refuses to
+              // signal unowned persisted ids — pid recycling); the tree is
+              // only terminated when its recorded start-time identity still
+              // matches the current holder. Without this, cancellation left
+              // the whole tree reparented to the init system running for
+              // hours (observed: 95 orphaned test processes, load 12).
+              run.runtimeMode !== "native" &&
+              !control &&
+              (run.processPid || run.processGroupId) &&
+              (await isPersistedRunProcessOwned({
+                processPid: run.processPid,
+                processGroupId: run.processGroupId,
+                processStartedAt: run.processStartedAt,
+              }))
+            ) {
+              await terminateHeartbeatRunProcess({
+                pid: run.processPid,
+                processGroupId: run.processGroupId,
+              });
             }
             terminationSettled = true;
           } finally {
@@ -29147,6 +29398,30 @@ export function heartbeatService(
             pid: running.child.pid,
             processGroupId: running.processGroupId,
             graceMs: Math.max(1, running.graceSec) * 1000,
+          });
+        } else if (
+          // SPA-9270 fix 3: same ownership-gated persisted-tree fallback as
+          // cancelRunInternal — an agent pause after a restart must still
+          // stop the recorded tree when (and only when) the start-time
+          // identity proves it is still ours.
+          run.runtimeMode !== "native" &&
+          (run.processPid || run.processGroupId) &&
+          (await isPersistedRunProcessOwned({
+            processPid: run.processPid,
+            processGroupId: run.processGroupId,
+            processStartedAt: run.processStartedAt,
+          }))
+        ) {
+          await terminateHeartbeatRunProcess({
+            pid: run.processPid,
+            processGroupId: run.processGroupId,
+          }).catch((killError) => {
+            // One unattributable pgid must not abort cancelling the agent's
+            // remaining runs.
+            logger.warn(
+              { err: killError, runId: run.id },
+              "persisted process-tree termination failed during agent-wide cancel",
+            );
           });
         }
         runningProcesses.delete(run.id);
@@ -29562,6 +29837,24 @@ export function heartbeatService(
     reconcileHotRestartAdoption,
     recoverNativeRunsAfterRestart,
     reapOrphanedRuns,
+    // SPA-9270 fix 3: filesystem-driven sweep of orphaned run scratch dirs
+    // (and the process trees still living under them). Called at startup and
+    // on the periodic scheduler tick; never touches a live run's scratch.
+    sweepOrphanedRunScratch: () =>
+      sweepOrphanedRunScratch({
+        isProcessGroupAlive,
+        loadRun: (runId) =>
+          db
+            .select({
+              status: heartbeatRuns.status,
+              processGroupId: heartbeatRuns.processGroupId,
+              processPid: heartbeatRuns.processPid,
+            })
+            .from(heartbeatRuns)
+            .where(eq(heartbeatRuns.id, runId))
+            .limit(1)
+            .then((rows) => rows[0] ?? null),
+      }),
     sweepPendingCleanupLeases,
     // Override-aware scheduling-suppression check (honors the worktree
     // run-execution experimental setting). Callers outside the service that
