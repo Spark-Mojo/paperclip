@@ -121,9 +121,9 @@ Head: `ty/SPA-8998` @ `0ed1d16536`. PR: https://github.com/Spark-Mojo/paperclip/
 
 ## Gate A6 — FORK-PATCHES.md row 15 added
   CHECK: git diff origin/rebuild/v2026.916.0-survivors -- doc/FORK-PATCHES.md | grep -c "SPA-8998\|renumber"
-  EXPECT: ≥ 1. The row records the renumber decision and the journal-`when`
+  EXPECT: ≥ 1. The row records the renumber decision and the journal-when
   ordering fix (9280=1789390281191, 9281=1789390281192, both monotonic past
-  0279's 1789390281190). The journal's `when` fields feed `folderMillis` in
+  0279's 1789390281190). The journal's when fields feed `folderMillis` in
   `applyPendingMigrations`; a re-order would silently produce inconsistent
   timestamps.
 
