@@ -86,6 +86,51 @@ function readRecord(value: unknown): Record<string, unknown> | null {
     : null;
 }
 
+/**
+ * Map a successful GitHub external-object snapshot onto the merge-details
+ * shape the done-gate consumes. Pulled out of `createPullRequestMergeDetailsResolver`
+ * for unit testing.
+ *
+ * "not_found" means the resolver could not locate the PR — either the PR was
+ * deleted at the URL or the configured GitHub token cannot see it
+ * (cross-account 404). In both cases the resolver cannot prove an actionable
+ * merge state, so we surface the closure via `workProductState: "closed"` (the
+ * existing human-signal bucket `gateStateFromDetails` reads first). The
+ * done-gate treats `closed` as non-blocking, so the card can close. Without
+ * this mapping the done-gate sees `state: "unknown"` and fails-closed on the
+ * card, which wedges every closure whose PR is invisible to the token. See
+ * SPA-9149.
+ */
+export function mapGitHubPullRequestSnapshot(snapshot: {
+  statusKey?: string | null;
+  data?: unknown;
+}): PullRequestMergeDetails {
+  const data = readRecord(snapshot.data);
+  const statusKey = snapshot.statusKey ?? undefined;
+  const isClosedByStatus = statusKey === "closed";
+  const isClosedByNotFound = statusKey === "not_found";
+  const workProductState = statusKey === "open" || statusKey === "draft" || statusKey === "merged" || isClosedByStatus
+    ? statusKey
+    : isClosedByNotFound
+      ? "closed"
+      : undefined;
+  return {
+    state: statusKey === "merged" || data?.merged === true
+      ? "merged"
+      : statusKey === "open" || statusKey === "draft"
+        ? "open"
+        : "unknown",
+    headRef: typeof data?.headRef === "string" ? data.headRef : null,
+    headSha: typeof data?.headSha === "string" ? data.headSha : null,
+    ...(workProductState ? { workProductState } : {}),
+    draft: data?.draft === true,
+    baseRef: typeof data?.baseRef === "string" ? data.baseRef : null,
+    additions: typeof data?.additions === "number" ? data.additions : null,
+    deletions: typeof data?.deletions === "number" ? data.deletions : null,
+    changedFiles: typeof data?.changedFiles === "number" ? data.changedFiles : null,
+  };
+}
+
 export function createPullRequestMergeDetailsResolver(db: Db): PullRequestMergeDetailsResolver {
   const resolver = createGitHubExternalObjectProvider(db).resolvers
     .find((candidate) => candidate.objectType === "pull_request") ?? null;
@@ -100,26 +145,7 @@ export function createPullRequestMergeDetailsResolver(db: Db): PullRequestMergeD
       } as never,
     });
     if (!result.ok) return { state: "unknown", headRef: null, headSha: null };
-    const data = readRecord(result.snapshot.data);
-    const statusKey = result.snapshot.statusKey;
-    const workProductState = statusKey === "open" || statusKey === "draft" || statusKey === "merged" || statusKey === "closed"
-      ? statusKey
-      : undefined;
-    return {
-      state: statusKey === "merged" || data?.merged === true
-        ? "merged"
-        : statusKey === "open" || statusKey === "draft" || statusKey === "closed"
-          ? "open"
-          : "unknown",
-      headRef: typeof data?.headRef === "string" ? data.headRef : null,
-      headSha: typeof data?.headSha === "string" ? data.headSha : null,
-      ...(workProductState ? { workProductState } : {}),
-      draft: data?.draft === true,
-      baseRef: typeof data?.baseRef === "string" ? data.baseRef : null,
-      additions: typeof data?.additions === "number" ? data.additions : null,
-      deletions: typeof data?.deletions === "number" ? data.deletions : null,
-      changedFiles: typeof data?.changedFiles === "number" ? data.changedFiles : null,
-    };
+    return mapGitHubPullRequestSnapshot(result.snapshot);
   };
 }
 
