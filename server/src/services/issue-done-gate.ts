@@ -1,4 +1,4 @@
-import { and, desc, eq } from "drizzle-orm";
+import { and, desc, eq, isNull } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
   issueComments,
@@ -23,18 +23,28 @@ import {
  * approve path auto-closed SPA-8708/8669/8919 with PRs open and auto-merge
  * never armed. James ruled 2026-09-27: the engine refuses.
  *
- * Detection is deliberately NARROW (a card-close DoD check that blocks
- * legitimate closures is worse than none):
- *   - The only binding signal is a `pull_request` work product on the card.
- *     PR URLs pasted into prose/comments are NOT a binding — a comment that
- *     mentions a related PR must never wedge the card closed.
+ * SPA-9038 (James ruled option 1, 2026-09-27): besides `pull_request` work
+ * products, the card's description and comments are also scanned for GitHub
+ * PR URLs in Spark-Mojo repos, and each such link is checked exactly like an
+ * attached work product. Live gap that prompted it (2026-09-27 22:57Z,
+ * engine 15e0c7906): SPA-9036 closed done with PR #1140 open — the PR was
+ * only linked in a comment, and agents usually link PRs in comments, so the
+ * work-product-only key missed the common case.
+ *
+ * Detection (fail-closed, but scoped so a foreign mention never wedges us):
+ *   - Binding signals are (a) `pull_request` work products on the card
+ *     (any repo) and (b) GitHub PR URLs/`owner/repo#N` shorthands found in
+ *     the card's description or comments, restricted to Spark-Mojo repos —
+ *     our own repos, where "the card's PR is unmerged" is a real DoD fact.
+ *     PR mentions of foreign repos are not ours to gate on.
+ *   - Deleted comments do not bind; the live card text is the record.
  *   - `state === "merged"` passes. `state === "open"` refuses.
  *     `state === "unknown"` (GitHub unreachable, credentials missing,
  *     resolver absent) refuses — fail-closed on ambiguity.
  *   - A PR that is closed WITHOUT being merged (a refused PR) does NOT block:
- *     a refused PR is a human signal, not an engine decision (card's own
- *     "you do not" list).
- *   - A card with zero `pull_request` work products passes untouched — docs,
+ *     a refused PR is a deliberate human close, not an engine decision
+ *     (James's ruling, 2026-09-27).
+ *   - A card with zero binding references passes untouched — docs,
  *     judgment, audit cards close exactly as before.
  *
  * The refused transition returns 409 with the offending PR list and the two
@@ -52,8 +62,20 @@ import {
 
 export const DONE_GATE_OPEN_PR_REFUSAL = "issue_done_with_unmerged_pull_request";
 
-/** How many recent comments to scan for stale PR mentions (diagnostics only). */
-const DIAGNOSTIC_COMMENT_SCAN_LIMIT = 20;
+/**
+ * SPA-9038: PR links parsed out of card prose (description/comments) bind the
+ * gate only when they point at Spark-Mojo repos — our own repos, where an
+ * unmerged PR is a real DoD fact for the card. Foreign-repo mentions are
+ * context, not obligations.
+ */
+const SPARK_MOJO_ORG = "spark-mojo";
+
+/** How many recent comments to scan for PR mentions (SPA-9038 bindings). */
+const COMMENT_SCAN_LIMIT = 200;
+
+function isSparkMojoRepo(reference: GitHubPullRequestReference): boolean {
+  return reference.owner.toLowerCase() === SPARK_MOJO_ORG;
+}
 
 export type DoneGatePullRequestReference = GitHubPullRequestReference;
 
@@ -133,12 +155,32 @@ export function issueDoneGateService(db: Db, opts: IssueDoneGateServiceOptions =
   }
 
   /**
-   * Every `pull_request` work product on the issue is a binding. References
-   * are extracted from the product's url/externalId/title/summary/metadata —
-   * the same extraction surface `execution-workspaces.ts` uses for delivery
-   * assessment.
+   * Binding references, per James's SPA-9038 ruling (option 1):
+   *   1. Every `pull_request` work product on the issue (any repo) —
+   *      references extracted from url/externalId/title/summary/metadata,
+   *      the same extraction surface `execution-workspaces.ts` uses for
+   *      delivery assessment.
+   *   2. GitHub PR URLs and `owner/repo#N` shorthands parsed from the card's
+   *      description and its most recent comments, restricted to Spark-Mojo
+   *      repos. Deleted comments never bind.
    */
-  async function listBoundPullRequests(issue: { id: string; companyId: string }) {
+  async function listBoundPullRequests(
+    issue: { id: string; companyId: string; description?: string | null },
+  ) {
+    const references = new Map<string, GitHubPullRequestReference>();
+    const addReferences = (values: readonly unknown[]) => {
+      for (const reference of extractGitHubPullRequestReferences(values)) {
+        const key = formatReference(reference).toLowerCase();
+        if (!references.has(key)) references.set(key, reference);
+      }
+    };
+    const addExtracted = (extracted: readonly GitHubPullRequestReference[]) => {
+      for (const reference of extracted) {
+        const key = formatReference(reference).toLowerCase();
+        if (!references.has(key)) references.set(key, reference);
+      }
+    };
+
     const products = await db
       .select({
         url: issueWorkProducts.url,
@@ -156,24 +198,40 @@ export function issueDoneGateService(db: Db, opts: IssueDoneGateServiceOptions =
       .orderBy(desc(issueWorkProducts.updatedAt))
       .limit(100);
 
-    const references = new Map<string, GitHubPullRequestReference>();
     for (const product of products) {
-      for (const reference of extractGitHubPullRequestReferences([
+      addReferences([
         product.url,
         product.externalId,
         product.title,
         product.summary,
         product.metadata ? JSON.stringify(product.metadata) : null,
-      ])) {
-        const key = formatReference(reference).toLowerCase();
-        if (!references.has(key)) references.set(key, reference);
-      }
+      ]);
+    }
+
+    // SPA-9038: prose bindings — description first, then recent live comments.
+    if (typeof issue.description === "string" && issue.description.length > 0) {
+      addExtracted(extractGitHubPullRequestReferences([issue.description])
+        .filter(isSparkMojoRepo));
+    }
+    const commentBodies = await db
+      .select({ body: issueComments.body })
+      .from(issueComments)
+      .where(and(
+        eq(issueComments.companyId, issue.companyId),
+        eq(issueComments.issueId, issue.id),
+        isNull(issueComments.deletedAt),
+      ))
+      .orderBy(desc(issueComments.createdAt))
+      .limit(COMMENT_SCAN_LIMIT);
+    for (const row of commentBodies) {
+      addExtracted(extractGitHubPullRequestReferences([row.body])
+        .filter(isSparkMojoRepo));
     }
     return [...references.values()];
   }
 
   async function evaluateDoneGate(
-    issue: { id: string; companyId: string },
+    issue: { id: string; companyId: string; description?: string | null },
   ): Promise<DoneGateDecision> {
     const references = await listBoundPullRequests(issue);
     if (references.length === 0) return { outcome: "allow" };
@@ -280,7 +338,7 @@ export async function listRecentPullRequestCommentMentions(
       eq(issueComments.issueId, issue.id),
     ))
     .orderBy(desc(issueComments.createdAt))
-    .limit(DIAGNOSTIC_COMMENT_SCAN_LIMIT);
+    .limit(COMMENT_SCAN_LIMIT);
   const mentions: string[] = [];
   for (const row of rows) {
     for (const reference of extractGitHubPullRequestReferences([row.body])) {

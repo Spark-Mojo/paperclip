@@ -10613,6 +10613,10 @@ export function issueService(db: Db) {
         const decision = await gate.evaluateDoneGate({
           id: existing.id,
           companyId: existing.companyId,
+          // SPA-9038: the card's own description can carry binding PR links.
+          description: typeof issueData.description === "string"
+            ? issueData.description
+            : existing.description,
         });
         if (decision.outcome === "refuse") {
           throw gate.refusalError(decision.reason);
