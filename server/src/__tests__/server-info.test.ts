@@ -1,28 +1,29 @@
-import { beforeEach, describe, expect, it } from "vitest";
+import { describe, expect, it } from "vitest";
 import {
   createServerInfoSnapshot,
   getServerInfoSnapshot,
+  refreshServerInfoForTests,
   resetServerInfoCacheForTests,
 } from "../server-info.js";
 
-function gitCommandFor(shortSha: string, subject: string): () => string {
-  return () =>
+function gitCommandFor(shortSha: string, subject: string): () => Promise<string> {
+  return async () =>
     [shortSha.padEnd(40, "0"), shortSha, subject, "2026-06-25T17:00:00-07:00"].join("\n");
 }
 
 describe("server info snapshot", () => {
-  it("captures process start time and git metadata", () => {
-    const snapshot = createServerInfoSnapshot({
+  it("captures process start time and git metadata", async () => {
+    const snapshot = await createServerInfoSnapshot({
       now: new Date("2026-06-26T00:00:00.000Z"),
-      gitCommand: () =>
+      gitCommand: async () =>
         [
           "0123456789abcdef0123456789abcdef01234567",
           "0123456",
           "Add server info debug view",
           "2026-06-25T17:00:00-07:00",
         ].join("\n"),
-      gitBranchCommand: () => "feature/server-info\n",
-      gitStatusCommand: () => "",
+      gitBranchCommand: async () => "feature/server-info\n",
+      gitStatusCommand: async () => "",
     });
 
     expect(snapshot).toEqual({
@@ -45,17 +46,17 @@ describe("server info snapshot", () => {
     });
   });
 
-  it("summarizes local checkout changes without exposing file paths", () => {
-    const snapshot = createServerInfoSnapshot({
+  it("summarizes local checkout changes without exposing file paths", async () => {
+    const snapshot = await createServerInfoSnapshot({
       now: new Date("2026-06-26T00:00:00.000Z"),
-      gitCommand: () =>
+      gitCommand: async () =>
         [
           "0123456789abcdef0123456789abcdef01234567",
           "0123456",
           "Add server info debug view",
           "2026-06-25T17:00:00-07:00",
         ].join("\n"),
-      gitStatusCommand: () =>
+      gitStatusCommand: async () =>
         [
           "M  packages/shared/src/types/server-info.ts",
           " M ui/src/components/SidebarServerInfo.tsx",
@@ -76,17 +77,17 @@ describe("server info snapshot", () => {
     });
   });
 
-  it("keeps commit metadata available when git status is unavailable", () => {
-    const snapshot = createServerInfoSnapshot({
+  it("keeps commit metadata available when git status is unavailable", async () => {
+    const snapshot = await createServerInfoSnapshot({
       now: new Date("2026-06-26T00:00:00.000Z"),
-      gitCommand: () =>
+      gitCommand: async () =>
         [
           "0123456789abcdef0123456789abcdef01234567",
           "0123456",
           "Add server info debug view",
           "2026-06-25T17:00:00-07:00",
         ].join("\n"),
-      gitStatusCommand: () => {
+      gitStatusCommand: async () => {
         throw new Error("status unavailable");
       },
     });
@@ -100,20 +101,20 @@ describe("server info snapshot", () => {
     });
   });
 
-  it("keeps commit metadata available when HEAD is detached", () => {
-    const snapshot = createServerInfoSnapshot({
+  it("keeps commit metadata available when HEAD is detached", async () => {
+    const snapshot = await createServerInfoSnapshot({
       now: new Date("2026-06-26T00:00:00.000Z"),
-      gitCommand: () =>
+      gitCommand: async () =>
         [
           "0123456789abcdef0123456789abcdef01234567",
           "0123456",
           "Add server info debug view",
           "2026-06-25T17:00:00-07:00",
         ].join("\n"),
-      gitBranchCommand: () => {
+      gitBranchCommand: async () => {
         throw new Error("detached HEAD");
       },
-      gitStatusCommand: () => "",
+      gitStatusCommand: async () => "",
     });
 
     expect(snapshot.git).toMatchObject({
@@ -123,10 +124,10 @@ describe("server info snapshot", () => {
     });
   });
 
-  it("uses sanitized fallback metadata when git is unavailable", () => {
-    const snapshot = createServerInfoSnapshot({
+  it("uses sanitized fallback metadata when git is unavailable", async () => {
+    const snapshot = await createServerInfoSnapshot({
       now: new Date("2026-06-26T00:00:00.000Z"),
-      gitCommand: () => {
+      gitCommand: async () => {
         throw new Error("fatal: not a git repository");
       },
       buildCommitCommand: () => null,
@@ -141,10 +142,10 @@ describe("server info snapshot", () => {
     });
   });
 
-  it("uses deployment commit metadata when the runtime has no git directory", () => {
-    const snapshot = createServerInfoSnapshot({
+  it("uses deployment commit metadata when the runtime has no git directory", async () => {
+    const snapshot = await createServerInfoSnapshot({
       now: new Date("2026-06-26T00:00:00.000Z"),
-      gitCommand: () => {
+      gitCommand: async () => {
         throw new Error("fatal: not a git repository");
       },
       buildCommitCommand: () => "0123456789abcdef0123456789abcdef01234567",
@@ -169,35 +170,56 @@ describe("server info snapshot", () => {
 });
 
 describe("getServerInfoSnapshot", () => {
-  beforeEach(() => {
+  it("serves a stable snapshot from the cache without running git on the sync path", () => {
     resetServerInfoCacheForTests();
-  });
 
-  it("re-reads the running commit after the cache TTL expires", () => {
-    const first = getServerInfoSnapshot({
-      now: 0,
-      gitCommand: gitCommandFor("aaaaaaa", "First boot"),
-    });
-    expect(first.git).toMatchObject({ shortSha: "aaaaaaa", subject: "First boot" });
+    const first = getServerInfoSnapshot();
+    // The seeded cache is either a valid build commit (available) or the
+    // explicit unavailable marker — never a partial snapshot.
+    if (first.git.available) {
+      expect(first.git.fullSha).toMatch(/^[0-9a-f]{40}$/);
+      expect(first.git.subject).toBe("Source build");
+    } else {
+      expect(first.git.unavailableReason).toBe("git_unavailable");
+    }
 
-    // Within the TTL window the cached commit is reused.
-    const cached = getServerInfoSnapshot({
-      now: 1000,
-      gitCommand: gitCommandFor("bbbbbbb", "After restart"),
-    });
-    expect(cached.git).toMatchObject({ shortSha: "aaaaaaa", subject: "First boot" });
-
-    // Past the TTL the new HEAD is picked up without a process restart.
-    const refreshed = getServerInfoSnapshot({
-      now: 3000,
-      gitCommand: gitCommandFor("bbbbbbb", "After restart"),
-    });
-    expect(refreshed.git).toMatchObject({ shortSha: "bbbbbbb", subject: "After restart" });
-  });
-
-  it("keeps processStartedAt stable across refreshes", () => {
-    const first = getServerInfoSnapshot({ now: 0, gitCommand: gitCommandFor("aaaaaaa", "a") });
-    const second = getServerInfoSnapshot({ now: 5000, gitCommand: gitCommandFor("bbbbbbb", "b") });
+    // The sync reader is stable between refreshes: it cannot observe a
+    // half-written cache, and reading it must not trigger any git spawn.
+    const second = getServerInfoSnapshot();
     expect(second.processStartedAt).toBe(first.processStartedAt);
+    expect(second.git).toEqual(first.git);
+  });
+
+  it("picks up a refreshed HEAD after an explicit background refresh", async () => {
+    resetServerInfoCacheForTests();
+
+    await refreshServerInfoForTests({
+      gitCommand: gitCommandFor("aaaaaaa", "Live HEAD"),
+      gitStatusCommand: async () => "",
+    });
+    expect(getServerInfoSnapshot().git).toMatchObject({
+      shortSha: "aaaaaaa",
+      subject: "Live HEAD",
+    });
+
+    // A later refresh replaces it again — the cache tracks the running HEAD.
+    await refreshServerInfoForTests({
+      gitCommand: gitCommandFor("bbbbbbb", "After restart"),
+      gitStatusCommand: async () => "",
+    });
+    expect(getServerInfoSnapshot().git).toMatchObject({
+      shortSha: "bbbbbbb",
+      subject: "After restart",
+    });
+  });
+
+  it("keeps processStartedAt stable across refreshes", async () => {
+    resetServerInfoCacheForTests();
+    const first = getServerInfoSnapshot();
+    await refreshServerInfoForTests({
+      gitCommand: gitCommandFor("ccccccc", "c"),
+      gitStatusCommand: async () => "",
+    });
+    expect(getServerInfoSnapshot().processStartedAt).toBe(first.processStartedAt);
   });
 });
