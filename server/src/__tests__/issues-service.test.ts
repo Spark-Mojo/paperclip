@@ -3683,6 +3683,76 @@ describeEmbeddedPostgres("issueService.create workspace inheritance", () => {
     });
   });
 
+  it.each(["archived", "cleanup_failed", "closed"] as const)(
+    "does NOT inherit a parent execution workspace whose status is %s (SPA-9140)",
+    async (nonActiveStatus) => {
+      const companyId = randomUUID();
+      const projectId = randomUUID();
+      const sourceIssueId = randomUUID();
+      const projectWorkspaceId = randomUUID();
+      const executionWorkspaceId = randomUUID();
+
+      await db.insert(companies).values({
+        id: companyId,
+        name: "Paperclip",
+        issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+        requireBoardApprovalForNewAgents: false,
+      });
+      await instanceSettingsService(db).updateExperimental({ enableIsolatedWorkspaces: true });
+
+      await db.insert(projects).values({
+        id: projectId,
+        companyId,
+        name: "Workspace project",
+        status: "in_progress",
+      });
+
+      await db.insert(projectWorkspaces).values({
+        id: projectWorkspaceId,
+        companyId,
+        projectId,
+        name: "Primary workspace",
+      });
+
+      await db.insert(executionWorkspaces).values({
+        id: executionWorkspaceId,
+        companyId,
+        projectId,
+        projectWorkspaceId,
+        mode: "operator_branch",
+        strategyType: "git_worktree",
+        name: `Reaped worktree (${nonActiveStatus})`,
+        status: nonActiveStatus,
+        providerType: "git_worktree",
+      });
+
+      await db.insert(issues).values({
+        id: sourceIssueId,
+        companyId,
+        projectId,
+        projectWorkspaceId,
+        title: "Source issue",
+        status: "todo",
+        priority: "medium",
+        executionWorkspaceId,
+        executionWorkspacePreference: "reuse_existing",
+        executionWorkspaceSettings: {
+          mode: "operator_branch",
+        },
+      });
+
+      const followUp = await svc.create(companyId, {
+        projectId,
+        title: "Follow-up issue",
+        inheritExecutionWorkspaceFromIssueId: sourceIssueId,
+      });
+
+      expect(followUp.parentId).toBeNull();
+      expect(followUp.executionWorkspaceId).toBeNull();
+      expect(followUp.executionWorkspacePreference).toBeNull();
+    },
+  );
+
   it("createChild applies parent defaults, acceptance criteria, workspace inheritance, and optional parent blocker chaining", async () => {
     const companyId = randomUUID();
     const projectId = randomUUID();
