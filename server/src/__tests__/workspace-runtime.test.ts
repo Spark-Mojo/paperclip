@@ -33,9 +33,11 @@ import {
   listConfiguredRuntimeServiceEntries,
   normalizeAdapterManagedRuntimeServices,
   reapOrphanedRunWorktrees,
+  reconcileEphemeralWorktreesOnStartup,
   reconcilePersistedRuntimeServicesOnStartup,
   realizeExecutionWorkspace,
   refreshRemoteTrackingBaseRef,
+  releaseEphemeralRunWorkspaceForHeartbeatFinally,
   releaseRunExecutionWorkspace,
   releaseRunExecutionWorkspaceForHeartbeat,
   releaseRuntimeServicesForRun,
@@ -3941,14 +3943,17 @@ describe("ephemeral worktree per run (SPA-9275)", () => {
       recorder,
     });
 
-    const result = await releaseRunExecutionWorkspaceForHeartbeat({
+    const result = await releaseEphemeralRunWorkspaceForHeartbeatFinally({
+      db: null as never,
       repoRoot,
       worktreePath: realized.worktreePath,
       branchName: realized.branchName,
       runId,
+      executionWorkspaceId: null,
       recorder,
     });
     expect(result.removed).toBe(true);
+    expect(result.archived).toBe(false);
     expect(existsSync(realized.worktreePath)).toBe(false);
   });
 
@@ -4093,6 +4098,234 @@ describeEmbeddedPostgres("ephemeral worktree per run sweep (SPA-9275)", () => {
       });
       expect(second.scanned).toBe(0);
       expect(second.archived).toBe(0);
+    } finally {
+      await tempDb.cleanup();
+    }
+  }, 30_000);
+
+  it("sweep covers legacy per-branch and cleanup_failed worktrees, not just ephemeral shape", async () => {
+    const tempDb = await startEmbeddedPostgresTestDatabase("paperclip-spa-9275-sweep-legacy-");
+    try {
+      const testDb = createDb(tempDb.connectionString);
+      const companyId = randomUUID();
+      const projectId = randomUUID();
+      const projectWorkspaceId = randomUUID();
+      const sourceIssueId = randomUUID();
+      await testDb.insert(companies).values({ id: companyId, name: "SPA-9275 Legacy" });
+      await testDb.insert(projects).values({
+        id: projectId,
+        companyId,
+        name: "SPA-9275 Legacy Project",
+      });
+      await testDb.insert(projectWorkspaces).values({
+        id: projectWorkspaceId,
+        companyId,
+        projectId,
+        name: "primary",
+        cwd: "/tmp/never-resolved",
+      });
+      await testDb.insert(issues).values({
+        id: sourceIssueId,
+        companyId,
+        projectId,
+        title: "Done legacy card",
+        status: "done",
+        kind: "task",
+      });
+      const repoRoot = await createTempRepo("master");
+      const branchName = `PAP-9283-legacy`;
+      // Legacy shape: <parent>/<branch>/, NOT <parent>/runs/<runId>/.
+      const legacyWorktreePath = path.join(repoRoot, ".paperclip", "worktrees", branchName);
+      await fs.mkdir(path.dirname(legacyWorktreePath), { recursive: true });
+      await runGit(repoRoot, ["worktree", "add", "-b", branchName, legacyWorktreePath, "HEAD"]);
+      const legacyWorkspaceId = randomUUID();
+      await testDb.insert(executionWorkspaces).values({
+        id: legacyWorkspaceId,
+        companyId,
+        projectId,
+        projectWorkspaceId,
+        sourceIssueId,
+        providerType: "git_worktree",
+        providerRef: legacyWorktreePath,
+        cwd: legacyWorktreePath,
+        branchName,
+        mode: "isolated_workspace",
+        strategyType: "git_worktree",
+        status: "cleanup_failed", // the 717 stuck teardowns
+        name: branchName,
+        metadata: {},
+      });
+      const liveRunIds = new Set<string>();
+      const { recorder } = createWorkspaceOperationRecorderDouble();
+      const result = await sweepTerminalIssueRunWorktrees({
+        db: testDb,
+        repoRoot,
+        worktreeParentDir: path.join(repoRoot, ".paperclip", "worktrees"),
+        liveRunIds,
+        recorder,
+      });
+      expect(result.scanned).toBe(1);
+      expect(result.archived).toBe(1);
+      expect(existsSync(legacyWorktreePath)).toBe(false);
+      const archivedRow = await testDb
+        .select()
+        .from(executionWorkspaces)
+        .where(eq(executionWorkspaces.id, legacyWorkspaceId))
+        .then((rows) => rows[0] ?? null);
+      expect(archivedRow?.status).toBe("archived");
+      expect(archivedRow?.cleanupReason).toBe("issue_terminal_sweep");
+    } finally {
+      await tempDb.cleanup();
+    }
+  }, 30_000);
+
+  it("heartbeat finally composite removes the worktree AND archives the execution workspace row", async () => {
+    const tempDb = await startEmbeddedPostgresTestDatabase("paperclip-spa-9275-hb-composite-");
+    try {
+      const testDb = createDb(tempDb.connectionString);
+      const companyId = randomUUID();
+      const projectId = randomUUID();
+      const projectWorkspaceId = randomUUID();
+      const sourceIssueId = randomUUID();
+      await testDb.insert(companies).values({ id: companyId, name: "SPA-9275 HB" });
+      await testDb.insert(projects).values({
+        id: projectId,
+        companyId,
+        name: "SPA-9275 HB Project",
+      });
+      await testDb.insert(projectWorkspaces).values({
+        id: projectWorkspaceId,
+        companyId,
+        projectId,
+        name: "primary",
+        cwd: "/tmp/never-resolved",
+      });
+      await testDb.insert(issues).values({
+        id: sourceIssueId,
+        companyId,
+        projectId,
+        title: "In-progress card",
+        status: "in_progress",
+        kind: "task",
+      });
+      const repoRoot = await createTempRepo("master");
+      const runId = `run-${randomUUID()}`;
+      const worktreePath = path.join(repoRoot, ".paperclip", "worktrees", "runs", runId);
+      const branchName = `PAP-9284-hb-finally`;
+      await fs.mkdir(path.dirname(worktreePath), { recursive: true });
+      await runGit(repoRoot, ["worktree", "add", "-b", branchName, worktreePath, "HEAD"]);
+      const wsId = randomUUID();
+      await testDb.insert(executionWorkspaces).values({
+        id: wsId,
+        companyId,
+        projectId,
+        projectWorkspaceId,
+        sourceIssueId,
+        providerType: "git_worktree",
+        providerRef: worktreePath,
+        cwd: worktreePath,
+        branchName,
+        mode: "isolated_workspace",
+        strategyType: "git_worktree",
+        status: "active",
+        name: branchName,
+        metadata: { ephemeralLifecycle: true },
+      });
+      const { recorder } = createWorkspaceOperationRecorderDouble();
+      const result = await releaseEphemeralRunWorkspaceForHeartbeatFinally({
+        db: testDb,
+        repoRoot,
+        worktreePath,
+        branchName,
+        runId,
+        executionWorkspaceId: wsId,
+        recorder,
+      });
+      expect(result.removed).toBe(true);
+      expect(result.archived).toBe(true);
+      expect(existsSync(worktreePath)).toBe(false);
+      const row = await testDb
+        .select()
+        .from(executionWorkspaces)
+        .where(eq(executionWorkspaces.id, wsId))
+        .then((rows) => rows[0] ?? null);
+      expect(row?.status).toBe("archived");
+      expect(row?.cleanupReason).toBe("ephemeral_run_release");
+    } finally {
+      await tempDb.cleanup();
+    }
+  }, 30_000);
+
+  it("reconcileEphemeralWorktreesOnStartup reaps orphans and sweeps done issues in one call", async () => {
+    const tempDb = await startEmbeddedPostgresTestDatabase("paperclip-spa-9275-recon-");
+    try {
+      const testDb = createDb(tempDb.connectionString);
+      const companyId = randomUUID();
+      const projectId = randomUUID();
+      const projectWorkspaceId = randomUUID();
+      const sourceIssueId = randomUUID();
+      await testDb.insert(companies).values({ id: companyId, name: "SPA-9275 Recon" });
+      await testDb.insert(projects).values({
+        id: projectId,
+        companyId,
+        name: "SPA-9275 Recon Project",
+      });
+      const repoRoot = await createTempRepo("master");
+      await testDb.insert(projectWorkspaces).values({
+        id: projectWorkspaceId,
+        companyId,
+        projectId,
+        name: "primary",
+        cwd: repoRoot,
+      });
+      await testDb.insert(issues).values({
+        id: sourceIssueId,
+        companyId,
+        projectId,
+        title: "Done card",
+        status: "done",
+        kind: "task",
+      });
+      // (a) Orphan run worktree (no DB row, no live run).
+      const orphanRunId = `run-${randomUUID()}`;
+      const orphanPath = path.join(repoRoot, ".paperclip", "worktrees", "runs", orphanRunId);
+      await fs.mkdir(path.dirname(orphanPath), { recursive: true });
+      await runGit(repoRoot, ["worktree", "add", "-b", "PAP-9285-orphan", orphanPath, "HEAD"]);
+      // (b) Done issue with stuck worktree.
+      const stuckBranch = "PAP-9286-stuck";
+      const stuckPath = path.join(repoRoot, ".paperclip", "worktrees", stuckBranch);
+      await fs.mkdir(path.dirname(stuckPath), { recursive: true });
+      await runGit(repoRoot, ["worktree", "add", "-b", stuckBranch, stuckPath, "HEAD"]);
+      const stuckWorkspaceId = randomUUID();
+      await testDb.insert(executionWorkspaces).values({
+        id: stuckWorkspaceId,
+        companyId,
+        projectId,
+        projectWorkspaceId,
+        sourceIssueId,
+        providerType: "git_worktree",
+        providerRef: stuckPath,
+        cwd: stuckPath,
+        branchName: stuckBranch,
+        mode: "isolated_workspace",
+        strategyType: "git_worktree",
+        status: "cleanup_failed",
+        name: stuckBranch,
+        metadata: {},
+      });
+      const { recorder } = createWorkspaceOperationRecorderDouble();
+      const summary = await reconcileEphemeralWorktreesOnStartup({
+        db: testDb,
+        liveRunIds: new Set<string>(),
+        recorder,
+      });
+      expect(summary.reposScanned).toBeGreaterThanOrEqual(1);
+      expect(summary.reaper.scanned).toBe(1);
+      expect(summary.reaper.removed).toBe(1);
+      expect(summary.sweep.scanned).toBe(1);
+      expect(summary.sweep.archived).toBe(1);
+      expect(existsSync(orphanPath)).toBe(false);
+      expect(existsSync(stuckPath)).toBe(false);
     } finally {
       await tempDb.cleanup();
     }
