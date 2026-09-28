@@ -2785,7 +2785,7 @@ registry.registerPath({
   method: "post",
   path: "/api/companies/{companyId}/summary-slots/{scopeKind}/{slotKey}/generate",
   tags: ["summaries"],
-  summary: "Manually generate (or refresh) a summary slot",
+  summary: "Manually generate (or refresh) a summary slot (board operators or the Summarizer built-in agent)",
   request: {
     params: summarySlotParams,
     body: jsonBody(generateSummarySlotSchema),

@@ -139,6 +139,22 @@ export function summarySlotService(db: Db) {
   const agents = agentService(db);
   const issuesSvc = issueService(db);
 
+  /**
+   * Single authoritative predicate for "this agent is the company's built-in
+   * Summarizer agent". Shared by the write guard (`assertSummarizerWriter`)
+   * and exposed so the generate route can admit the Summarizer without
+   * re-typing (and drifting from) the marker check.
+   */
+  async function isSummarizerBuiltInAgent(
+    companyId: string,
+    agentId: string | null | undefined,
+  ): Promise<boolean> {
+    if (!agentId) return false;
+    const agent = await agents.getById(agentId);
+    if (!agent || agent.companyId !== companyId) return false;
+    return readBuiltInAgentMarker(agent.metadata)?.key === SUMMARIZER_BUILT_IN_KEY;
+  }
+
   function resolveSelector(input: SummarySlotSelectorInput): ResolvedSelector {
     const parsed = summarySlotScopeSelectorSchema.safeParse({
       scopeKind: input.scopeKind,
@@ -559,12 +575,7 @@ export function summarySlotService(db: Db) {
     if (!actor.agentId) {
       throw forbidden("Only the Summarizer built-in agent may write summaries");
     }
-    const agent = await agents.getById(actor.agentId);
-    if (!agent || agent.companyId !== sel.companyId) {
-      throw forbidden("Only the Summarizer built-in agent may write summaries");
-    }
-    const marker = readBuiltInAgentMarker(agent.metadata);
-    if (marker?.key !== SUMMARIZER_BUILT_IN_KEY) {
+    if (!(await isSummarizerBuiltInAgent(sel.companyId, actor.agentId))) {
       throw forbidden("Only the Summarizer built-in agent may write summaries");
     }
 
@@ -759,5 +770,6 @@ export function summarySlotService(db: Db) {
     listRevisions,
     generate,
     write,
+    isSummarizerBuiltInAgent,
   };
 }
