@@ -26208,6 +26208,38 @@ export function heartbeatService(
 
     let agent = await getAgent(agentId);
     if (!agent) throw notFound("Agent not found");
+
+    // Automation-source wakes initiated by an agent or user (i.e. an
+    // external caller) must carry an issue binding. An external automation
+    // wake with no issueId (e.g. an agent calling /api/agents/{id}/wakeup
+    // with source=automation and no issueId in payload or context) has no
+    // dispatch target — without this guard the run is queued, the dispatcher
+    // claims it, and it sits pinned in 'dispatching' forever because there is
+    // nothing to dispatch against.
+    //
+    // System-originated automation wakes (requestedByActorType="system")
+    // bypass this guard — internal callers legitimately run no-issue wakes
+    // (e.g. productivity_review, board-review probes).
+    if (
+      source === "automation" &&
+      !issueId &&
+      opts.requestedByActorType !== "system"
+    ) {
+      await db.insert(agentWakeupRequests).values({
+        companyId: agent.companyId,
+        agentId,
+        source,
+        triggerDetail,
+        reason: "automation_wake_no_issue_binding",
+        payload,
+        status: "skipped",
+        requestedByActorType: opts.requestedByActorType ?? null,
+        requestedByActorId: opts.requestedByActorId ?? null,
+        idempotencyKey: opts.idempotencyKey ?? null,
+        finishedAt: new Date(),
+      });
+      return null;
+    }
     if (issueId) {
       const conversation = await getIssueExecutionContext(agent.companyId, issueId);
       if (isConversation(conversation)) {
