@@ -177,7 +177,9 @@ describe("LiveUpdatesProvider socket run notification scope", () => {
     await vi.waitFor(() => expect(sockets).toHaveLength(1));
     expect(sockets[0]?.onmessage).toBeTypeOf("function");
     await reactAct(async () => sockets[0]!.onmessage!(new MessageEvent("message", {
-      data: JSON.stringify({ id: 1, companyId: "company-1", type: "heartbeat.run.status", createdAt: "2026-09-09T18:00:00.000Z", payload }),
+      // SPA-9258: terminal events older than the staleness cutoff never toast,
+      // so the helper must emit a fresh event timestamp (not a fixed past one).
+      data: JSON.stringify({ id: 1, companyId: "company-1", type: "heartbeat.run.status", createdAt: new Date().toISOString(), payload }),
     })));
   }
 
@@ -287,15 +289,17 @@ describe("LiveUpdatesProvider socket run notification scope", () => {
       });
       expect(pushToast).not.toHaveBeenCalled();
 
+      // SPA-9258: cancelled runs never toast, so the unrelated-run case uses
+      // `failed` — the scope question (exact-run suppression) is unchanged.
       await receiveStatus({
         runId: "unrelated-run",
         agentId: "parent-agent",
-        status: "cancelled",
+        status: "failed",
         deliveryId: "retryable-unrelated-status",
       });
       expect(pushToast).toHaveBeenCalledExactlyOnceWith(
         expect.objectContaining({
-          dedupeKey: "run-status:unrelated-run:cancelled",
+          dedupeKey: "run-status:unrelated-run:failed",
         }),
       );
     },
@@ -309,10 +313,12 @@ describe("LiveUpdatesProvider socket run notification scope", () => {
       ]);
       if (scope === "background")
         vi.mocked(document.hasFocus).mockReturnValue(false);
+      // SPA-9258: cancelled runs never toast; `failed` keeps the scope test
+      // meaningful (the visible task's canonical history must not suppress it).
       await receiveStatus({
         runId: "parent-run",
         agentId: "parent-agent",
-        status: "cancelled",
+        status: "failed",
         deliveryId: "retryable-parent-status",
         ...(scope === "explicit unrelated issue"
           ? { issueId: "unrelated" }
@@ -320,7 +326,7 @@ describe("LiveUpdatesProvider socket run notification scope", () => {
       });
       expect(pushToast).toHaveBeenCalledExactlyOnceWith(
         expect.objectContaining({
-          dedupeKey: "run-status:parent-run:cancelled",
+          dedupeKey: "run-status:parent-run:failed",
         }),
       );
     },
@@ -469,7 +475,10 @@ describe("LiveUpdatesProvider socket run notification scope", () => {
     expect(pushToast).not.toHaveBeenCalled();
   });
 
-  it.each(["child", "unrelated"])(
+  it.each([
+    "child",
+    "unrelated",
+  ])(
     "routes a never-visited child's retryable status by its explicit %s task",
     async (issueId) => {
       queryClient.setQueryData(queryKeys.liveRuns("company-1"), []);
@@ -496,11 +505,13 @@ describe("LiveUpdatesProvider socket run notification scope", () => {
           queryClient.getQueryData(queryKeys.issues.liveRuns(ref)),
         ).toBeUndefined();
       }
+      // SPA-9258: cancelled runs never toast; `failed` keeps the routing test
+      // meaningful (only the explicit unrelated task may toast).
       await receiveStatus({
         issueId,
         runId: "child-run",
         agentId: "child-agent",
-        status: "cancelled",
+        status: "failed",
         startedAt: "2026-09-09T17:59:00.000Z",
         finishedAt: "2026-09-09T18:00:00.000Z",
         deliveryId: "retryable-uncached-child-status",
@@ -509,7 +520,7 @@ describe("LiveUpdatesProvider socket run notification scope", () => {
       else
         expect(pushToast).toHaveBeenCalledExactlyOnceWith(
           expect.objectContaining({
-            dedupeKey: "run-status:child-run:cancelled",
+            dedupeKey: "run-status:child-run:failed",
           }),
         );
     },

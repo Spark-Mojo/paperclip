@@ -1329,6 +1329,122 @@ describe("LiveUpdatesProvider run lifecycle toasts", () => {
   });
 });
 
+describe("benign cancellation toasts (SPA-9258)", () => {
+  it.each([
+    "issue_reassigned",
+    "issue_assignee_changed",
+    "issue_terminal_status",
+    "issue_continuation_waiting_on_review",
+    "issue_cancelled",
+    "server_shutdown_interrupted",
+    "issue_dependencies_blocked",
+    "workspace_busy",
+    "operator_interrupted",
+    "cancelled",
+    undefined,
+  ])("never toasts a cancelled run (errorCode %s)", (errorCode) => {
+    const payload: Record<string, unknown> = {
+      runId: "run-cancelled",
+      agentId: "agent-1",
+      status: "cancelled",
+      error: "Cancelled because issue dependencies are still blocked",
+    };
+    if (errorCode !== undefined) payload.errorCode = errorCode;
+    expect(
+      __liveUpdatesTestUtils.buildRunStatusToast(payload, () => "Steve"),
+    ).toBeNull();
+  });
+
+  it("still toasts real failures with error tone", () => {
+    expect(
+      __liveUpdatesTestUtils.buildRunStatusToast(
+        {
+          runId: "run-failed",
+          agentId: "agent-1",
+          status: "failed",
+          error: "boom",
+          errorCode: "adapter_failed",
+        },
+        () => "Steve",
+      ),
+    ).toMatchObject({ title: "Steve run failed", tone: "error" });
+
+    expect(
+      __liveUpdatesTestUtils.buildRunStatusToast(
+        {
+          runId: "run-timed-out",
+          agentId: "agent-1",
+          status: "timed_out",
+        },
+        () => "Steve",
+      ),
+    ).toMatchObject({ title: "Steve run timed out", tone: "error" });
+  });
+
+  it("coalesces a burst of failure toasts for one agent into one toast", () => {
+    const gate = {
+      cooldownHits: new Map(),
+      suppressUntil: 0,
+      runErrorBursts: new Map(),
+    };
+    expect(
+      __liveUpdatesTestUtils.shouldSuppressRunErrorBurst(gate as never, "agent-1"),
+    ).toBe(false);
+    expect(
+      __liveUpdatesTestUtils.shouldSuppressRunErrorBurst(gate as never, "agent-1"),
+    ).toBe(true);
+    expect(
+      __liveUpdatesTestUtils.shouldSuppressRunErrorBurst(gate as never, "agent-1"),
+    ).toBe(true);
+  });
+
+  it("does not coalesce failures across agents", () => {
+    const gate = {
+      cooldownHits: new Map(),
+      suppressUntil: 0,
+      runErrorBursts: new Map(),
+    };
+    expect(
+      __liveUpdatesTestUtils.shouldSuppressRunErrorBurst(gate as never, "agent-1"),
+    ).toBe(false);
+    expect(
+      __liveUpdatesTestUtils.shouldSuppressRunErrorBurst(gate as never, "agent-2"),
+    ).toBe(false);
+  });
+
+  it("suppresses run-status toast for a stale (old) event", () => {
+    expect(
+      __liveUpdatesTestUtils.buildRunStatusToast(
+        {
+          runId: "run-old",
+          agentId: "agent-1",
+          status: "failed",
+          error: "LiteLLM provider error",
+          errorCode: "provider_error",
+        },
+        () => "Steve",
+        "2026-09-20T12:00:00.000Z",
+      ),
+    ).toBeNull();
+  });
+
+  it("keeps toast for a fresh failure", () => {
+    expect(
+      __liveUpdatesTestUtils.buildRunStatusToast(
+        {
+          runId: "run-fresh",
+          agentId: "agent-1",
+          status: "failed",
+          error: "boom",
+          errorCode: "adapter_failed",
+        },
+        () => "Steve",
+        new Date().toISOString(),
+      ),
+    ).toMatchObject({ title: "Steve run failed", tone: "error" });
+  });
+});
+
 describe("applyRunLifecycleToCompanyLiveRuns", () => {
   function makeClient(initial: Array<{ id: string; status: string }>) {
     const initialDetail = initial.find((run) => run.id === "run-1");
