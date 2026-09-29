@@ -16,9 +16,12 @@
 --
 -- 1. heartbeat_runs_audit_terminal_run_writer_trg — BEFORE UPDATE. A
 --    diagnostic side trigger that captures every UPDATE on heartbeat_runs
---    for the observed ids (plus a 1h retention self-clean) so the writer's
---    call site can be identified from production traffic without re-running
---    pg_stat_activity captures. AFTER the writer is identified and patched
+--    whose row is (or becomes) terminal (status in the terminal set),
+--    plus a 1h retention self-clean. Any writer that touches a terminal row
+--    is captured — id-agnostic, so the periodic writer identied by the
+--    board (Steve 50d635ad, Argus d02721f6, Steve 7ae9b507, Sadie
+--    a2af3915, Sadie b36824a3) is recorded regardless of which of the five
+--    it reaches on a given pass. AFTER the writer is identified and patched
 --    at its source, this trigger should be removed in a follow-up
 --    migration.
 --
@@ -134,22 +137,19 @@ BEGIN
 END;
 $$;
 
--- The five observed ids from the 02:20Z board capture. They cover all
--- three failure shapes seen in the flood (provider failure / cancelled /
--- process lost). The filter is on OLD.id so the trigger only fires when
--- one of these rows is the target of an UPDATE. The audit trigger is
--- named before "block_" alphabetically so it fires BEFORE the no-op
--- block trigger; the no-op block trigger then short-circuits the
--- rewrite, but the audit row is already captured.
+-- The audit trigger fires on any UPDATE whose row is (or becomes) terminal
+-- — id-agnostic, so every observed run (50d635ad, d02721f6, 7ae9b507,
+-- a2af3915, b36824a3) and any future terminal-row writer is captured. It
+-- is named before "block_" alphabetically so it fires BEFORE the no-op
+-- block trigger; the audit row is captured first, the block trigger then
+-- short-circuits the rewrite.
 DROP TRIGGER IF EXISTS heartbeat_runs_audit_terminal_run_writer_trg ON heartbeat_runs;
 CREATE TRIGGER heartbeat_runs_audit_terminal_run_writer_trg
   BEFORE UPDATE ON heartbeat_runs
   FOR EACH ROW
   WHEN (
-    OLD.id IN (
-      '50d635ad-3dfa-4ebf-8bb0-d34869c43f8a'::uuid,
-      'd02721f6-94b4-4b28-bb2c-fd9ad5c596e1'::uuid
-    )
+    OLD.status IN ('succeeded', 'failed', 'cancelled', 'timed_out', 'interrupted')
+    OR NEW.status IN ('succeeded', 'failed', 'cancelled', 'timed_out', 'interrupted')
   )
   EXECUTE FUNCTION heartbeat_runs_terminal_run_writer_audit_fn();
 
@@ -159,14 +159,8 @@ CREATE TRIGGER heartbeat_runs_block_terminal_no_op_context_rewrite_trg
   FOR EACH ROW
   EXECUTE FUNCTION heartbeat_runs_block_terminal_no_op_context_rewrite_fn();
 
--- The remaining three ids (7ae9b507, a2af3915, b36824a3) are tracked at
--- run-id prefix in the board comment. The trigger body above covers only
--- the two full UUIDs; the deployment checklist on the SPA-9282 PR will
--- resolve the remaining three prefixes against
---   SELECT id, status, liveness_state, error_code, updated_at
---   FROM heartbeat_runs
---   WHERE id::text LIKE 'a2af3915%' OR id::text LIKE '7ae9b507%' OR id::text LIKE 'b36824a3%'
--- and apply the trigger widening as a follow-up commit on the same PR
--- before the engine ships. The block_terminal_no_op_context_rewrite_trg
--- is unconditional and already covers the toast-flood writer's shape on
--- all terminal rows.
+-- The audit trigger is terminal-status-gated (OLD or NEW status in the
+-- terminal set) rather than id-listed, so all five observed runs — and any
+-- terminal row any writer touches — are captured. The block trigger is
+-- unconditional over all terminal rows and already covers the toast-flood
+-- writer's pure-touch shape engine-wide.
