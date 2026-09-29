@@ -16,26 +16,25 @@
 --
 -- 1. heartbeat_runs_audit_terminal_run_writer_trg — BEFORE UPDATE. A
 --    diagnostic side trigger that captures every UPDATE on heartbeat_runs
---    for the five observed ids (plus a 1h retention self-clean) so the
---    writer's call site can be identified from production traffic without
---    re-running pg_stat_activity captures. AFTER the writer is identified
---    and patched at its source, this trigger should be removed in a
---    follow-up migration.
+--    for the observed ids (plus a 1h retention self-clean) so the writer's
+--    call site can be identified from production traffic without re-running
+--    pg_stat_activity captures. AFTER the writer is identified and patched
+--    at its source, this trigger should be removed in a follow-up
+--    migration.
 --
 -- 2. heartbeat_runs_block_terminal_no_op_context_rewrite_trg — BEFORE
---    UPDATE. Suppresses the UPDATE entirely when:
---      • the row's status is terminal
---        (succeeded / failed / cancelled / timed_out / interrupted), AND
---      • context_snapshot is byte-equal to its pre-write value (text cast), AND
---      • no other substantive column changed
---        (error_code / error / finished_at / execution_status_delivery_id /
---         result_json / liveness_state all equal pre-write).
---    Status-transition writers (running -> failed) and writers that
---    genuinely modify context_snapshot or other substantive columns are
---    unaffected. The pattern matches the captured writer: only
---    context_snapshot (idempotently) and updated_at touched on a terminal
---    row. RETURN NULL on a BEFORE UPDATE trigger discards the row write
---    (Postgres 11+).
+--    UPDATE. Suppresses the UPDATE entirely when the target row is terminal
+--    AND the write is a PURE TOUCH: every column except updated_at /
+--    created_at is byte-identical pre/post write (expressed as a
+--    to_jsonb(record) equality with the volatile timestamps removed).
+--    Status-transition writers, process_pid / process_group_id /
+--    process_started_at clears, error_code / error / finished_at /
+--    execution_status_delivery_id / result_json / liveness_state changes,
+--    exit_code / signal / log / excerpt writes — ANY substantive change —
+--    differ in to_jsonb and land normally. Only a write that leaves the
+--    row's state byte-for-byte identical (the captured touch-flood writer)
+--    is discarded. RETURN NULL on a BEFORE UPDATE trigger discards the row
+--    write (Postgres 11+).
 --
 -- The audit trigger is named before "block_" alphabetically so it fires
 -- BEFORE the no-op block trigger (Postgres fires same-event triggers in
@@ -45,10 +44,10 @@
 -- paperclip:migration-safety-ignore trigger-on-large-table: the
 -- block_terminal_no_op_context_rewrite_trg BEFORE UPDATE trigger runs
 -- synchronously inside every UPDATE on heartbeat_runs. Its body is a
--- short-circuit on six column comparisons and one text cast — bounded,
--- no row insert — and fires no-ops for non-terminal / substantive
--- updates. The audit trigger fires only on the five observed ids (BEFORE
--- UPDATE row filter via WHEN), so its cost is also bounded.
+-- bounded to_jsonb construction and comparison — no row insert — and
+-- fires no-ops for non-terminal / substantive updates. The audit trigger
+-- fires only on the observed ids (BEFORE UPDATE row filter via WHEN), so
+-- its cost is also bounded.
 
 CREATE OR REPLACE FUNCTION heartbeat_runs_block_terminal_no_op_context_rewrite_fn()
 RETURNS TRIGGER
@@ -59,18 +58,21 @@ DECLARE
 BEGIN
   v_terminal_status := NEW.status IN ('succeeded', 'failed', 'cancelled', 'timed_out', 'interrupted');
 
+  -- A PURE TOUCH: every column except updated_at / created_at is
+  -- byte-identical pre/post. to_jsonb() canonicalises the whole record; we
+  -- delete the two volatile timestamp keys before comparing. Any
+  -- substantive write (process_pid clear, error_code set, exit_code,
+  -- status change, log/excerpt write, execution_status_delivery_id) makes
+  -- the comparison unequal and lands normally.
   IF v_terminal_status
-     AND NEW.status IS NOT DISTINCT FROM OLD.status
-     AND OLD.context_snapshot::text IS NOT DISTINCT FROM NEW.context_snapshot::text
-     AND NEW.error_code IS NOT DISTINCT FROM OLD.error_code
-     AND NEW.error IS NOT DISTINCT FROM OLD.error
-     AND NEW.finished_at IS NOT DISTINCT FROM OLD.finished_at
-     AND NEW.execution_status_delivery_id IS NOT DISTINCT FROM OLD.execution_status_delivery_id
-     AND NEW.result_json::text IS NOT DISTINCT FROM OLD.result_json::text
-     AND NEW.liveness_state IS NOT DISTINCT FROM OLD.liveness_state
+     AND (
+       to_jsonb(OLD) #- '{updated_at}' #- '{created_at}'
+     ) IS NOT DISTINCT FROM (
+       to_jsonb(NEW) #- '{updated_at}' #- '{created_at}'
+     )
   THEN
-    -- The captured writer re-emits the same context_snapshot on a terminal
-    -- row with only updated_at bumped. Discard the write so the UI does
+    -- The captured writer re-emits byte-identical row state on a terminal
+    -- run with only updated_at bumped. Discard the write so the UI does
     -- not toast the row as a fresh failure.
     RETURN NULL;
   END IF;
