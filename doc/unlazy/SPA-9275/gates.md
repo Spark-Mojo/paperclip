@@ -70,7 +70,7 @@
 
 # SPA-9285 re-merge verification (results against merged head)
 
-Merged head verified: **`43201aab6d`** (= `09941266b2` + the gates-ledger doc commit). Test results below were produced against `09941266b2`; the only difference to `43201aab6d` is the `doc/unlazy/SPA-9275/gates.md` doc commit itself, so all results carry to the verified head. Base synced: `09941266b2` merges base `172c6ce891` (PRs #109/#111) onto the SPA-9275 branch.
+Merged head verified: **`3a0d96cd10`** (= `09941266b2` + two `doc/unlazy/SPA-9275/gates.md` doc commits: `43201aab6d` and `3a0d96cd10`). Test results below were produced against `09941266b2`; the only differences to the verified head are the gates-ledger doc commits themselves, so all results carry. Base synced: `09941266b2` merges base `172c6ce891` (PRs #109/#111) onto the SPA-9275 branch.
 
 Known-redundant ahead-commits on the branch: `2fb9c6f880` (SPA-9140) and `8ed6a7122a` (SPA-9282) mirror later base PRs #87/#111. Cosmetic history; the merged tree is identical to the base's canonical copies. Not a merge risk — confirmed `MERGEABLE` at `43201aab6d`. Reviewers should not flag these as drift.
 
