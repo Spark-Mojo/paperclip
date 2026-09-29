@@ -81,6 +81,7 @@ export async function buildExecutionContinuation(input: {
   runId?: string;
   summary: string | null;
   exposeLowTrustRaw: boolean;
+  requireCompleteSourceContext?: boolean;
 }): Promise<ExecutionContinuationEnvelope> {
   const { db, companyId, issueId } = input;
   const [issue] = await db
@@ -144,6 +145,8 @@ export async function buildExecutionContinuation(input: {
           )
       )[0]
     : null;
+  if (input.requireCompleteSourceContext && !sourceRun)
+    throw new Error("continuation_source_context_missing");
   if (explicitUserSource && !sourceRun)
     throw new Error("continuation_user_authorization_missing");
   if (sourceRunId && !sourceRun)
@@ -160,6 +163,8 @@ export async function buildExecutionContinuation(input: {
     ]),
   ];
   const originCommentIds = originCandidates.filter((id) => rows.some((row) => row.id === id));
+  if (input.requireCompleteSourceContext && originCommentIds.length !== originCandidates.length)
+    throw new Error("continuation_source_context_missing");
   if (originCommentIds.length !== originCandidates.length)
     logger.warn({ companyId, issueId, missingOriginCount: originCandidates.length - originCommentIds.length }, "continuation origin comments unavailable; using issue history");
   const messages = rows.map((row) => {
