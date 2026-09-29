@@ -37,8 +37,9 @@ const outFile = join(distDir, "build-info.json");
  */
 export function resolveBuildCommit(gitCommit, suppliedCommit) {
   const git = typeof gitCommit === "string" ? gitCommit.trim() : "";
-  if (git) return git;
   const supplied = typeof suppliedCommit === "string" ? suppliedCommit.trim() : "";
+  if (/^[0-9a-f]{40}$/i.test(supplied)) return supplied.toLowerCase();
+  if (git) return git;
   if (supplied) return supplied;
   return null;
 }
