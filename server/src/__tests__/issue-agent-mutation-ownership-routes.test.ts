@@ -492,7 +492,18 @@ describe("agent issue mutation checkout ownership", () => {
     mockBudgetService.getInvocationBlock.mockReset();
     mockBudgetService.getInvocationBlock.mockResolvedValue(null);
     mockProjectService.getById.mockReset();
-    mockProjectService.getById.mockResolvedValue(null);
+    mockProjectService.getById.mockImplementation(async (id: string) =>
+      id
+        ? {
+            id,
+            companyId,
+            name: "test-project",
+            archivedAt: null,
+            goals: [],
+            workspaces: [],
+          }
+        : null,
+    );
     mockIssueService.addComment.mockReset();
     mockIssueService.assertCheckoutOwner.mockReset();
     mockIssueService.create.mockReset();
@@ -1392,6 +1403,45 @@ describe("agent issue mutation checkout ownership", () => {
         inheritExecutionWorkspaceFromIssueId: issueId,
       }),
     );
+  });
+
+  // SPA-9453: a project row exists but belongs to a different company.
+  it("rejects a projectId that belongs to a different company (SPA-9453)", async () => {
+    mockProjectService.getById.mockResolvedValue({
+      id: "948042e0-0000-4000-8000-000000000000",
+      companyId: "99999999-9999-4999-8999-999999999999",
+      name: "other-tenant-project",
+      archivedAt: null,
+      goals: [],
+      workspaces: [],
+    });
+
+    const res = await request(await createApp(ownerActor()))
+      .post(`/api/companies/${companyId}/issues`)
+      .send({
+        title: "Card with a cross-tenant projectId",
+        projectId: "948042e0-0000-4000-8000-000000000000",
+      });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(422);
+    expect(res.body.error).toContain("projectId");
+    expect(mockIssueService.create).not.toHaveBeenCalled();
+  });
+
+  // SPA-9453: an agent UUID in `projectId` must 422, not silently blow the FK.
+  it("rejects a projectId that does not belong to this company (SPA-9453)", async () => {
+    mockProjectService.getById.mockImplementation(async () => null);
+
+    const res = await request(await createApp(ownerActor()))
+      .post(`/api/companies/${companyId}/issues`)
+      .send({
+        title: "Card with an agent UUID in projectId",
+        projectId: "948042e0-0000-4000-8000-000000000000",
+      });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(422);
+    expect(res.body.error).toContain("projectId");
+    expect(mockIssueService.create).not.toHaveBeenCalled();
   });
 
   it("authorizes child creation through the shared visible-issue write path", async () => {
