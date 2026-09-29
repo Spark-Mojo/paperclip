@@ -55,6 +55,7 @@ function createApp(
       authReady: true,
       companyDeletionEnabled: true,
       serverInfo,
+      installedCommitPath: "/nonexistent-paperclip-install-for-health-tests.json",
       databaseBackupHealth,
       runtimeEnv,
     }),
@@ -327,6 +328,7 @@ describe("GET /health", () => {
         authReady: true,
         companyDeletionEnabled: false,
         serverInfo: testServerInfo,
+        installedCommitPath: "/nonexistent-paperclip-install-for-health-tests.json",
         databaseBackupHealth: {
           enabled: true,
           backupDir,
@@ -391,6 +393,7 @@ describe("GET /health", () => {
         authReady: true,
         companyDeletionEnabled: false,
         serverInfo: testServerInfo,
+        installedCommitPath: "/nonexistent-paperclip-install-for-health-tests.json",
       }),
     );
 
@@ -430,6 +433,7 @@ describe("GET /health", () => {
         authReady: true,
         companyDeletionEnabled: false,
         serverInfo: testServerInfo,
+        installedCommitPath: "/nonexistent-paperclip-install-for-health-tests.json",
       }),
     );
 
@@ -473,6 +477,7 @@ describe("GET /health", () => {
         authReady: true,
         companyDeletionEnabled: false,
         serverInfo: testServerInfo,
+        installedCommitPath: "/nonexistent-paperclip-install-for-health-tests.json",
       }),
     );
 
@@ -518,6 +523,7 @@ describe("GET /health", () => {
         authReady: true,
         companyDeletionEnabled: false,
         serverInfo: testServerInfo,
+        installedCommitPath: "/nonexistent-paperclip-install-for-health-tests.json",
       }),
     );
 
@@ -555,6 +561,7 @@ describe("GET /health", () => {
         authReady: true,
         companyDeletionEnabled: false,
         serverInfo: testServerInfo,
+        installedCommitPath: "/nonexistent-paperclip-install-for-health-tests.json",
       }),
     );
 

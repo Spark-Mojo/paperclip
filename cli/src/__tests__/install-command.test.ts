@@ -183,6 +183,7 @@ describe("managed install commands", () => {
       const env = call[2]?.env;
       expect(env, `${call[0]} ${call[1].join(" ")} must run with an explicit env`).toBeDefined();
       expect(env, `${call[0]} ${call[1].join(" ")} must not inherit NODE_ENV`).not.toHaveProperty("NODE_ENV");
+      expect(env?.PAPERCLIP_BUILD_COMMIT).toBe(sha);
     }
     const uiPackCall = buildCalls.find(([file, , options]) => file === "corepack" && options?.env?.PAPERCLIP_RELEASE_REUSE_UI_DIST === "1");
     expect(uiPackCall).toBeDefined();
