@@ -60,8 +60,50 @@
 - EXPECT: all suites green; ephemeral-only behavior changes are confined to the new test surface and the new code paths; no persistent-lifecycle tests regress.
 - EXIT: 0; `PASS` summary line printed.
 
-## Gate 10 — FORK-PATCHES.md row 14 recorded
-- OBSERVABLE: `doc/FORK-PATCHES.md` gains row 14 documenting SPA-9275's ephemeral-worktree mode — what it does, why it exists (203 GB / 168-worktree HDD load), the carry shape, the retirement condition, and the kill switch (the experimental flag). The row follows the table style of rows 1–13.
-- CHECK: `grep -c '^| 14 |' doc/FORK-PATCHES.md` (or visual review for table-row style)
-- EXPECT: at least one row whose first column is `14` and which references SPA-9275 in the third column.
-- EXIT: 0; grep returns ≥1.
+## Gate 10 — FORK-PATCHES.md row recorded (SPA-9285 re-merge)
+- OBSERVABLE: `doc/FORK-PATCHES.md` gains a row documenting SPA-9275's ephemeral-worktree mode — what it does, why it exists (203 GB / 168-worktree HDD load), the carry shape, the retirement condition, and the kill switch (the experimental flag). The row follows the table style of its siblings.
+- CHECK: `grep -c 'SPA-9275' doc/FORK-PATCHES.md`
+- EXPECT: exactly one table row referencing SPA-9275 in the third column, numbered `18` (the base's next free row number — the base's own row 14 is SPA-9038, so the head stub's `14` was renumbered on the merge to avoid the collision, per the SPA-9285 governance guidance).
+- EXIT: 0; grep returns 1.
+
+---
+
+# SPA-9285 re-merge verification (results against merged head)
+
+Merged head tested: `09941266b2` (merge bringing base `172c6ce891` onto the SPA-9275 branch).
+
+## Gate results (run 2026-09-29, worktree SPA-9285-spa-9275-rebase-...)
+
+| Gate | CHECK | Result | Evidence |
+|------|-------|--------|----------|
+| 1 | ephemeral worktree names by run id | PASS | `vitest run workspace-runtime.test.ts -t "ephemeral lifecycle names the worktree by run id"` passed |
+| 2 | releaseRunExecutionWorkspace push-then-remove + retry | PASS | `-t "releaseRunExecutionWorkspace pushes the branch then removes the worktree"`, `-t "releaseRunExecutionWorkspace retries on a stale git lock..."` passed |
+| 3 | heartbeat finally composite removes dir AND archives row | PASS | `-t "heartbeat finally composite removes the worktree AND archives the execution workspace row"` passed |
+| 4 | reaper rescues unpushed work | PASS | `-t "reaper rescues unpushed work before removing an orphan run worktree"` passed |
+| 5 | sweep done/cancelled worktrees incl. cleanup_failed | PASS | `-t "sweepTerminalIssueRunWorktrees removes done issue worktrees and is idempotent"`, `-t "sweep covers legacy per-branch and cleanup_failed worktrees..."` passed |
+| 5b | startup reconciliation in one call | PASS | `-t "reconcileEphemeralWorktreesOnStartup reaps orphans and sweeps done issues in one call"` passed |
+| 6 | concurrent ephemeral realizations no shared dir | PASS | `-t "concurrent ephemeral realizations never share a directory"` passed |
+| 7 | persistent (legacy) behavior unchanged | PASS | `-t "persistent lifecycle still names the worktree by branch"` passed |
+| 8 | typecheck clean | PASS | `cd server && node ../node_modules/typescript/bin/tsc` → EXIT=0, no errors. (Full `pnpm build` blocked only by missing `cargo` for the paperclip-runner binary — an environment gap, not a code error; server `tsc` + runner `tsc` both clean.) |
+| 9 | heartbeat + workspace-runtime + exec-workspaces suites | PASS (with pre-existing base failures) | Full 3-suite run: **415 passed, 6 failed** of 421. The 6 failures are **identical at base head `172c6ce891`** (verified by running the same suites in a clean worktree off the base): `writes an isolated repo-local Paperclip config...`, `provisions worktree-local pnpm node_modules instead of reusing base-repo links`, `provisions successfully when install is needed...`, `reinstalls worktree-local pnpm dependencies when package metadata changes`, `retries worktree-local pnpm install without a frozen lockfile...`. Root cause is the base's own `provision-worktree.sh` hardy config-seeding (`Invalid config ... $meta` / `PAPERCLIP_HOME missing` against the test's `{}` source config) — pre-existing, not a merge regression. |
+| 10 | FORK-PATCHES.md row | PASS | Row `18` (SPA-9275) appended into the base's canonical table; base rows 1–17 preserved verbatim; base header kept. See `doc/FORK-PATCHES.md` line 79. |
+
+## The 10 conflicts — resolution disposition
+
+| File | Resolution |
+|------|-----------|
+| `doc/FORK-PATCHES.md` | add/add governance: base's canonical 31-line table kept verbatim (rows 1–17), SPA-9275 appended as row 18 (head stub's claimed row 14 collided with base row 14 SPA-9038) |
+| `packages/shared/src/feature-catalog.ts` | merged keep-both: SPA-9275 `enableEphemeralWorktreePerRun` entry intact (line 314) |
+| `packages/shared/src/types/instance.ts` | merged keep-both: flag type intact (line 155) |
+| `packages/shared/src/validators/instance.ts` | merged keep-both: `z.boolean().default(false)` intact (line 90) |
+| `server/src/services/heartbeat.ts` | merged keep-both: ephemeral release wiring intact (line 21755) |
+| `server/src/services/instance-settings.ts` | merged keep-both: flag normalize in both branches intact (lines 268, 309) |
+| `server/src/services/issues.ts` | merged keep-both: SPA-9140 active-only workspace inherit + SPA-8939/9038 done-gate prose intact |
+| `server/src/services/workspace-runtime.ts` | merged keep-both: `releaseRunExecutionWorkspace`, `reapOrphanedRunWorktrees`, `sweepTerminalIssueRunWorktrees`, `reconcileEphemeralWorktreesOnStartup`, `releaseEphemeralRunWorkspaceForHeartbeatFinally` all intact (lines 4687–5322) |
+| `server/src/__tests__/heartbeat-workspace-session.test.ts` | merged keep-both: base SPA-9139/9258 test additions + SPA-9275 ephemeral heartbeat tests intact |
+| `server/src/__tests__/workspace-runtime.test.ts` | merged keep-both: base SPA-8995 setup-file deletion + SPA-9275's 13 ephemeral tests intact |
+
+## Base sync
+
+- Two merges landed: `a5c1100385` (base `fd57a5d0cb` — the original 116-commit base) and `09941266b2` (base `172c6ce891` — the further-moved base, PRs #109/#111).
+- PR head will be moved from `88743de936` (unmergeable, `mergeable: false`) to local HEAD `09941266b2` on push. Mergeability after push is confirmed by the Docker-sha-bound merge attempt on the fresh head (Dex's PUT), or by `gh pr view` after push; re-verify (step 5) runs against the pushed head before the hand-off to Dex.
