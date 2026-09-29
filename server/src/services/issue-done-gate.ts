@@ -42,8 +42,16 @@ import {
  *     `state === "unknown"` (GitHub unreachable, credentials missing,
  *     resolver absent) refuses — fail-closed on ambiguity.
  *   - A PR that is closed WITHOUT being merged (a refused PR) does NOT block:
- *     a refused PR is a deliberate human close, not an engine decision
- *     (James's ruling, 2026-09-27).
+ *     a deliberate human close, not an engine decision (James's ruling,
+ *     2026-09-27).
+ *   - SPA-9323: a reference that is positively identified as NOT a pull
+ *     request does NOT block. `owner/repo#N` binds the gate without knowing
+ *     whether N is a PR or an ISSUE, and the `/pull/N` read of an ISSUE 404s
+ *     into the same `unknown` bucket as a GitHub outage — permanently, because
+ *     no merge sha will ever exist and `doneOverride` is board-only. The
+ *     resolver discriminates the two on GitHub's `/issues/N` endpoint; only a
+ *     positive discrimination relaxes the gate. A 404 on BOTH endpoints
+ *     (private repo, cross-account token, typo) stays `unknown` and blocks.
  *   - A card with zero binding references passes untouched — docs,
  *     judgment, audit cards close exactly as before.
  *
@@ -120,8 +128,16 @@ function formatReference(reference: GitHubPullRequestReference) {
  * Map the merge-details snapshot onto the gate's four-state view.
  * `closed` (closed WITHOUT merge — a refused PR) is deliberately non-blocking:
  * a refused PR is a human signal, not an engine decision.
+ *
+ * SPA-9323: `notAPullRequest` is a classification, not a PR state. A card that
+ * cites `owner/repo#779` where 779 is an ISSUE has no merge state to guard, so
+ * it must not wedge the close. It maps to `closed` here — the same non-blocking
+ * bucket — purely so the gate has nothing new to consume. The resolver keeps
+ * `state: "unknown"` for those references so the three other consumers of
+ * `PullRequestMergeDetails.state` are unaffected.
  */
 function gateStateFromDetails(details: PullRequestMergeDetails): "merged" | "open" | "closed" | "unknown" {
+  if (details.notAPullRequest) return "closed";
   if (details.state === "merged") return "merged";
   if (details.workProductState === "closed") return "closed";
   if (details.state === "open") return "open";
