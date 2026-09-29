@@ -4211,12 +4211,34 @@ export function recoveryService(
       latestRun,
       classification,
     );
+    const desiredResultJson = parseObject(classifiedRun.resultJson);
+
+    // SPA-9282: classify-once, not classify-every-tick. The recovery sweep runs
+    // every HEARTBEAT_SCHEDULER_INTERVAL_MS (default 30s) and re-derives the
+    // same classification for terminal runs on every pass; the unconditional
+    // .update().set({updatedAt: new Date()}) below moved updated_at on every
+    // tick and the UI surfaced each move as a run update that toasted as a
+    // fresh failure (Steve/Argus "failing every 30 s"). Gate the write on a
+    // real change — errorCode or the persisted classification block — so a
+    // no-change pass is a no-op. The same update also clears stale
+    // process_pid / process_group_id exactly once (the run is terminal, so
+    // any handle it pointed at is dead; clearing here is the one place that
+    // owns the once).
+    const classificationMarker = desiredResultJson.recoveryClassification ?? null;
+    const persistedMarker = parseObject(latestRun.resultJson).recoveryClassification ?? null;
+    const sameErrorCode = latestRun.errorCode === classifiedRun.errorCode;
+    const sameMarker = classificationMarker === persistedMarker;
+    if (sameErrorCode && sameMarker) {
+      return classifiedRun;
+    }
 
     await db
       .update(heartbeatRuns)
       .set({
         errorCode: classifiedRun.errorCode,
-        resultJson: parseObject(classifiedRun.resultJson),
+        resultJson: desiredResultJson,
+        processPid: null,
+        processGroupId: null,
         updatedAt: new Date(),
       })
       .where(eq(heartbeatRuns.id, latestRun.id));
