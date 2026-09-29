@@ -3,8 +3,8 @@ import { describe, expect, it } from "vitest";
 import { resolveBuildCommit } from "../../scripts/write-build-stamp.mjs";
 
 describe("resolveBuildCommit", () => {
-  it("prefers the git commit over the supplied environment commit", () => {
-    expect(resolveBuildCommit("aaaaaaa", "bbbbbbb")).toBe("aaaaaaa");
+  it("prefers a full supplied commit over a short git commit", () => {
+    expect(resolveBuildCommit("aaaaaaa", "b".repeat(40))).toBe("b".repeat(40));
   });
 
   it("falls back to PAPERCLIP_BUILD_COMMIT when git gives no commit", () => {
