@@ -9838,7 +9838,10 @@ export function issueService(db: Db) {
               .from(executionWorkspaces)
               .where(
                 and(
-                  eq(executionWorkspaces.id, workspaceSource.executionWorkspaceId),
+                  eq(
+                    executionWorkspaces.id,
+                    workspaceSource.executionWorkspaceId,
+                  ),
                   eq(executionWorkspaces.status, "active"),
                 ),
               )
