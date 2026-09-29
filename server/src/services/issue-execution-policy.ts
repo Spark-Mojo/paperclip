@@ -6,9 +6,11 @@ import type {
   IssueExecutionMonitorState,
   IssueExecutionPolicy,
   IssueExecutionStage,
+  IssueExecutionStageApproval,
   IssueExecutionStagePrincipal,
   IssueExecutionState,
   IssueMonitorScheduledBy,
+  IssueStageApprovalPullRequest,
 } from "@paperclipai/shared";
 import { issueExecutionPolicySchema, issueExecutionStateSchema } from "@paperclipai/shared";
 import { unprocessable } from "../errors.js";
@@ -42,6 +44,11 @@ type RequestedAssigneePatch = {
   assigneeUserId?: string | null;
 };
 
+export type IssueExecutionStageApprovalInput = {
+  pullRequests: IssueStageApprovalPullRequest[];
+  approvedAt: Date;
+};
+
 type TransitionInput = {
   issue: IssueLike;
   policy: IssueExecutionPolicy | null;
@@ -53,6 +60,8 @@ type TransitionInput = {
   commentBody?: string | null;
   reviewRequest?: IssueExecutionState["reviewRequest"] | null;
   monitorExplicitlyUpdated?: boolean;
+  approvalPullRequests?: IssueStageApprovalPullRequest[] | null;
+  approvalRecordedAt?: Date;
 };
 
 type TransitionResult = {
@@ -512,6 +521,29 @@ function patchForPrincipal(principal: IssueExecutionStagePrincipal | null) {
     : { assigneeAgentId: null, assigneeUserId: principal.userId ?? null };
 }
 
+function recordStageApproval(input: {
+  previous: IssueExecutionState | null;
+  stage: IssueExecutionStage;
+  reviewer: IssueExecutionStagePrincipal | null;
+  pullRequests: IssueStageApprovalPullRequest[];
+  approvedAt: Date;
+}): IssueExecutionStageApproval[] {
+  const carried = (input.previous?.approvals ?? []).filter(
+    (approval) => approval.stageId !== input.stage.id,
+  );
+  return [
+    ...carried,
+    {
+      stageId: input.stage.id,
+      stageType: input.stage.type,
+      reviewerAgentId: input.reviewer?.type === "agent" ? input.reviewer.agentId ?? null : null,
+      reviewerUserId: input.reviewer?.type === "user" ? input.reviewer.userId ?? null : null,
+      approvedAt: input.approvedAt.toISOString(),
+      pullRequests: input.pullRequests,
+    },
+  ];
+}
+
 function buildCompletedState(previous: IssueExecutionState | null, currentStage: IssueExecutionStage): IssueExecutionState {
   const completedStageIds = Array.from(new Set([...(previous?.completedStageIds ?? []), currentStage.id]));
   return {
@@ -527,6 +559,7 @@ function buildCompletedState(previous: IssueExecutionState | null, currentStage:
     lastDecisionOutcome: "approved",
     monitor: previous?.monitor ?? null,
     changesRequestedCount: 0,
+    ...(previous?.approvals ? { approvals: previous.approvals } : {}),
   };
 }
 
@@ -547,6 +580,7 @@ function buildStateWithCompletedStages(input: {
     lastDecisionId: input.previous?.lastDecisionId ?? null,
     lastDecisionOutcome: input.previous?.lastDecisionOutcome ?? null,
     monitor: input.previous?.monitor ?? null,
+    ...(input.previous?.approvals ? { approvals: input.previous.approvals } : {}),
   };
 }
 
@@ -567,6 +601,7 @@ function buildSkippedStageCompletedState(input: {
     lastDecisionId: input.previous?.lastDecisionId ?? null,
     lastDecisionOutcome: input.previous?.lastDecisionOutcome ?? null,
     monitor: input.previous?.monitor ?? null,
+    ...(input.previous?.approvals ? { approvals: input.previous.approvals } : {}),
   };
 }
 
@@ -599,6 +634,7 @@ function buildPendingState(input: {
     lastDecisionOutcome: input.previous?.lastDecisionOutcome ?? null,
     monitor: input.previous?.monitor ?? null,
     changesRequestedCount: input.changesRequestedCount ?? input.previous?.changesRequestedCount ?? 0,
+    ...(input.previous?.approvals ? { approvals: input.previous.approvals } : {}),
   };
 }
 
@@ -820,6 +856,35 @@ function applyIssueExecutionStageTransition(input: TransitionInput): TransitionR
         const nextStage = nextPendingStageAfter(input.policy, activeStage, approvedState);
 
         if (!nextStage) {
+          const approvalPullRequests = input.approvalPullRequests ?? [];
+          if (approvalPullRequests.length > 0) {
+            const approvals = recordStageApproval({
+              previous: existingState,
+              stage: activeStage,
+              reviewer: currentParticipant,
+              pullRequests: approvalPullRequests,
+              approvedAt: input.approvalRecordedAt ?? new Date(),
+            });
+            const returnAssignee =
+              existingState?.returnAssignee ?? currentAssignee ?? currentParticipant;
+            patch.status = "todo";
+            Object.assign(patch, patchForPrincipal(returnAssignee));
+            patch.executionState = {
+              ...approvedState,
+              approvals,
+              awaitingMerge: true,
+            };
+            return {
+              patch,
+              decision: {
+                stageId: activeStage.id,
+                stageType: activeStage.type,
+                outcome: "approved",
+                body: input.commentBody.trim(),
+              },
+              workflowControlledAssignment: true,
+            };
+          }
           patch.executionState = approvedState;
           return {
             patch,
@@ -830,6 +895,17 @@ function applyIssueExecutionStageTransition(input: TransitionInput): TransitionR
               body: input.commentBody.trim(),
             },
           };
+        }
+
+        if ((input.approvalPullRequests?.length ?? 0) > 0) {
+          const approvals = recordStageApproval({
+            previous: existingState,
+            stage: activeStage,
+            reviewer: currentParticipant,
+            pullRequests: input.approvalPullRequests ?? [],
+            approvedAt: input.approvalRecordedAt ?? new Date(),
+          });
+          approvedState.approvals = approvals;
         }
 
         const participant = selectStageParticipant(nextStage, {

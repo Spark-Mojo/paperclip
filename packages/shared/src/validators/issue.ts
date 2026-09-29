@@ -500,6 +500,24 @@ export const issueReviewRequestSchema = z
   })
   .strict();
 
+export const reviewedPullRequestSchema = z
+  .object({
+    owner: z.string().trim().min(1).max(200),
+    repo: z.string().trim().min(1).max(200),
+    number: z.number().int().positive(),
+    headSha: z.string().regex(/^[0-9a-f]{40}$/i, "headSha must be a 40-character commit sha"),
+  })
+  .strict();
+
+export const issueExecutionStageApprovalSchema = z.object({
+  stageId: z.string().guid(),
+  stageType: z.enum(ISSUE_EXECUTION_STAGE_TYPES),
+  reviewerAgentId: z.string().guid().nullable(),
+  reviewerUserId: z.string().nullable(),
+  approvedAt: z.string().datetime(),
+  pullRequests: z.array(reviewedPullRequestSchema).default([]),
+});
+
 export const issueExecutionStateSchema = z.object({
   status: z.enum(ISSUE_EXECUTION_STATE_STATUSES),
   currentStageId: z.string().guid().nullable(),
@@ -514,6 +532,8 @@ export const issueExecutionStateSchema = z.object({
   lastDecisionOutcome: z.enum(ISSUE_EXECUTION_DECISION_OUTCOMES).nullable(),
   monitor: issueExecutionMonitorStateSchema.optional().nullable(),
   changesRequestedCount: z.number().int().nonnegative().optional().default(0),
+  approvals: z.array(issueExecutionStageApprovalSchema).optional(),
+  awaitingMerge: z.boolean().optional(),
 });
 
 export const issueRecoveryActionReadModelSchema = z.object({
@@ -879,6 +899,7 @@ export const stalledReviewDecisionSchema = z
   .object({
     action: z.enum(["approve", "request_changes", "send_back"]),
     note: multilineTextSchema.pipe(z.string().min(1)).optional(),
+    reviewedPullRequests: z.array(reviewedPullRequestSchema).max(50).optional(),
   })
   .strict()
   .superRefine((value, ctx) => {
@@ -1028,6 +1049,7 @@ export const addIssueCommentSchema = z.object({
   reopen: z.boolean().optional(),
   resume: z.boolean().optional(),
   interrupt: z.boolean().optional(),
+  reviewedPullRequests: z.array(reviewedPullRequestSchema).max(50).optional(),
 });
 
 export type AddIssueComment = z.infer<typeof addIssueCommentSchema>;

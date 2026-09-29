@@ -161,6 +161,99 @@ describe("parseIssueExecutionState", () => {
   });
 });
 
+describe("premerge execution stage approval", () => {
+  const headSha = "9e0e5288875f46460e711ca233c3a88506ea2ecf";
+  const pullRequests = [{ owner: "Spark-Mojo", repo: "spark-mojo-platform", number: 1202, headSha }];
+
+  function pendingReview(policy: IssueExecutionPolicy): IssueExecutionState {
+    return {
+      status: "pending",
+      currentStageId: policy.stages[0]!.id,
+      currentStageIndex: 0,
+      currentStageType: "review",
+      currentParticipant: { type: "agent", agentId: qaAgentId },
+      returnAssignee: { type: "agent", agentId: coderAgentId },
+      reviewRequest: null,
+      completedStageIds: [],
+      lastDecisionId: null,
+      lastDecisionOutcome: "changes_requested",
+      changesRequestedCount: 1,
+    };
+  }
+
+  function approve(policy: IssueExecutionPolicy, actorAgentId = qaAgentId) {
+    const input: Parameters<typeof applyIssueExecutionPolicyTransition>[0] & {
+      approvalPullRequests: typeof pullRequests;
+    } = {
+      issue: {
+        status: "in_review",
+        assigneeAgentId: qaAgentId,
+        executionPolicy: policy,
+        executionState: pendingReview(policy),
+      },
+      policy,
+      requestedStatus: "done",
+      requestedAssigneePatch: {},
+      actor: { agentId: actorAgentId },
+      commentBody: `Approved reviewed head ${headSha}`,
+      approvalPullRequests: pullRequests,
+    };
+    return applyIssueExecutionPolicyTransition(input);
+  }
+
+  it("records final PR-backed approval without terminal completion", () => {
+    const policy = reviewOnlyPolicy();
+    const result = approve(policy);
+    expect(result.decision?.outcome).toBe("approved");
+    expect(result.patch.status).toBe("todo");
+    expect(result.patch.assigneeAgentId).toBe(coderAgentId);
+    expect(result.workflowControlledAssignment).toBe(true);
+    expect(result.patch.executionState).toMatchObject({
+      status: "completed",
+      lastDecisionOutcome: "approved",
+      awaitingMerge: true,
+      approvals: [{ stageId: policy.stages[0]!.id, pullRequests }],
+    });
+  });
+
+  it("carries head-bound approval through a subsequent review stage", () => {
+    const policy = twoStagePolicy();
+    const result = approve(policy);
+    expect(result.patch.status).toBe("in_review");
+    expect(result.patch.assigneeUserId).toBe(ctoUserId);
+    expect(result.patch.executionState).toMatchObject({
+      status: "pending",
+      approvals: [{ stageId: policy.stages[0]!.id, pullRequests }],
+    });
+  });
+
+  it("does not grant approval to the builder or a different reviewer", () => {
+    const policy = reviewOnlyPolicy();
+    expect(() => approve(policy, coderAgentId)).toThrow("Only the active reviewer");
+    expect(() => approve(policy, ctoAgentId)).toThrow("Only the active reviewer");
+  });
+
+  it("preserves merge-wait state on a duplicate terminal request", () => {
+    const policy = reviewOnlyPolicy();
+    const approved = approve(policy);
+    const result = applyIssueExecutionPolicyTransition({
+      issue: {
+        status: "todo",
+        assigneeAgentId: coderAgentId,
+        executionPolicy: policy,
+        executionState: approved.patch.executionState as IssueExecutionState,
+      },
+      policy,
+      requestedStatus: "done",
+      requestedAssigneePatch: {},
+      actor: { agentId: coderAgentId },
+      commentBody: "Close after merge",
+    });
+    expect(result.decision).toBeUndefined();
+    expect(result.patch.executionState).not.toMatchObject({ status: "pending" });
+  });
+});
+
 describe("issue execution policy transitions", () => {
   it("activates a review attached mid-flight without accepting a builder decision", () => {
     const policy = reviewOnlyPolicy();
