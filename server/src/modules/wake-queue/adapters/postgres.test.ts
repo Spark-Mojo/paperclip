@@ -1,6 +1,6 @@
 import { instanceSettingsService } from "../../../services/instance-settings.js";
 import { randomUUID } from "node:crypto";
-import { eq } from "drizzle-orm";
+import { and, eq } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import type { Db } from "@paperclipai/db";
 import {
@@ -284,6 +284,69 @@ describeEmbeddedPostgres("wake-queue postgres adapter", () => {
     } finally {
       await settings.updateExperimental({ enableAgentChat: original });
     }
+  });
+
+  // SPA-9314 (measured 2026-09-29 04:00Z on the live engine, 172c6ce89179):
+  // a reassignment cancels the old assignee's run (`issue_reassigned`) while
+  // the new assignee's `issue_assigned` wake is parked `deferred_issue_execution`
+  // behind it. The release of that run must promote the current assignee's wake
+  // to queued — the acknowledged-execution-cancellation short-circuit must NOT
+  // stop the drain for a REASSIGNMENT cancel (it exists for operator Stops).
+  it("promotes the current assignee's deferred wake when a reassignment-cancelled run releases the lock (SPA-9314)", async () => {
+    const companyId = await seedCompany();
+    const oldAgentId = await seedAgent({ companyId, name: "TyOld" });
+    const newAgentId = await seedAgent({ companyId, name: "DexNew" });
+    const issueId = await seedIssue({ companyId, assigneeAgentId: newAgentId, status: "in_progress" });
+    const cancelledRunId = await seedRun({
+      companyId, agentId: oldAgentId, status: "cancelled", contextSnapshot: { issueId },
+    });
+    await db.update(heartbeatRuns).set({
+      runtimeMode: "legacy",
+      errorCode: "issue_reassigned",
+      resultJson: {
+        stopReason: "cancelled",
+        executionCancellation: { state: "acknowledged", acknowledgedAt: new Date().toISOString() },
+        reassignmentStopConfirmed: true,
+      },
+    }).where(eq(heartbeatRuns.id, cancelledRunId));
+    // The issue lock still points at the cancelled run at the instant the new
+    // assignee's wake parks behind it (measured 03:25:03 state).
+    await db.update(issues).set({ executionRunId: cancelledRunId }).where(eq(issues.id, issueId));
+    const wakeId = await db.insert(agentWakeupRequests).values({
+      id: randomUUID(),
+      companyId,
+      agentId: newAgentId,
+      source: "assignment",
+      reason: "issue_assigned",
+      status: "deferred_issue_execution",
+      requestedByActorType: "user",
+      requestedByActorId: "local-board",
+      payload: {
+        issueId,
+        mutation: "update",
+        _paperclipWakeContext: { issueId, taskId: issueId, wakeReason: "issue_assigned" },
+      },
+    }).returning().then((rows) => rows[0]!.id);
+
+    const release = createReleaseIssueExecution({
+      issueLock: createPostgresWakeQueueAdapter(db, stubDeps),
+      recovery: {
+        escalateStrandedAssignedIssue: async () => { throw new Error("unexpected escalation"); },
+        escalateStrandedRecoveryIssueInPlace: async () => { throw new Error("unexpected escalation"); },
+      },
+    });
+    const result = await release({ companyId, runId: cancelledRunId, now: new Date() });
+
+    // Pre-fix: executionCancellationAcknowledged short-circuited the release to
+    // `released` and the deferred wake sat forever. Post-fix: the drain promotes
+    // the CURRENT assignee's wake into a queued run within the release.
+    expect(result.outcome.kind).toBe("promoted");
+    const [promoted] = await db.select().from(heartbeatRuns)
+      .where(and(eq(heartbeatRuns.companyId, companyId), eq(heartbeatRuns.agentId, newAgentId)));
+    expect(promoted).toBeTruthy();
+    expect(promoted!.status).toBe("queued");
+    const [wake] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, wakeId));
+    expect(wake!.status).toBe("queued");
   });
 
   for (const hasDeferredMessage of [false, true]) {
