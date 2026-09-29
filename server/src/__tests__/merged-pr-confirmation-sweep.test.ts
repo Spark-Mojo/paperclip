@@ -42,7 +42,7 @@ describe("merged pull-request confirmation extraction", () => {
       "Also paperclipai/paperclip#40 and PAPERCLIPAI/paperclip#40.",
     ])).toEqual([
       { host: "github.com", owner: "PaperclipAI", repo: "paperclip", number: 39 },
-      { host: "github.com", owner: "paperclipai", repo: "paperclip", number: 40 },
+      { host: "github.com", owner: "paperclipai", repo: "paperclip", number: 40, proseShorthand: true },
     ]);
   });
 
@@ -84,7 +84,7 @@ describe("merged pull-request confirmation extraction", () => {
         },
       },
     })).toEqual([
-      { host: "github.com", owner: "paperclipai", repo: "paperclip", number: 39 },
+      { host: "github.com", owner: "paperclipai", repo: "paperclip", number: 39, proseShorthand: true },
       { host: "github.com", owner: "paperclipai", repo: "paperclip", number: 40 },
     ]);
   });
