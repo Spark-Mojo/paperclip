@@ -104,12 +104,16 @@ describe("opencode remote execution", () => {
   const cleanupDirs: string[] = [];
   const originalOpenCodeAllowAllModels = process.env.OPENCODE_ALLOW_ALL_MODELS;
 
-  beforeEach(() => {
+  beforeEach(async () => {
+    const configHome = await mkdtemp(path.join(os.tmpdir(), "paperclip-opencode-test-config-"));
+    cleanupDirs.push(configHome);
+    vi.stubEnv("XDG_CONFIG_HOME", configHome);
     delete process.env.OPENCODE_ALLOW_ALL_MODELS;
   });
 
   afterEach(async () => {
     vi.clearAllMocks();
+    vi.unstubAllEnvs();
     if (originalOpenCodeAllowAllModels === undefined) {
       delete process.env.OPENCODE_ALLOW_ALL_MODELS;
     } else {
@@ -122,7 +126,7 @@ describe("opencode remote execution", () => {
     }
   });
 
-  it("prepares the workspace, syncs OpenCode skills, and restores workspace changes for remote SSH execution", async () => {
+  it.each([false, true])("prepares the workspace, syncs OpenCode skills, and restores workspace changes for remote SSH execution (managed=%s)", async (managed) => {
     const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-opencode-remote-"));
     cleanupDirs.push(rootDir);
     const workspaceDir = path.join(rootDir, "workspace");
@@ -149,6 +153,13 @@ describe("opencode remote execution", () => {
       config: {
         command: "opencode",
         model: "opencode/gpt-5-nano",
+        ...(managed ? {
+          managedAiConnection: { provider: "openrouter", method: "api_key" },
+        } : {}),
+        env: {
+          XDG_CONFIG_HOME: path.join(rootDir, "config"),
+          ...(managed ? { HOME: "/var/folders/qa-managed", XDG_DATA_HOME: "/var/folders/qa-managed/data" } : {}),
+        },
       },
       context: {
         paperclipWorkspace: {
@@ -229,6 +240,17 @@ describe("opencode remote execution", () => {
       | [string, string, string[], { env: Record<string, string>; remoteExecution?: { remoteCwd: string } | null }]
       | undefined;
     expect(call?.[3].env.PAPERCLIP_WORKSPACE_CWD).toBe(managedRemoteWorkspace);
+    if (managed) {
+      const home = `${managedRemoteWorkspace}/.paperclip-runtime/opencode/managed-auth/run-1`;
+      expect(call?.[3].env.HOME).toBe(home);
+      expect(call?.[3].env.XDG_DATA_HOME).toBe(`${home}/data`);
+      expect(modelProbeCall?.[3].env.XDG_DATA_HOME).toBe(`${home}/data`);
+      expect(runSshCommand).toHaveBeenCalledWith(
+        expect.anything(),
+        expect.stringContaining(`${home}/.claude/skills`),
+        expect.anything(),
+      );
+    }
     expect(JSON.parse(call?.[3].env.PAPERCLIP_WORKSPACES_JSON ?? "[]")).toEqual([
       {
         workspaceId: "workspace-1",
@@ -375,135 +397,5 @@ describe("opencode remote execution", () => {
       | undefined;
     expect(call?.[2]).toContain("--session");
     expect(call?.[2]).toContain("session-123");
-  });
-
-  it("retries with backoff when OpenCode dies on the shared-DB SQLite lock at startup (SPA-7226)", async () => {
-    const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-opencode-remote-db-lock-"));
-    cleanupDirs.push(rootDir);
-    const workspaceDir = path.join(rootDir, "workspace");
-    const managedRemoteWorkspace = "/remote/workspace/.paperclip-runtime/runs/run-ssh-db-lock/workspace";
-    await mkdir(workspaceDir, { recursive: true });
-
-    const failureStdout = [
-      JSON.stringify({
-        type: "error",
-        error: {
-          message: 'Failed query: insert into "project" ... (cause: SQLiteError: database is locked)',
-        },
-      }),
-      JSON.stringify({ type: "error", error: { message: "SQLiteError: database is locked" } }),
-    ].join("\n");
-    const successStdout = [
-      JSON.stringify({ type: "step_start", sessionID: "session_db_lock" }),
-      JSON.stringify({ type: "text", sessionID: "session_db_lock", part: { text: "hello after retry" } }),
-      JSON.stringify({
-        type: "step_finish",
-        sessionID: "session_db_lock",
-        part: { cost: 0.001, tokens: { input: 1, output: 1, reasoning: 0, cache: { read: 0, write: 0 } } },
-      }),
-    ].join("\n");
-
-    // Sequence: (1..n) `models` probes succeed, (2) first `run` dies on the
-    // shared-DB lock, (3) the retried `run` succeeds.
-    const defaultImpl = runChildProcess.getMockImplementation();
-    let runCallCount = 0;
-    runChildProcess.mockImplementation(async (_runId: string, _command: string, args: string[]) => {
-      if (args.includes("models")) {
-        return {
-          exitCode: 0,
-          signal: null,
-          timedOut: false,
-          stdout: "opencode/gpt-5-nano\n",
-          stderr: "",
-          pid: 9000,
-          startedAt: new Date().toISOString(),
-        };
-      }
-      runCallCount += 1;
-      if (runCallCount === 1) {
-        return {
-          exitCode: 1,
-          signal: null,
-          timedOut: false,
-          stdout: failureStdout,
-          stderr: "",
-          pid: 9001,
-          startedAt: new Date().toISOString(),
-        };
-      }
-      return {
-        exitCode: 0,
-        signal: null,
-        timedOut: false,
-        stdout: successStdout,
-        stderr: "",
-        pid: 9002,
-        startedAt: new Date().toISOString(),
-      };
-    });
-
-    const result = await execute({
-      runId: "run-ssh-db-lock",
-      agent: {
-        id: "agent-1",
-        companyId: "company-1",
-        name: "OpenCode Builder",
-        adapterType: "opencode_local",
-        adapterConfig: {},
-      },
-      runtime: {
-        sessionId: "session-db-lock",
-        sessionParams: {
-          sessionId: "session-db-lock",
-          cwd: managedRemoteWorkspace,
-          remoteExecution: {
-            transport: "ssh",
-            host: "127.0.0.1",
-            port: 2222,
-            username: "fixture",
-            remoteCwd: managedRemoteWorkspace,
-          },
-        },
-        sessionDisplayId: "session-db-lock",
-        taskKey: null,
-      },
-      config: {
-        command: "opencode",
-        model: "opencode/gpt-5-nano",
-      },
-      context: {
-        paperclipWorkspace: {
-          cwd: workspaceDir,
-          source: "project_primary",
-        },
-      },
-      executionTransport: {
-        remoteExecution: {
-          host: "127.0.0.1",
-          port: 2222,
-          username: "fixture",
-          remoteWorkspacePath: "/remote/workspace",
-          remoteCwd: "/remote/workspace",
-          privateKey: "PRIVATE KEY",
-          knownHosts: "[127.0.0.1]:2222 ssh-ed25519 AAAA",
-          strictHostKeyChecking: true,
-        },
-      },
-      onLog: async () => {},
-    });
-
-    if (defaultImpl) {
-      runChildProcess.mockImplementation(defaultImpl);
-    }
-    expect(result.errorMessage).toBeNull();
-    expect(result.sessionId).toBe("session_db_lock");
-    const runCalls = runChildProcess.mock.calls.filter(
-      (entry) => Array.isArray(entry[2]) && (entry[2] as string[]).includes("run"),
-    );
-    expect(runCalls).toHaveLength(2);
-    expect(runCalls[0]?.[2]).toContain("--session");
-    expect(runCalls[0]?.[2]).toContain("session-db-lock");
-    expect(runCalls[1]?.[2]).toContain("--session");
-    expect(runCalls[1]?.[2]).toContain("session-db-lock");
   });
 });

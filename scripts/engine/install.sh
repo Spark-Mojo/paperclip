@@ -30,13 +30,6 @@
 # failure: automatic rollback to the previous symlink target (NOT a DB
 # rollback — see README) and exit non-zero.
 #
-# Pointer safety (SPA-7564, root-cause fix for SPA-7223): the live
-# paperclip-current pointer is guarded by a trap-based restore on EVERY exit
-# path — an interrupt, any unexpected failure after the flip, and a completed
-# dry-run all restore the pre-install target; only a successful REAL install
-# intentionally leaves the pointer on the new prefix. See the "SPA-7564
-# restore guard" block below.
-#
 # Idempotent: re-running with the same source reuses an already-installed,
 # smoke-tested prefix instead of reinstalling.
 
@@ -85,95 +78,6 @@ esac
 guard_host
 
 # ---------------------------------------------------------------------------
-# SPA-7564 restore guard — armed before preflight, active for the whole run.
-#
-# SPA-7223 (2026-09-14): a dry-run flipped the live paperclip-current pointer
-# onto a stub overlay and left it there; the real install that followed died
-# in preflight and restored nothing. paperclip.service runs with
-# Restart=always and execs "$CURRENT_LINK/bin/paperclipai" on every start, so
-# for ~3.5 hours any engine restart would have brought the board up inside a
-# crash loop.
-#
-# Contract (this block is the single home of the pointer-safety guarantee):
-#   LINK_FLIPPED=1  this run flipped $CURRENT_LINK onto its new prefix.
-#   LINK_FINAL=1    $CURRENT_LINK has reached its intended final state for
-#                   this run — kept on the new prefix after a successful REAL
-#                   install, or returned to the pre-install target after a
-#                   dry-run ends, an explicit rollback, or this trap.
-#   The EXIT/INT/TERM/HUP traps restore the pre-install target whenever the
-#   script dies in the flipped-not-final window: an interrupt, a genuine
-#   `set -e` abort after the flip (a bare failing command — note that a
-#   failing `var="$(cmd)"` assignment is NOT always a set -e abort in bash,
-#   which is why health_url below is also guarded explicitly), any failure
-#   path that does not route through main()'s explicit rollback. A
-#   successful dry-run restores explicitly in main() for a readable
-#   receipt; the trap remains the net behind it.
-#
-# Note: prepare_existing_prefix_adoption() may seed $CURRENT_LINK during
-# preflight (first install on an adopted prefix). That seed points at a REAL
-# prefix, happens before LINK_FLIPPED can be set, and `previous` is captured
-# after preflight — so a later restore always returns to the adopted prefix.
-LINK_FLIPPED=0
-LINK_FINAL=0
-UNIT_STOPPED=0
-PREVIOUS_FOR_RESTORE=""
-
-restore_link_to_pre_install() {
-  # Best-effort and idempotent; every command is guarded so the trap always
-  # completes and the script exits with its original status.
-  if [ -n "$PREVIOUS_FOR_RESTORE" ]; then
-    if ln -sfn "$PREVIOUS_FOR_RESTORE" "$CURRENT_LINK"; then
-      log "RESTORE: $CURRENT_LINK -> $PREVIOUS_FOR_RESTORE"
-    else
-      log "ERROR: automatic pointer restore FAILED — restore manually: ln -sfn '$PREVIOUS_FOR_RESTORE' '$CURRENT_LINK'"
-    fi
-  else
-    if rm -f "$CURRENT_LINK"; then
-      log "RESTORE: removed $CURRENT_LINK (no pre-install target existed — first install)"
-    else
-      log "ERROR: automatic pointer restore FAILED — restore manually: rm -f '$CURRENT_LINK'"
-    fi
-  fi
-}
-
-engine_install_restore_trap() {
-  local rc=$?
-  if [ "$LINK_FLIPPED" = "1" ] && [ "$LINK_FINAL" = "0" ]; then
-    if [ "$rc" -eq 0 ]; then
-      log "=== dry-run finished — restoring $CURRENT_LINK to its pre-install target (SPA-7564: a dry-run never leaves the pointer moved) ==="
-    else
-      log "=== install aborted (exit status $rc) — restoring $CURRENT_LINK to its pre-install target (SPA-7564) ==="
-    fi
-    restore_link_to_pre_install
-    if [ "$DRY_RUN" = "1" ]; then
-      log "+DRYRUN would start $UNIT_NAME against the restored prefix"
-    elif unit_start; then
-      log "RESTORE: $UNIT_NAME started against the restored prefix"
-    else
-      log "ERROR: $UNIT_NAME failed to start against the restored prefix — manual intervention required"
-    fi
-    LINK_FINAL=1
-  elif [ "$LINK_FLIPPED" = "0" ] && [ "$LINK_FINAL" = "0" ] && [ "$UNIT_STOPPED" = "1" ]; then
-    # Interrupted between unit_stop and the flip: the pointer was never
-    # touched, so nothing to restore — but the unit is stopped and nothing
-    # would restart it. Bring it back up on the untouched (previous) prefix.
-    log "=== install interrupted after stopping $UNIT_NAME — restarting it on the untouched prefix (SPA-7564) ==="
-    if [ "$DRY_RUN" = "1" ]; then
-      log "+DRYRUN would start $UNIT_NAME"
-    elif unit_start; then
-      log "RESTORE: $UNIT_NAME started against the untouched prefix"
-    else
-      log "ERROR: $UNIT_NAME failed to start — manual intervention required"
-    fi
-  fi
-  exit "$rc"
-}
-trap engine_install_restore_trap EXIT
-trap 'exit 129' HUP
-trap 'exit 130' INT
-trap 'exit 143' TERM
-
-# ---------------------------------------------------------------------------
 # Preflight
 # ---------------------------------------------------------------------------
 
@@ -184,18 +88,6 @@ preflight() {
   # package.json "engines": { "node": ">=20" }
   if [ "$node_major" -lt 20 ]; then
     die "Node $node_major found; Paperclip requires Node >= 20 (package.json engines.node)."
-  fi
-
-  if [ "$SOURCE_KIND" = "fork" ] && [ "$DRY_RUN" != "1" ]; then
-    log "Preflight: fork Rust toolchain"
-    assert_fork_rust_toolchain "$(fork_source_repo)"
-  fi
-
-  log "Preflight: systemd unit compatibility"
-  if [ -n "$PAPERCLIP_ENGINE_ADOPT_EXISTING_PREFIX" ]; then
-    prepare_existing_prefix_adoption
-  else
-    unit_assert_compatible "$SCRIPT_DIR/systemd/$UNIT_NAME"
   fi
 
   log "Preflight: disk space at $ENGINE_ROOT"
@@ -214,7 +106,7 @@ preflight() {
     if connection_string="$(connection_string_from_config "$INSTANCE_CONFIG" 2>/dev/null)"; then
       log "Preflight: postgres reachability"
       if [ "$DRY_RUN" != "1" ]; then
-        if ! database_reachable "$connection_string" >/dev/null 2>&1; then
+        if ! psql "$connection_string" -tAc 'select 1' >/dev/null 2>&1; then
           die "Cannot reach postgres at the configured connectionString. Aborting before touching the running instance."
         fi
       fi
@@ -244,7 +136,10 @@ install_from_npm() {
     stage_fake_payload "$staging" "$version"
   else
     # Mirrors installNpmPayload() in cli/src/commands/install.ts.
-    install_npm_payload "$staging" "$version"
+    run npm install --prefix "$staging" "paperclipai@$version" \
+      --registry=https://registry.npmjs.org \
+      "--@paperclipai:registry=https://registry.npmjs.org" \
+      --no-audit --no-fund
   fi
 
   mv "$staging" "$prefix"
@@ -276,20 +171,12 @@ install_from_fork() {
   local sha short_sha prefix
   sha="$(resolve_fork_sha "$ref")"
   short_sha="$(echo "$sha" | cut -c1-12)"
-  local release_version="2026.831.1"
-  VERSION_LABEL="overlay-$release_version-$short_sha"
+  VERSION_LABEL="fork-$short_sha"
   prefix="$ENGINE_ROOT/paperclip-$VERSION_LABEL"
   NEW_PREFIX="$prefix"
 
   if [ -f "$prefix/lib/node_modules/paperclipai/package.json" ]; then
-    local receipt="$prefix/.paperclip-engine-overlay.json"
-    [ -f "$receipt" ] || die "Refusing to reuse overlay prefix without receipt: $prefix"
-    if [ "$DRY_RUN" = "1" ]; then
-      node -e 'const r=require(process.argv[1]);if(r.sourceSha!==process.argv[2])process.exit(1)' "$receipt" "$sha" || die "Overlay receipt does not match source $sha"
-    else
-      node "$SCRIPT_DIR/overlay-contract.mjs" --verify "$prefix" "$sha" "$receipt"
-    fi
-    log "Reusing verified overlay prefix $prefix (idempotent)."
+    log "Reusing already-installed fork prefix $prefix (idempotent)."
     return 0
   fi
 
@@ -301,13 +188,10 @@ install_from_fork() {
 
   if [ "$DRY_RUN" = "1" ]; then
     stage_fake_payload "$payload" "0.0.0-$short_sha"
-    printf '{"schema":2,"sourceSha":"%s"}\n' "$sha" > "$payload/.paperclip-engine-overlay.json"
     mv "$payload" "$prefix"
     rm -rf "$staging_root"
     return 0
   fi
-
-  install_npm_payload "$payload" "$release_version"
 
   # ---- Faithfully mirrors installGitPayload() in cli/src/commands/install.ts ----
   log "Cloning fork ref '$ref' ($sha) into $checkout"
@@ -316,7 +200,7 @@ install_from_fork() {
 
   local build_env_path="$PATH"
   # Workspace build scripts invoke bare `pnpm`; corepack provisions it.
-  prepare_pnpm_toolchain "$staging_root"
+  run corepack enable pnpm --install-directory "$staging_root/pnpm-bin"
   export PATH="$staging_root/pnpm-bin:$build_env_path"
 
   (cd "$checkout" && run corepack pnpm install --frozen-lockfile)
@@ -327,24 +211,80 @@ install_from_fork() {
   # changes (e.g. SPA-6057's recovery service) are what gets packed, not
   # whatever is on the npm registry.
   (cd "$checkout" && run corepack pnpm -r --filter '@paperclipai/server...' --if-present run build)
-  # Upstream records `git rev-parse --short HEAD`; first bind that stamp to the
-  # frozen commit, then expand it to the exact SHA consumed by overlay proof.
-  validate_and_expand_build_stamp "$checkout" "$checkout/server/dist/build-info.json" "$sha"
-  # server's regular build excludes its static UI. Use the package's official
-  # preparation command so the overlay contains the same self-contained UI as
-  # the published server package.
-  (cd "$checkout" && run corepack pnpm --filter '@paperclipai/server' run prepare:ui-dist)
-  [ -f "$checkout/server/ui-dist/index.html" ] \
-    || die "Fork build did not produce server/ui-dist/index.html."
-  grep -RIl --include='*.js' 'stage-decision-actions' "$checkout/server/ui-dist" >/dev/null \
-    || die "Fork UI build does not contain compiled StageDecisionActions (stage-decision-actions)."
-  # Match release.sh Step 2: server's published artifact carries root skills.
-  rm -rf "$checkout/server/skills"
-  cp -r "$checkout/skills" "$checkout/server/skills"
-  [ -f "$checkout/server/skills/paperclip/SKILL.md" ] \
-    || die "Fork build did not stage the official server skills inventory."
+  # Git-ref installs package @paperclipai/server via pnpm pack, which runs the
+  # upstream `prepack` (prepare:ui-dist && build) SERIALIZED. Upstream's server
+  # `build` deliberately does NOT rebuild the ui: root `pnpm -r build` runs the
+  # ui and server lanes concurrently, and two vite builds racing in the same
+  # ui/dist make serviceWorkerBuildIdPlugin stamp sw.js twice — the second
+  # closeBundle reads a file whose __PAPERCLIP_BUILD_ID__ placeholder is already
+  # consumed and fails CI's Build/Canary jobs (SPA-8995 defect 1; fork commit
+  # cdcbcfd8f originally moved this step into `build`). Run prepare:ui-dist
+  # here instead, serialized after the server build, so server/ui-dist exists
+  # for the pack loop below without ever racing the ui lane.
+  (cd "$checkout/server" && run corepack pnpm run prepare:ui-dist)
 
-  node "$SCRIPT_DIR/overlay-contract.mjs" "$payload" "$checkout" "$sha" "$payload/.paperclip-engine-overlay.json"
+  local cli_version
+  cli_version="$(node -e 'console.log(JSON.parse(require("fs").readFileSync(process.argv[1],"utf8")).version)' "$checkout/cli/package.json")"
+
+  # Resolve the exact set of workspace packages @paperclipai/server depends
+  # on, in dependency order — by calling the SAME function the CLI uses
+  # (resolveGitInstallWorkspacePackages), via tsx (already installed above),
+  # rather than re-deriving the graph by hand.
+  local packages_json
+  packages_json="$(cd "$checkout" && node cli/node_modules/tsx/dist/cli.mjs -e '
+    import { resolveGitInstallWorkspacePackages } from "./cli/src/commands/install.ts";
+    console.log(JSON.stringify(resolveGitInstallWorkspacePackages(process.cwd())));
+  ')"
+
+  # Pack each workspace package (bundleDependencies packages, e.g.
+  # @paperclipai/db, go through scripts/prepare-bundled-package.mjs first —
+  # same special case installGitPayload() handles).
+  echo "$packages_json" | node -e '
+    const packages = JSON.parse(require("fs").readFileSync(0, "utf8"));
+    for (const p of packages) process.stdout.write(p.dir + "\n");
+  ' > "$staging_root/workspace-dirs.txt"
+
+  while IFS= read -r wdir; do
+    [ -z "$wdir" ] && continue
+    local pkg_json="$checkout/$wdir/package.json"
+    local has_bundle
+    has_bundle="$(node -e '
+      const pkg = JSON.parse(require("fs").readFileSync(process.argv[1], "utf8"));
+      const deps = pkg.bundleDependencies || pkg.bundledDependencies || [];
+      console.log(deps.length > 0 ? "1" : "0");
+    ' "$pkg_json")"
+    if [ "$has_bundle" = "1" ]; then
+      local staged_dir="$staging_root/bundled-$(basename "$wdir")"
+      run node "$checkout/scripts/prepare-bundled-package.mjs" "$checkout/$wdir" "$staged_dir"
+      (cd "$checkout" && run npm pack "$staged_dir" --pack-destination "$staging_root")
+    else
+      (cd "$checkout" && PAPERCLIP_RELEASE_REUSE_UI_DIST=1 run corepack pnpm --dir "$wdir" pack --pack-destination "$staging_root")
+    fi
+  done < "$staging_root/workspace-dirs.txt"
+
+  (cd "$checkout/cli" && run npm pack --pack-destination "$staging_root")
+
+  local cli_tarball="$staging_root/paperclipai-$cli_version.tgz"
+  if [ ! -f "$cli_tarball" ]; then
+    die "Expected CLI tarball $cli_tarball was not produced by npm pack."
+  fi
+  local workspace_tarballs=()
+  while IFS= read -r -d '' tgz; do
+    [ "$(basename "$tgz")" = "$(basename "$cli_tarball")" ] && continue
+    workspace_tarballs+=("$tgz")
+  done < <(find "$staging_root" -maxdepth 1 -name '*.tgz' -print0)
+
+  run npm install --prefix "$payload" "$cli_tarball" "${workspace_tarballs[@]}" --no-audit --no-fund
+
+  # Read-back: confirm @paperclipai/server resolved to our packed tarball, not
+  # the npm registry, by checking it exists under the new prefix at all.
+  local server_pkg
+  server_pkg="$(prefix_server_package_path "$payload")"
+  if [ -z "$server_pkg" ]; then
+    log "WARNING: could not locate a packed @paperclipai/server/package.json under $payload — fork server changes may not be included. Investigate before trusting this install."
+  else
+    log "Fork server package present at: $server_pkg"
+  fi
 
   mv "$payload" "$prefix"
   rm -rf "$staging_root"
@@ -385,16 +325,16 @@ EOF
 # NOT set that on the unit; migrations here are the only place they run.
 run_migrations() {
   local prefix="$1"
-  if [ ! -f "$INSTANCE_CONFIG" ]; then
-    log "No instance config at $INSTANCE_CONFIG; no existing database to migrate."
-    return 0
-  fi
   if [ "$DRY_RUN" = "1" ]; then
     log "+DRYRUN would run @paperclipai/db migrations from $prefix"
     return 0
   fi
   local migrate_js
-  migrate_js="$(resolve_migration_artifact "$prefix")"
+  migrate_js="$(find "$prefix/lib/node_modules" -maxdepth 5 -path '*/@paperclipai/db/dist/migrate.js' 2>/dev/null | head -1)"
+  if [ -z "$migrate_js" ]; then
+    log "WARNING: no @paperclipai/db/dist/migrate.js found under $prefix — skipping explicit migration run. The server will refuse to start if the schema is stale (see above); this is a fail-safe, not silent drift."
+    return 0
+  fi
   log "Running migrations via $migrate_js"
   PAPERCLIP_HOME="$PAPERCLIP_HOME" PAPERCLIP_INSTANCE_ID="$PAPERCLIP_INSTANCE_ID" PAPERCLIP_CONFIG="$INSTANCE_CONFIG" \
     run node "$migrate_js"
@@ -424,32 +364,15 @@ main() {
     install_from_fork "$GIT_REF"
   fi
 
-  if [ "$SOURCE_KIND" = "fork" ] && [ "$DRY_RUN" != "1" ] && [ -n "$previous_connection_string" ]; then
-    assert_overlay_zero_pending "$NEW_PREFIX" "$(current_target)" "$previous_connection_string"
-  fi
   run_migrations "$NEW_PREFIX"
 
   local previous
   previous="$(current_target)"
-  PREVIOUS_FOR_RESTORE="$previous"
   record_previous_target "$previous"
 
-  if [ -z "$PAPERCLIP_ENGINE_ADOPT_EXISTING_PREFIX" ]; then
-    unit_ensure_installed "$SCRIPT_DIR/systemd/$UNIT_NAME"
-  fi
+  unit_ensure_installed "$SCRIPT_DIR/systemd/$UNIT_NAME"
   unit_stop
-  UNIT_STOPPED=1
   flip_symlink "$NEW_PREFIX"
-  LINK_FLIPPED=1
-  UNIT_STOPPED=0
-  if [ "${PAPERCLIP_ENGINE_TEST_DIE_AFTER_FLIP:-0}" = "1" ]; then
-    # Test hook (SPA-7564): simulates an unexpected death inside the
-    # flipped-not-final window (interrupt, OOM, operator kill) so the
-    # trap-based restore can be exercised without a real fault.
-    log "+TESTHOOK simulating unexpected death after the pointer flip (PAPERCLIP_ENGINE_TEST_DIE_AFTER_FLIP=1)"
-    kill -TERM "$$"
-    sleep 5
-  fi
 
   # unit_start can legitimately fail (Type=notify blocks for sd_notify
   # READY=1; a broken new version times out non-zero). It must NOT be called
@@ -459,49 +382,22 @@ main() {
   local url body started=1
   unit_start || started=0
 
-  # url must be built before the health wait; a config that cannot yield a
-  # URL (missing/unreadable) must fail LOUDLY here, not silently poll a
-  # garbage URL for the full HEALTH_TIMEOUT_SECS deadline (SPA-7564: this
-  # sits inside the flipped-pointer window — keep it short and explicit).
-  if ! url="$(health_url "$INSTANCE_CONFIG")"; then
-    log "ERROR: cannot build the health URL from $INSTANCE_CONFIG — proceeding to the rollback path."
-    url=""
-  fi
-  local report_failed=0
+  url="$(health_url "$INSTANCE_CONFIG")"
   if [ "$started" = "1" ] && body="$(wait_for_health "$url")"; then
     local after_migrations="unknown"
     if [ -n "$previous_connection_string" ]; then
       after_migrations="$(migration_count "$previous_connection_string" || echo unknown)"
     fi
-    if [ "$SOURCE_KIND" = "fork" ] && [ "$DRY_RUN" != "1" ]; then
-      local report_path="${PAPERCLIP_WHATS_RUNNING_PATH:-$HOME/bin/whats-running}"
-      if ! ( install_whats_running ) || ! "$report_path"; then report_failed=1; fi
-    elif [ "$SOURCE_KIND" = "fork" ] && { [ "${PAPERCLIP_ENGINE_TEST_FAIL_REPORT_READBACK:-0}" = "1" ] || [ "${PAPERCLIP_ENGINE_TEST_FAIL_REPORT_INSTALL:-0}" = "1" ]; }; then
-      report_failed=1
-    fi
-    if [ "$report_failed" = "0" ]; then
-      log "=== INSTALL OK ==="
-      log "prefix:            $NEW_PREFIX"
-      log "version:           $(prefix_version "$NEW_PREFIX")"
-      log "migrations before: $before_migrations"
-      log "migrations after:  $after_migrations"
-      log "health:            $body"
-      if [ "$DRY_RUN" = "1" ]; then
-        log "=== DRY-RUN COMPLETE — restoring $CURRENT_LINK to its pre-install target (SPA-7564: a dry-run never leaves the pointer moved) ==="
-        restore_link_to_pre_install
-        if [ "$(current_target)" = "$PREVIOUS_FOR_RESTORE" ]; then
-          LINK_FINAL=1
-        fi
-        exit 0
-      fi
-      LINK_FINAL=1
-      exit 0
-    fi
+    log "=== INSTALL OK ==="
+    log "prefix:            $NEW_PREFIX"
+    log "version:           $(prefix_version "$NEW_PREFIX")"
+    log "migrations before: $before_migrations"
+    log "migrations after:  $after_migrations"
+    log "health:            $body"
+    exit 0
   fi
 
-  if [ "$report_failed" = "1" ]; then
-    log "=== installed runtime report FAILED — rolling back symlink to previous prefix ==="
-  elif [ "$started" = "1" ]; then
+  if [ "$started" = "1" ]; then
     log "=== HEALTH CHECK FAILED after ${HEALTH_TIMEOUT_SECS}s — rolling back symlink to previous prefix ==="
   else
     log "=== systemctl start FAILED — rolling back symlink to previous prefix ==="
@@ -514,30 +410,13 @@ main() {
     flip_symlink "$previous"
     local rollback_started=1
     unit_start || rollback_started=0
-    # The pointer is now in its intended final state (restored). LINK_FINAL
-    # is set only AFTER the restart attempt so an interrupt landing between
-    # the flip and here still gets a restart attempt from the SPA-7564 trap;
-    # the restore itself is idempotent, so a trap fire after a successful
-    # rollback would only re-point the same (already correct) target.
-    LINK_FINAL=1
     if [ "$rollback_started" = "1" ] && body="$(wait_for_health "$url")"; then
       log "Rollback to $previous succeeded. New prefix $NEW_PREFIX left on disk for investigation (not deleted)."
     else
       log "ERROR: rollback to $previous ALSO failed to start/pass health. Manual intervention required."
     fi
   else
-    if [ "$DRY_RUN" = "1" ]; then
-      # SPA-7564: a dry-run must never leave the pointer moved — and with no
-      # previous prefix, the pre-install state is "no link at all".
-      log "=== dry-run rollback with no previous prefix — removing $CURRENT_LINK (SPA-7564) ==="
-      restore_link_to_pre_install
-      LINK_FINAL=1
-    else
-      log "No previous prefix recorded — nothing to roll back to. This was a first install."
-      # Deliberate keep: the pointer stays on the new (real, non-stub)
-      # prefix for investigation, matching first-install semantics.
-      LINK_FINAL=1
-    fi
+    log "No previous prefix recorded — nothing to roll back to. This was a first install."
   fi
   log "NOTE: this rollback only reverted the code symlink. If migrations ran above, the DATABASE SCHEMA WAS NOT ROLLED BACK. Use rollback.sh --restore <dump> if the new schema is incompatible with the previous code."
   exit 1

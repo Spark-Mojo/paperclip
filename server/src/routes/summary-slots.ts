@@ -37,11 +37,22 @@ export function summarySlotRoutes(db: Db) {
     }
   }
 
-  /** Manual generate is a board/user action; agents cannot trigger it. */
+  /**
+   * Manual generate is a board/user action, with one deliberate agent lane:
+   * the company's built-in Summarizer may also kick a generation (SPA-5893) so
+   * its refresh-stale-summaries routine can re-run against live slots. Every
+   * other agent is refused by design.
+   */
   async function assertCanGenerateSummary(req: Request, companyId: string) {
     assertCompanyAccess(req, companyId);
+    if (req.actor.type === "agent") {
+      if (req.actor.agentId && (await svc.isSummarizerBuiltInAgent(companyId, req.actor.agentId))) {
+        return;
+      }
+      throw forbidden("Only board operators or the Summarizer built-in agent can generate summaries.");
+    }
     if (req.actor.type !== "board") {
-      throw forbidden("Only board operators can generate summaries.");
+      throw forbidden("Only board operators or the Summarizer built-in agent can generate summaries.");
     }
     if (req.actor.source === "local_implicit" || req.actor.isInstanceAdmin) return;
     const allowed = await access.canUser(companyId, req.actor.userId, "tasks:assign");

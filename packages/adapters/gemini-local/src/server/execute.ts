@@ -16,6 +16,8 @@ import {
   ensureAdapterExecutionTargetCommandResolvable,
   ensureAdapterExecutionTargetRuntimeCommandInstalled,
   prepareAdapterExecutionTargetRuntime,
+  adapterExecutionTargetDuplexObservabilityRecorder,
+  adapterExecutionTargetEnablesSandboxDuplexBridge,
   readAdapterExecutionTarget,
   readAdapterExecutionTargetHomeDir,
   resolveAdapterExecutionTargetTimeoutSec,
@@ -30,24 +32,29 @@ import {
   asString,
   asStringArray,
   buildPaperclipEnv,
+  buildRuntimeToolsEnv,
   buildInvocationEnvForLogs,
   ensureAbsoluteDirectory,
   ensurePaperclipSkillSymlink,
   joinPromptSections,
   ensurePathInEnv,
   refreshPaperclipWorkspaceEnvForExecution,
+  isPaperclipSkillSourceMissing,
   readPaperclipRuntimeSkillEntries,
   readPaperclipIssueWorkModeFromContext,
-  resolvePaperclipDesiredSkillNames,
+  resolveLegacyPaperclipDesiredSkillNames,
   removeMaintainerOnlySkillSymlinks,
   parseObject,
   renderTemplate,
   renderPaperclipWakePrompt,
+  selectPaperclipTaskMarkdown,
   isPaperclipRecoveryWakePayload,
   stringifyPaperclipWakePayload,
   DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE,
+  DEFAULT_PAPERCLIP_CONVERSATION_PROMPT_TEMPLATE,
   runChildProcess,
 } from "@paperclipai/adapter-utils/server-utils";
+import { applyPaperclipWakePayloadEnv } from "@paperclipai/adapter-utils/wake-payload-env";
 import { DEFAULT_GEMINI_LOCAL_MODEL, SANDBOX_INSTALL_COMMAND } from "../index.js";
 import {
   describeGeminiFailure,
@@ -60,9 +67,9 @@ import {
 import { firstNonEmptyLine } from "./utils.js";
 import {
   createGeminiAcpExecutor,
-  formatGeminiAcpFallbackMessage,
   resolveGeminiExecutionEngineForRun,
 } from "./acp.js";
+import { resolveGeminiSkillsHome } from "./skills.js";
 
 const __moduleDir = path.dirname(fileURLToPath(import.meta.url));
 const executeGeminiAcp = createGeminiAcpExecutor();
@@ -122,31 +129,28 @@ function renderApiAccessNote(env: Record<string, string>): string {
     "GET example:",
     `  run_shell_command({ command: "curl -s -H \\"Authorization: Bearer $PAPERCLIP_API_KEY\\" \\"$PAPERCLIP_API_URL/api/agents/me\\"" })`,
     "POST/PATCH example:",
-    `  run_shell_command({ command: "curl -s -X POST -H \\"Authorization: Bearer $PAPERCLIP_API_KEY\\" -H 'Content-Type: application/json' -H \\"X-Paperclip-Run-Id: $PAPERCLIP_RUN_ID\\" -d '{...}' \\"$PAPERCLIP_API_URL/api/issues/{id}/checkout\\"" })`,
+    `  run_shell_command({ command: "curl -s -X POST -H \\"Authorization: Bearer $PAPERCLIP_API_KEY\\" -H 'Content-Type: application/json' -H \\"X-Paperclip-Run-Id: $PAPERCLIP_RUN_ID\\" -d '{...}' \\"$PAPERCLIP_API_URL/api/issues/$PAPERCLIP_TASK_ID/checkout\\"" })`,
+    "When PAPERCLIP_TASK_ID is not set, substitute a real issue id from the current context; never send a placeholder like {id} in the URL.",
     "",
     "",
   ].join("\n");
 }
 
-function geminiSkillsHome(): string {
-  return path.join(os.homedir(), ".gemini", "skills");
-}
-
 /**
- * Inject Paperclip skills directly into `~/.gemini/skills/` via symlinks.
+ * Inject Paperclip skills directly into the effective Gemini skills home.
  * This avoids needing GEMINI_CLI_HOME overrides, so the CLI naturally finds
- * both its auth credentials and the injected skills in the real home directory.
+ * both its auth credentials and the injected skills under the child HOME.
  */
 async function ensureGeminiSkillsInjected(
   onLog: AdapterExecutionContext["onLog"],
   skillsEntries: Array<{ key: string; runtimeName: string; source: string }>,
   desiredSkillNames?: string[],
+  skillsHome = resolveGeminiSkillsHome({}),
 ): Promise<void> {
   const desiredSet = new Set(desiredSkillNames ?? skillsEntries.map((entry) => entry.key));
   const selectedEntries = skillsEntries.filter((entry) => desiredSet.has(entry.key));
   if (selectedEntries.length === 0) return;
 
-  const skillsHome = geminiSkillsHome();
   try {
     await fs.mkdir(skillsHome, { recursive: true });
   } catch (err) {
@@ -193,9 +197,10 @@ async function buildGeminiSkillsDir(
   const target = path.join(tmp, "skills");
   await fs.mkdir(target, { recursive: true });
   const availableEntries = await readPaperclipRuntimeSkillEntries(config, __moduleDir);
-  const desiredNames = new Set(resolvePaperclipDesiredSkillNames(config, availableEntries));
+  const desiredNames = new Set(resolveLegacyPaperclipDesiredSkillNames(config, availableEntries));
   for (const entry of availableEntries) {
     if (!desiredNames.has(entry.key)) continue;
+    if (isPaperclipSkillSourceMissing(entry)) continue;
     await fs.symlink(entry.source, path.join(target, entry.runtimeName));
   }
   return target;
@@ -203,20 +208,20 @@ async function buildGeminiSkillsDir(
 
 export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExecutionResult> {
   const engineSelection = await resolveGeminiExecutionEngineForRun(ctx);
-  if (engineSelection.engine === "acp") {
-    try {
-      return await executeGeminiAcp(ctx);
-    } catch (err) {
-      if (engineSelection.explicit) throw err;
-      const reason = err instanceof Error ? err.message : String(err);
-      await ctx.onLog(
-        "stderr",
-        formatGeminiAcpFallbackMessage(`Gemini ACP startup failed: ${reason}`),
-      );
-    }
+  if (engineSelection.unavailableReason) {
+    return {
+      exitCode: 1,
+      signal: null,
+      timedOut: false,
+      errorCode: "adapter_engine_unavailable",
+      errorMessage: engineSelection.unavailableReason,
+      resultJson: {
+        executionRecovery: { kind: "bootstrap", providerWorkStarted: false },
+      },
+    };
   }
-  if (!engineSelection.explicit && engineSelection.fallbackReason) {
-    await ctx.onLog("stderr", formatGeminiAcpFallbackMessage(engineSelection.fallbackReason));
+  if (engineSelection.engine === "acp") {
+    return executeGeminiAcp(ctx);
   }
 
   const { runId, agent, runtime, config, context, onLog, onMeta, onSpawn, authToken } = ctx;
@@ -228,7 +233,9 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
 
   const promptTemplate = asString(
     config.promptTemplate,
-    DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE,
+    context.conversationMode === true
+      ? DEFAULT_PAPERCLIP_CONVERSATION_PROMPT_TEMPLATE
+      : DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE,
   );
   const command = asString(config.command, "gemini");
   const model = asString(config.model, DEFAULT_GEMINI_LOCAL_MODEL).trim();
@@ -253,13 +260,21 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   let effectiveExecutionCwd = adapterExecutionTargetRemoteCwd(executionTarget, cwd);
   await ensureAbsoluteDirectory(cwd, { createIfMissing: true });
   const geminiSkillEntries = await readPaperclipRuntimeSkillEntries(config, __moduleDir);
-  const desiredGeminiSkillNames = resolvePaperclipDesiredSkillNames(config, geminiSkillEntries);
+  const desiredGeminiSkillNames = resolveLegacyPaperclipDesiredSkillNames(config, geminiSkillEntries);
   if (!executionTargetIsRemote) {
-    await ensureGeminiSkillsInjected(onLog, geminiSkillEntries, desiredGeminiSkillNames);
+    await ensureGeminiSkillsInjected(
+      onLog,
+      geminiSkillEntries.filter((entry) => !isPaperclipSkillSourceMissing(entry)),
+      desiredGeminiSkillNames,
+      resolveGeminiSkillsHome(config),
+    );
   }
 
   const envConfig = parseObject(config.env);
-  const env: Record<string, string> = { ...buildPaperclipEnv(agent) };
+  const env: Record<string, string> = {
+    ...buildPaperclipEnv(agent),
+    ...buildRuntimeToolsEnv(ctx.runtimeTools),
+  };
   env.PAPERCLIP_RUN_ID = runId;
   const wakeTaskId =
     (typeof context.taskId === "string" && context.taskId.trim().length > 0 && context.taskId.trim()) ||
@@ -293,7 +308,6 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   if (approvalId) env.PAPERCLIP_APPROVAL_ID = approvalId;
   if (approvalStatus) env.PAPERCLIP_APPROVAL_STATUS = approvalStatus;
   if (linkedIssueIds.length > 0) env.PAPERCLIP_LINKED_ISSUE_IDS = linkedIssueIds.join(",");
-  if (wakePayloadJson) env.PAPERCLIP_WAKE_PAYLOAD_JSON = wakePayloadJson;
   refreshPaperclipWorkspaceEnvForExecution({
     env,
     envConfig,
@@ -307,6 +321,24 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     executionTargetIsRemote,
     executionCwd: effectiveExecutionCwd,
   });
+  // SPA-9259: cap the inline env copy of the wake payload; oversized
+  // payloads are staged to a file (local) or dropped in favor of the wake
+  // prompt (remote) so spawn never hits E2BIG. Runs AFTER env assembly so
+  // the run scratch dir from envConfig is present for file staging.
+  const wakePayloadEnv = await applyPaperclipWakePayloadEnv(env, {
+    runId,
+    wakePayloadJson,
+    executionTargetIsRemote,
+  });
+  if (wakePayloadEnv.mode !== "inline") {
+    await onLog(
+      "stdout",
+      `[paperclip] Wake payload (${wakePayloadEnv.byteLength} bytes) exceeds the inline env limit; ` +
+        (wakePayloadEnv.mode === "file"
+          ? `staged to ${wakePayloadEnv.filePath} via PAPERCLIP_WAKE_PAYLOAD_FILE.\n`
+          : "env copy dropped (remote execution target); the wake prompt in stdin still carries the payload content.\n"),
+    );
+  }
   if (executionTargetIsRemote && typeof env.GEMINI_CLI_TRUST_WORKSPACE !== "string") {
     env.GEMINI_CLI_TRUST_WORKSPACE = "true";
   }
@@ -458,6 +490,8 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     paperclipBridge = await startAdapterExecutionTargetPaperclipBridge({
       runId,
       target: runtimeExecutionTarget,
+      enableSandboxDuplexBridge: adapterExecutionTargetEnablesSandboxDuplexBridge(runtimeExecutionTarget),
+      duplexObservabilityRecorder: adapterExecutionTargetDuplexObservabilityRecorder(runtimeExecutionTarget),
       runtimeRootDir: remoteRuntimeRootDir,
       adapterKey: "gemini",
       timeoutSec,
@@ -543,7 +577,14 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     !sessionId && bootstrapPromptTemplate.trim().length > 0
       ? renderTemplate(bootstrapPromptTemplate, templateData).trim()
       : "";
-  const wakePrompt = renderPaperclipWakePrompt(context.paperclipWake, { resumedSession: Boolean(sessionId) });
+  const taskContextNote = context.conversationMode === true
+    ? selectPaperclipTaskMarkdown(context, { resumedSession: Boolean(sessionId) })
+    : "";
+  const wakePrompt = renderPaperclipWakePrompt(context.paperclipWake, {
+    conversationMode: context.conversationMode === true,
+    resumedSession: Boolean(sessionId),
+    suppressIssueDescription: taskContextNote.length > 0,
+  });
   const shouldUseResumeDeltaPrompt = Boolean(sessionId) && wakePrompt.length > 0;
   const renderedPrompt = shouldUseResumeDeltaPrompt || isPaperclipRecoveryWakePayload(context.paperclipWake)
     ? ""
@@ -555,6 +596,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     instructionsPrefix,
     renderedBootstrapPrompt,
     wakePrompt,
+    taskContextNote,
     sessionHandoffNote,
     paperclipEnvNote,
     apiAccessNote,
@@ -565,6 +607,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     instructionsChars: instructionsPrefix.length,
     bootstrapPromptChars: renderedBootstrapPrompt.length,
     wakePromptChars: wakePrompt.length,
+    taskContextChars: taskContextNote.length,
     sessionHandoffChars: sessionHandoffNote.length,
     runtimeNoteChars: paperclipEnvNote.length + apiAccessNote.length,
     heartbeatPromptChars: renderedPrompt.length,
@@ -619,6 +662,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       onRuntimeProgress: ctx.onRuntimeProgress,
       onLog,
       runLogTail: paperclipBridge?.runLogTail,
+      settleRunDisposition: paperclipBridge?.settleRunDisposition,
     });
     return {
       proc,
@@ -634,6 +678,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         timedOut: boolean;
         stdout: string;
         stderr: string;
+        errorCode?: string | null;
       };
       parsed: ReturnType<typeof parseGeminiJsonl>;
     },
@@ -709,7 +754,12 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       signal: attempt.proc.signal,
       timedOut: false,
       errorMessage: failed ? fallbackErrorMessage : null,
-      errorCode: failed && authMeta.requiresAuth
+      // Forward the transport-level error code from the run-disposition seam
+      // first. A lost duplex control channel surfaces the typed
+      // `duplex_channel_lost` code before any provider classification.
+      errorCode: attempt.proc.errorCode
+        ? attempt.proc.errorCode
+        : failed && authMeta.requiresAuth
         ? "gemini_auth_required"
         : failed && clearSessionForTurnLimit
         ? "max_turns_exhausted"

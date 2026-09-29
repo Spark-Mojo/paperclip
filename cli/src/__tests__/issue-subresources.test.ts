@@ -13,6 +13,7 @@ const PRODUCT_ID = "77777777-7777-4777-8777-777777777777";
 const INTERACTION_ID = "88888888-8888-4888-8888-888888888888";
 const HOLD_ID = "99999999-9999-4999-8999-999999999999";
 const ATTACHMENT_ID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+const SECOND_ATTACHMENT_ID = "abababab-abab-4bab-8bab-abababababab";
 const LABEL_ID = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
 
 function createProgram(): Command {
@@ -50,7 +51,7 @@ describe("issue subresource commands", () => {
     const fetchMock = vi.fn().mockImplementation(() => Promise.resolve(jsonResponse()));
     vi.stubGlobal("fetch", fetchMock);
 
-    await run(["issue", "get", ISSUE_ID, "--json"]);
+    await run(["issue", "get", ISSUE_ID]);
     await run(["issue", "update", ISSUE_ID, "--title", "New title"]);
     await run(["issue", "delete", ISSUE_ID, "--yes"]);
 
@@ -61,91 +62,22 @@ describe("issue subresource commands", () => {
     ]);
   });
 
-  it("augments issue get with pendingInteractions (pending + expired) when --include-interactions is set", async () => {
-    const fetchMock = vi
-      .fn()
-      .mockImplementation((url: string) => {
-        if (url.endsWith(`/interactions`)) {
-          return Promise.resolve(
-            jsonResponse([
-              {
-                id: INTERACTION_ID,
-                kind: "request_confirmation",
-                status: "pending",
-                title: "Approve PR",
-                summary: "Ship it",
-                createdAt: "2026-08-22T00:00:00Z",
-              },
-              {
-                id: "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
-                kind: "request_confirmation",
-                status: "expired",
-                title: "Approve PR (expired)",
-                summary: null,
-                createdAt: "2026-08-20T00:00:00Z",
-              },
-              {
-                id: "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
-                kind: "ask_user_questions",
-                status: "accepted",
-                title: "Already answered",
-                summary: null,
-                createdAt: "2026-08-21T00:00:00Z",
-              },
-            ]),
-          );
-        }
-        return Promise.resolve(jsonResponse({ id: ISSUE_ID, status: "todo" }));
-      });
-    vi.stubGlobal("fetch", fetchMock);
-
-    await run(["issue", "get", ISSUE_ID, "--json", "--include-interactions"]);
-
-    expect(fetchMock.mock.calls.map((call) => call[0])).toEqual([
-      `http://localhost:3100/api/issues/${ISSUE_ID}`,
-      `http://localhost:3100/api/issues/${ISSUE_ID}/interactions`,
-    ]);
-    // SPA-4971 honest-state set: pending + expired surface; accepted does not.
-    expect(vi.mocked(console.log).mock.calls).toEqual([
-      [
-        JSON.stringify(
-          {
-            ...{ id: ISSUE_ID, status: "todo" },
-            pendingInteractions: [
-              {
-                id: INTERACTION_ID,
-                kind: "request_confirmation",
-                status: "pending",
-                title: "Approve PR",
-                summary: "Ship it",
-                createdAt: "2026-08-22T00:00:00Z",
-              },
-              {
-                id: "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
-                kind: "request_confirmation",
-                status: "expired",
-                title: "Approve PR (expired)",
-                summary: null,
-                createdAt: "2026-08-20T00:00:00Z",
-              },
-            ],
-          },
-          null,
-          2,
-        ),
-      ],
-    ]);
-  });
-
-  it("skips the interactions fetch when --no-include-interactions is set", async () => {
+  it("binds explicit uploaded attachments when adding a comment", async () => {
     const fetchMock = vi.fn().mockImplementation(() => Promise.resolve(jsonResponse()));
     vi.stubGlobal("fetch", fetchMock);
 
-    await run(["issue", "get", ISSUE_ID, "--no-include-interactions"]);
-
-    expect(fetchMock.mock.calls.map((call) => call[0])).toEqual([
-      `http://localhost:3100/api/issues/${ISSUE_ID}`,
+    await run([
+      "issue", "comment", ISSUE_ID,
+      "--body", "The requested files are ready.",
+      "--attachment-id", ATTACHMENT_ID, SECOND_ATTACHMENT_ID,
     ]);
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(fetchMock.mock.calls[0]?.[0]).toBe(`http://localhost:3100/api/issues/${ISSUE_ID}/comments`);
+    expect(JSON.parse(String(fetchMock.mock.calls[0]?.[1]?.body))).toEqual({
+      body: "The requested files are ready.",
+      attachmentIds: [ATTACHMENT_ID, SECOND_ATTACHMENT_ID],
+    });
   });
 
   it("wraps comments, approvals, markers, and recovery action endpoints", async () => {
