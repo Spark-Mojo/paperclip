@@ -523,6 +523,15 @@ import {
   type RunSnapshot as WakeQueueRunSnapshot,
 } from "../modules/wake-queue/index.js";
 import {
+  evaluateWakeLoopGuard,
+  hasRecentTripRecord,
+  hasEligibleRoutineContinuation,
+  isTerminalIssueStatusForWake,
+  loadIssueStatusForWakeGuard,
+  WAKE_LOOP_GUARD_HOURLY_LIMIT,
+  WAKE_LOOP_GUARD_WINDOW_MS,
+} from "./wake-loop-guard.js";
+import {
   buildIssueReviewPathLostIdempotencyKey,
   decideIssueReviewPathRecovery,
   ISSUE_REVIEW_PATH_LOST_WAKE_REASON,
@@ -13717,19 +13726,11 @@ export function heartbeatService(
         ? treeControlSvc.getActivePauseHoldGate(issue.companyId, issue.id)
         : Promise.resolve(null),
       issue
-        ? db
-            .select({ id: routines.id })
-            .from(routines)
-            .where(
-              and(
-                eq(routines.companyId, issue.companyId),
-                eq(routines.parentIssueId, issue.id),
-                eq(routines.status, "active"),
-              ),
-            )
-            .limit(1)
-            .then((rows) => rows[0] ?? null)
-        : Promise.resolve(null),
+        ? hasEligibleRoutineContinuation(db, {
+            companyId: issue.companyId, agentId: run.agentId, issueId: issue.id,
+            continuationRoutineId: parseObject(run.contextSnapshot).continuationRoutineId,
+          })
+        : Promise.resolve(false),
     ]);
 
     const decision = decideSuccessfulRunHandoff({
@@ -26602,6 +26603,93 @@ export function heartbeatService(
         error: `Wake suppressed because company status is ${companyStatus}`,
       }, { companyStatus });
       return null;
+    }
+
+    // SPA-9280: wake-loop guard at the emit site. Skipped wakes do not create
+    // `heartbeatRuns`, so the existing terminal-status continuation-retry gate
+    // never sees them; without this, an interaction-delivery wake whose
+    // dependencies are permanently unresolvable (e.g. cancelled blocker) is
+    // re-queued every reconciliation tick and produces one
+    // `agent_wakeup_requests` row per tick. Three layers, gated at emit so the
+    // loop never produces another row once tripped:
+    //
+    //   0. Terminal-status guard: refuses to emit on `done`/`cancelled` issues
+    //      and skips the row write — the issue is terminal, no evidence row is
+    //      needed (defends against the TOCTOU between recovery sweep candidate
+    //      reads and status transitions).
+    //   1. Per-chain guard: keyed on (agent, issue, mutation, retryOfRunId).
+    //   2. Per-(agent, issue) hourly guard: gross-abuse ceiling.
+    //
+    // Trip-rows are deduped on (company, agent, issue, guard) within a 60 s
+    // window so a 30 s tick cadence produces one trip-row per minute per guard
+    // instead of one per tick. Operator-driven wakes (`requestedByActorType
+    // === "user"`) always pass.
+    if (issueId && opts.requestedByActorType !== "user") {
+      if (opts.idempotencyKey?.startsWith("handoff_bounded_continuation:")) {
+        const existing = await db.select({ id: agentWakeupRequests.id }).from(agentWakeupRequests)
+          .where(and(
+            eq(agentWakeupRequests.companyId, agent.companyId),
+            eq(agentWakeupRequests.agentId, agentId),
+            eq(agentWakeupRequests.idempotencyKey, opts.idempotencyKey),
+            ne(agentWakeupRequests.status, "skipped"),
+          )).limit(1);
+        if (existing.length > 0) return null;
+      }
+      if ((opts.reason === "issue_continuation_needed" || opts.reason === "finish_successful_run_handoff") &&
+          await hasEligibleRoutineContinuation(db, {
+            companyId: agent.companyId, agentId, issueId,
+            continuationRoutineId: payload?.continuationRoutineId ?? enrichedContextSnapshot.continuationRoutineId,
+          })) return null;
+      const issueStatus = await loadIssueStatusForWakeGuard(db, issueId);
+      if (isTerminalIssueStatusForWake(issueStatus)) {
+        // Terminal-issue short-circuit: refuse to emit, write no row. The
+        // recovery sweep's candidate filter excludes terminal statuses, but a
+        // status transition committed between candidate read and this point
+        // can still leak through; this layer closes the gap.
+        logger.debug(
+          {
+            agentId,
+            issueId,
+            issueStatus,
+            source,
+            triggerDetail,
+          },
+          "wake-loop guard (layer 0): refusing wake for terminal-status issue",
+        );
+        return null;
+      }
+      const decision = await evaluateWakeLoopGuard(db, {
+        companyId: agent.companyId,
+        agentId,
+        issueId,
+        payload,
+        reason: opts.reason,
+      });
+      if (decision.tripped) {
+        // Trip-row dedup: write at most one row per (company, agent, issue,
+        // guard) within WAKE_LOOP_GUARD_TRIP_RECORD_DEDUP_MS. Without this,
+        // a 30 s reconciliation tick keeps producing rows forever, just with
+        // a different reason — same observable symptom as the original loop.
+        const alreadyRecorded = await hasRecentTripRecord(db, {
+          companyId: agent.companyId,
+          agentId,
+          issueId,
+          guard: decision.guard,
+          mutation: typeof payload?.mutation === "string" ? payload.mutation : null,
+          retryOfRunId: typeof payload?.retryOfRunId === "string" ? payload.retryOfRunId : null,
+        });
+        if (!alreadyRecorded) {
+          await writeSkippedHeartbeatRequest("wake_loop_guard_tripped", {
+            guard: decision.guard,
+            count: decision.count,
+            limit: decision.limit,
+            windowMs: decision.windowMs,
+            source,
+            triggerDetail,
+          });
+        }
+        return null;
+      }
     }
 
     const explicitResumeSession = await resolveExplicitResumeSessionOverride(

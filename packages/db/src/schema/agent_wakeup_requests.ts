@@ -93,5 +93,11 @@ export const agentWakeupRequests = pgTable(
       table.companyId,
       sql`(${table.payload} ->> 'issueId')`,
     ),
+    wakeLoopGuardIdx: index("agent_wakeup_requests_company_agent_issue_created_idx").on(
+      table.companyId,
+      table.agentId,
+      sql`(${table.payload} ->> 'issueId')`,
+      table.createdAt,
+    ),
   }),
 );
