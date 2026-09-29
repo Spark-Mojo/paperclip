@@ -61,10 +61,11 @@
 import { randomUUID } from "node:crypto";
 import { and, desc, eq, gte, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
-import { agentWakeupRequests, issues, issueRelations } from "@paperclipai/db";
+import { agentWakeupRequests, issues, issueRelations, routines, routineTriggers } from "@paperclipai/db";
 
 /** How many wakeup attempts on one (agent, issue) per hour trip the gross-abuse guard. */
 export const WAKE_LOOP_GUARD_HOURLY_LIMIT = 20;
+export const WAKE_LOOP_GUARD_CHAIN_LIMIT = 10;
 
 /** Window for the hourly guard. */
 export const WAKE_LOOP_GUARD_WINDOW_MS = 60 * 60 * 1000;
@@ -138,6 +139,8 @@ export async function hasRecentTripRecord(
     agentId: string;
     issueId: string;
     guard: "chain" | "hourly" | "backoff";
+    mutation?: string | null;
+    retryOfRunId?: string | null;
     now?: Date;
     windowMs?: number;
   },
@@ -155,12 +158,36 @@ export async function hasRecentTripRecord(
         eq(agentWakeupRequests.reason, "wake_loop_guard_tripped"),
         sql`${agentWakeupRequests.payload} ->> 'issueId' = ${input.issueId}`,
         sql`(${agentWakeupRequests.payload} -> 'heartbeatSkip' ->> 'guard') = ${input.guard}`,
-        gte(agentWakeupRequests.createdAt, cutoff),
+        ...(input.guard === "chain" ? [
+          sql`${agentWakeupRequests.payload} ->> 'retryOfRunId' IS NOT DISTINCT FROM ${input.retryOfRunId ?? null}`,
+          sql`${agentWakeupRequests.payload} ->> 'mutation' IS NOT DISTINCT FROM ${input.mutation ?? null}`,
+        ] : [gte(agentWakeupRequests.createdAt, cutoff)]),
       ),
     )
     .limit(1)
     .then((rows) => rows[0] ?? null);
   return row !== null;
+}
+
+export async function hasEligibleRoutineContinuation(db: Db, input: {
+  companyId: string; agentId: string; issueId: string; continuationRoutineId: unknown;
+}): Promise<boolean> {
+  if (typeof input.continuationRoutineId !== "string" ||
+      !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(input.continuationRoutineId)) return false;
+  const rows = await db.select({ id: routines.id }).from(routines)
+    .innerJoin(routineTriggers, eq(routineTriggers.routineId, routines.id))
+    .where(and(
+      eq(routines.id, input.continuationRoutineId),
+      eq(routines.companyId, input.companyId),
+      eq(routineTriggers.companyId, input.companyId),
+      eq(routines.parentIssueId, input.issueId),
+      eq(routines.assigneeAgentId, input.agentId),
+      eq(routines.status, "active"),
+      eq(routineTriggers.enabled, true),
+      eq(routineTriggers.kind, "schedule"),
+      sql`${routineTriggers.nextRunAt} IS NOT NULL`,
+    )).limit(1);
+  return rows.length > 0;
 }
 
 export interface WakeLoopGuardSummary {
@@ -189,6 +216,7 @@ export interface WakeLoopGuardInput {
   agentId: string;
   issueId: string;
   payload: Record<string, unknown> | null | undefined;
+  reason?: string | null;
   now?: Date;
 }
 
@@ -285,6 +313,7 @@ export async function loadChainMostRecentSkipAt(
     eq(agentWakeupRequests.companyId, input.companyId),
     eq(agentWakeupRequests.agentId, input.agentId),
     sql`${agentWakeupRequests.payload} ->> 'issueId' = ${input.issueId}`,
+    sql`${agentWakeupRequests.reason} IS DISTINCT FROM 'wake_loop_guard_tripped'`,
   ];
   if (input.mutation) {
     conditions.push(sql`${agentWakeupRequests.payload} ->> 'mutation' = ${input.mutation}`);
@@ -319,7 +348,7 @@ export async function summarizeMutationChainWakeups(
 ): Promise<WakeLoopChainSummary> {
   const now = input.now ?? new Date();
   const windowMs = input.windowMs ?? WAKE_LOOP_GUARD_WINDOW_MS;
-  const cutoff = new Date(now.getTime() - windowMs);
+  const cutoff = new Date(now.getTime() - (Number.isFinite(windowMs) ? windowMs : 0));
 
   // A chain is keyed on mutation + retryOfRunId. Without a mutation or
   // retryOfRunId the chain is "shapeless" and the per-chain guard cannot
@@ -338,7 +367,8 @@ export async function summarizeMutationChainWakeups(
     eq(agentWakeupRequests.companyId, input.companyId),
     eq(agentWakeupRequests.agentId, input.agentId),
     sql`${agentWakeupRequests.payload} ->> 'issueId' = ${input.issueId}`,
-    gte(agentWakeupRequests.createdAt, cutoff),
+    ...(input.windowMs === Infinity ? [] : [gte(agentWakeupRequests.createdAt, cutoff)]),
+    sql`${agentWakeupRequests.reason} IS DISTINCT FROM 'wake_loop_guard_tripped'`,
   ];
   if (input.mutation) {
     conditions.push(sql`${agentWakeupRequests.payload} ->> 'mutation' = ${input.mutation}`);
@@ -404,6 +434,35 @@ export async function evaluateWakeLoopGuard(
   const now = input.now ?? new Date();
   const payload = (input.payload ?? {}) as Record<string, unknown>;
   const mutation = typeof payload.mutation === "string" ? payload.mutation : null;
+  const continuation = input.reason === "issue_continuation_needed" || input.reason === "finish_successful_run_handoff";
+  if (continuation) {
+    const humanWake = await db.select({ createdAt: agentWakeupRequests.createdAt })
+      .from(agentWakeupRequests).where(and(
+        eq(agentWakeupRequests.companyId, input.companyId),
+        eq(agentWakeupRequests.agentId, input.agentId),
+        sql`${agentWakeupRequests.payload} ->> 'issueId' = ${input.issueId}`,
+        eq(agentWakeupRequests.requestedByActorType, "user"),
+      )).orderBy(desc(agentWakeupRequests.createdAt)).limit(1);
+    const attempts = await db.select({ createdAt: agentWakeupRequests.createdAt })
+      .from(agentWakeupRequests).where(and(
+        eq(agentWakeupRequests.companyId, input.companyId),
+        eq(agentWakeupRequests.agentId, input.agentId),
+        sql`${agentWakeupRequests.payload} ->> 'issueId' = ${input.issueId}`,
+        sql`${agentWakeupRequests.reason} IN ('issue_continuation_needed', 'finish_successful_run_handoff')`,
+        sql`${agentWakeupRequests.requestedByActorType} IS DISTINCT FROM 'user'`,
+        ...(humanWake[0] ? [gte(agentWakeupRequests.createdAt, humanWake[0].createdAt)] : []),
+      )).orderBy(desc(agentWakeupRequests.createdAt));
+    const prior = attempts[0]?.createdAt;
+    if (prior) {
+      const exhausted = attempts.length >= WAKE_LOOP_GUARD_CHAIN_LIMIT;
+      const nextEligibleAt = new Date(prior.getTime() + backoffWindowMsForAttempt(attempts.length + 1));
+      if (exhausted || now < nextEligibleAt) return {
+        tripped: true, guard: exhausted ? "chain" : "backoff", count: attempts.length,
+        limit: exhausted ? WAKE_LOOP_GUARD_CHAIN_LIMIT : attempts.length + 1,
+        windowMs: 0, attempt: attempts.length + 1, nextEligibleAt, mostRecentSkipAt: prior,
+      };
+    }
+  }
   const retryOfRunId = typeof payload.retryOfRunId === "string" ? payload.retryOfRunId : null;
 
   if (mutation || retryOfRunId) {
@@ -426,7 +485,17 @@ export async function evaluateWakeLoopGuard(
       mutation,
       retryOfRunId,
       now,
+      windowMs: Infinity,
     });
+
+    if (chain.totalInWindow >= WAKE_LOOP_GUARD_CHAIN_LIMIT) {
+      return {
+        tripped: true, guard: "chain", count: chain.totalInWindow,
+        limit: WAKE_LOOP_GUARD_CHAIN_LIMIT, windowMs: 0,
+        attempt: chain.totalInWindow + 1, nextEligibleAt: now,
+        mostRecentSkipAt: chain.mostRecentSkipAt ?? now,
+      };
+    }
 
     if (chainMostRecentSkipAt !== null && chain.totalInWindow >= 1) {
       const attempt = chain.totalInWindow + 1;

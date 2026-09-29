@@ -189,6 +189,77 @@ describeEmbeddedPostgres("SPA-9282 — terminalizeLegacyExecution once-write gua
     expect(recoveryActionsAfterSecond[0]?.id).toBe(recoveryActionsAfterFirst[0]?.id);
   });
 
+  it("does not reopen the once-write guard when status delivery clears executionStatusDeliveryId", async () => {
+    // SPA-9282 cycle 4 regression: deliverExecutionStatuses (a 15s sweep)
+    // publishes the run status and then CLEARS executionStatusDeliveryId to
+    // null after each pass. A guard latched on the delivery id therefore
+    // re-opens on the next periodic reconciliation sweep and the terminal
+    // run is rewritten with a fresh delivery id + updated_at (toast flood).
+    // The once marker must live in result_json so it survives the
+    // publish-and-clear cycle.
+    const { run, runId } = await seedLegacyFailedRun();
+
+    const first = await terminalizeLegacyExecution({
+      db,
+      run,
+      status: "failed",
+    });
+    expect(first).not.toBeNull();
+    const afterFirst = await db
+      .select({
+        executionStatusDeliveryId: heartbeatRuns.executionStatusDeliveryId,
+        resultJson: heartbeatRuns.resultJson,
+        updatedAt: heartbeatRuns.updatedAt,
+      })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, runId))
+      .then((rows) => rows[0]);
+    expect(afterFirst?.executionStatusDeliveryId).toBeTruthy();
+    expect(
+      (afterFirst?.resultJson as Record<string, unknown> | null)
+        ?.executionTerminalizedAt,
+    ).toEqual(expect.any(String));
+    const updatedAtAfterFirst = afterFirst?.updatedAt.getTime();
+
+    // Simulate deliverExecutionStatuses publishing and clearing the receipt.
+    await db
+      .update(heartbeatRuns)
+      .set({ executionStatusDeliveryId: null })
+      .where(eq(heartbeatRuns.id, runId));
+
+    // The next periodic sweep re-terminalizes the same already-terminal run
+    // with an empty patch. The result_json marker (not the delivery id) must
+    // make this a no-op: no new delivery id, no updated_at bump.
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    const second = await terminalizeLegacyExecution({
+      db,
+      run,
+      status: "failed",
+    });
+    expect(second).toBeNull();
+
+    const afterSecond = await db
+      .select({
+        executionStatusDeliveryId: heartbeatRuns.executionStatusDeliveryId,
+        resultJson: heartbeatRuns.resultJson,
+        updatedAt: heartbeatRuns.updatedAt,
+      })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, runId))
+      .then((rows) => rows[0]);
+    expect(afterSecond?.executionStatusDeliveryId).toBeNull();
+    expect(afterSecond?.updatedAt.getTime()).toBe(updatedAtAfterFirst);
+    expect(
+      (afterSecond?.resultJson as Record<string, unknown> | null)
+        ?.executionTerminalizedAt,
+    ).toEqual(expect.any(String));
+
+    const recoveryActionsAfterSecond = await db
+      .select({ id: issueRecoveryActions.id })
+      .from(issueRecoveryActions);
+    expect(recoveryActionsAfterSecond).toHaveLength(1);
+  });
+
   it("admits a second call when the caller carries a patch (status transition shape)", async () => {
     const { run, runId } = await seedLegacyFailedRun();
 

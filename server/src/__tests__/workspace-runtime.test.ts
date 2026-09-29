@@ -28,13 +28,19 @@ import {
   buildWorkspaceRuntimeDesiredStatePatch,
   cleanupExecutionWorkspaceArtifacts,
   ensurePersistedExecutionWorkspaceAvailable,
+  ExecutionWorkspaceNotProvisionableError,
   ensureServerWorkspaceLinksCurrent,
   ensureRuntimeServicesForRun,
   listConfiguredRuntimeServiceEntries,
   normalizeAdapterManagedRuntimeServices,
+  reapOrphanedRunWorktrees,
+  reconcileEphemeralWorktreesOnStartup,
   reconcilePersistedRuntimeServicesOnStartup,
   realizeExecutionWorkspace,
   refreshRemoteTrackingBaseRef,
+  releaseEphemeralRunWorkspaceForHeartbeatFinally,
+  releaseRunExecutionWorkspace,
+  releaseRunExecutionWorkspaceForHeartbeat,
   releaseRuntimeServicesForRun,
   UnresolvedWorkspaceBaseRefError,
   resetRuntimeServicesForTests,
@@ -48,6 +54,7 @@ import {
   startRuntimeServicesForWorkspaceControl,
   stopRuntimeServicesForExecutionWorkspace,
   stopRuntimeServicesForProjectWorkspace,
+  sweepTerminalIssueRunWorktrees,
   WORKSPACE_RUNTIME_PORT_ALLOCATION_ATTEMPTS,
   type RealizedExecutionWorkspace,
 } from "../services/workspace-runtime.ts";
@@ -3642,11 +3649,20 @@ describe("realizeExecutionWorkspace", () => {
     });
   }, 15_000);
 
-  it("does not reuse a missing persisted local filesystem workspace", async () => {
+  it("never silently reuses a missing persisted local filesystem workspace (SPA-9315)", async () => {
     const baseCwd = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-workspace-base-"));
     const missingCwd = path.join(baseCwd, "missing-workspace");
 
-    const restored = await ensurePersistedExecutionWorkspaceAvailable({
+    // Pre-SPA-9315 this returned `null`, which the heartbeat provisioning layer
+    // turned into the generic `inherited_workspace_reuse_unavailable` throw and
+    // a `setup_failed` run — because SPA-7090's refusal gate keys on the row
+    // status, and this row still reads `active`. The missing directory is
+    // PROVABLY unrestorable for a non-git_worktree strategy (the SPA-8870
+    // restore-from-origin arm is gated behind git_worktree), so it now signals a
+    // typed failure the caller can discriminate. The invariant this test guards —
+    // "never hand back a workspace that is not on disk" — is unchanged and
+    // stronger: it now fails loudly instead of degrading to a bare null.
+    await expect(ensurePersistedExecutionWorkspaceAvailable({
       base: {
         baseCwd,
         source: "project_primary",
@@ -3656,8 +3672,10 @@ describe("realizeExecutionWorkspace", () => {
         repoRef: null,
       },
       workspace: {
+        id: "workspace-missing",
         mode: "shared_workspace",
         strategyType: "project_primary",
+        status: "active",
         cwd: missingCwd,
         providerRef: null,
         projectId: "project-1",
@@ -3676,9 +3694,56 @@ describe("realizeExecutionWorkspace", () => {
         name: "Codex Coder",
         companyId: "company-1",
       },
-    });
+    })).rejects.toThrow(ExecutionWorkspaceNotProvisionableError);
 
-    expect(restored).toBeNull();
+    // The typed error must remain catchable as a workspace validation failure so
+    // the two other callers of this function keep their fail-closed handling.
+    const error = await ensurePersistedExecutionWorkspaceAvailable({
+      base: {
+        baseCwd,
+        source: "project_primary",
+        projectId: "project-1",
+        workspaceId: null,
+        repoUrl: null,
+        repoRef: null,
+      },
+      workspace: {
+        id: "workspace-missing",
+        mode: "shared_workspace",
+        strategyType: "project_primary",
+        status: "active",
+        cwd: missingCwd,
+        providerRef: null,
+        projectId: "project-1",
+        projectWorkspaceId: null,
+        repoUrl: null,
+        baseRef: null,
+        branchName: null,
+      },
+      issue: {
+        id: "issue-1",
+        identifier: "PAP-453",
+        title: "Missing local workspace",
+      },
+      agent: {
+        id: "agent-1",
+        name: "Codex Coder",
+        companyId: "company-1",
+      },
+    }).catch((caught) => caught);
+
+    expect(error).toBeInstanceOf(ExecutionWorkspaceNotProvisionableError);
+    expect(error.code).toBe("workspace_validation_failed");
+    expect(error.executionWorkspaceId).toBe("workspace-missing");
+    expect(error.workspaceStatus).toBe("active");
+    expect(error.resultJson).toMatchObject({
+      workspaceValidation: {
+        reason: "execution_workspace_not_provisionable",
+        reasonCode: "missing_on_disk_directory",
+        executionWorkspaceId: "workspace-missing",
+        workspaceStatus: "active",
+      },
+    });
   });
 
   it("reprovisions an existing persisted git worktree before manual control starts it", async () => {
@@ -4321,6 +4386,832 @@ describe("realizeExecutionWorkspace", () => {
     await expect(fs.stat(instanceRoot)).rejects.toMatchObject({ code: "ENOENT" });
     await fs.rm(worktreesDir, { recursive: true, force: true });
   });
+});
+
+describe("ephemeral worktree per run (SPA-9275)", () => {
+  it("ephemeral lifecycle names the worktree by run id", async () => {
+    const repoRoot = await createTempRepo();
+    const runId = `run-${randomUUID()}`;
+    const { recorder, operations } = createWorkspaceOperationRecorderDouble();
+    const workspace = await realizeExecutionWorkspace({
+      base: {
+        baseCwd: repoRoot,
+        source: "project_primary",
+        projectId: "project-1",
+        workspaceId: "workspace-1",
+        repoUrl: null,
+        repoRef: "HEAD",
+      },
+      config: {
+        workspaceStrategy: {
+          type: "git_worktree",
+          branchTemplate: "{{issue.identifier}}-{{slug}}",
+        },
+      },
+      issue: {
+        id: "issue-1",
+        identifier: "PAP-9275",
+        title: "Run-scoped worktree",
+      },
+      agent: {
+        id: "agent-1",
+        name: "Codex Coder",
+        companyId: "company-1",
+      },
+      heartbeatRunId: runId,
+      ephemeralLifecycle: true,
+      recorder,
+    });
+    expect(workspace.ephemeralLifecycle).toBe(true);
+    expect(workspace.worktreePath).toBe(
+      path.join(repoRoot, ".paperclip", "worktrees", "runs", runId),
+    );
+    expect(workspace.branchName).toBe("PAP-9275-run-scoped-worktree");
+    expect(existsSync(workspace.worktreePath)).toBe(true);
+    const addOp = operations.find((op) => op.command?.includes("git worktree add"));
+    expect(addOp?.command).toContain("git worktree add");
+    expect(addOp?.command).toContain(runId);
+  });
+
+  it("persistent lifecycle still names the worktree by branch", async () => {
+    const repoRoot = await createTempRepo();
+    const workspace = await realizeExecutionWorkspace({
+      base: {
+        baseCwd: repoRoot,
+        source: "project_primary",
+        projectId: "project-1",
+        workspaceId: "workspace-1",
+        repoUrl: null,
+        repoRef: "HEAD",
+      },
+      config: {
+        workspaceStrategy: {
+          type: "git_worktree",
+          branchTemplate: "{{issue.identifier}}-{{slug}}",
+        },
+      },
+      issue: {
+        id: "issue-1",
+        identifier: "PAP-9276",
+        title: "Persistent worktree",
+      },
+      agent: {
+        id: "agent-1",
+        name: "Codex Coder",
+        companyId: "company-1",
+      },
+    });
+    expect(workspace.ephemeralLifecycle).toBeFalsy();
+    expect(workspace.worktreePath).toBe(
+      path.join(repoRoot, ".paperclip", "worktrees", "PAP-9276-persistent-worktree"),
+    );
+  });
+
+  it("concurrent ephemeral realizations never share a directory", async () => {
+    const repoRoot = await createTempRepo();
+    const runIdA = `run-${randomUUID()}`;
+    const runIdB = `run-${randomUUID()}`;
+    const [a, b] = await Promise.all([
+      realizeExecutionWorkspace({
+        base: {
+          baseCwd: repoRoot,
+          source: "project_primary",
+          projectId: "project-1",
+          workspaceId: "workspace-1",
+          repoUrl: null,
+          repoRef: "HEAD",
+        },
+        config: {
+          workspaceStrategy: {
+            type: "git_worktree",
+            branchTemplate: "{{issue.identifier}}-{{slug}}",
+          },
+        },
+        issue: { id: "issue-a", identifier: "PAP-A", title: "Card A" },
+        agent: { id: "agent-1", name: "Codex", companyId: "company-1" },
+        heartbeatRunId: runIdA,
+        ephemeralLifecycle: true,
+      }),
+      realizeExecutionWorkspace({
+        base: {
+          baseCwd: repoRoot,
+          source: "project_primary",
+          projectId: "project-1",
+          workspaceId: "workspace-1",
+          repoUrl: null,
+          repoRef: "HEAD",
+        },
+        config: {
+          workspaceStrategy: {
+            type: "git_worktree",
+            branchTemplate: "{{issue.identifier}}-{{slug}}",
+          },
+        },
+        issue: { id: "issue-b", identifier: "PAP-B", title: "Card B" },
+        agent: { id: "agent-1", name: "Codex", companyId: "company-1" },
+        heartbeatRunId: runIdB,
+        ephemeralLifecycle: true,
+      }),
+    ]);
+    expect(a.worktreePath).not.toBe(b.worktreePath);
+    expect(existsSync(a.worktreePath)).toBe(true);
+    expect(existsSync(b.worktreePath)).toBe(true);
+  });
+
+  it("releaseRunExecutionWorkspace pushes the branch then removes the worktree", async () => {
+    const sourceRepo = await createTempRepo("master");
+    const remoteDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-ephemeral-remote-"));
+    const remotePath = path.join(remoteDir, "paperclip.git");
+    await execFileAsync("git", ["clone", "--bare", sourceRepo, remotePath]);
+    const cloneRoot = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-ephemeral-clone-"));
+    const repoRoot = path.join(cloneRoot, "paperclip");
+    await execFileAsync("git", ["clone", remotePath, repoRoot]);
+    await runGit(repoRoot, ["config", "user.email", "paperclip@example.com"]);
+    await runGit(repoRoot, ["config", "user.name", "Paperclip Test"]);
+
+    const runId = `run-${randomUUID()}`;
+    const { recorder, operations } = createWorkspaceOperationRecorderDouble();
+    const realized = await realizeExecutionWorkspace({
+      base: {
+        baseCwd: repoRoot,
+        source: "project_primary",
+        projectId: "project-1",
+        workspaceId: "workspace-1",
+        repoUrl: remotePath,
+        repoRef: "master",
+      },
+      config: {
+        workspaceStrategy: {
+          type: "git_worktree",
+          branchTemplate: "{{issue.identifier}}-{{slug}}",
+        },
+      },
+      issue: { id: "issue-1", identifier: "PAP-9277", title: "ephemeral push" },
+      agent: { id: "agent-1", name: "Codex", companyId: "company-1" },
+      heartbeatRunId: runId,
+      ephemeralLifecycle: true,
+      recorder,
+    });
+    // Make a commit on the branch so push has something to do.
+    await fs.writeFile(path.join(realized.worktreePath, "feature.txt"), "hello\n", "utf8");
+    await runGit(realized.worktreePath, ["add", "feature.txt"]);
+    await runGit(realized.worktreePath, ["commit", "-m", "feature"]);
+
+    const release = await releaseRunExecutionWorkspace({
+      repoRoot,
+      worktreePath: realized.worktreePath,
+      branchName: realized.branchName,
+      runId,
+      resolveGitAuth: async () => null,
+      recorder,
+    });
+    expect(release.pushed).toBe(true);
+    expect(release.removed).toBe(true);
+    expect(release.errors).toEqual([]);
+    expect(existsSync(realized.worktreePath)).toBe(false);
+    const pushOps = operations.filter((op) => op.command?.includes("git push"));
+    const removeOps = operations.filter((op) => op.command?.includes("git worktree remove --force"));
+    expect(pushOps.length).toBeGreaterThan(0);
+    expect(removeOps.length).toBe(1);
+    // The push operation runs BEFORE the first worktree remove.
+    const pushIdx = operations.findIndex((op) => op.command?.includes("git push"));
+    const removeIdx = operations.findIndex((op) => op.command?.includes("git worktree remove --force"));
+    expect(pushIdx).toBeLessThan(removeIdx);
+    // Confirm the remote actually got the branch.
+    const remoteBranchList = (await execFileAsync("git", ["branch"], { cwd: remotePath })).stdout;
+    expect(remoteBranchList).toContain(realized.branchName);
+  });
+
+  it("releaseRunExecutionWorkspace retries on a stale git lock and ultimately removes the directory", async () => {
+    const repoRoot = await createTempRepo("master");
+    const runId = `run-${randomUUID()}`;
+    const worktreePath = path.join(repoRoot, ".paperclip", "worktrees", "runs", runId);
+    // Create a real-looking directory at the worktree path WITHOUT registering
+    // it with `git worktree add`. Both `git worktree remove --force` attempts
+    // will fail with "is not a working tree" — the retry path must run, then
+    // the fs.rm fallback clears the dir. `branchName: null` — this scenario
+    // is exercising the not-a-registered-worktree fallback, not push/branch
+    // behavior, and this repoRoot has no `origin` remote configured.
+    await fs.mkdir(worktreePath, { recursive: true });
+    await fs.writeFile(path.join(worktreePath, "stale.txt"), "leftover\n", "utf8");
+    const { recorder, operations } = createWorkspaceOperationRecorderDouble();
+    const release = await releaseRunExecutionWorkspace({
+      repoRoot,
+      worktreePath,
+      branchName: null,
+      runId,
+      resolveGitAuth: async () => null,
+      recorder,
+    });
+    expect(release.retriedRemoval).toBe(true);
+    expect(release.removed).toBe(true);
+    expect(existsSync(worktreePath)).toBe(false);
+    const removeOps = operations.filter((op) => op.command?.includes("git worktree remove --force"));
+    expect(removeOps.length).toBe(2);
+  }, 20_000);
+
+  it("releaseRunExecutionWorkspace keeps a dirty worktree instead of removing it (SPA-9275 fail-safe)", async () => {
+    const sourceRepo = await createTempRepo("master");
+    const remoteDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-dirty-remote-"));
+    const remotePath = path.join(remoteDir, "paperclip.git");
+    await execFileAsync("git", ["clone", "--bare", sourceRepo, remotePath]);
+    const cloneRoot = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-dirty-clone-"));
+    const repoRoot = path.join(cloneRoot, "paperclip");
+    await execFileAsync("git", ["clone", remotePath, repoRoot]);
+    await runGit(repoRoot, ["config", "user.email", "paperclip@example.com"]);
+    await runGit(repoRoot, ["config", "user.name", "Paperclip Test"]);
+
+    const runId = `run-${randomUUID()}`;
+    const { recorder } = createWorkspaceOperationRecorderDouble();
+    const realized = await realizeExecutionWorkspace({
+      base: {
+        baseCwd: repoRoot,
+        source: "project_primary",
+        projectId: "project-1",
+        workspaceId: "workspace-1",
+        repoUrl: remotePath,
+        repoRef: "master",
+      },
+      config: {
+        workspaceStrategy: {
+          type: "git_worktree",
+          branchTemplate: "{{issue.identifier}}-{{slug}}",
+        },
+      },
+      issue: { id: "issue-1", identifier: "PAP-9283", title: "dirty worktree kept" },
+      agent: { id: "agent-1", name: "Codex", companyId: "company-1" },
+      heartbeatRunId: runId,
+      ephemeralLifecycle: true,
+      recorder,
+    });
+    // Modify a tracked file WITHOUT committing, and add an untracked file.
+    // README.md is created by createTempRepo and is tracked on master.
+    await fs.writeFile(path.join(realized.worktreePath, "README.md"), "modified but uncommitted\n", "utf8");
+    await fs.writeFile(path.join(realized.worktreePath, "untracked.txt"), "scratch\n", "utf8");
+
+    const release = await releaseRunExecutionWorkspace({
+      repoRoot,
+      worktreePath: realized.worktreePath,
+      branchName: realized.branchName,
+      runId,
+      resolveGitAuth: async () => null,
+      recorder,
+    });
+    expect(release.kept).toBe(true);
+    expect(release.keptReason).toBe("dirty_worktree");
+    expect(release.removed).toBe(false);
+    expect(existsSync(realized.worktreePath)).toBe(true);
+    const readmeContents = await fs.readFile(path.join(realized.worktreePath, "README.md"), "utf8");
+    expect(readmeContents).toBe("modified but uncommitted\n");
+    const untrackedContents = await fs.readFile(path.join(realized.worktreePath, "untracked.txt"), "utf8");
+    expect(untrackedContents).toBe("scratch\n");
+  });
+
+  it("releaseRunExecutionWorkspace keeps a dirty worktree that is not registered under the given repoRoot (SPA-9275 fail-safe)", async () => {
+    const repoRoot = await createTempRepo("master");
+    const otherRepoRoot = await createTempRepo("master");
+    const runId = `run-${randomUUID()}`;
+    const { recorder } = createWorkspaceOperationRecorderDouble();
+    const realized = await realizeExecutionWorkspace({
+      base: {
+        baseCwd: repoRoot,
+        source: "project_primary",
+        projectId: "project-1",
+        workspaceId: "workspace-1",
+        repoUrl: null,
+        repoRef: "master",
+      },
+      config: {
+        workspaceStrategy: {
+          type: "git_worktree",
+          branchTemplate: "{{issue.identifier}}-{{slug}}",
+        },
+      },
+      issue: { id: "issue-1", identifier: "PAP-9285", title: "repo root mismatch kept" },
+      agent: { id: "agent-1", name: "Codex", companyId: "company-1" },
+      heartbeatRunId: runId,
+      ephemeralLifecycle: true,
+      recorder,
+    });
+    await fs.writeFile(path.join(realized.worktreePath, "wip.txt"), "uncommitted work\n", "utf8");
+
+    // Release against a repoRoot that does not list this worktree.
+    const release = await releaseRunExecutionWorkspace({
+      repoRoot: otherRepoRoot,
+      worktreePath: realized.worktreePath,
+      branchName: null,
+      runId,
+      resolveGitAuth: async () => null,
+      recorder,
+    });
+    expect(release.removed).toBe(false);
+    expect(release.kept).toBe(true);
+    expect(release.keptReason).toBe("dirty_worktree");
+    expect(await fs.readFile(path.join(realized.worktreePath, "wip.txt"), "utf8")).toBe("uncommitted work\n");
+  });
+
+  it("releaseRunExecutionWorkspace keeps a clean worktree when the push fails (SPA-9275 fail-safe)", async () => {
+    const sourceRepo = await createTempRepo("master");
+    const remoteDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-pushfail-remote-"));
+    const remotePath = path.join(remoteDir, "paperclip.git");
+    await execFileAsync("git", ["clone", "--bare", sourceRepo, remotePath]);
+    const cloneRoot = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-pushfail-clone-"));
+    const repoRoot = path.join(cloneRoot, "paperclip");
+    await execFileAsync("git", ["clone", remotePath, repoRoot]);
+    await runGit(repoRoot, ["config", "user.email", "paperclip@example.com"]);
+    await runGit(repoRoot, ["config", "user.name", "Paperclip Test"]);
+
+    const runId = `run-${randomUUID()}`;
+    const { recorder } = createWorkspaceOperationRecorderDouble();
+    const realized = await realizeExecutionWorkspace({
+      base: {
+        baseCwd: repoRoot,
+        source: "project_primary",
+        projectId: "project-1",
+        workspaceId: "workspace-1",
+        repoUrl: remotePath,
+        repoRef: "master",
+      },
+      config: {
+        workspaceStrategy: {
+          type: "git_worktree",
+          branchTemplate: "{{issue.identifier}}-{{slug}}",
+        },
+      },
+      issue: { id: "issue-1", identifier: "PAP-9284", title: "push fail kept" },
+      agent: { id: "agent-1", name: "Codex", companyId: "company-1" },
+      heartbeatRunId: runId,
+      ephemeralLifecycle: true,
+      recorder,
+    });
+    await fs.writeFile(path.join(realized.worktreePath, "feature.txt"), "committed work\n", "utf8");
+    await runGit(realized.worktreePath, ["add", "feature.txt"]);
+    await runGit(realized.worktreePath, ["commit", "-m", "feature"]);
+    const commitSha = (await execFileAsync("git", ["rev-parse", "HEAD"], { cwd: realized.worktreePath })).stdout.trim();
+
+    // Point origin at a path that cannot exist so the push fails.
+    await runGit(repoRoot, ["remote", "set-url", "origin", path.join(remoteDir, "does-not-exist.git")]);
+
+    const release = await releaseRunExecutionWorkspace({
+      repoRoot,
+      worktreePath: realized.worktreePath,
+      branchName: realized.branchName,
+      runId,
+      resolveGitAuth: async () => null,
+      recorder,
+    });
+    expect(release.pushed).toBe(false);
+    expect(release.kept).toBe(true);
+    expect(release.keptReason).toBe("push_failed");
+    expect(release.removed).toBe(false);
+    expect(existsSync(realized.worktreePath)).toBe(true);
+    const headAfter = (await execFileAsync("git", ["rev-parse", "HEAD"], { cwd: realized.worktreePath })).stdout.trim();
+    expect(headAfter).toBe(commitSha);
+  });
+
+  it("releaseRunExecutionWorkspaceForHeartbeat is a no-op when the directory is already gone", async () => {
+    const repoRoot = await createTempRepo();
+    const runId = `run-${randomUUID()}`;
+    const result = await releaseRunExecutionWorkspaceForHeartbeat({
+      repoRoot,
+      worktreePath: path.join(repoRoot, ".paperclip", "worktrees", "runs", runId),
+      branchName: null,
+      runId,
+    });
+    expect(result.removed).toBe(true);
+    expect(result.pushed).toBe(false);
+    expect(result.errors).toEqual([]);
+  });
+
+  it("heartbeat ephemeral release pushes and removes after a terminal run", async () => {
+    const sourceRepo = await createTempRepo("master");
+    const remoteDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-hb-release-remote-"));
+    const remotePath = path.join(remoteDir, "paperclip.git");
+    await execFileAsync("git", ["clone", "--bare", sourceRepo, remotePath]);
+    const cloneRoot = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-hb-release-clone-"));
+    const repoRoot = path.join(cloneRoot, "paperclip");
+    await execFileAsync("git", ["clone", remotePath, repoRoot]);
+    await runGit(repoRoot, ["config", "user.email", "paperclip@example.com"]);
+    await runGit(repoRoot, ["config", "user.name", "Paperclip Test"]);
+
+    const runId = `run-${randomUUID()}`;
+    const { recorder } = createWorkspaceOperationRecorderDouble();
+    const realized = await realizeExecutionWorkspace({
+      base: {
+        baseCwd: repoRoot,
+        source: "project_primary",
+        projectId: "project-1",
+        workspaceId: "workspace-1",
+        repoUrl: remotePath,
+        repoRef: "master",
+      },
+      config: {
+        workspaceStrategy: {
+          type: "git_worktree",
+          branchTemplate: "{{issue.identifier}}-{{slug}}",
+        },
+      },
+      issue: { id: "issue-1", identifier: "PAP-9279", title: "HB release" },
+      agent: { id: "agent-1", name: "Codex", companyId: "company-1" },
+      heartbeatRunId: runId,
+      ephemeralLifecycle: true,
+      recorder,
+    });
+
+    const result = await releaseEphemeralRunWorkspaceForHeartbeatFinally({
+      db: null as never,
+      repoRoot,
+      worktreePath: realized.worktreePath,
+      branchName: realized.branchName,
+      runId,
+      executionWorkspaceId: null,
+      recorder,
+    });
+    expect(result.removed).toBe(true);
+    expect(result.archived).toBe(false);
+    expect(existsSync(realized.worktreePath)).toBe(false);
+  });
+
+  it("reaper rescues unpushed work before removing an orphan run worktree", async () => {
+    const sourceRepo = await createTempRepo("master");
+    const remoteDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-reaper-remote-"));
+    const remotePath = path.join(remoteDir, "paperclip.git");
+    await execFileAsync("git", ["clone", "--bare", sourceRepo, remotePath]);
+    const repoRoot = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-reaper-clone-"));
+    await execFileAsync("git", ["clone", remotePath, repoRoot]);
+    await runGit(repoRoot, ["config", "user.email", "paperclip@example.com"]);
+    await runGit(repoRoot, ["config", "user.name", "Paperclip Test"]);
+    // Make sure origin/master is reachable.
+    await runGit(repoRoot, ["fetch", "origin", "master"]);
+    const runId = `run-${randomUUID()}`;
+    const worktreePath = path.join(repoRoot, ".paperclip", "worktrees", "runs", runId);
+    const branchName = `PAP-9280-rescue`;
+    await fs.mkdir(path.dirname(worktreePath), { recursive: true });
+    await runGit(repoRoot, ["worktree", "add", "-b", branchName, worktreePath, "HEAD"]);
+    // Write + commit WITHOUT pushing — the branch tip is ahead of origin/<branch>
+    // (which doesn't exist), so the rescue path fires.
+    await fs.writeFile(path.join(worktreePath, "uncommitted.txt"), "draft\n", "utf8");
+    await runGit(worktreePath, ["add", "uncommitted.txt"]);
+    await runGit(worktreePath, ["commit", "-m", "unpushed feature"]);
+    const liveRunIds = new Set<string>();
+    const { recorder, operations } = createWorkspaceOperationRecorderDouble();
+    const result = await reapOrphanedRunWorktrees({
+      repoRoot,
+      worktreeParentDir: path.join(repoRoot, ".paperclip", "worktrees"),
+      liveRunIds,
+      recorder,
+    });
+    expect(result.scanned).toBe(1);
+    expect(result.removed).toBe(1);
+    expect(result.rescued).toBe(1);
+    expect(existsSync(worktreePath)).toBe(false);
+    const rescueOp = operations.find((op) => op.metadata?.cleanupAction === "ephemeral_reaper_rescue");
+    expect(rescueOp).toBeTruthy();
+    expect(rescueOp?.metadata?.rescueBranch).toMatch(/^paperclip\/rescue\/[A-Za-z0-9._/-]+\/\d{4}-\d{2}-\d{2}T/);
+    const rescueBranch = rescueOp?.metadata?.rescueBranch as string;
+    const showOutput = (await execFileAsync("git", ["show", `${rescueBranch}:uncommitted.txt`], { cwd: repoRoot })).stdout;
+    expect(showOutput).toContain("draft");
+  }, 30_000);
+
+  it("reaper is a no-op when the run is still live", async () => {
+    const repoRoot = await createTempRepo("master");
+    const runId = `run-${randomUUID()}`;
+    const worktreePath = path.join(repoRoot, ".paperclip", "worktrees", "runs", runId);
+    const branchName = `PAP-9281-live`;
+    await fs.mkdir(path.dirname(worktreePath), { recursive: true });
+    await runGit(repoRoot, ["worktree", "add", "-b", branchName, worktreePath, "HEAD"]);
+    const liveRunIds = new Set([runId]);
+    const { recorder } = createWorkspaceOperationRecorderDouble();
+    const result = await reapOrphanedRunWorktrees({
+      repoRoot,
+      worktreeParentDir: path.join(repoRoot, ".paperclip", "worktrees"),
+      liveRunIds,
+      recorder,
+    });
+    expect(result.scanned).toBe(1);
+    expect(result.removed).toBe(0);
+    expect(result.rescued).toBe(0);
+    expect(existsSync(worktreePath)).toBe(true);
+  });
+});
+
+async function getOrCreateDb(pool: import("pg").Pool) {
+  const { createDb } = await import("@paperclipai/db");
+  return createDb(pool);
+}
+
+describeEmbeddedPostgres("ephemeral worktree per run sweep (SPA-9275)", () => {
+  it("sweepTerminalIssueRunWorktrees removes done issue worktrees and is idempotent", async () => {
+    const tempDb = await startEmbeddedPostgresTestDatabase("paperclip-spa-9275-sweep-");
+    try {
+      const testDb = createDb(tempDb.connectionString);
+      const companyId = randomUUID();
+      const projectId = randomUUID();
+      const projectWorkspaceId = randomUUID();
+      const sourceIssueId = randomUUID();
+      await testDb.insert(companies).values({ id: companyId, name: "SPA-9275 Co" });
+      await testDb.insert(projects).values({
+        id: projectId,
+        companyId,
+        name: "SPA-9275 Project",
+      });
+      await testDb.insert(projectWorkspaces).values({
+        id: projectWorkspaceId,
+        companyId,
+        projectId,
+        name: "primary",
+        cwd: "/tmp/never-resolved",
+      });
+      await testDb.insert(issues).values({
+        id: sourceIssueId,
+        companyId,
+        projectId,
+        title: "Done card",
+        status: "done",
+        kind: "task",
+      });
+      const repoRoot = await createTempRepo("master");
+      const runId = `run-${randomUUID()}`;
+      const worktreePath = path.join(repoRoot, ".paperclip", "worktrees", "runs", runId);
+      const branchName = `PAP-9282-sweep`;
+      await fs.mkdir(path.dirname(worktreePath), { recursive: true });
+      await runGit(repoRoot, ["worktree", "add", "-b", branchName, worktreePath, "HEAD"]);
+      await testDb.insert(executionWorkspaces).values({
+        id: randomUUID(),
+        companyId,
+        projectId,
+        projectWorkspaceId,
+        sourceIssueId,
+        providerType: "git_worktree",
+        providerRef: worktreePath,
+        cwd: worktreePath,
+        branchName,
+        mode: "isolated_workspace",
+        strategyType: "git_worktree",
+        status: "active",
+        name: branchName,
+        metadata: { ephemeralLifecycle: true },
+      });
+      const liveRunIds = new Set<string>();
+      const { recorder } = createWorkspaceOperationRecorderDouble();
+      const first = await sweepTerminalIssueRunWorktrees({
+        db: testDb,
+        repoRoot,
+        worktreeParentDir: path.join(repoRoot, ".paperclip", "worktrees"),
+        liveRunIds,
+        recorder,
+      });
+      expect(first.scanned).toBe(1);
+      expect(first.archived).toBe(1);
+      expect(existsSync(worktreePath)).toBe(false);
+      const second = await sweepTerminalIssueRunWorktrees({
+        db: testDb,
+        repoRoot,
+        worktreeParentDir: path.join(repoRoot, ".paperclip", "worktrees"),
+        liveRunIds,
+        recorder,
+      });
+      expect(second.scanned).toBe(0);
+      expect(second.archived).toBe(0);
+    } finally {
+      await tempDb.cleanup();
+    }
+  }, 30_000);
+
+  it("sweep covers legacy per-branch and cleanup_failed worktrees, not just ephemeral shape", async () => {
+    const tempDb = await startEmbeddedPostgresTestDatabase("paperclip-spa-9275-sweep-legacy-");
+    try {
+      const testDb = createDb(tempDb.connectionString);
+      const companyId = randomUUID();
+      const projectId = randomUUID();
+      const projectWorkspaceId = randomUUID();
+      const sourceIssueId = randomUUID();
+      await testDb.insert(companies).values({ id: companyId, name: "SPA-9275 Legacy" });
+      await testDb.insert(projects).values({
+        id: projectId,
+        companyId,
+        name: "SPA-9275 Legacy Project",
+      });
+      await testDb.insert(projectWorkspaces).values({
+        id: projectWorkspaceId,
+        companyId,
+        projectId,
+        name: "primary",
+        cwd: "/tmp/never-resolved",
+      });
+      await testDb.insert(issues).values({
+        id: sourceIssueId,
+        companyId,
+        projectId,
+        title: "Done legacy card",
+        status: "done",
+        kind: "task",
+      });
+      const repoRoot = await createTempRepo("master");
+      const branchName = `PAP-9283-legacy`;
+      // Legacy shape: <parent>/<branch>/, NOT <parent>/runs/<runId>/.
+      const legacyWorktreePath = path.join(repoRoot, ".paperclip", "worktrees", branchName);
+      await fs.mkdir(path.dirname(legacyWorktreePath), { recursive: true });
+      await runGit(repoRoot, ["worktree", "add", "-b", branchName, legacyWorktreePath, "HEAD"]);
+      const legacyWorkspaceId = randomUUID();
+      await testDb.insert(executionWorkspaces).values({
+        id: legacyWorkspaceId,
+        companyId,
+        projectId,
+        projectWorkspaceId,
+        sourceIssueId,
+        providerType: "git_worktree",
+        providerRef: legacyWorktreePath,
+        cwd: legacyWorktreePath,
+        branchName,
+        mode: "isolated_workspace",
+        strategyType: "git_worktree",
+        status: "cleanup_failed", // the 717 stuck teardowns
+        name: branchName,
+        metadata: {},
+      });
+      const liveRunIds = new Set<string>();
+      const { recorder } = createWorkspaceOperationRecorderDouble();
+      const result = await sweepTerminalIssueRunWorktrees({
+        db: testDb,
+        repoRoot,
+        worktreeParentDir: path.join(repoRoot, ".paperclip", "worktrees"),
+        liveRunIds,
+        recorder,
+      });
+      expect(result.scanned).toBe(1);
+      expect(result.archived).toBe(1);
+      expect(existsSync(legacyWorktreePath)).toBe(false);
+      const archivedRow = await testDb
+        .select()
+        .from(executionWorkspaces)
+        .where(eq(executionWorkspaces.id, legacyWorkspaceId))
+        .then((rows) => rows[0] ?? null);
+      expect(archivedRow?.status).toBe("archived");
+      expect(archivedRow?.cleanupReason).toBe("issue_terminal_sweep");
+    } finally {
+      await tempDb.cleanup();
+    }
+  }, 30_000);
+
+  it("heartbeat finally composite removes the worktree AND archives the execution workspace row", async () => {
+    const tempDb = await startEmbeddedPostgresTestDatabase("paperclip-spa-9275-hb-composite-");
+    try {
+      const testDb = createDb(tempDb.connectionString);
+      const companyId = randomUUID();
+      const projectId = randomUUID();
+      const projectWorkspaceId = randomUUID();
+      const sourceIssueId = randomUUID();
+      await testDb.insert(companies).values({ id: companyId, name: "SPA-9275 HB" });
+      await testDb.insert(projects).values({
+        id: projectId,
+        companyId,
+        name: "SPA-9275 HB Project",
+      });
+      await testDb.insert(projectWorkspaces).values({
+        id: projectWorkspaceId,
+        companyId,
+        projectId,
+        name: "primary",
+        cwd: "/tmp/never-resolved",
+      });
+      await testDb.insert(issues).values({
+        id: sourceIssueId,
+        companyId,
+        projectId,
+        title: "In-progress card",
+        status: "in_progress",
+        kind: "task",
+      });
+      const repoRoot = await createTempRepo("master");
+      // SPA-9275 fail-safe: the release path requires the branch push to
+      // succeed before removing a clean worktree, so give this repo a real
+      // `origin` the push can land on.
+      const bareDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-hb-composite-origin-"));
+      const barePath = path.join(bareDir, "origin.git");
+      await execFileAsync("git", ["init", "--bare", barePath]);
+      await runGit(repoRoot, ["remote", "add", "origin", barePath]);
+      const runId = `run-${randomUUID()}`;
+      const worktreePath = path.join(repoRoot, ".paperclip", "worktrees", "runs", runId);
+      const branchName = `PAP-9284-hb-finally`;
+      await fs.mkdir(path.dirname(worktreePath), { recursive: true });
+      await runGit(repoRoot, ["worktree", "add", "-b", branchName, worktreePath, "HEAD"]);
+      const wsId = randomUUID();
+      await testDb.insert(executionWorkspaces).values({
+        id: wsId,
+        companyId,
+        projectId,
+        projectWorkspaceId,
+        sourceIssueId,
+        providerType: "git_worktree",
+        providerRef: worktreePath,
+        cwd: worktreePath,
+        branchName,
+        mode: "isolated_workspace",
+        strategyType: "git_worktree",
+        status: "active",
+        name: branchName,
+        metadata: { ephemeralLifecycle: true },
+      });
+      const { recorder } = createWorkspaceOperationRecorderDouble();
+      const result = await releaseEphemeralRunWorkspaceForHeartbeatFinally({
+        db: testDb,
+        repoRoot,
+        worktreePath,
+        branchName,
+        runId,
+        executionWorkspaceId: wsId,
+        recorder,
+      });
+      expect(result.removed).toBe(true);
+      expect(result.archived).toBe(true);
+      expect(existsSync(worktreePath)).toBe(false);
+      const row = await testDb
+        .select()
+        .from(executionWorkspaces)
+        .where(eq(executionWorkspaces.id, wsId))
+        .then((rows) => rows[0] ?? null);
+      expect(row?.status).toBe("archived");
+      expect(row?.cleanupReason).toBe("ephemeral_run_release");
+    } finally {
+      await tempDb.cleanup();
+    }
+  }, 30_000);
+
+  it("reconcileEphemeralWorktreesOnStartup reaps orphans and sweeps done issues in one call", async () => {
+    const tempDb = await startEmbeddedPostgresTestDatabase("paperclip-spa-9275-recon-");
+    try {
+      const testDb = createDb(tempDb.connectionString);
+      const companyId = randomUUID();
+      const projectId = randomUUID();
+      const projectWorkspaceId = randomUUID();
+      const sourceIssueId = randomUUID();
+      await testDb.insert(companies).values({ id: companyId, name: "SPA-9275 Recon" });
+      await testDb.insert(projects).values({
+        id: projectId,
+        companyId,
+        name: "SPA-9275 Recon Project",
+      });
+      const repoRoot = await createTempRepo("master");
+      await testDb.insert(projectWorkspaces).values({
+        id: projectWorkspaceId,
+        companyId,
+        projectId,
+        name: "primary",
+        cwd: repoRoot,
+      });
+      await testDb.insert(issues).values({
+        id: sourceIssueId,
+        companyId,
+        projectId,
+        title: "Done card",
+        status: "done",
+        kind: "task",
+      });
+      // (a) Orphan run worktree (no DB row, no live run).
+      const orphanRunId = `run-${randomUUID()}`;
+      const orphanPath = path.join(repoRoot, ".paperclip", "worktrees", "runs", orphanRunId);
+      await fs.mkdir(path.dirname(orphanPath), { recursive: true });
+      await runGit(repoRoot, ["worktree", "add", "-b", "PAP-9285-orphan", orphanPath, "HEAD"]);
+      // (b) Done issue with stuck worktree.
+      const stuckBranch = "PAP-9286-stuck";
+      const stuckPath = path.join(repoRoot, ".paperclip", "worktrees", stuckBranch);
+      await fs.mkdir(path.dirname(stuckPath), { recursive: true });
+      await runGit(repoRoot, ["worktree", "add", "-b", stuckBranch, stuckPath, "HEAD"]);
+      const stuckWorkspaceId = randomUUID();
+      await testDb.insert(executionWorkspaces).values({
+        id: stuckWorkspaceId,
+        companyId,
+        projectId,
+        projectWorkspaceId,
+        sourceIssueId,
+        providerType: "git_worktree",
+        providerRef: stuckPath,
+        cwd: stuckPath,
+        branchName: stuckBranch,
+        mode: "isolated_workspace",
+        strategyType: "git_worktree",
+        status: "cleanup_failed",
+        name: stuckBranch,
+        metadata: {},
+      });
+      const { recorder } = createWorkspaceOperationRecorderDouble();
+      const summary = await reconcileEphemeralWorktreesOnStartup({
+        db: testDb,
+        liveRunIds: new Set<string>(),
+        recorder,
+      });
+      expect(summary.reposScanned).toBeGreaterThanOrEqual(1);
+      expect(summary.reaper.scanned).toBe(1);
+      expect(summary.reaper.removed).toBe(1);
+      expect(summary.sweep.scanned).toBe(1);
+      expect(summary.sweep.archived).toBe(1);
+      expect(existsSync(orphanPath)).toBe(false);
+      expect(existsSync(stuckPath)).toBe(false);
+    } finally {
+      await tempDb.cleanup();
+    }
+  }, 30_000);
 });
 
 describe("cleanupExecutionWorkspaceArtifacts executed-command callback", () => {

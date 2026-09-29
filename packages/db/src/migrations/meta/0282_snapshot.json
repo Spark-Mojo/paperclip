@@ -1,6 +1,4 @@
 {
-  "id": "7b70fb4f-507c-4a02-bcd1-a170617a2094",
-  "prevId": "4770ad6d-2cdc-45c4-af89-c300fd134d91",
   "version": "7",
   "dialect": "postgresql",
   "tables": {
@@ -2005,39 +2003,6 @@
               "expression": "(\"payload\" ->> 'issueId')",
               "asc": true,
               "isExpression": true,
-              "nulls": "last"
-            }
-          ],
-          "isUnique": false,
-          "concurrently": false,
-          "method": "btree",
-          "with": {}
-        },
-        "agent_wakeup_requests_company_agent_issue_created_idx": {
-          "name": "agent_wakeup_requests_company_agent_issue_created_idx",
-          "columns": [
-            {
-              "expression": "company_id",
-              "isExpression": false,
-              "asc": true,
-              "nulls": "last"
-            },
-            {
-              "expression": "agent_id",
-              "isExpression": false,
-              "asc": true,
-              "nulls": "last"
-            },
-            {
-              "expression": "(\"payload\" ->> 'issueId')",
-              "asc": true,
-              "isExpression": true,
-              "nulls": "last"
-            },
-            {
-              "expression": "created_at",
-              "isExpression": false,
-              "asc": true,
               "nulls": "last"
             }
           ],
@@ -47878,8 +47843,10 @@
   "policies": {},
   "views": {},
   "_meta": {
-    "columns": {},
     "schemas": {},
-    "tables": {}
-  }
+    "tables": {},
+    "columns": {}
+  },
+  "id": "8379f41b-a61d-4864-8287-f0b7034e540c",
+  "prevId": "00000000-0000-0000-0000-000000000000"
 }

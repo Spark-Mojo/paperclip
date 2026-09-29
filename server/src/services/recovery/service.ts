@@ -141,6 +141,7 @@ import {
 } from "../../modules/active-run-watchdog/index.js";
 import {
   evaluateWakeLoopGuard,
+  hasEligibleRoutineContinuation,
   escalateWakeBudgetExhausted,
   isTerminalIssueStatusForWake,
   loadIssueStatusForWakeGuard,
@@ -2083,6 +2084,11 @@ export function recoveryService(
             eq(heartbeatRuns.agentId, input.agentId),
           ),
         );
+      if (predecessor && input.reason === "issue_continuation_needed" &&
+          await hasEligibleRoutineContinuation(db, {
+            companyId: predecessor.companyId, agentId: input.agentId, issueId: input.issueId,
+            continuationRoutineId: parseObject(predecessor.contextSnapshot).continuationRoutineId,
+          })) return null;
       if (
         predecessor &&
         ["failed", "timed_out", "interrupted", "cancelled"].includes(
@@ -2185,8 +2191,10 @@ export function recoveryService(
         agentId: input.agentId,
         issueId: input.issueId,
         payload: payloadPreview,
+        reason: input.reason,
       });
       if (decision.tripped) {
+        if (decision.guard === "backoff") return null;
         const escalation = await escalateWakeBudgetExhausted({
           db,
           issueId: input.issueId,

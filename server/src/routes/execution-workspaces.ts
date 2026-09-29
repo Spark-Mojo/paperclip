@@ -540,6 +540,9 @@ export function executionWorkspaceRoutes(db: Db, opts: { pluginWorkerManager?: P
             workspace: {
               mode: existing.mode,
               strategyType: existing.strategyType,
+              // SPA-9315: carried so an unrestorable workspace names its row
+              // status in the failure instead of the "unknown status" default.
+              status: existing.status,
               cwd: existing.cwd,
               providerRef: existing.providerRef,
               projectId: existing.projectId,

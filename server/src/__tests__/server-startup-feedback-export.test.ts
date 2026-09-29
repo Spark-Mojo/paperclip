@@ -329,6 +329,12 @@ vi.mock("../services/index.js", () => ({
     unknown: 0,
     duplicates: 0,
   })),
+  reconcileEphemeralWorktreesOnStartup: vi.fn(async () => ({
+    reposScanned: 0,
+    reaper: { scanned: 0, removed: 0, rescued: 0, errors: [] },
+    sweep: { scanned: 0, archived: 0, rescued: 0, errors: [] },
+    totalErrors: [],
+  })),
   reconcilePersistedRuntimeServicesOnStartup: vi.fn(async () => ({ reconciled: 0 })),
   resolveHeartbeatSchedulingSuppression: resolveHeartbeatSchedulingSuppressionMock,
   routineService: routineServiceFactoryMock,

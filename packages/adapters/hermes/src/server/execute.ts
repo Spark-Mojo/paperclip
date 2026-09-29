@@ -41,6 +41,7 @@ import {
   stringifyPaperclipWakePayload,
   isPaperclipRecoveryWakePayload,
 } from "@paperclipai/adapter-utils/server-utils";
+import { applyPaperclipWakePayloadEnv } from "@paperclipai/adapter-utils/wake-payload-env";
 
 import {
   HERMES_CLI,
@@ -526,7 +527,19 @@ export async function execute(
   const envCommentId = cfgString(ctxContext.commentId) || cfgString(ctxContext.wakeCommentId) || cfgString(ctx.config?.commentId);
   if (envCommentId) env.PAPERCLIP_WAKE_COMMENT_ID = envCommentId;
   const wakePayloadJson = stringifyPaperclipWakePayload(ctxContext.paperclipWake);
-  if (wakePayloadJson) env.PAPERCLIP_WAKE_PAYLOAD_JSON = wakePayloadJson;
+  // SPA-9259: cap the inline env copy of the wake payload; oversized
+  // payloads are staged to a file so spawn never hits E2BIG. Hermes runs
+  // locally via runChildProcess, so the host file path is readable.
+  const wakePayloadEnv = await applyPaperclipWakePayloadEnv(env, {
+    runId: ctx.runId,
+    wakePayloadJson,
+  });
+  if (wakePayloadEnv.mode === "file") {
+    await ctx.onLog(
+      "stdout",
+      `[hermes] Wake payload (${wakePayloadEnv.byteLength} bytes) exceeds the inline env limit; staged to ${wakePayloadEnv.filePath} via PAPERCLIP_WAKE_PAYLOAD_FILE.\n`,
+    );
+  }
 
   // ── Resolve working directory ──────────────────────────────────────────
   const cwd =

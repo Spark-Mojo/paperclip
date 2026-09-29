@@ -49,6 +49,10 @@ import {
   buildAnchorFallbackWorkspaceNotes,
   type ResolvedWorkspaceForRun,
 } from "../services/heartbeat.ts";
+import {
+  ExecutionWorkspaceNotProvisionableError,
+  WorkspaceRuntimeValidationFailure,
+} from "../services/workspace-runtime.ts";
 import type { TrustPresetResolution } from "../services/trust-preset-resolver.ts";
 
 const execFile = promisify(execFileCallback);
@@ -1938,6 +1942,106 @@ describe("effective run execution workspace config freshness", () => {
     expect(realizeWorkspace).not.toHaveBeenCalled();
   });
 
+  it("refuses a reuse binding to an active-but-unprovisionable workspace and provisions fresh (SPA-9315)", async () => {
+    const metadata = buildWorkspaceConfigMetadata();
+    const decision = resolveExecutionWorkspaceConfigFreshness({
+      hasExistingWorkspace: true,
+      existingWorkspaceMetadata: persistedWorkspaceConfigFingerprint(metadata),
+      nextMetadata: metadata,
+    });
+    const realizeWorkspace = vi.fn(async () => ({ id: "fresh-workspace", warnings: [] }));
+    const restoreExistingWorkspace = vi.fn(async () => {
+      throw new ExecutionWorkspaceNotProvisionableError({
+        executionWorkspaceId: "workspace-c56b8dfb",
+        workspaceStatus: "active",
+        cwd: "/home/jamesilsley/.paperclip/instances/default/projects/5f87/f6f7/spark-mojo-platform",
+        strategy: "project_primary",
+      });
+    });
+
+    const result = await provisionExecutionWorkspaceForFreshnessDecision({
+      requestedShouldReuseExisting: true,
+      existingExecutionWorkspaceId: "workspace-c56b8dfb",
+      issueRef: { id: "issue-1", identifier: "SPA-2501" },
+      runId: "run-1",
+      workspaceConfigFreshness: decision,
+      restoreExistingWorkspace,
+      realizeWorkspace,
+    });
+
+    expect(result.executionWorkspace).toEqual({ id: "fresh-workspace", warnings: [] });
+    expect(result.reusedExecutionWorkspace).toBeNull();
+    expect(result.freshFallbackForStaleReuse).toBe(true);
+    expect(realizeWorkspace).toHaveBeenCalledTimes(1);
+  });
+
+  it("names the unprovisionable binding so the operator can act without restore logs (SPA-9315)", async () => {
+    const metadata = buildWorkspaceConfigMetadata();
+    const decision = resolveExecutionWorkspaceConfigFreshness({
+      hasExistingWorkspace: true,
+      existingWorkspaceMetadata: persistedWorkspaceConfigFingerprint(metadata),
+      nextMetadata: metadata,
+    });
+
+    const result = await provisionExecutionWorkspaceForFreshnessDecision({
+      requestedShouldReuseExisting: true,
+      existingExecutionWorkspaceId: "workspace-c56b8dfb",
+      issueRef: { id: "issue-1", identifier: "SPA-2501" },
+      runId: "run-1",
+      workspaceConfigFreshness: decision,
+      restoreExistingWorkspace: async () => {
+        throw new ExecutionWorkspaceNotProvisionableError({
+          executionWorkspaceId: "workspace-c56b8dfb",
+          workspaceStatus: "active",
+          cwd: "/home/jamesilsley/.paperclip/instances/default/projects/5f87/f6f7/spark-mojo-platform",
+          strategy: "project_primary",
+        });
+      },
+      realizeWorkspace: async () => ({ id: "fresh-workspace", warnings: [] }),
+    });
+
+    const warning = result.freshFallbackWarning;
+    expect(warning).toBeTruthy();
+    expect(warning).toContain("workspace-c56b8dfb");
+    expect(warning).toContain("active");
+    expect(warning).toContain("SPA-2501");
+    expect(warning).toContain("on-disk");
+    expect(warning).toContain("SPA-9315");
+  });
+
+  it("still fails loudly on a generic workspace validation failure, not just unprovisionable (SPA-9315)", async () => {
+    const metadata = buildWorkspaceConfigMetadata();
+    const decision = resolveExecutionWorkspaceConfigFreshness({
+      hasExistingWorkspace: true,
+      existingWorkspaceMetadata: persistedWorkspaceConfigFingerprint(metadata),
+      nextMetadata: metadata,
+    });
+    const realizeWorkspace = vi.fn(async () => ({ id: "fresh-workspace", warnings: [] }));
+
+    await expect(provisionExecutionWorkspaceForFreshnessDecision({
+      requestedShouldReuseExisting: true,
+      existingExecutionWorkspaceId: "workspace-old",
+      issueRef: { id: "issue-1", identifier: "SPA-2501" },
+      runId: "run-1",
+      workspaceConfigFreshness: decision,
+      restoreExistingWorkspace: async () => {
+        throw new WorkspaceRuntimeValidationFailure(
+          'Persisted git worktree "/tmp/wt" is not reusable (branch mismatch).',
+          {
+            workspaceValidation: {
+              reason: "git_worktree_not_reusable",
+              reasonCode: "branch_mismatch",
+              worktreePath: "/tmp/wt",
+              executionWorkspaceId: "workspace-old",
+            },
+          },
+        );
+      },
+      realizeWorkspace,
+    })).rejects.toThrow();
+    expect(realizeWorkspace).not.toHaveBeenCalled();
+  });
+
   it("allocator reuses the existing workspace when the same open issue holds it (R1 same-issue path)", () => {
     expect(
       resolveAllocatorExecutionWorkspaceReuseDecision({
@@ -2119,6 +2223,13 @@ describe("effective run execution workspace config freshness", () => {
       issueRef: { id: "issue-1", identifier: "PAP-42" },
       runId: "run-1",
       workspaceConfigFreshness: decision,
+      staleReuseFallback: allocatorDecision.refusedDeadWorkspaceReuse
+        ? {
+            executionWorkspaceId: allocatorDecision.requestedExecutionWorkspaceId,
+            workspaceStatus: "ready",
+            branchName: null,
+          }
+        : null,
       restoreExistingWorkspace: allocatorDecision.shouldRestoreExistingWorkspace
         ? restoreExistingWorkspace
         : null,
@@ -2129,6 +2240,8 @@ describe("effective run execution workspace config freshness", () => {
     expect(realizeWorkspace).toHaveBeenCalledTimes(1);
     expect(result.executionWorkspace.id).toBe("workspace-fresh");
     expect(result.reusedExecutionWorkspace).toBeNull();
+    expect(result.freshFallbackForStaleReuse).toBe(false);
+    expect(result.freshFallbackWarning).toBeNull();
   });
 
   it("formats a safe workspace operation payload for config drift decisions", () => {

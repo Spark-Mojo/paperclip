@@ -275,6 +275,11 @@ function issueSnapshot(identity: GitHubObjectIdentity, body: Record<string, unkn
   const state = asString(body.state) ?? "unknown";
   const stateReason = asString(body.state_reason);
   const authorLogin = asNestedString(body, "user", "login");
+  // SPA-9323: GitHub's issues endpoint answers 200 for BOTH issues and pull
+  // requests, carrying a `pull_request` key only for the latter. Forward that
+  // classification so the done-gate can tell a cited issue from a cited PR
+  // (whose `/pull/N` read 404s) instead of failing closed forever.
+  const isPullRequest = Boolean(body.pull_request);
   const statusKey = state === "closed" && stateReason ? `closed_${stateReason}` : state;
   const statusLabel = state === "closed"
     ? stateReason
@@ -303,6 +308,7 @@ function issueSnapshot(identity: GitHubObjectIdentity, body: Record<string, unkn
       repo: identity.repo,
       number: identity.number,
       state,
+      isPullRequest,
       ...(stateReason ? { stateReason } : {}),
       ...(authorLogin ? { authorLogin } : {}),
     },
@@ -359,9 +365,45 @@ export function createGitHubExternalObjectProvider(
       });
     },
   };
+  function resolver(objectType: GitHubObjectIdentity["objectType"]): ExternalObjectResolver & {
+    /**
+     * SPA-9325 namespace probe: can this credential LIST this kind of object
+     * in the repo? Used by the done-gate's fallback discriminator — a
+     * readable pull-request namespace plus a 404 on `/pulls/N` positively
+     * proves N names no PR (shared number space, PRs undeletable).
+     */
+    probeNamespace?: (companyId: string, identity: Pick<GitHubObjectIdentity, "host" | "owner" | "repo">) => Promise<boolean>;
+  } {
+    async function authenticate(companyId: string): Promise<
+      | { ok: true; headers: Record<string, string> }
+      | { ok: false; failure: { ok: false; liveness: "auth_required"; errorCode: string; errorMessage: string; retryAfterSeconds: number } }
+    > {
+      let token: string | null = null;
+      try {
+        token = typeof tokenProvider === "function" ? await tokenProvider(companyId) : tokenProvider;
+      } catch {
+        return {
+          ok: false,
+          failure: {
+            ok: false,
+            liveness: "auth_required",
+            errorCode: "github_token_unavailable",
+            errorMessage: "Configured GitHub credentials could not be resolved.",
+            retryAfterSeconds: GITHUB_OBJECT_TTL_SECONDS,
+          },
+        };
+      }
+      token = token?.trim() || null;
+      const headers: Record<string, string> = {
+        accept: "application/vnd.github+json",
+        "user-agent": "paperclip-external-object-resolver",
+        "x-github-api-version": "2022-11-28",
+      };
+      if (token) headers.authorization = `Bearer ${token}`;
+      return { ok: true, headers };
+    }
 
-  function resolver(objectType: GitHubObjectIdentity["objectType"]): ExternalObjectResolver {
-    return {
+    const base: ExternalObjectResolver = {
       providerKey: "github",
       objectType,
       async resolve({ companyId, object }) {
@@ -376,33 +418,17 @@ export function createGitHubExternalObjectProvider(
           };
         }
 
-        let token: string | null = null;
-        try {
-          token = typeof tokenProvider === "function" ? await tokenProvider(companyId) : tokenProvider;
-        } catch {
-          return {
-            ok: false,
-            liveness: "auth_required",
-            errorCode: "github_token_unavailable",
-            errorMessage: "Configured GitHub credentials could not be resolved.",
-            retryAfterSeconds: GITHUB_OBJECT_TTL_SECONDS,
-          };
-        }
-        token = token?.trim() || null;
-        const headers: Record<string, string> = {
-          accept: "application/vnd.github+json",
-          "user-agent": "paperclip-external-object-resolver",
-          "x-github-api-version": "2022-11-28",
-        };
-        if (token) headers.authorization = `Bearer ${token}`;
+        const auth = await authenticate(companyId);
+        if (!auth.ok) return auth.failure;
 
         const apiKind = objectType === "pull_request" ? "pulls" : "issues";
         const url = `${gitHubApiBase(identity.host)}/repos/${encodeURIComponent(identity.owner)}/${encodeURIComponent(identity.repo)}/${apiKind}/${identity.number}`;
 
         let response: Response;
         try {
-          response = await fetchImpl(url, { headers });
-        } catch {
+          response = await fetchImpl(url, { headers: auth.headers });
+        }
+        catch {
           return {
             ok: false,
             liveness: "unreachable",
@@ -448,8 +474,27 @@ export function createGitHubExternalObjectProvider(
         };
       },
     };
-  }
 
+    if (objectType !== "pull_request") return base;
+
+    return {
+      ...base,
+      async probeNamespace(companyId, identity) {
+        const auth = await authenticate(companyId);
+        if (!auth.ok) return false;
+        const url = `${gitHubApiBase(identity.host)}/repos/${encodeURIComponent(identity.owner)}/${encodeURIComponent(identity.repo)}/pulls?per_page=1&state=all`;
+        try {
+          const response = await fetchImpl(url, { headers: auth.headers });
+          // Only a readable listing proves the namespace. 403 (token lacks
+          // pulls:read), 404 (repo invisible to this token), 429/5xx, and
+          // network failures all fail closed.
+          return response.status === 200;
+        } catch {
+          return false;
+        }
+      },
+    };
+  }
   return {
     detector,
     resolvers: [resolver("pull_request"), resolver("issue")],

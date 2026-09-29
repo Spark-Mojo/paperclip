@@ -11,6 +11,8 @@ import {
   heartbeatRuns,
   issueRelations,
   issues,
+  routines,
+  routineTriggers,
 } from "@paperclipai/db";
 import {
   getEmbeddedPostgresTestSupport,
@@ -19,6 +21,7 @@ import {
 import { heartbeatService } from "../services/heartbeat.ts";
 import {
   evaluateWakeLoopGuard,
+  hasEligibleRoutineContinuation,
   summarizeAgentIssueWakeupsInWindow,
   summarizeMutationChainWakeups,
   WAKE_LOOP_GUARD_BACKOFF_BASE_MS,
@@ -52,6 +55,8 @@ describeEmbeddedPostgres("wake-loop guard", () => {
   afterEach(async () => {
     for (let attempt = 0; ; attempt += 1) {
       try {
+        await db.delete(routineTriggers);
+        await db.delete(routines);
         await db.delete(issueRelations);
         await db.delete(heartbeatRunEvents);
         await db.delete(heartbeatRuns);
@@ -714,7 +719,84 @@ describeEmbeddedPostgres("wake-loop guard", () => {
     expect(reentryWake).toBeNull();
   });
 
-  it("window cutoff excludes wakeups older than the rolling hour", async () => {
+  it.each(["interaction", "issue_continuation_needed", "finish_successful_run_handoff"])("permanently exhausts a low-frequency %s chain across hourly rollover", async (mutation) => {
+    const { companyId, agentId, issueId } = await seedCompanyAgentIssue();
+    const now = new Date();
+    await db.insert(agentWakeupRequests).values(Array.from({ length: 10 }, (_, index) => ({
+      companyId, agentId,
+      source: "automation", triggerDetail: "system", status: "skipped",
+      reason: "issue_dependencies_blocked",
+      payload: { issueId, mutation, retryOfRunId: "persistent-chain" },
+      createdAt: new Date(now.getTime() - (12 - index) * 12 * 60_000),
+    })));
+    for (const elapsed of [0, 24 * 60 * 60_000]) {
+      const decision = await evaluateWakeLoopGuard(db, {
+        companyId, agentId, issueId,
+        payload: { issueId, mutation, retryOfRunId: "persistent-chain" },
+        now: new Date(now.getTime() + elapsed),
+      });
+      expect(decision).toMatchObject({ tripped: true, guard: "chain", count: 10, limit: 10 });
+    }
+    expect(await evaluateWakeLoopGuard(db, {
+      companyId, agentId, issueId, payload: { issueId, mutation, retryOfRunId: "new-work" }, now,
+    })).toEqual({ tripped: false });
+  });
+
+  it("bounds successful continuations across changing run identities until human intervention", async () => {
+    const { companyId, agentId, issueId } = await seedCompanyAgentIssue();
+    const now = new Date();
+    await db.insert(agentWakeupRequests).values(Array.from({ length: 10 }, (_, index) => ({
+      companyId, agentId, source: "automation", triggerDetail: "system", status: "consumed",
+      reason: index % 2 ? "issue_continuation_needed" : "finish_successful_run_handoff",
+      payload: { issueId, retryOfRunId: randomUUID() },
+      createdAt: new Date(now.getTime() - (12 - index) * 12 * 60_000),
+    })));
+    expect(await evaluateWakeLoopGuard(db, {
+      companyId, agentId, issueId, payload: { issueId, retryOfRunId: randomUUID() },
+      reason: "issue_continuation_needed", now,
+    })).toMatchObject({ tripped: true, guard: "chain", count: 10 });
+    await db.insert(agentWakeupRequests).values({
+      companyId, agentId, source: "on_demand", triggerDetail: "user", status: "consumed",
+      reason: "issue_commented", payload: { issueId }, requestedByActorType: "user", createdAt: now,
+    });
+    expect(await evaluateWakeLoopGuard(db, {
+      companyId, agentId, issueId, payload: { issueId, retryOfRunId: randomUUID() },
+      reason: "issue_continuation_needed", now,
+    })).toEqual({ tripped: false });
+  });
+
+  it("credits only explicit same-owner scheduled routine delegation", async () => {
+    const { companyId, agentId, issueId } = await seedCompanyAgentIssue();
+    const routineId = randomUUID();
+    await db.insert(routines).values({ id: routineId, companyId, parentIssueId: issueId,
+      assigneeAgentId: agentId, title: "Next continuation", status: "active" });
+    await db.insert(routineTriggers).values({ companyId, routineId, kind: "schedule",
+      enabled: true, nextRunAt: new Date(Date.now() + 60_000) });
+    const input = { companyId, agentId, issueId, continuationRoutineId: routineId };
+    expect(await hasEligibleRoutineContinuation(db, input)).toBe(true);
+    expect(await hasEligibleRoutineContinuation(db, { ...input, continuationRoutineId: undefined })).toBe(false);
+    expect(await hasEligibleRoutineContinuation(db, { ...input, agentId: randomUUID() })).toBe(false);
+    await db.update(routineTriggers).set({ enabled: false }).where(eq(routineTriggers.routineId, routineId));
+    expect(await hasEligibleRoutineContinuation(db, input)).toBe(false);
+    await db.update(routineTriggers).set({ enabled: true, nextRunAt: null }).where(eq(routineTriggers.routineId, routineId));
+    expect(await hasEligibleRoutineContinuation(db, input)).toBe(false);
+  });
+
+  it("keeps the backoff attempt count across the hourly boundary", async () => {
+    const { companyId, agentId, issueId } = await seedCompanyAgentIssue();
+    const now = new Date();
+    await db.insert(agentWakeupRequests).values(Array.from({ length: 8 }, (_, index) => ({
+      companyId, agentId, source: "automation", triggerDetail: "system", status: "skipped",
+      reason: "issue_dependencies_blocked",
+      payload: { issueId, mutation: "interaction", retryOfRunId: "long-chain" },
+      createdAt: new Date(now.getTime() - (index === 7 ? 30_000 : (9 - index) * 60 * 60_000)),
+    })));
+    expect(await evaluateWakeLoopGuard(db, {
+      companyId, agentId, issueId, payload: { issueId, mutation: "interaction", retryOfRunId: "long-chain" }, now,
+    })).toMatchObject({ tripped: true, guard: "backoff", attempt: 9 });
+  });
+
+  it("window cutoff excludes unrelated wakeups older than the rolling hour", async () => {
     const { companyId, agentId, issueId } = await seedCompanyAgentIssue();
     const retryOfRunId = "e6d552b0-old-skipped-rows";
     const stale = new Date(Date.now() - (WAKE_LOOP_GUARD_WINDOW_MS + 60_000));
@@ -734,7 +816,7 @@ describeEmbeddedPostgres("wake-loop guard", () => {
 
     const decision = await evaluateWakeLoopGuard(db, {
       companyId, agentId, issueId,
-      payload: { issueId, mutation: "interaction", retryOfRunId },
+      payload: { issueId, mutation: "interaction", retryOfRunId: "fresh-chain" },
     });
     expect(decision.tripped).toBe(false);
   });

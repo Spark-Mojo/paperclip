@@ -27,7 +27,11 @@ export interface HeartbeatRunScratchEnvResult {
 
 export type HeartbeatRunScratchCleanupResult =
   | { removed: true; dir: string }
-  | { removed: false; dir: string; reason: "missing" | "unmarked" | "owner_mismatch" | "process_group_alive" };
+  | { removed: false; dir: string; reason: "missing" | "unmarked" | "owner_mismatch" | "process_group_alive" }
+  | { removed: false; dir: string; reason: "protected_content" | "content_check_failed"; recoveryAction: string };
+
+const SCRATCH_RECOVERY_ACTION =
+  "Ty/operator: move retained content into a durable workspace, then retry ownership-checked cleanup after writers stop. No automatic reaper; OS temporary-storage eviction remains possible.";
 
 const TEMP_ENV_KEYS = ["TMPDIR", "TEMP", "TMP"] as const;
 const ISSUE_SEGMENT_MAX_CHARS = 32;
@@ -152,6 +156,24 @@ export async function cleanupHeartbeatRunScratch(input: {
     return { removed: false, dir, reason: "process_group_alive" };
   }
 
-  await fs.rm(dir, { recursive: true, force: true });
+  try {
+    const entries = await fs.readdir(dir);
+    if (entries.some((entry) => entry !== HEARTBEAT_RUN_SCRATCH_MARKER)) {
+      return { removed: false, dir, reason: "protected_content", recoveryAction: SCRATCH_RECOVERY_ACTION };
+    }
+  } catch {
+    return { removed: false, dir, reason: "content_check_failed", recoveryAction: SCRATCH_RECOVERY_ACTION };
+  }
+
+  await fs.unlink(path.join(dir, HEARTBEAT_RUN_SCRATCH_MARKER));
+  try {
+    await fs.rmdir(dir);
+  } catch {
+    await fs.writeFile(path.join(dir, HEARTBEAT_RUN_SCRATCH_MARKER), `${JSON.stringify(marker, null, 2)}\n`, {
+      mode: 0o600,
+      flag: "wx",
+    }).catch(() => undefined);
+    return { removed: false, dir, reason: "content_check_failed", recoveryAction: SCRATCH_RECOVERY_ACTION };
+  }
   return { removed: true, dir };
 }

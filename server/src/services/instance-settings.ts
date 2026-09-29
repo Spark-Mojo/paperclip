@@ -263,6 +263,9 @@ export function normalizeExperimentalSettings(raw: unknown): InstanceExperimenta
       worktreeRunExecutionActivatedAt: parsed.data.worktreeRunExecutionActivatedAt ?? null,
       worktreeRunExecutionActivationInstanceId:
         parsed.data.worktreeRunExecutionActivationInstanceId ?? null,
+      // SPA-9275: ephemeral worktree per run (push-then-remove, startup reaper,
+      // terminal sweep). Default OFF — opt-in via instance settings.
+      enableEphemeralWorktreePerRun: parsed.data.enableEphemeralWorktreePerRun ?? false,
     };
   }
   return {
@@ -303,6 +306,7 @@ export function normalizeExperimentalSettings(raw: unknown): InstanceExperimenta
     enableWorktreeRunExecution: false,
     worktreeRunExecutionActivatedAt: null,
     worktreeRunExecutionActivationInstanceId: null,
+    enableEphemeralWorktreePerRun: false,
   };
 }
 

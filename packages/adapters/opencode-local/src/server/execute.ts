@@ -51,7 +51,11 @@ import {
   readPaperclipIssueWorkModeFromContext,
   resolveLegacyPaperclipDesiredSkillNames,
 } from "@paperclipai/adapter-utils/server-utils";
-import { isOpenCodeUnknownSessionError, parseOpenCodeJsonl } from "./parse.js";
+import { applyPaperclipWakePayloadEnv } from "@paperclipai/adapter-utils/wake-payload-env";
+import {
+  isOpenCodeUnknownSessionError,
+  parseOpenCodeJsonl,
+} from "./parse.js";
 import {
   ensureOpenCodeModelConfiguredAndAvailable,
   isTruthyEnvFlag,
@@ -306,7 +310,6 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   if (approvalId) env.PAPERCLIP_APPROVAL_ID = approvalId;
   if (approvalStatus) env.PAPERCLIP_APPROVAL_STATUS = approvalStatus;
   if (linkedIssueIds.length > 0) env.PAPERCLIP_LINKED_ISSUE_IDS = linkedIssueIds.join(",");
-  if (wakePayloadJson) env.PAPERCLIP_WAKE_PAYLOAD_JSON = wakePayloadJson;
   refreshPaperclipWorkspaceEnvForExecution({
     env,
     envConfig,
@@ -320,6 +323,26 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     executionTargetIsRemote,
     executionCwd: effectiveExecutionCwd,
   });
+  // SPA-9259: never put an oversized serialized wake payload in the env —
+  // execve rejects single env strings over MAX_ARG_STRLEN (128 KiB) with
+  // E2BIG before opencode starts. Payloads above the inline bound are staged
+  // to a file (local) or dropped in favor of the wake prompt (remote). Must
+  // run AFTER env assembly so the run scratch dir from envConfig is already
+  // present for file staging.
+  const wakePayloadEnv = await applyPaperclipWakePayloadEnv(env, {
+    runId,
+    wakePayloadJson,
+    executionTargetIsRemote: executionTargetIsRemote,
+  });
+  if (wakePayloadEnv.mode !== "inline") {
+    await onLog(
+      "stdout",
+      `[paperclip] Wake payload (${wakePayloadEnv.byteLength} bytes) exceeds the inline env limit; ` +
+        (wakePayloadEnv.mode === "file"
+          ? `staged to ${wakePayloadEnv.filePath} via PAPERCLIP_WAKE_PAYLOAD_FILE.\n`
+          : "env copy dropped (remote execution target); the wake prompt in stdin still carries the payload content.\n"),
+    );
+  }
   // Prevent OpenCode from writing an opencode.json config file into the
   // project working directory (which would pollute the git repo).  Model
   // selection is already handled via the --model CLI flag.  Set after the

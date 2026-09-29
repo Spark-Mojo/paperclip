@@ -364,12 +364,18 @@ import {
   inspectManagedGitWorktreeBranch,
   persistAdapterManagedRuntimeServices,
   realizeExecutionWorkspace,
+  releaseEphemeralRunWorkspaceForHeartbeatFinally,
+  releaseRunExecutionWorkspaceForHeartbeat,
+  resolveGitOwnerRepoRoot,
   releaseRuntimeServicesForRun,
   isUnresolvedWorkspaceBaseRefError,
   type ExecutionWorkspaceInput,
   type RealizedExecutionWorkspace,
   type RuntimeServiceRef,
   type UnresolvedWorkspaceBaseRefError,
+  // SPA-9315: discriminated against a generic WorkspaceValidationFailure so a
+  // provably-unrestorable reuse binding falls back fresh instead of failing setup.
+  ExecutionWorkspaceNotProvisionableError,
   sanitizeRuntimeServiceBaseEnv,
 } from "./workspace-runtime.js";
 import {
@@ -519,6 +525,7 @@ import {
 import {
   evaluateWakeLoopGuard,
   hasRecentTripRecord,
+  hasEligibleRoutineContinuation,
   isTerminalIssueStatusForWake,
   loadIssueStatusForWakeGuard,
   WAKE_LOOP_GUARD_HOURLY_LIMIT,
@@ -2136,6 +2143,13 @@ export function mergeExecutionWorkspaceMetadataForPersistence(input: {
   workspaceConfigMetadata?: EffectiveRunWorkspaceConfigMetadata | null;
   baseRef: string | null | undefined;
   baseRefSha: string | null | undefined;
+  /**
+   * SPA-9275: persists the ephemeral run-lifecycle flag so the heartbeat
+   * finally block can read it back from `executionWorkspaces.metadata`
+   * without re-deriving it from the worktree path shape (which is also a
+   * sufficient signal, but a stored flag is authoritative).
+   */
+  ephemeralLifecycle?: boolean;
 }) {
   const base = {
     ...(input.existingMetadata ?? {}),
@@ -2165,6 +2179,10 @@ export function mergeExecutionWorkspaceMetadataForPersistence(input: {
       categoryFingerprints: input.workspaceConfigMetadata.categoryFingerprints,
       lastEvaluatedAt: input.workspaceConfigMetadata.evaluatedAt,
     };
+  }
+
+  if (input.ephemeralLifecycle !== undefined) {
+    base.ephemeralLifecycle = input.ephemeralLifecycle;
   }
 
   if (
@@ -2776,6 +2794,31 @@ function isWorkspaceValidationFailure(
     maybe.resultJson &&
     typeof maybe.resultJson === "object" &&
     !Array.isArray(maybe.resultJson),
+  );
+}
+
+/**
+ * SPA-9315: the identifying fields of an
+ * `ExecutionWorkspaceNotProvisionableError`, carried structurally so this
+ * module can discriminate the failure without depending on the concrete
+ * class identity across module boundaries.
+ */
+type ExecutionWorkspaceNotProvisionableBinding = {
+  executionWorkspaceId: string | null;
+  workspaceStatus: string | null;
+  cwd: string;
+  strategy: string;
+};
+
+function isExecutionWorkspaceNotProvisionableError(
+  error: unknown,
+): error is ExecutionWorkspaceNotProvisionableError {
+  if (error instanceof ExecutionWorkspaceNotProvisionableError) return true;
+  const maybe = error as { name?: unknown; cwd?: unknown; strategy?: unknown } | null;
+  return (
+    maybe?.name === "ExecutionWorkspaceNotProvisionableError" &&
+    typeof maybe.cwd === "string" &&
+    typeof maybe.strategy === "string"
   );
 }
 
@@ -6093,20 +6136,48 @@ export async function provisionExecutionWorkspaceForFreshnessDecision<
 
   let restored: T | null = null;
   let reuseFailure: string | null = null;
+  /**
+   * SPA-9315: set when the restore proved the bound workspace can never be
+   * re-provisioned (a live row whose on-disk directory is gone). Such a binding
+   * is dead in exactly the sense SPA-7090 meant — restore can never succeed — so
+   * the run refuses it and provisions fresh instead of failing setup. The
+   * generic `null` result below is NOT that proof and still throws.
+   */
+  let unprovisionableBinding: ExecutionWorkspaceNotProvisionableBinding | null = null;
   try {
     restored = (await input.restoreExistingWorkspace?.()) ?? null;
   } catch (error) {
-    if (isWorkspaceValidationFailure(error)) {
+    if (isExecutionWorkspaceNotProvisionableError(error)) {
+      unprovisionableBinding = error;
+    } else if (isWorkspaceValidationFailure(error)) {
       throw error;
+    } else {
+      reuseFailure = formatInheritedExecutionWorkspaceReuseFailure({
+        reason: "inherited_workspace_reuse_failed",
+        issueRef: input.issueRef,
+        runId: input.runId,
+        executionWorkspaceId: input.existingExecutionWorkspaceId,
+        workspaceConfigFreshness: input.workspaceConfigFreshness,
+        cause: error,
+      });
     }
-    reuseFailure = formatInheritedExecutionWorkspaceReuseFailure({
-      reason: "inherited_workspace_reuse_failed",
-      issueRef: input.issueRef,
-      runId: input.runId,
-      executionWorkspaceId: input.existingExecutionWorkspaceId,
-      workspaceConfigFreshness: input.workspaceConfigFreshness,
-      cause: error,
-    });
+  }
+
+  if (unprovisionableBinding) {
+    // The SPA-7090 refusal is decided on the row's status, which still reads
+    // live here. Refuse the binding, provision fresh, and name the dead binding
+    // so the operator can repair or archive the row without reading restore logs.
+    const executionWorkspace = await input.realizeWorkspace();
+    return {
+      executionWorkspace,
+      reusedExecutionWorkspace: null,
+      policy,
+      freshFallbackForStaleReuse: true,
+      freshFallbackWarning: formatUnprovisionableReuseFallbackWarning({
+        issueRef: input.issueRef,
+        binding: unprovisionableBinding,
+      }),
+    };
   }
 
   if (!restored) {
@@ -6154,6 +6225,28 @@ function formatStaleReuseFallbackWarning(input: {
     `reuse_existing binding on issue ${issueLabel} was refused and a fresh execution workspace was ` +
     `provisioned instead of failing setup (SPA-7090). The stale binding is inert; no action needed.` +
     branchLine
+  );
+}
+
+/**
+ * SPA-9315: the SPA-7090-style named comment for a reuse binding whose row
+ * still reads live but whose on-disk directory was torn down. It names the
+ * workspace, the status the SPA-7090 gate admitted it on, and the missing
+ * directory, so the operator can repair or archive the row directly.
+ */
+function formatUnprovisionableReuseFallbackWarning(input: {
+  issueRef: WorkspaceReuseIssueRef;
+  binding: ExecutionWorkspaceNotProvisionableBinding;
+}) {
+  const issueLabel = input.issueRef?.identifier ?? input.issueRef?.id ?? "unknown issue";
+  const workspaceLabel = input.binding.executionWorkspaceId ?? "unknown workspace";
+  const statusLabel = input.binding.workspaceStatus ?? "unknown status";
+  return (
+    `Execution workspace \`${workspaceLabel}\` is still recorded as ${statusLabel}, but its on-disk ` +
+    `directory \`${input.binding.cwd}\` is gone, so the ${input.binding.strategy} workspace cannot be ` +
+    `restored. Its reuse_existing binding on issue ${issueLabel} was refused and a fresh execution ` +
+    `workspace was provisioned instead of failing setup (SPA-9315). The stale binding is inert; ` +
+    `no action needed for this run.`
   );
 }
 
@@ -13633,19 +13726,11 @@ export function heartbeatService(
         ? treeControlSvc.getActivePauseHoldGate(issue.companyId, issue.id)
         : Promise.resolve(null),
       issue
-        ? db
-            .select({ id: routines.id })
-            .from(routines)
-            .where(
-              and(
-                eq(routines.companyId, issue.companyId),
-                eq(routines.parentIssueId, issue.id),
-                eq(routines.status, "active"),
-              ),
-            )
-            .limit(1)
-            .then((rows) => rows[0] ?? null)
-        : Promise.resolve(null),
+        ? hasEligibleRoutineContinuation(db, {
+            companyId: issue.companyId, agentId: run.agentId, issueId: issue.id,
+            continuationRoutineId: parseObject(run.contextSnapshot).continuationRoutineId,
+          })
+        : Promise.resolve(false),
     ]);
 
     const decision = decideSuccessfulRunHandoff({
@@ -20070,6 +20155,22 @@ export function heartbeatService(
       ReturnType<typeof traceStore.prepare>
     > | null = null;
     let providerTraceFinalized = false;
+    // SPA-9275: captured at workspace-realize time so the outer finally block
+    // can push-then-remove the run's ephemeral worktree on terminal status
+    // (success, failure, cancel, process-loss) regardless of which path landed
+    // us in finally.
+    let ephemeralRunCleanup: {
+      worktreePath: string;
+      branchName: string | null;
+      repoRoot: string;
+      executionWorkspaceId: string | null;
+    } | null = null;
+    // SPA-9275: the workspace git-auth provider and operation recorder are
+    // declared inside the workspace-realization inner try; the outer finally
+    // needs both to invoke `releaseRunExecutionWorkspaceForHeartbeat`. Hoist
+    // them so the finally block can read the same instances.
+    let ephemeralRunGitAuth: GitRemoteAuthProvider | null = null;
+    let ephemeralRunRecorder: WorkspaceOperationRecorder | null = null;
 
     try {
       const agent = await getAgent(run.agentId);
@@ -21609,6 +21710,7 @@ export function heartbeatService(
             : null,
         issueId,
       });
+      ephemeralRunRecorder = workspaceOperationRecorder;
       // The run-scoped provider resolves the active identity at each Git operation,
       // including base-ref refreshes, workspace realization, and restore.
       const workspaceGitAuthProvider = createGitRemoteAuthProvider(
@@ -21621,6 +21723,7 @@ export function heartbeatService(
           agentId: agent.id,
         },
       );
+      ephemeralRunGitAuth = workspaceGitAuthProvider;
       const {
         executionWorkspace,
         reusedExecutionWorkspace,
@@ -21651,6 +21754,9 @@ export function heartbeatService(
                     mode: reusableExistingExecutionWorkspace.mode,
                     strategyType:
                       reusableExistingExecutionWorkspace.strategyType,
+                    // SPA-9315: carried so an unrestorable reuse binding can name
+                    // the row status the SPA-7090 gate admitted it on.
+                    status: reusableExistingExecutionWorkspace.status,
                     cwd: reusableExistingExecutionWorkspace.cwd,
                     providerRef: reusableExistingExecutionWorkspace.providerRef,
                     projectId: reusableExistingExecutionWorkspace.projectId,
@@ -21726,6 +21832,9 @@ export function heartbeatService(
               enableWorkspaceDirtyQuarantineRepair:
                 resolvedInstanceSettings.experimental
                   .enableWorkspaceDirtyQuarantineRepair,
+              ephemeralLifecycle:
+                resolvedInstanceSettings.experimental
+                  .enableEphemeralWorktreePerRun === true,
               recorder: workspaceOperationRecorder,
               resolveGitAuth: workspaceGitAuthProvider,
             }),
@@ -21826,6 +21935,7 @@ export function heartbeatService(
               : null,
           baseRef: executionWorkspace.repoRef,
           baseRefSha: executionWorkspace.baseRefSha ?? null,
+          ephemeralLifecycle: executionWorkspace.ephemeralLifecycle,
         });
       let persistedWorktreeInstanceRoot =
         resolvedWorkspaceReusePolicy.shouldRestoreExistingWorkspace &&
@@ -21992,6 +22102,43 @@ export function heartbeatService(
       await workspaceOperationRecorder.attachExecutionWorkspaceId(
         persistedExecutionWorkspace?.id ?? null,
       );
+      // SPA-9275: capture ephemeral workspace info for the outer finally cleanup.
+      // The branch is the durable identifier on the remote; only the local dir
+      // shape changes between persistent and ephemeral lifecycles.
+      if (
+        executionWorkspace.ephemeralLifecycle === true
+        && executionWorkspace.strategy === "git_worktree"
+        && executionWorkspace.worktreePath
+        && executionWorkspace.worktreePath.startsWith(`${path.join(resolvedWorkspace.cwd ?? "", ".paperclip", "worktrees", "runs")}`)
+        || (
+          executionWorkspace.ephemeralLifecycle === true
+          && executionWorkspace.strategy === "git_worktree"
+          && executionWorkspace.worktreePath
+          && path.basename(path.dirname(executionWorkspace.worktreePath)) === "runs"
+        )
+      ) {
+        try {
+          const repoRoot = await resolveGitOwnerRepoRoot(resolvedWorkspace.cwd ?? executionWorkspace.cwd);
+          if (repoRoot) {
+            ephemeralRunCleanup = {
+              worktreePath: executionWorkspace.worktreePath,
+              branchName: executionWorkspace.branchName ?? null,
+              repoRoot,
+              // The execution workspace row id is needed so the outer finally
+              // can archive the row when the local dir is removed — without
+              // this every ephemeral run leaves an `active` row pointing at a
+              // deleted directory, which a later `reuse_existing` run would
+              // then try to restore.
+              executionWorkspaceId: persistedExecutionWorkspace?.id ?? null,
+            };
+          }
+        } catch (resolveErr) {
+          logger.warn(
+            { err: resolveErr, runId: run.id },
+            "failed to resolve repo root for ephemeral run cleanup",
+          );
+        }
+      }
       await recordWorkspaceConfigFreshnessOperation({
         recorder: workspaceOperationRecorder,
         runId: run.id,
@@ -25987,6 +26134,87 @@ export function heartbeatService(
             nativeLifecycleTelemetry: nativeLifecycleTelemetryForRun,
           });
           await releaseRuntimeServicesForRun(run.id).catch(() => undefined);
+          // SPA-9275: ephemeral run-lifecycle cleanup. Pushes the branch to
+          // origin and force-removes the per-run worktree directory, retrying
+          // once on a stale git lock. Runs on every terminal outcome
+          // (succeeded / failed / cancelled / timed_out / process-lost) AND
+          // on the late-failure path. Never throws — failures are recorded as
+          // warnings and surfaced through the run's result JSON.
+          if (ephemeralRunCleanup && latestRun && isHeartbeatRunTerminalStatus(latestRun.status)) {
+            try {
+              // SPA-9275: heartbeat finally composite — pushes branch, force-removes
+              // the worktree dir, and archives the execution workspace row. The
+              // composite is the same code path the regression test exercises,
+              // so the test stays a faithful simulation of the finally block.
+              const releaseResult = await releaseEphemeralRunWorkspaceForHeartbeatFinally({
+                db,
+                repoRoot: ephemeralRunCleanup.repoRoot,
+                worktreePath: ephemeralRunCleanup.worktreePath,
+                branchName: ephemeralRunCleanup.branchName,
+                runId: run.id,
+                executionWorkspaceId: ephemeralRunCleanup.executionWorkspaceId,
+                resolveGitAuth: ephemeralRunGitAuth,
+                recorder: ephemeralRunRecorder,
+              });
+              // SPA-9275 fail-safe: `kept: true` means the release deliberately
+              // preserved a dirty or unpushed worktree instead of destroying
+              // it — this is expected, working behavior, not a cleanup
+              // failure, and must never be escalated toward `cleanup_failed`
+              // or retried in a loop from here. Only a genuinely incomplete
+              // removal (kept: false, removed: false) warrants a warning.
+              if (!releaseResult.removed && !releaseResult.kept) {
+                logger.warn(
+                  {
+                    runId: run.id,
+                    worktreePath: ephemeralRunCleanup.worktreePath,
+                    pushed: releaseResult.pushed,
+                    removed: releaseResult.removed,
+                    retriedRemoval: releaseResult.retriedRemoval,
+                    errors: releaseResult.errors,
+                  },
+                  "ephemeral run worktree cleanup did not finish cleanly",
+                );
+              } else if (releaseResult.kept) {
+                logger.info(
+                  {
+                    runId: run.id,
+                    worktreePath: ephemeralRunCleanup.worktreePath,
+                    keptReason: releaseResult.keptReason,
+                  },
+                  "ephemeral run worktree kept (not removed) to avoid losing state",
+                );
+              }
+              if (latestRun) {
+                const message = releaseResult.removed
+                  ? "ephemeral run worktree cleaned"
+                  : releaseResult.kept
+                    ? `ephemeral run worktree kept: ${releaseResult.keptReason}`
+                    : `ephemeral run worktree cleanup incomplete: ${releaseResult.errors.join(" | ")}`;
+                await appendRunEvent(latestRun, {
+                  eventType: "lifecycle",
+                  stream: "system",
+                  level: releaseResult.removed || releaseResult.kept ? "info" : "warn",
+                  message,
+                  payload: {
+                    worktreePath: ephemeralRunCleanup.worktreePath,
+                    branchName: ephemeralRunCleanup.branchName,
+                    pushed: releaseResult.pushed,
+                    removed: releaseResult.removed,
+                    retriedRemoval: releaseResult.retriedRemoval,
+                    archived: releaseResult.archived,
+                    kept: releaseResult.kept,
+                    keptReason: releaseResult.keptReason,
+                    errors: releaseResult.errors,
+                  },
+                }).catch(() => undefined);
+              }
+            } catch (releaseErr) {
+              logger.warn(
+                { err: releaseErr, runId: run.id, worktreePath: ephemeralRunCleanup.worktreePath },
+                "ephemeral run worktree release threw",
+              );
+            }
+          }
         }
         if (
           runScratch &&
@@ -26397,6 +26625,11 @@ export function heartbeatService(
     // instead of one per tick. Operator-driven wakes (`requestedByActorType
     // === "user"`) always pass.
     if (issueId && opts.requestedByActorType !== "user") {
+      if ((opts.reason === "issue_continuation_needed" || opts.reason === "finish_successful_run_handoff") &&
+          await hasEligibleRoutineContinuation(db, {
+            companyId: agent.companyId, agentId, issueId,
+            continuationRoutineId: payload?.continuationRoutineId ?? enrichedContextSnapshot.continuationRoutineId,
+          })) return null;
       const issueStatus = await loadIssueStatusForWakeGuard(db, issueId);
       if (isTerminalIssueStatusForWake(issueStatus)) {
         // Terminal-issue short-circuit: refuse to emit, write no row. The
@@ -26420,6 +26653,7 @@ export function heartbeatService(
         agentId,
         issueId,
         payload,
+        reason: opts.reason,
       });
       if (decision.tripped) {
         // Trip-row dedup: write at most one row per (company, agent, issue,
@@ -26431,6 +26665,8 @@ export function heartbeatService(
           agentId,
           issueId,
           guard: decision.guard,
+          mutation: typeof payload?.mutation === "string" ? payload.mutation : null,
+          retryOfRunId: typeof payload?.retryOfRunId === "string" ? payload.retryOfRunId : null,
         });
         if (!alreadyRecorded) {
           await writeSkippedHeartbeatRequest("wake_loop_guard_tripped", {
