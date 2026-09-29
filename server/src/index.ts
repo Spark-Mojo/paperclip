@@ -1065,6 +1065,18 @@ export async function startServer(): Promise<StartedServer> {
           }
         }
 
+        // SPA-9270 fix 3: reap orphaned run scratch dirs and any process
+        // trees still living under them (cancelled runs whose tree escaped
+        // termination before a restart). Never touches live runs scratch.
+        try {
+          const swept = await heartbeat.sweepOrphanedRunScratch();
+          if (swept.killedProcessGroups > 0 || swept.removedDirs > 0) {
+            logger.warn(swept, "startup run-scratch orphan sweep reclaimed leaked run scratch state");
+          }
+        } catch (err) {
+          logger.error({ err }, "startup run-scratch orphan sweep failed");
+        }
+
         const promotion = await heartbeat.promoteDueScheduledRetries();
         await heartbeat.resumeQueuedRuns();
         const reconciled = await heartbeat.reconcileStrandedAssignedIssues();
