@@ -353,6 +353,13 @@ const support = await getEmbeddedPostgresTestSupport();
       expect(freshPrompt).toContain("Read my Notion launch notes.");
       expect(freshPrompt).not.toContain('"resumeDelta"');
     });
+    it("fails closed for a recovery preflight whose required origin is missing", async () => {
+      await expect(buildExecutionContinuation({ db, companyId, issueId, agentId,
+        context: { previousRunId: runId, commentId: randomUUID() },
+        summary: null, exposeLowTrustRaw: false, requireCompleteSourceContext: true }))
+        .rejects.toThrow("continuation_source_context_missing");
+    });
+
     it("continues from available history when an origin comment is missing", async () => {
       const envelope = await buildExecutionContinuation({
         db,
