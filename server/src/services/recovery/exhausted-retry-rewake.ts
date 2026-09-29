@@ -257,3 +257,164 @@ function parseRecord(value: unknown): Record<string, unknown> {
 function readNonEmptyString(value: unknown): string | null {
   return typeof value === "string" && value.trim() ? value : null;
 }
+
+export const ORPHANED_RETRY_REWAKE_WAKE_REASON = "issue_orphaned_retry_redispatch";
+export const ORPHANED_RETRY_REWAKE_SOURCE = "issue.orphaned_retry_redispatch";
+export const ORPHANED_RETRY_REWAKE_EPISODE_EVIDENCE_KEY = "orphanedRetryRedispatchEpisode";
+export const ORPHANED_RETRY_REWAKE_MAX_ATTEMPTS = 1;
+export const EXHAUSTED_RETRY_REWAKE_ISSUE_STATUSES = ["todo", "in_progress"] as const;
+export const ORPHANED_RETRY_RUN_ERROR_CODE = "orphaned_running_run";
+
+export function isOrphanedRetryRun(run: {
+  status: string | null;
+  errorCode: string | null;
+}) {
+  return run.status === "interrupted" && run.errorCode === ORPHANED_RETRY_RUN_ERROR_CODE;
+}
+
+export type OrphanedRetryFacts = {
+  runStatus: string | null;
+  runErrorCode: string | null;
+  latestFinishedAt: Date | null;
+  episodeRewakeCount: number;
+  recoveryBudgetExhausted: boolean;
+  hasNewerRun: boolean;
+  exhaustedRetryBudgetSpent: boolean;
+  hasLiveExecutionPath: boolean;
+  hasQueuedWake: boolean;
+  hasOpenBlocker: boolean;
+  hasPendingInteraction: boolean;
+  isInvocationBudgetBlocked: boolean;
+  isSuppressedByPauseHold: boolean;
+  issueStatus: string;
+  hasAgentAssignee: boolean;
+  now?: Date;
+};
+
+export type OrphanedRetryRewakeDecision =
+  | { kind: "redispatch"; delayMs: number }
+  | { kind: "suppressed"; reason: OrphanedRetryRewakeSuppressReason };
+
+export type OrphanedRetryRewakeSuppressReason =
+  | "not_orphaned_retry_run"
+  | "newer_run_exists"
+  | "exhausted_retry_budget_spent"
+  | "episode_already_redispatched"
+  | "recovery_budget_exhausted"
+  | "issue_not_assignable"
+  | "live_execution_path"
+  | "queued_wake"
+  | "open_blocker"
+  | "pending_interaction"
+  | "invocation_budget_blocked"
+  | "pause_hold"
+  | "delay_not_elapsed";
+
+export function decideOrphanedRetryRewake(
+  facts: OrphanedRetryFacts,
+): OrphanedRetryRewakeDecision {
+  if (!isOrphanedRetryRun({ status: facts.runStatus, errorCode: facts.runErrorCode })) {
+    return { kind: "suppressed", reason: "not_orphaned_retry_run" };
+  }
+  if (facts.hasNewerRun) {
+    return { kind: "suppressed", reason: "newer_run_exists" };
+  }
+  if (facts.exhaustedRetryBudgetSpent) {
+    return { kind: "suppressed", reason: "exhausted_retry_budget_spent" };
+  }
+  if (facts.episodeRewakeCount >= ORPHANED_RETRY_REWAKE_MAX_ATTEMPTS) {
+    return { kind: "suppressed", reason: "episode_already_redispatched" };
+  }
+  if (facts.recoveryBudgetExhausted) {
+    return { kind: "suppressed", reason: "recovery_budget_exhausted" };
+  }
+  if (!facts.hasAgentAssignee || !REWAKABLE_ISSUE_STATUSES.has(facts.issueStatus)) {
+    return { kind: "suppressed", reason: "issue_not_assignable" };
+  }
+  if (facts.hasLiveExecutionPath) {
+    return { kind: "suppressed", reason: "live_execution_path" };
+  }
+  if (facts.hasQueuedWake) {
+    return { kind: "suppressed", reason: "queued_wake" };
+  }
+  if (facts.hasOpenBlocker) {
+    return { kind: "suppressed", reason: "open_blocker" };
+  }
+  if (facts.hasPendingInteraction) {
+    return { kind: "suppressed", reason: "pending_interaction" };
+  }
+  if (facts.isInvocationBudgetBlocked) {
+    return { kind: "suppressed", reason: "invocation_budget_blocked" };
+  }
+  if (facts.isSuppressedByPauseHold) {
+    return { kind: "suppressed", reason: "pause_hold" };
+  }
+  if (!facts.latestFinishedAt) {
+    return { kind: "suppressed", reason: "delay_not_elapsed" };
+  }
+  const now = facts.now ?? new Date();
+  if (now.getTime() - facts.latestFinishedAt.getTime() < exhaustedRetryRewakeDelayMs()) {
+    return { kind: "suppressed", reason: "delay_not_elapsed" };
+  }
+  return { kind: "redispatch", delayMs: exhaustedRetryRewakeDelayMs() };
+}
+
+export function buildOrphanedRetryRewakeEpisodeKey(input: {
+  companyId: string;
+  issueId: string;
+  rootRunId: string;
+}) {
+  return ["orphaned_retry_rewake", input.companyId, input.issueId, input.rootRunId].join(":");
+}
+
+export function buildOrphanedRetryRewakeIdempotencyKey(input: {
+  companyId: string;
+  issueId: string;
+  episodeKey: string;
+}) {
+  return `${input.episodeKey}:redispatch`;
+}
+
+export function orphanedRetryRewakeReplacementContext(input: {
+  episodeKey: string;
+  orphanRunId: string;
+  rootRunId: string;
+  previousOrphanRunId?: string | null;
+}) {
+  return {
+    [ORPHANED_RETRY_REWAKE_EPISODE_EVIDENCE_KEY]: {
+      episodeKey: input.episodeKey,
+      orphanRunId: input.orphanRunId,
+      rootRunId: input.rootRunId,
+      previousOrphanRunId: input.previousOrphanRunId ?? null,
+    },
+  };
+}
+
+export function orphanedRetryRewakeEpisodeContext(context: unknown) {
+  const episode = readOrphanedRetryRewakeEpisode(context);
+  if (!episode) return {};
+  return orphanedRetryRewakeReplacementContext(episode);
+}
+
+export function readOrphanedRetryRewakeEpisode(
+  context: unknown,
+): {
+  episodeKey: string;
+  orphanRunId: string;
+  rootRunId: string;
+  previousOrphanRunId: string | null;
+} | null {
+  const marker = parseRecord(parseRecord(context)[ORPHANED_RETRY_REWAKE_EPISODE_EVIDENCE_KEY]);
+  if (!marker) return null;
+  const episodeKey = readNonEmptyString(marker.episodeKey);
+  const orphanRunId = readNonEmptyString(marker.orphanRunId);
+  const rootRunId = readNonEmptyString(marker.rootRunId);
+  if (!episodeKey || !orphanRunId || !rootRunId) return null;
+  return {
+    episodeKey,
+    orphanRunId,
+    rootRunId,
+    previousOrphanRunId: readNonEmptyString(marker.previousOrphanRunId),
+  };
+}

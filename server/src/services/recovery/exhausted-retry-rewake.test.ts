@@ -29,12 +29,23 @@ import {
   EXHAUSTED_RETRY_REWAKE_MAX_ATTEMPTS,
   EXHAUSTED_RETRY_REWAKE_SOURCE,
   EXHAUSTED_RETRY_REWAKE_WAKE_REASON,
+  ORPHANED_RETRY_REWAKE_MAX_ATTEMPTS,
+  ORPHANED_RETRY_REWAKE_SOURCE,
+  ORPHANED_RETRY_REWAKE_WAKE_REASON,
   buildExhaustedRetryRewakeEpisodeKey,
   buildExhaustedRetryRewakeIdempotencyKey,
+  buildOrphanedRetryRewakeEpisodeKey,
+  buildOrphanedRetryRewakeIdempotencyKey,
   decideExhaustedRetryRewake,
+  decideOrphanedRetryRewake,
   exhaustedRetryRewakeEpisodeContext,
+  isOrphanedRetryRun,
+  orphanedRetryRewakeEpisodeContext,
+  orphanedRetryRewakeReplacementContext,
   readExhaustedRetryRewakeEpisode,
+  readOrphanedRetryRewakeEpisode,
   type ExhaustedRetryEpisodeFacts,
+  type OrphanedRetryFacts,
 } from "./exhausted-retry-rewake.js";
 import {
   getEmbeddedPostgresTestSupport,
@@ -256,6 +267,211 @@ describe("SPA-9351 shape 1: decideExhaustedRetryRewake", () => {
       decideExhaustedRetryRewake(eligible({ classificationKind: "non_retryable" })).kind,
     ).toBe("suppressed");
     console.log("STRANDED-RECOVERY-GATES: shape1-bounded");
+  });
+});
+
+function orphanedEligible(overrides: Partial<OrphanedRetryFacts> = {}): OrphanedRetryFacts {
+  return {
+    runStatus: "interrupted",
+    runErrorCode: "orphaned_running_run",
+    latestFinishedAt: LONG_AGO,
+    episodeRewakeCount: 0,
+    recoveryBudgetExhausted: false,
+    hasNewerRun: false,
+    exhaustedRetryBudgetSpent: false,
+    hasLiveExecutionPath: false,
+    hasQueuedWake: false,
+    hasOpenBlocker: false,
+    hasPendingInteraction: false,
+    isInvocationBudgetBlocked: false,
+    isSuppressedByPauseHold: false,
+    issueStatus: "in_progress",
+    hasAgentAssignee: true,
+    now: NOW,
+    ...overrides,
+  };
+}
+
+describe("SPA-9351 shape 4: decideOrphanedRetryRewake", () => {
+  it("re-dispatches a run orphaned by a restart", () => {
+    const decision = decideOrphanedRetryRewake(orphanedEligible());
+    expect(decision.kind).toBe("redispatch");
+    if (decision.kind === "redispatch") {
+      expect(decision.delayMs).toBe(DELAY_MS);
+    }
+  });
+
+  it.each([
+    ["server_shutdown_interrupted", "own shutdown lane"],
+    ["orphaned_running_run_issue_terminal", "issue-terminal authority"],
+    ["operator_interrupted", "deliberate stop"],
+    [null, "no recorded code"],
+  ] as [string | null, string][])("never re-dispatches %s (%s)", (errorCode) => {
+    expect(
+      decideOrphanedRetryRewake(orphanedEligible({ runErrorCode: errorCode })),
+    ).toEqual({ kind: "suppressed", reason: "not_orphaned_retry_run" });
+    expect(isOrphanedRetryRun({ status: "interrupted", errorCode })).toBe(false);
+  });
+
+  it.each(["failed", "cancelled", "timed_out", "succeeded", "running"])(
+    "never re-dispatches a run whose status is %s",
+    (status) => {
+      expect(decideOrphanedRetryRewake(orphanedEligible({ runStatus: status }))).toEqual({
+        kind: "suppressed",
+        reason: "not_orphaned_retry_run",
+      });
+    },
+  );
+
+  it("accepts only the exact interrupted + orphaned_running_run pair", () => {
+    expect(isOrphanedRetryRun({ status: "interrupted", errorCode: "orphaned_running_run" })).toBe(
+      true,
+    );
+  });
+
+  it("never displaces a newer run, however old the orphan looks", () => {
+    expect(decideOrphanedRetryRewake(orphanedEligible({ hasNewerRun: true }))).toEqual({
+      kind: "suppressed",
+      reason: "newer_run_exists",
+    });
+  });
+
+  it("caps the re-dispatch at one per episode", () => {
+    expect(ORPHANED_RETRY_REWAKE_MAX_ATTEMPTS).toBe(1);
+    expect(
+      decideOrphanedRetryRewake(
+        orphanedEligible({ episodeRewakeCount: ORPHANED_RETRY_REWAKE_MAX_ATTEMPTS }),
+      ),
+    ).toEqual({ kind: "suppressed", reason: "episode_already_redispatched" });
+  });
+
+  it("does not spend a second budget when shape 1 already recovered the card", () => {
+    expect(
+      decideOrphanedRetryRewake(orphanedEligible({ exhaustedRetryBudgetSpent: true })),
+    ).toEqual({ kind: "suppressed", reason: "exhausted_retry_budget_spent" });
+  });
+
+  it("keys the episode on the retry ROOT, so a replacement orphan cannot reset it", () => {
+    const first = buildOrphanedRetryRewakeEpisodeKey({
+      companyId: "c1",
+      issueId: "i1",
+      rootRunId: "root-1",
+    });
+    const second = buildOrphanedRetryRewakeEpisodeKey({
+      companyId: "c1",
+      issueId: "i1",
+      rootRunId: "root-1",
+    });
+    expect(second).toBe(first);
+    expect(
+      buildOrphanedRetryRewakeEpisodeKey({ companyId: "c1", issueId: "i1", rootRunId: "root-2" }),
+    ).not.toBe(first);
+  });
+
+  it("gives a stable idempotency key per episode so concurrent sweeps race on it", () => {
+    const episodeKey = buildOrphanedRetryRewakeEpisodeKey({
+      companyId: "c1",
+      issueId: "i1",
+      rootRunId: "root-1",
+    });
+    expect(
+      buildOrphanedRetryRewakeIdempotencyKey({ companyId: "c1", issueId: "i1", episodeKey }),
+    ).toBe(
+      buildOrphanedRetryRewakeIdempotencyKey({ companyId: "c1", issueId: "i1", episodeKey }),
+    );
+  });
+
+  it.each([
+    ["hasLiveExecutionPath", "live_execution_path"],
+    ["hasQueuedWake", "queued_wake"],
+    ["hasOpenBlocker", "open_blocker"],
+    ["hasPendingInteraction", "pending_interaction"],
+    ["isInvocationBudgetBlocked", "invocation_budget_blocked"],
+    ["isSuppressedByPauseHold", "pause_hold"],
+  ] as const)("suppresses on %s", (fact, reason) => {
+    expect(decideOrphanedRetryRewake(orphanedEligible({ [fact]: true }))).toEqual({
+      kind: "suppressed",
+      reason,
+    });
+  });
+
+  it.each(["done", "blocked", "in_review", "backlog", "cancelled"])(
+    "does not re-dispatch a %s card",
+    (status) => {
+      expect(decideOrphanedRetryRewake(orphanedEligible({ issueStatus: status }))).toEqual({
+        kind: "suppressed",
+        reason: "issue_not_assignable",
+      });
+    },
+  );
+
+  it("does not re-dispatch an unassigned card", () => {
+    expect(decideOrphanedRetryRewake(orphanedEligible({ hasAgentAssignee: false }))).toEqual({
+      kind: "suppressed",
+      reason: "issue_not_assignable",
+    });
+  });
+
+  it("does not resurrect a card whose recovery action already escalated", () => {
+    expect(
+      decideOrphanedRetryRewake(orphanedEligible({ recoveryBudgetExhausted: true })),
+    ).toEqual({ kind: "suppressed", reason: "recovery_budget_exhausted" });
+  });
+
+  it("waits out the delay, and never fires immediately on an unanchored orphan", () => {
+    expect(
+      decideOrphanedRetryRewake(
+        orphanedEligible({ latestFinishedAt: new Date(NOW.getTime() - DELAY_MS + 1_000) }),
+      ),
+    ).toEqual({ kind: "suppressed", reason: "delay_not_elapsed" });
+    expect(decideOrphanedRetryRewake(orphanedEligible({ latestFinishedAt: null }))).toEqual({
+      kind: "suppressed",
+      reason: "delay_not_elapsed",
+    });
+  });
+
+  it("round-trips the episode and the replacement marker through a wake context", () => {
+    const episodeKey = buildOrphanedRetryRewakeEpisodeKey({
+      companyId: "c1",
+      issueId: "i1",
+      rootRunId: "root-1",
+    });
+    const context = orphanedRetryRewakeReplacementContext({
+      episodeKey,
+      orphanRunId: "orphan-1",
+      rootRunId: "root-1",
+      previousOrphanRunId: "orphan-0",
+    });
+    expect(readOrphanedRetryRewakeEpisode(context)).toEqual({
+      episodeKey,
+      orphanRunId: "orphan-1",
+      rootRunId: "root-1",
+      previousOrphanRunId: "orphan-0",
+    });
+    expect(orphanedRetryRewakeEpisodeContext(context)).toEqual(context);
+    expect(readOrphanedRetryRewakeEpisode({ issueId: "i1" })).toBeNull();
+  });
+
+  it("carries the shape-1 episode marker forward so the two budgets cannot stack", () => {
+    const orphanEpisode = buildOrphanedRetryRewakeEpisodeKey({
+      companyId: "c1",
+      issueId: "i1",
+      rootRunId: "root-1",
+    });
+    const context = {
+      ...orphanedRetryRewakeReplacementContext({
+        episodeKey: orphanEpisode,
+        orphanRunId: "orphan-1",
+        rootRunId: "root-1",
+      }),
+      ...exhaustedRetryRewakeEpisodeContext({
+        episodeKey: "exhausted_retry_rewake:c1:i1:run-a",
+        exhaustedRunId: "run-a",
+        errorCode: "adapter_failed",
+      }),
+    };
+    expect(readOrphanedRetryRewakeEpisode(context)?.episodeKey).toBe(orphanEpisode);
+    expect(readExhaustedRetryRewakeEpisode(context)?.exhaustedRunId).toBe("run-a");
   });
 });
 
@@ -490,6 +706,420 @@ describeEmbeddedPostgres("SPA-9351 shape 1: stranded sweep re-wakes an exhausted
     const result = await recovery.reconcileStrandedAssignedIssues();
 
     expect(result.exhaustedRetryRewoken).toBe(0);
+    expect(enqueueWakeup).not.toHaveBeenCalled();
+  });
+});
+
+if (!embeddedPostgresSupport.supported) {
+  console.warn(
+    `Skipping SPA-9351 shape 4 integration on this host: ${embeddedPostgresSupport.reason ?? "unsupported environment"}`,
+  );
+}
+
+describeEmbeddedPostgres("SPA-9351 shape 4: sweep re-dispatches a run orphaned by a restart", () => {
+  let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
+  let db: ReturnType<typeof createDb>;
+
+  beforeAll(async () => {
+    tempDb = await startEmbeddedPostgresTestDatabase("paperclip-spa-9351-shape4-");
+    db = createDb(tempDb.connectionString);
+  }, 60_000);
+
+  afterEach(async () => {
+    await db
+      .update(issues)
+      .set({ checkoutRunId: null, executionRunId: null, executionLockedAt: null });
+    await db.delete(activityLog);
+    await db.delete(issueComments);
+    await db.execute(sql`delete from heartbeat_run_events`);
+    await db.delete(heartbeatRuns);
+    await db.delete(agentWakeupRequests);
+    await db.delete(issueRecoveryActions);
+    await db.delete(issues);
+    await db.delete(agentRuntimeState);
+    await db.delete(agents);
+    await db.delete(companies);
+    await db.delete(authUsers);
+  });
+
+  async function seedLiveRetryAcrossRestart(options: {
+    agentId: string;
+    issueId: string;
+    rootRunId: string;
+    retryRunId: string;
+  }) {
+    const companyId = "12121212-1212-4121-8121-121212121212";
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: "SPA",
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(authUsers).values({
+      id: "local-board",
+      name: "Board",
+      email: "board@local",
+      createdAt: LONG_AGO,
+      updatedAt: LONG_AGO,
+    });
+    await db.insert(agents).values({
+      id: options.agentId,
+      companyId,
+      name: "agent",
+      status: "idle",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    await db.insert(issues).values({
+      id: options.issueId,
+      companyId,
+      title: "Retry orphaned by a restart",
+      status: "in_progress",
+      priority: "medium",
+      assigneeAgentId: options.agentId,
+      issueNumber: 2,
+      identifier: "SPA-2",
+    });
+    await db.insert(heartbeatRuns).values({
+      id: options.rootRunId,
+      companyId,
+      agentId: options.agentId,
+      invocationSource: "manual",
+      status: "failed",
+      errorCode: "adapter_failed",
+      startedAt: LONG_AGO,
+      finishedAt: LONG_AGO,
+      createdAt: LONG_AGO,
+      contextSnapshot: {
+        issueId: options.issueId,
+        taskId: options.issueId,
+        retryReason: BOUNDED_TRANSIENT_RETRY_REASON,
+      },
+    });
+    await db.insert(heartbeatRuns).values({
+      id: options.retryRunId,
+      companyId,
+      agentId: options.agentId,
+      invocationSource: "automation",
+      status: "running",
+      retryOfRunId: options.rootRunId,
+      scheduledRetryReason: "transient_failure",
+      processPid: 999_999_999,
+      processGroupId: 999_999_999,
+      startedAt: NOW,
+      createdAt: NOW,
+      contextSnapshot: {
+        issueId: options.issueId,
+        taskId: options.issueId,
+        wakeReason: "transient_failure_retry",
+        retryOfRunId: options.rootRunId,
+      },
+    });
+    await db
+      .update(issues)
+      .set({
+        executionRunId: options.retryRunId,
+        checkoutRunId: options.retryRunId,
+        executionLockedAt: NOW,
+      })
+      .where(eq(issues.id, options.issueId));
+
+    return { companyId, ...options };
+  }
+
+  async function simulateRestartOrphanCleanup(seeded: {
+    companyId: string;
+    retryRunId: string;
+    issueId: string;
+  }) {
+    const { recoveryService } = await import("./service.js");
+    const recovery = recoveryService(db, {
+      enqueueWakeup: (async () => null) as never,
+    });
+    const swept = await recovery.sweepStaleIssueLocks();
+    expect(swept.terminalizedRunIds).toContain(seeded.retryRunId);
+
+    const [run] = await db
+      .select({ status: heartbeatRuns.status, errorCode: heartbeatRuns.errorCode })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, seeded.retryRunId));
+    expect(run?.status).toBe("interrupted");
+    expect(run?.errorCode).toBe("orphaned_running_run");
+
+    await db
+      .update(heartbeatRuns)
+      .set({ finishedAt: LONG_AGO })
+      .where(eq(heartbeatRuns.id, seeded.retryRunId));
+
+    const [issue] = await db
+      .select({ executionRunId: issues.executionRunId, checkoutRunId: issues.checkoutRunId })
+      .from(issues)
+      .where(eq(issues.id, seeded.issueId));
+    expect(issue?.executionRunId).toBeNull();
+    expect(issue?.checkoutRunId).toBeNull();
+  }
+
+  it("re-dispatches the card after the engine restarts mid-retry", async () => {
+    const seeded = await seedLiveRetryAcrossRestart({
+      agentId: "d1d1d1d1-d1d1-41d1-81d1-d1d1d1d1d1d1",
+      issueId: "d2d2d2d2-d2d2-42d2-82d2-d2d2d2d2d2d2",
+      rootRunId: "d3d3d3d3-d3d3-43d3-83d3-d3d3d3d3d3d3",
+      retryRunId: "d4d4d4d4-d4d4-44d4-84d4-d4d4d4d4d4d4",
+    });
+    await simulateRestartOrphanCleanup(seeded);
+
+    const { recoveryService } = await import("./service.js");
+    const captured: Record<string, unknown>[] = [];
+    const enqueueWakeup = vi.fn(async (_agentId: string, opts: Record<string, unknown>) => {
+      captured.push(opts);
+      return {
+        id: "d5d5d5d5-d5d5-45d5-85d5-d5d5d5d5d5d5",
+        companyId: seeded.companyId,
+        agentId: seeded.agentId,
+        status: "queued",
+      };
+    });
+
+    const recovery = recoveryService(db, { enqueueWakeup } as never);
+    const result = await recovery.reconcileStrandedAssignedIssues();
+
+    expect(result.orphanedRetryRedispatched).toBe(1);
+    expect(result.issueIds).toContain(seeded.issueId);
+    expect(enqueueWakeup).toHaveBeenCalledTimes(1);
+    const [wakeAgentId, wakeOpts] = enqueueWakeup.mock.calls[0] as unknown as [
+      string,
+      Record<string, unknown>,
+    ];
+    expect(wakeAgentId).toBe(seeded.agentId);
+    expect(wakeOpts.reason).toBe(ORPHANED_RETRY_REWAKE_WAKE_REASON);
+    expect((wakeOpts.contextSnapshot as Record<string, unknown>).source).toBe(
+      ORPHANED_RETRY_REWAKE_SOURCE,
+    );
+    expect(wakeOpts.retryOfRunId).toBeUndefined();
+    expect(wakeOpts.idempotencyKey).toContain("orphaned_retry_rewake");
+
+    const episode = readOrphanedRetryRewakeEpisode(
+      captured[0].contextSnapshot as Record<string, unknown>,
+    );
+    expect(episode?.orphanRunId).toBe(seeded.retryRunId);
+    expect(episode?.rootRunId).toBe(seeded.rootRunId);
+
+    const [issue] = await db
+      .select({ status: issues.status })
+      .from(issues)
+      .where(eq(issues.id, seeded.issueId));
+    expect(issue?.status).toBe("in_progress");
+    console.log("STRANDED-RECOVERY-GATES: shape4-orphaned-retry");
+  });
+
+  it("leaves a shutdown-interrupted run on its own lane", async () => {
+    const seeded = await seedLiveRetryAcrossRestart({
+      agentId: "b1b1b1b1-b1b1-41b1-81b1-b1b1b1b1b1b1",
+      issueId: "b2b2b2b2-b2b2-42b2-82b2-b2b2b2b2b2b2",
+      rootRunId: "b3b3b3b3-b3b3-43b3-83b3-b3b3b3b3b3b3",
+      retryRunId: "b4b4b4b4-b4b4-44b4-84b4-b4b4b4b4b4b4",
+    });
+    await simulateRestartOrphanCleanup(seeded);
+    await db
+      .update(heartbeatRuns)
+      .set({ errorCode: "server_shutdown_interrupted" })
+      .where(eq(heartbeatRuns.id, seeded.retryRunId));
+
+    const { recoveryService } = await import("./service.js");
+    const enqueueWakeup = vi.fn(async () => ({
+      id: "b5b5b5b5-b5b5-45b5-85b5-b5b5b5b5b5b5",
+      companyId: seeded.companyId,
+      agentId: seeded.agentId,
+      status: "queued",
+    }));
+    const recovery = recoveryService(db, { enqueueWakeup } as never);
+    const result = await recovery.reconcileStrandedAssignedIssues();
+
+    expect(result.orphanedRetryRedispatched).toBe(0);
+  });
+
+  it("leaves an issue-terminal orphan on its own lane", async () => {
+    const seeded = await seedLiveRetryAcrossRestart({
+      agentId: "c1c1c1c1-c1c1-41c1-81c1-c1c1c1c1c1c1",
+      issueId: "c2c2c2c2-c2c2-42c2-82c2-c2c2c2c2c2c2",
+      rootRunId: "c3c3c3c3-c3c3-43c3-83c3-c3c3c3c3c3c3",
+      retryRunId: "c4c4c4c4-c4c4-44c4-84c4-c4c4c4c4c4c4",
+    });
+    await simulateRestartOrphanCleanup(seeded);
+    await db
+      .update(heartbeatRuns)
+      .set({ errorCode: "orphaned_running_run_issue_terminal" })
+      .where(eq(heartbeatRuns.id, seeded.retryRunId));
+
+    const { recoveryService } = await import("./service.js");
+    const enqueueWakeup = vi.fn(async () => ({
+      id: "c5c5c5c5-c5c5-45c5-85c5-c5c5c5c5c5c5",
+      companyId: seeded.companyId,
+      agentId: seeded.agentId,
+      status: "queued",
+    }));
+    const recovery = recoveryService(db, { enqueueWakeup } as never);
+    const result = await recovery.reconcileStrandedAssignedIssues();
+
+    expect(result.orphanedRetryRedispatched).toBe(0);
+  });
+
+  it("does not reset the budget when the replacement is itself orphaned", async () => {
+    const seeded = await seedLiveRetryAcrossRestart({
+      agentId: "e1e1e1e1-e1e1-41e1-81e1-e1e1e1e1e1e1",
+      issueId: "e2e2e2e2-e2e2-42e2-82e2-e2e2e2e2e2e2",
+      rootRunId: "e3e3e3e3-e3e3-43e3-83e3-e3e3e3e3e3e3",
+      retryRunId: "e4e4e4e4-e4e4-44e4-84e4-e4e4e4e4e4e4",
+    });
+    await simulateRestartOrphanCleanup(seeded);
+
+    const { recoveryService } = await import("./service.js");
+    const first = vi.fn(async () => ({
+      id: "e5e5e5e5-e5e5-45e5-85e5-e5e5e5e5e5e5",
+      companyId: seeded.companyId,
+      agentId: seeded.agentId,
+      status: "queued",
+    }));
+    const recovery = recoveryService(db, { enqueueWakeup: first } as never);
+    expect((await recovery.reconcileStrandedAssignedIssues()).orphanedRetryRedispatched).toBe(1);
+
+    const replacementRunId = "e6e6e6e6-e6e6-46e6-86e6-e6e6e6e6e6e6";
+    await db.insert(heartbeatRuns).values({
+      id: replacementRunId,
+      companyId: seeded.companyId,
+      agentId: seeded.agentId,
+      invocationSource: "automation",
+      status: "running",
+      retryOfRunId: seeded.rootRunId,
+      processPid: 999_999_998,
+      processGroupId: 999_999_998,
+      startedAt: NOW,
+      createdAt: NOW,
+      contextSnapshot: {
+        issueId: seeded.issueId,
+        taskId: seeded.issueId,
+        wakeReason: ORPHANED_RETRY_REWAKE_WAKE_REASON,
+        ...orphanedRetryRewakeReplacementContext({
+          episodeKey: buildOrphanedRetryRewakeEpisodeKey({
+            companyId: seeded.companyId,
+            issueId: seeded.issueId,
+            rootRunId: seeded.rootRunId,
+          }),
+          orphanRunId: seeded.retryRunId,
+          rootRunId: seeded.rootRunId,
+        }),
+      },
+    });
+    await db
+      .update(issues)
+      .set({ executionRunId: replacementRunId, checkoutRunId: replacementRunId })
+      .where(eq(issues.id, seeded.issueId));
+
+    const second = vi.fn(async () => ({
+      id: "e7e7e7e7-e7e7-47e7-87e7-e7e7e7e7e7e7",
+      companyId: seeded.companyId,
+      agentId: seeded.agentId,
+      status: "queued",
+    }));
+    const recoveryAgain = recoveryService(db, { enqueueWakeup: second } as never);
+    await recoveryAgain.sweepStaleIssueLocks();
+    const result = await recoveryAgain.reconcileStrandedAssignedIssues();
+
+    expect(second).not.toHaveBeenCalled();
+    expect(result.orphanedRetryRedispatched).toBe(0);
+  });
+
+  it("admits exactly one replacement under concurrent sweeps", async () => {
+    const seeded = await seedLiveRetryAcrossRestart({
+      agentId: "f1f1f1f1-f1f1-41f1-81f1-f1f1f1f1f1f1",
+      issueId: "f2f2f2f2-f2f2-42f2-82f2-f2f2f2f2f2f2",
+      rootRunId: "f3f3f3f3-f3f3-43f3-83f3-f3f3f3f3f3f3",
+      retryRunId: "f4f4f4f4-f4f4-44f4-84f4-f4f4f4f4f4f4",
+    });
+    await simulateRestartOrphanCleanup(seeded);
+
+    const { recoveryService } = await import("./service.js");
+    const episodeKey = buildOrphanedRetryRewakeEpisodeKey({
+      companyId: seeded.companyId,
+      issueId: seeded.issueId,
+      rootRunId: seeded.rootRunId,
+    });
+    const enqueueWakeup = vi.fn(async () => {
+      const inserted = await db
+        .insert(agentWakeupRequests)
+        .values([
+          {
+            companyId: seeded.companyId,
+            agentId: seeded.agentId,
+            source: "automation",
+            triggerDetail: "system",
+            reason: ORPHANED_RETRY_REWAKE_WAKE_REASON,
+            status: "queued",
+            idempotencyKey: buildOrphanedRetryRewakeIdempotencyKey({
+              companyId: seeded.companyId,
+              issueId: seeded.issueId,
+              episodeKey,
+            }),
+            payload: { issueId: seeded.issueId },
+          },
+        ])
+        .returning({ id: agentWakeupRequests.id })
+        .then((rows) => rows[0] ?? null)
+        .catch((error: unknown) => {
+          const conflict = error as { code?: string };
+          return conflict?.code === "23505" ? null : Promise.reject(error);
+        });
+      return inserted
+        ? { id: inserted.id, companyId: seeded.companyId, agentId: seeded.agentId, status: "queued" }
+        : null;
+    });
+
+    const recovery = recoveryService(db, { enqueueWakeup } as never);
+    const [a, b] = await Promise.all([
+      recovery.reconcileStrandedAssignedIssues(),
+      recovery.reconcileStrandedAssignedIssues(),
+    ]);
+
+    expect([a, b].reduce((n, r) => n + r.orphanedRetryRedispatched, 0)).toBe(1);
+    const queued = await db
+      .select({ id: agentWakeupRequests.id })
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.status, "queued"));
+    expect(queued).toHaveLength(1);
+  });
+
+  it("leaves a newer live run alone", async () => {
+    const seeded = await seedLiveRetryAcrossRestart({
+      agentId: "a1a1a1a1-a1a1-41a1-81a1-a1a1a1a1a1a1",
+      issueId: "a2a2a2a2-a2a2-42a2-82a2-a2a2a2a2a2a2",
+      rootRunId: "a3a3a3a3-a3a3-43a3-83a3-a3a3a3a3a3a3",
+      retryRunId: "a4a4a4a4-a4a4-44a4-84a4-a4a4a4a4a4a4",
+    });
+    await simulateRestartOrphanCleanup(seeded);
+    await db.insert(heartbeatRuns).values({
+      id: "a5a5a5a5-a5a5-45a5-85a5-a5a5a5a5a5a5",
+      companyId: seeded.companyId,
+      agentId: seeded.agentId,
+      invocationSource: "automation",
+      status: "running",
+      startedAt: NOW,
+      createdAt: new Date(NOW.getTime() + 60_000),
+      contextSnapshot: { issueId: seeded.issueId, taskId: seeded.issueId },
+    });
+
+    const { recoveryService } = await import("./service.js");
+    const enqueueWakeup = vi.fn(async () => ({
+      id: "a6a6a6a6-a6a6-46a6-86a6-a6a6a6a6a6a6",
+      companyId: seeded.companyId,
+      agentId: seeded.agentId,
+      status: "queued",
+    }));
+    const recovery = recoveryService(db, { enqueueWakeup } as never);
+    const result = await recovery.reconcileStrandedAssignedIssues();
+
+    expect(result.orphanedRetryRedispatched).toBe(0);
     expect(enqueueWakeup).not.toHaveBeenCalled();
   });
 });

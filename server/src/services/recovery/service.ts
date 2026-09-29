@@ -135,12 +135,22 @@ import {
 } from "./disposition-repair.js";
 import {
   BOUNDED_TRANSIENT_RETRY_REASON,
+  EXHAUSTED_RETRY_REWAKE_ISSUE_STATUSES,
   EXHAUSTED_RETRY_REWAKE_SOURCE,
   EXHAUSTED_RETRY_REWAKE_WAKE_REASON,
+  ORPHANED_RETRY_REWAKE_SOURCE,
+  ORPHANED_RETRY_REWAKE_WAKE_REASON,
   buildExhaustedRetryRewakeEpisodeKey,
   buildExhaustedRetryRewakeIdempotencyKey,
+  buildOrphanedRetryRewakeEpisodeKey,
+  buildOrphanedRetryRewakeIdempotencyKey,
   decideExhaustedRetryRewake,
+  decideOrphanedRetryRewake,
   exhaustedRetryRewakeEpisodeContext,
+  isOrphanedRetryRun,
+  orphanedRetryRewakeReplacementContext,
+  readExhaustedRetryRewakeEpisode,
+  readOrphanedRetryRewakeEpisode,
 } from "./exhausted-retry-rewake.js";
 import {
   createActiveRunWatchdog,
@@ -2270,6 +2280,267 @@ export function recoveryService(
       "re-woke card stranded by an exhausted retry budget",
     );
     return "rewoken";
+  }
+
+  async function resolveRetryLineageRootRunId(
+    companyId: string,
+    runId: string,
+  ): Promise<{ rootRunId: string; lineageRunIds: string[] }> {
+    let currentId = runId;
+    const lineageRunIds = [runId];
+    const seen = new Set<string>([runId]);
+    for (let depth = 0; depth < 32; depth += 1) {
+      const [row] = await db
+        .select({ retryOfRunId: heartbeatRuns.retryOfRunId })
+        .from(heartbeatRuns)
+        .where(
+          and(
+            eq(heartbeatRuns.companyId, companyId),
+            eq(heartbeatRuns.id, currentId),
+          ),
+        )
+        .limit(1);
+      const parentId = row?.retryOfRunId ?? null;
+      if (!parentId || seen.has(parentId)) break;
+      seen.add(parentId);
+      currentId = parentId;
+      lineageRunIds.push(parentId);
+    }
+    return { rootRunId: currentId, lineageRunIds };
+  }
+
+  async function enqueueOrphanedRetryRedispatch(input: {
+    issue: typeof issues.$inferSelect;
+    agentId: string;
+    latestRun: LatestIssueRun;
+  }): Promise<"redispatched" | "suppressed"> {
+    const orphanRun = input.latestRun;
+    if (!orphanRun) return "suppressed";
+
+    const { rootRunId, lineageRunIds } = await resolveRetryLineageRootRunId(
+      input.issue.companyId,
+      orphanRun.id,
+    );
+    const episodeKey = buildOrphanedRetryRewakeEpisodeKey({
+      companyId: input.issue.companyId,
+      issueId: input.issue.id,
+      rootRunId,
+    });
+
+    const [
+      hasLivePath,
+      hasQueuedWake,
+      hasPendingInteraction,
+      unresolvedBlockerIds,
+      invocationBudgetBlocked,
+      pauseHeld,
+      hasNewerRun,
+      episodeRuns,
+      activeAction,
+      exhaustedEpisode,
+    ] = await Promise.all([
+      hasActiveExecutionPath(input.issue.companyId, input.issue.id, input.agentId),
+      hasQueuedIssueWake(input.issue.companyId, input.issue.id, input.agentId),
+      hasPendingWakeInteraction(input.issue.companyId, input.issue.id),
+      existingUnresolvedBlockerIssueIds(input.issue.companyId, input.issue.id),
+      isInvocationBudgetBlocked(input.issue, input.agentId),
+      isAutomaticRecoverySuppressedByPauseHold(
+        db,
+        input.issue.companyId,
+        input.issue.id,
+      ),
+      db
+        .select({ id: heartbeatRuns.id })
+        .from(heartbeatRuns)
+        .where(
+          and(
+            eq(heartbeatRuns.companyId, input.issue.companyId),
+            sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${input.issue.id}`,
+            or(
+              gt(heartbeatRuns.createdAt, orphanRun.createdAt),
+              and(
+                eq(heartbeatRuns.createdAt, orphanRun.createdAt),
+                gt(heartbeatRuns.id, orphanRun.id),
+              ),
+            ),
+            notInArray(heartbeatRuns.id, lineageRunIds),
+          ),
+        )
+        .limit(1)
+        .then((rows) => rows.length > 0),
+      db
+        .select({
+          id: heartbeatRuns.id,
+          finishedAt: heartbeatRuns.finishedAt,
+          createdAt: heartbeatRuns.createdAt,
+          carriesMarker: sql<boolean>`(${heartbeatRuns.contextSnapshot} -> 'orphanedRetryRedispatchEpisode' ->> 'episodeKey' = ${episodeKey})`,
+        })
+        .from(heartbeatRuns)
+        .where(
+          and(
+            eq(heartbeatRuns.companyId, input.issue.companyId),
+            or(
+              sql`${heartbeatRuns.contextSnapshot} -> 'orphanedRetryRedispatchEpisode' ->> 'episodeKey' = ${episodeKey}`,
+              eq(heartbeatRuns.id, orphanRun.id),
+            ),
+          ),
+        )
+        .orderBy(desc(heartbeatRuns.createdAt)),
+      recoveryActionsSvc.getActiveForIssue(input.issue.companyId, input.issue.id),
+      db
+        .select({ id: heartbeatRuns.id })
+        .from(heartbeatRuns)
+        .where(
+          and(
+            eq(heartbeatRuns.companyId, input.issue.companyId),
+            sql`(${heartbeatRuns.contextSnapshot} -> 'exhaustedRetryRewakeEpisode' ->> 'exhaustedRunId') is not null`,
+          ),
+        )
+        .limit(1)
+        .then((rows) => rows.length > 0),
+    ]);
+
+    const episodeRewakeCount = episodeRuns.filter((row) => row.carriesMarker).length;
+    const latestFinishedAt =
+      episodeRuns
+        .map((row) => row.finishedAt)
+        .filter((value): value is Date => value instanceof Date)
+        .sort((a, b) => b.getTime() - a.getTime())[0] ?? null;
+
+    const decision = decideOrphanedRetryRewake({
+      runStatus: orphanRun.status,
+      runErrorCode: orphanRun.errorCode ?? null,
+      latestFinishedAt,
+      episodeRewakeCount,
+      recoveryBudgetExhausted:
+        Boolean(activeAction) && isRecoveryActionBudgetExhausted(activeAction!),
+      hasNewerRun,
+      exhaustedRetryBudgetSpent: exhaustedEpisode,
+      hasLiveExecutionPath: hasLivePath,
+      hasQueuedWake,
+      hasOpenBlocker: unresolvedBlockerIds.length > 0,
+      hasPendingInteraction,
+      isInvocationBudgetBlocked: invocationBudgetBlocked,
+      isSuppressedByPauseHold: pauseHeld,
+      issueStatus: input.issue.status,
+      hasAgentAssignee: Boolean(input.issue.assigneeAgentId),
+    });
+
+    if (decision.kind === "suppressed") {
+      logger.info(
+        {
+          issueId: input.issue.id,
+          agentId: input.agentId,
+          orphanRunId: orphanRun.id,
+          errorCode: orphanRun.errorCode,
+          rootRunId,
+          episodeKey,
+          reason: decision.reason,
+        },
+        "orphaned-retry replacement dispatch suppressed",
+      );
+      return "suppressed";
+    }
+
+    const inheritedExhaustedEpisode = readExhaustedRetryRewakeEpisode(
+      orphanRun.contextSnapshot,
+    );
+    const inheritedOrphanEpisode = readOrphanedRetryRewakeEpisode(
+      orphanRun.contextSnapshot,
+    );
+
+    const episodeContext = {
+      ...(inheritedExhaustedEpisode
+        ? exhaustedRetryRewakeEpisodeContext({
+            episodeKey: inheritedExhaustedEpisode.episodeKey,
+            exhaustedRunId: inheritedExhaustedEpisode.exhaustedRunId,
+            errorCode: inheritedExhaustedEpisode.errorCode,
+          })
+        : {}),
+      ...orphanedRetryRewakeReplacementContext({
+        episodeKey,
+        orphanRunId: orphanRun.id,
+        rootRunId,
+        previousOrphanRunId: inheritedOrphanEpisode?.orphanRunId ?? null,
+      }),
+    };
+
+    const claimed = await db
+      .update(heartbeatRuns)
+      .set({
+        contextSnapshot: sql`${heartbeatRuns.contextSnapshot} || ${JSON.stringify(episodeContext)}::jsonb`,
+        updatedAt: new Date(),
+      })
+      .where(
+        and(
+          eq(heartbeatRuns.id, orphanRun.id),
+          eq(heartbeatRuns.companyId, input.issue.companyId),
+          sql`(${heartbeatRuns.contextSnapshot} -> 'orphanedRetryRedispatchEpisode' ->> 'episodeKey') is null`,
+        ),
+      )
+      .returning({ id: heartbeatRuns.id })
+      .then((rows) => rows[0] ?? null);
+    if (!claimed) return "suppressed";
+
+    const queued = await deps
+      .enqueueWakeup(input.agentId, {
+        source: "automation",
+        triggerDetail: "system",
+        reason: ORPHANED_RETRY_REWAKE_WAKE_REASON,
+        idempotencyKey: buildOrphanedRetryRewakeIdempotencyKey({
+          companyId: input.issue.companyId,
+          issueId: input.issue.id,
+          episodeKey,
+        }),
+        payload: withRecoveryContext(
+          { issueId: input.issue.id, ...episodeContext },
+          "normal_model",
+        ),
+        requestedByActorType: "system",
+        requestedByActorId: null,
+        contextSnapshot: withRecoveryContext(
+          {
+            issueId: input.issue.id,
+            taskId: input.issue.id,
+            wakeReason: ORPHANED_RETRY_REWAKE_WAKE_REASON,
+            source: ORPHANED_RETRY_REWAKE_SOURCE,
+            ...episodeContext,
+          },
+          "normal_model",
+        ),
+        issueStateGuard: {
+          statuses: [...EXHAUSTED_RETRY_REWAKE_ISSUE_STATUSES],
+          assigneeAgentId: input.agentId,
+        },
+      })
+      .catch((error: unknown) => {
+        const conflict = unwrapDatabaseConflictError(error);
+        if (
+          conflict?.code === "23505" &&
+          (conflict.constraint?.includes("orphaned_retry_rewake") ||
+            conflict.constraint_name?.includes("orphaned_retry_rewake") ||
+            conflict.message?.includes("orphaned_retry_rewake"))
+        ) {
+          return null;
+        }
+        throw error;
+      });
+
+    if (!queued) return "suppressed";
+
+    logger.warn(
+      {
+        issueId: input.issue.id,
+        agentId: input.agentId,
+        orphanRunId: orphanRun.id,
+        errorCode: orphanRun.errorCode,
+        rootRunId,
+        episodeKey,
+        wakeId: queued.id,
+      },
+      "re-dispatched a card whose retry was orphaned by a restart",
+    );
+    return "redispatched";
   }
 
   async function enqueueStrandedIssueRecovery(input: {
@@ -4647,6 +4918,7 @@ export function recoveryService(
       waitingOnReviewResolved: 0,
       providerQuotaMonitored: 0,
       exhaustedRetryRewoken: 0,
+      orphanedRetryRedispatched: 0,
       recentProgressExempted: 0,
       operatorCancelExempted: 0,
       onboardingFirstTaskExempted: 0,
@@ -4945,11 +5217,19 @@ export function recoveryService(
           readNonEmptyString(
             parseObject(source?.contextSnapshot).retryReason,
           ) === BOUNDED_TRANSIENT_RETRY_REASON;
+        // SPA-9351 shape 4: `legacyExecutionNeedsReconciliation` returns true for
+        // any run with a retry ancestry, which terminalizes a restart-orphaned
+        // retry behind a board-owned recovery action. The later sweeps then all
+        // stand down at the `ownerType === "board"` guard above, stranding the
+        // card with no run, no wake and no blocker. Scoped to the exact
+        // `interrupted` + `orphaned_running_run` class and nothing wider.
+        const restartOrphanedRetryRun = isOrphanedRetryRun(source);
         if (
           source &&
           legacyExecutionNeedsReconciliation(source) &&
           !isServerShutdownInterruptedRun(source) &&
-          !exhaustedBoundedTransientRun
+          !exhaustedBoundedTransientRun &&
+          !restartOrphanedRetryRun
         ) {
           await terminalizeLegacyExecution({
             db,
@@ -5683,6 +5963,26 @@ export function recoveryService(
         const unsuccessfulRun = latestRun;
         if (!unsuccessfulRun) {
           result.skipped += 1;
+          continue;
+        }
+
+        // SPA-9351 shape 4. Every branch below reads a terminal latest run as a
+        // verdict on the card and either escalates it to `blocked` or
+        // resubmits the dead predecessor to the bounded retry scheduler, which
+        // is refused because the restart spent the same budget. Ordered first:
+        // this is the only branch that reads the status as infrastructure.
+        if (isOrphanedRetryRun(unsuccessfulRun)) {
+          const redispatched = await enqueueOrphanedRetryRedispatch({
+            issue,
+            agentId,
+            latestRun: unsuccessfulRun,
+          });
+          if (redispatched === "redispatched") {
+            result.orphanedRetryRedispatched += 1;
+            result.issueIds.push(issue.id);
+          } else {
+            result.skipped += 1;
+          }
           continue;
         }
 
