@@ -310,6 +310,8 @@ export async function loadChainMostRecentSkipAt(
   // null (the hourly guard catches gross abuse).
   if (!input.mutation && !input.retryOfRunId) return null;
   const conditions = [
+    eq(agentWakeupRequests.status, "skipped"),
+    sql`${agentWakeupRequests.reason} IS DISTINCT FROM 'execution_reconciliation_required'`,
     eq(agentWakeupRequests.companyId, input.companyId),
     eq(agentWakeupRequests.agentId, input.agentId),
     sql`${agentWakeupRequests.payload} ->> 'issueId' = ${input.issueId}`,
@@ -443,7 +445,7 @@ export async function evaluateWakeLoopGuard(
         sql`${agentWakeupRequests.payload} ->> 'issueId' = ${input.issueId}`,
         eq(agentWakeupRequests.requestedByActorType, "user"),
       )).orderBy(desc(agentWakeupRequests.createdAt)).limit(1);
-    const attempts = await db.select({ createdAt: agentWakeupRequests.createdAt })
+    const attempts = await db.select({ createdAt: agentWakeupRequests.createdAt, status: agentWakeupRequests.status })
       .from(agentWakeupRequests).where(and(
         eq(agentWakeupRequests.companyId, input.companyId),
         eq(agentWakeupRequests.agentId, input.agentId),
@@ -455,7 +457,10 @@ export async function evaluateWakeLoopGuard(
     const prior = attempts[0]?.createdAt;
     if (prior) {
       const exhausted = attempts.length >= WAKE_LOOP_GUARD_CHAIN_LIMIT;
-      const nextEligibleAt = new Date(prior.getTime() + backoffWindowMsForAttempt(attempts.length + 1));
+      const skipped = attempts.filter((attempt) => attempt.status === "skipped");
+      const nextEligibleAt = skipped[0]
+        ? new Date(skipped[0].createdAt.getTime() + backoffWindowMsForAttempt(skipped.length + 1))
+        : now;
       if (exhausted || now < nextEligibleAt) return {
         tripped: true, guard: exhausted ? "chain" : "backoff", count: attempts.length,
         limit: exhausted ? WAKE_LOOP_GUARD_CHAIN_LIMIT : attempts.length + 1,
@@ -497,8 +502,8 @@ export async function evaluateWakeLoopGuard(
       };
     }
 
-    if (chainMostRecentSkipAt !== null && chain.totalInWindow >= 1) {
-      const attempt = chain.totalInWindow + 1;
+    if (chainMostRecentSkipAt !== null && chain.skippedInWindow >= 1) {
+      const attempt = chain.skippedInWindow + 1;
       const requiredElapsed = backoffWindowMsForAttempt(attempt);
       const elapsedMs = now.getTime() - chainMostRecentSkipAt.getTime();
       if (elapsedMs < requiredElapsed) {

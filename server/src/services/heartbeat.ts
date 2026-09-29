@@ -26625,6 +26625,16 @@ export function heartbeatService(
     // instead of one per tick. Operator-driven wakes (`requestedByActorType
     // === "user"`) always pass.
     if (issueId && opts.requestedByActorType !== "user") {
+      if (opts.idempotencyKey?.startsWith("handoff_bounded_continuation:")) {
+        const existing = await db.select({ id: agentWakeupRequests.id }).from(agentWakeupRequests)
+          .where(and(
+            eq(agentWakeupRequests.companyId, agent.companyId),
+            eq(agentWakeupRequests.agentId, agentId),
+            eq(agentWakeupRequests.idempotencyKey, opts.idempotencyKey),
+            ne(agentWakeupRequests.status, "skipped"),
+          )).limit(1);
+        if (existing.length > 0) return null;
+      }
       if ((opts.reason === "issue_continuation_needed" || opts.reason === "finish_successful_run_handoff") &&
           await hasEligibleRoutineContinuation(db, {
             companyId: agent.companyId, agentId, issueId,
