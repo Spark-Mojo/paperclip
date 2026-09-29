@@ -4077,6 +4077,13 @@ export async function ensurePersistedExecutionWorkspaceAvailable(input: {
     );
   }
   const repoRoot = await runGit(["rev-parse", "--show-toplevel"], baseCwd);
+  // SPA-9437: normalize both sides through `--git-common-dir` so the
+  // comparison is repo-relative, not worktree-relative. `repoRoot` resolves
+  // the baseCwd to its `--show-toplevel` (a worktree path when baseCwd
+  // is a worktree); `currentOwnerRepoRoot` resolves that to the owning
+  // repo so a project workspace that is itself a worktree of repo X
+  // does NOT spuriously compare against X's worktree as a different repo.
+  const currentOwnerRepoRoot = await resolveGitOwnerRepoRoot(baseCwd).catch(() => null);
   const recordedBaseRefSha = readRecordedBaseRefSha(input.workspace.metadata);
   if (await directoryExists(cwd)) {
     const reuseBaseRef = input.workspace.baseRef ?? input.base.repoRef ?? null;
@@ -4097,9 +4104,16 @@ export async function ensurePersistedExecutionWorkspaceAvailable(input: {
       expectedBranchName: realized.branchName,
     });
     const persistedRepoRoot = persistedCwd.repoRoot ?? null;
+    // Compare the persisted cwd's owning repo against the current
+    // project workspace's owning repo. `inspectManagedGitWorktreeBranch`
+    // already resolves the cwd through `--git-common-dir`, so a
+    // persisted worktree-of-repo-X is normalized to X. The current
+    // side must use the same normalization to avoid a false positive
+    // when `baseCwd` is itself a worktree.
     if (
       persistedRepoRoot
-      && path.resolve(persistedRepoRoot) !== path.resolve(repoRoot)
+      && currentOwnerRepoRoot
+      && path.resolve(persistedRepoRoot) !== path.resolve(currentOwnerRepoRoot)
     ) {
       // SPA-9437: the persisted cwd belongs to a different repo than the
       // current project workspace's repo. Tear down the OLD worktree when
@@ -4115,7 +4129,7 @@ export async function ensurePersistedExecutionWorkspaceAvailable(input: {
       const torn = await tearDownPersistedWorktreeBoundToOtherRepo({
         reuseWorktreePath,
         persistedRepoRoot,
-        currentRepoRoot: repoRoot,
+        currentRepoRoot: currentOwnerRepoRoot ?? repoRoot,
         branchName: realized.branchName,
         executionWorkspaceId: input.workspace.id ?? null,
         sourceIssue: input.issue,

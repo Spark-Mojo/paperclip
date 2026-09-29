@@ -11429,6 +11429,94 @@ describe("ensurePersistedExecutionWorkspaceAvailable SPA-9437 project workspace 
     const listedWorktrees = await readGit(oldRepo, ["worktree", "list", "--porcelain"]);
     expect(listedWorktrees).toContain(oldWorktreePath);
   }, 20_000);
+
+  // SPA-9437 normalization regression: when the persisted cwd is a worktree
+  // of repo X AND the new `baseCwd` is ALSO a worktree of repo X (different
+  // worktree path, same owning repo), the new comparison must NOT classify
+  // them as different repos. A project workspace that is itself a worktree
+  // must round-trip cleanly through rebind without the engine spuriously
+  // tearing down a valid worktree on every run.
+  it("does not tear down a persisted worktree whose owning repo matches the current project workspace's owning repo (SPA-9437)", async () => {
+    const sharedRepo = await createTempRepo();
+    // Persisted worktree = a worktree of sharedRepo at .paperclip/worktrees/A
+    const persistedBranch = "PAP-9437-same-repo-A";
+    const persistedWorktreePath = path.join(
+      sharedRepo,
+      ".paperclip",
+      "worktrees",
+      "A",
+    );
+    await fs.mkdir(path.dirname(persistedWorktreePath), { recursive: true });
+    await runGit(sharedRepo, [
+      "worktree",
+      "add",
+      "-b",
+      persistedBranch,
+      persistedWorktreePath,
+      "HEAD",
+    ]);
+    // baseCwd = a SECOND worktree of the SAME repo at .paperclip/worktrees/B
+    const baseCwdBranch = "PAP-9437-same-repo-B";
+    const baseCwd = path.join(sharedRepo, ".paperclip", "worktrees", "B");
+    await fs.mkdir(baseCwd, { recursive: true });
+    await runGit(sharedRepo, ["worktree", "add", "-b", baseCwdBranch, baseCwd, "HEAD"]);
+
+    // Persisted cwd stays as-is (same-repo worktree, must NOT be torn down).
+    // baseCwd is itself a worktree of the same repo, so the new
+    // resolveGitOwnerRepoRoot normalization must resolve both to the same
+    // sharedRepo and skip the different-repo tear-down path. The validator
+    // then sees a normal same-repo persisted cwd and proceeds.
+    const restored = await ensurePersistedExecutionWorkspaceAvailable({
+      base: {
+        baseCwd,
+        source: "project_primary",
+        projectId: "project-1",
+        workspaceId: "workspace-same",
+        repoUrl: null,
+        repoRef: "HEAD",
+      },
+      workspace: {
+        id: "execution-workspace-spa9437-same-repo",
+        mode: "isolated_workspace",
+        strategyType: "git_worktree",
+        cwd: persistedWorktreePath,
+        providerRef: persistedWorktreePath,
+        projectId: "project-1",
+        projectWorkspaceId: "workspace-same",
+        repoUrl: null,
+        baseRef: "HEAD",
+        branchName: persistedBranch,
+        metadata: RUNTIME_OWNED_GIT_BRANCH_METADATA,
+      },
+      issue: {
+        id: "issue-spa9437-same-repo",
+        identifier: "PAP-9437",
+        title: "SPA-9437 same-repo worktree must not trigger different-repo tear-down",
+      },
+      agent: {
+        id: "agent-1",
+        name: "Codex Coder",
+        companyId: "company-1",
+      },
+    });
+
+    // Same-repo path: the validator returns the realized workspace (not
+    // null, not a typed throw) and the persisted cwd is untouched on disk.
+    expect(restored).not.toBeNull();
+    expect(restored?.worktreePath).toBe(persistedWorktreePath);
+    const stillThere = await fs.stat(persistedWorktreePath).catch(() => null);
+    expect(stillThere).not.toBeNull();
+    // Branch on the persisted worktree is unchanged (still on the original branch).
+    const branchOnPersistedWorktree = (
+      await execFileAsync("git", [
+        "-C",
+        persistedWorktreePath,
+        "branch",
+        "--show-current",
+      ])
+    ).stdout.trim();
+    expect(branchOnPersistedWorktree).toBe(persistedBranch);
+  }, 20_000);
 });
 
 // SPA-9437 issue-update guard. The execution-workspaces service exposes
