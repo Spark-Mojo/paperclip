@@ -1113,11 +1113,23 @@ export function createPostgresWakeQueueAdapter(db: Db, deps: WakeQueuePostgresAd
             !(run.status === "cancelled" &&
               (run.errorCode === "issue_reassigned" ||
                 run.errorCode === "lock_released_on_reassignment")),
+          // SPA-9314 (2026-09-29, live measure): a REASSIGNMENT-cancelled run
+          // is not an operator stop. The acknowledged-execution-cancellation
+          // short-circuit exists so a user/agent Stop never auto-promotes old
+          // queued work by itself — but when the engine cancels the run to hand
+          // the card to a NEW assignee, the release MUST reach the
+          // deferred-wake drain so the new owner's `issue_assigned` wake is
+          // promoted to queued instead of sitting behind the cancelled run's
+          // lock forever. Same exemption shape as legacyExecutionNeedsReconciliation
+          // directly above (SPA-8631/SPA-9001 for the reassignment-cancelled
+          // line, which carries an acknowledged executionCancellation).
           // An operator stop never promotes old queued work by itself. The
           // next explicit wake adopts those messages atomically when it
           // queues a run.
           executionCancellationAcknowledged:
             run.status === "cancelled" &&
+            !(run.errorCode === "issue_reassigned" ||
+              run.errorCode === "lock_released_on_reassignment") &&
             (parseObject(run.resultJson?.executionCancellation).state === "acknowledged" || isAcknowledgedNativeStop(run)) &&
             !interruptedQueue,
         };
