@@ -156,6 +156,45 @@ describeEmbeddedPostgres("SPA-9282 terminal-run context_rewrite block trigger", 
   );
 
   it(
+    "allows a process_pid clear on a terminal row (card's 'clear stale process_pid once')",
+    async () => {
+      const database = await startEmbeddedPostgresTestDatabase(
+        "paperclip-spa-9282-allow-process-pid-clear-",
+      );
+      cleanups.push(database.cleanup);
+      const sql = postgres(database.connectionString, { max: 1 });
+      cleanups.push(async () => sql.end());
+
+      await ensureBlockAndAuditTriggersInstalled(sql);
+
+      const { companyId, agentId } = await seedCompanyAgent(sql);
+      await sql`
+        INSERT INTO heartbeat_runs (
+          id, company_id, agent_id, status, liveness_state,
+          process_pid, process_group_id, context_snapshot, updated_at, created_at
+        ) VALUES (
+          ${TERMINAL_RUN_ID_2}::uuid, ${companyId}::uuid, ${agentId}::uuid,
+          'failed', 'failed', 12345, 12345, ${sql.json({"phase":"first"})}, NOW(), NOW()
+        )
+      `;
+
+      // process_pid clear changes the row → NOT a pure touch → must land.
+      await sql`
+        UPDATE heartbeat_runs
+        SET process_pid = NULL, process_group_id = NULL, updated_at = NOW()
+        WHERE id = ${TERMINAL_RUN_ID_2}::uuid
+      `;
+      const rows = await sql`
+        SELECT process_pid, process_group_id FROM heartbeat_runs WHERE id = ${TERMINAL_RUN_ID_2}::uuid
+      ` as Array<{ process_pid: number | null; process_group_id: number | null }>;
+      if (rows[0].process_pid !== null || rows[0].process_group_id !== null) {
+        throw new Error("process_pid clear was suppressed by the block trigger");
+      }
+    },
+    60_000,
+  );
+
+  it(
     "audit trigger captures UPDATE on the five observed ids",
     async () => {
       const database = await startEmbeddedPostgresTestDatabase(
