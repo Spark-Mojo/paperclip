@@ -1,6 +1,6 @@
 import { execFileSync } from "node:child_process";
 import type { ServerGitInfo, ServerGitLocalChanges, ServerInfoSnapshot } from "@paperclipai/shared";
-import { parseBuildCommit, readBuildCommit } from "./build-commit.js";
+import { bootBuildCommit, parseBuildCommit, readBuildCommit } from "./build-commit.js";
 
 export type { ServerGitInfo, ServerInfoSnapshot };
 
@@ -112,6 +112,18 @@ function readGitInfo(
   gitBranchCommand: GitCommand = defaultGitBranchCommand,
   buildCommitCommand: BuildCommitCommand = readBuildCommit,
 ): ServerGitInfo {
+  const buildCommit = bootBuildCommit ?? parseBuildCommit(buildCommitCommand());
+  if (buildCommit) {
+    return {
+      available: true,
+      fullSha: buildCommit,
+      shortSha: buildCommit.slice(0, 7),
+      branchName: null,
+      subject: "Source build",
+      committedAt: null,
+      localChanges: { available: false, unavailableReason: "git_status_unavailable" },
+    };
+  }
   try {
     const output = gitCommand();
     const localChanges = getGitLocalChanges(gitStatusCommand);
@@ -123,23 +135,7 @@ function readGitInfo(
     }
     return parseGitInfo(output, branchName, localChanges);
   } catch {
-    const buildCommit = parseBuildCommit(buildCommitCommand());
-    if (!buildCommit) {
-      return { available: false, unavailableReason: "git_unavailable" };
-    }
-
-    return {
-      available: true,
-      fullSha: buildCommit,
-      shortSha: buildCommit.slice(0, 7),
-      branchName: null,
-      subject: "Source build",
-      committedAt: null,
-      localChanges: {
-        available: false,
-        unavailableReason: "git_status_unavailable",
-      },
-    };
+    return { available: false, unavailableReason: "git_unavailable" };
   }
 }
 
