@@ -50,11 +50,6 @@ type TransitionInput = {
   requestedAssigneePatch: RequestedAssigneePatch;
   actor: ActorLike;
   allowBoardOverride?: boolean;
-  /**
-   * Allows a separately-authorized human recovery actor to record the active
-   * stage's normal canonical decision without clearing execution state.
-   */
-  allowCurrentStageDecisionOverride?: boolean;
   commentBody?: string | null;
   reviewRequest?: IssueExecutionState["reviewRequest"] | null;
   monitorExplicitlyUpdated?: boolean;
@@ -696,6 +691,22 @@ function applyIssueExecutionStageTransition(input: TransitionInput): TransitionR
     requestedStatus !== "done" &&
     requestedStatus !== "cancelled"
   ) {
+    // SPA-9215: refuse to wipe executionState when it already represents a
+    // terminal review/approval decision. A stale queued assignment run whose
+    // cancellation triggers the assignment-recovery sweep PATCHes the card
+    // back to a non-terminal status; this branch used to unconditionally
+    // null out executionState on every such transition, destroying the
+    // reviewer's durable close record (lastDecisionOutcome, completedStageIds,
+    // returnAssignee) without any human decision. The same precondition
+    // applies to a cancelled queue for the prior assignee: preserving
+    // returnAssignee here means the follow-up queue resolves to the same
+    // assignee the original execution closed with — a no-op for the prior
+    // owner, not a state machine wipe. Existing states with no recorded
+    // terminal decision (lastDecisionOutcome === null) are not protected;
+    // they have nothing durable to lose and still clear cleanly.
+    if (existingState?.lastDecisionOutcome) {
+      return { patch };
+    }
     patch.executionState = null;
     return { patch };
   }
@@ -788,7 +799,7 @@ function applyIssueExecutionStageTransition(input: TransitionInput): TransitionR
       };
     }
 
-    if (principalsEqual(currentParticipant, actor) || input.allowCurrentStageDecisionOverride) {
+    if (principalsEqual(currentParticipant, actor)) {
       if (requestedStatus === "done") {
         if (!input.commentBody?.trim()) {
           throw unprocessable(`Approving a review or approval stage requires a comment. ${STAGE_DECISION_COMMENT_HINT}`);
@@ -814,40 +825,12 @@ function applyIssueExecutionStageTransition(input: TransitionInput): TransitionR
           };
         }
 
-        // SPA-5364 / SPA-5506 fingerprint: the sole next-stage participant can
-        // equal the returnAssignee. Excluding them would empty the candidate set
-        // and (pre-fix) collapse the workflow to terminal without ever routing
-        // to the configured approver.
-        //
-        // Primary call uses the standard exclude filter. Only apply the
-        // un-excluded fallback when the next stage is an approval stage —
-        // approval is a meaningful gate that the configured approver must
-        // exercise even when they are also the returnAssignee. For a review
-        // next stage whose sole participant equals returnAssignee, the existing
-        // `canAutoSkipPendingStage` path (L1017-1042) handles the self-review
-        // skip during re-entry; collapsing to terminal here would short-circuit
-        // that loop and bypass the auto-skip.
-        let nextParticipant = selectStageParticipant(nextStage, {
+        const participant = selectStageParticipant(nextStage, {
           preferred: explicitAssignee,
           exclude: existingState?.returnAssignee ?? null,
         });
-        if (!nextParticipant && nextStage.type === "approval") {
-          nextParticipant = selectStageParticipant(nextStage, {
-            preferred: explicitAssignee,
-            exclude: null,
-          });
-        }
-        if (!nextParticipant) {
-          patch.executionState = approvedState;
-          return {
-            patch,
-            decision: {
-              stageId: activeStage.id,
-              stageType: activeStage.type,
-              outcome: "approved",
-              body: input.commentBody.trim(),
-            },
-          };
+        if (!participant) {
+          throw unprocessable(`No eligible ${nextStage.type} participant is configured for this issue`);
         }
 
         buildPendingStagePatch({
@@ -855,7 +838,7 @@ function applyIssueExecutionStageTransition(input: TransitionInput): TransitionR
           previous: approvedState,
           policy: input.policy,
           stage: nextStage,
-          participant: nextParticipant,
+          participant,
           returnAssignee: existingState?.returnAssignee ?? currentAssignee ?? actor,
           reviewRequest: input.reviewRequest ?? null,
         });
@@ -1018,26 +1001,13 @@ function applyIssueExecutionStageTransition(input: TransitionInput): TransitionR
 
   const returnAssignee = existingState?.returnAssignee ?? currentAssignee;
   const skippedStageIds = [...(existingState?.completedStageIds ?? [])];
-  // SPA-5364 / SPA-5506 mirror: the sole approval participant may equal
-  // returnAssignee. Excluding them empties the candidate set; for an approval
-  // stage we re-select without the exclusion so the configured approver still
-  // acts (mirrors the L820 fallback). For review stages we let the existing
-  // auto-skip loop below handle the self-review case via
-  // canAutoSkipPendingStage.
-  const preferredForStage = (stage: IssueExecutionStage) =>
-    existingState?.status === CHANGES_REQUESTED_STATUS
-      ? explicitAssignee ?? existingState.currentParticipant ?? null
-      : explicitAssignee;
-  let participant =
-    pendingStage.type === "approval"
-      ? selectStageParticipant(pendingStage, {
-          preferred: preferredForStage(pendingStage),
-          exclude: null,
-        })
-      : selectStageParticipant(pendingStage, {
-          preferred: preferredForStage(pendingStage),
-          exclude: returnAssignee,
-        });
+  let participant = selectStageParticipant(pendingStage, {
+    preferred:
+      existingState?.status === CHANGES_REQUESTED_STATUS
+        ? explicitAssignee ?? existingState.currentParticipant ?? null
+        : explicitAssignee,
+    exclude: returnAssignee,
+  });
   while (!participant && canAutoSkipPendingStage({ stage: pendingStage, returnAssignee, requestedStatus })) {
     skippedStageIds.push(pendingStage.id);
     pendingStage = nextPendingStage(
@@ -1056,16 +1026,13 @@ function applyIssueExecutionStageTransition(input: TransitionInput): TransitionR
       });
       return { patch };
     }
-    participant =
-      pendingStage.type === "approval"
-        ? selectStageParticipant(pendingStage, {
-            preferred: preferredForStage(pendingStage),
-            exclude: null,
-          })
-        : selectStageParticipant(pendingStage, {
-            preferred: preferredForStage(pendingStage),
-            exclude: returnAssignee,
-          });
+    participant = selectStageParticipant(pendingStage, {
+      preferred:
+        existingState?.status === CHANGES_REQUESTED_STATUS
+          ? explicitAssignee ?? existingState.currentParticipant ?? null
+          : explicitAssignee,
+      exclude: returnAssignee,
+    });
   }
   if (!participant) {
     throw unprocessable(`No eligible ${pendingStage.type} participant is configured for this issue`);
@@ -1126,25 +1093,14 @@ function applyMonitorTransition(input: TransitionInput, stagePatch: Record<strin
       if (input.monitorExplicitlyUpdated) {
         throw unprocessable(MONITOR_INVALID_MESSAGE);
       }
-      // SPA-7105 (DECISION-140 rule 5): a non-explicit status write must never
-      // silently strip an armed monitor (SPA-5921, 2026-09-10 15:14:43Z +
-      // 15:41:53Z). The exception is a terminal transition (done/cancelled):
-      // the work is over, so the monitor clears with its terminal reason as
-      // before. Any other invalid transition (e.g. in_progress→blocked) is
-      // rejected — mirroring the explicit path's `unprocessable` — so the
-      // write cannot execute while leaving the monitor behind as silent loss.
-      if (nextStatus === "done" || nextStatus === "cancelled") {
-        patch.executionPolicy = stripMonitorFromExecutionPolicy(input.policy);
-        patch.monitorNextCheckAt = null;
-        patch.monitorWakeRequestedAt = null;
-        targetMonitorState = buildClearedMonitorState({
-          previous: currentMonitorState,
-          clearReason: invalidReason,
-          clearedAt: new Date(),
-        });
-      } else {
-        throw unprocessable(MONITOR_INVALID_MESSAGE, { clearReason: invalidReason });
-      }
+      patch.executionPolicy = stripMonitorFromExecutionPolicy(input.policy);
+      patch.monitorNextCheckAt = null;
+      patch.monitorWakeRequestedAt = null;
+      targetMonitorState = buildClearedMonitorState({
+        previous: currentMonitorState,
+        clearReason: invalidReason,
+        clearedAt: new Date(),
+      });
     } else {
       const exhaustedReason = exhaustedMonitorClearReason({
         monitor: input.policy.monitor,
@@ -1172,36 +1128,16 @@ function applyMonitorTransition(input: TransitionInput, stagePatch: Record<strin
       }
     }
   } else if (previousPolicy?.monitor) {
-    // SPA-7105 (DECISION-140 rule 5): a non-explicit monitor-policy removal
-    // must never silently strip an armed monitor. SPA-5921 lost its only
-    // continuation path twice in 24h (2026-09-10 15:14:43Z, 15:41:53Z,
-    // recovery.reconcile_stranded_assigned_issue in_progress→blocked) when the
-    // invalid transition executed AND cleared the armed monitor
-    // (clearReason=invalid_status, nextCheckAt=null). When the target keeps the
-    // card monitor-eligible (in_progress/in_review with the agent assignee)
-    // the monitor is preserved, not cleared: re-attach the previous policy
-    // monitor and keep nextCheckAt intact. A genuinely monitor-ineligible
-    // target (done/cancelled/assignee removed) still clears, as before.
-    if (!invalidReason) {
-      const carriedMonitor = previousPolicy.monitor;
-      patch.executionPolicy = input.policy
-        ? { ...input.policy, monitor: carriedMonitor }
-        : { mode: "normal" as const, commentRequired: true, stages: [], monitor: carriedMonitor };
-      patch.monitorNextCheckAt = input.issue.monitorNextCheckAt ?? null;
-      patch.monitorWakeRequestedAt = input.issue.monitorWakeRequestedAt ?? null;
-      targetMonitorState = currentMonitorState;
-    } else {
-      patch.monitorNextCheckAt = null;
-      patch.monitorWakeRequestedAt = null;
-      targetMonitorState = buildClearedMonitorState({
-        previous: currentMonitorState,
-        clearReason:
-          input.monitorExplicitlyUpdated
-            ? "manual"
-            : monitorClearReasonForIssue(nextStatus, assigneeAgentId, assigneeUserId) ?? "manual",
-        clearedAt: new Date(),
-      });
-    }
+    patch.monitorNextCheckAt = null;
+    patch.monitorWakeRequestedAt = null;
+    targetMonitorState = buildClearedMonitorState({
+      previous: currentMonitorState,
+      clearReason:
+        input.monitorExplicitlyUpdated
+          ? "manual"
+          : monitorClearReasonForIssue(nextStatus, assigneeAgentId, assigneeUserId) ?? "manual",
+      clearedAt: new Date(),
+    });
   }
 
   if (stagePatch.executionState !== undefined || !monitorStatesEqual(currentMonitorState, targetMonitorState)) {

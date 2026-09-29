@@ -1,4 +1,4 @@
-import type { IssueExecutionPolicy, IssueExecutionStageParticipant, IssueExecutionStagePrincipal } from "@paperclipai/shared";
+import type { Issue, IssueExecutionPolicy, IssueExecutionStageParticipant, IssueExecutionStagePrincipal } from "@paperclipai/shared";
 import { parseAssigneeValue } from "./assignees";
 
 type StageType = "review" | "approval";
@@ -53,6 +53,29 @@ export function selectionValueFromPrincipal(principal: IssueExecutionStagePrinci
 export function stageParticipantValues(policy: IssueExecutionPolicy | null | undefined, stageType: StageType): string[] {
   const stage = policy?.stages.find((candidate) => candidate.type === stageType);
   return stage?.participants.map((participant) => selectionValueFromPrincipal(participant)) ?? [];
+}
+
+/**
+ * Decision context for an execution stage that is currently pending with the
+ * signed-in board user. The engine refuses a stage approve/request-changes
+ * whose PATCH carries no comment when the policy requires one, so the board
+ * needs to collect that comment and send it in the same PATCH. Returns null
+ * when no stage decision is available to this user (agent participant, another
+ * user's stage, or no active pending stage).
+ */
+export function pendingStageDecisionFor(
+  issue: Pick<Issue, "executionState" | "executionPolicy">,
+  currentUserId: string | null | undefined,
+): { stageType: StageType; commentRequired: boolean } | null {
+  const state = issue.executionState;
+  if (!state || state.status !== "pending" || !state.currentStageType) return null;
+  const participant = state.currentParticipant;
+  if (!participant || participant.type !== "user" || !participant.userId) return null;
+  if (!currentUserId || participant.userId !== currentUserId) return null;
+  return {
+    stageType: state.currentStageType,
+    commentRequired: issue.executionPolicy?.commentRequired !== false,
+  };
 }
 
 function mergeParticipants(
