@@ -4585,19 +4585,20 @@ describe("ephemeral worktree per run (SPA-9275)", () => {
   it("releaseRunExecutionWorkspace retries on a stale git lock and ultimately removes the directory", async () => {
     const repoRoot = await createTempRepo("master");
     const runId = `run-${randomUUID()}`;
-    const branchName = `PAP-9278-retries`;
     const worktreePath = path.join(repoRoot, ".paperclip", "worktrees", "runs", runId);
     // Create a real-looking directory at the worktree path WITHOUT registering
     // it with `git worktree add`. Both `git worktree remove --force` attempts
     // will fail with "is not a working tree" — the retry path must run, then
-    // the fs.rm fallback clears the dir.
+    // the fs.rm fallback clears the dir. `branchName: null` — this scenario
+    // is exercising the not-a-registered-worktree fallback, not push/branch
+    // behavior, and this repoRoot has no `origin` remote configured.
     await fs.mkdir(worktreePath, { recursive: true });
     await fs.writeFile(path.join(worktreePath, "stale.txt"), "leftover\n", "utf8");
     const { recorder, operations } = createWorkspaceOperationRecorderDouble();
     const release = await releaseRunExecutionWorkspace({
       repoRoot,
       worktreePath,
-      branchName,
+      branchName: null,
       runId,
       resolveGitAuth: async () => null,
       recorder,
@@ -4608,6 +4609,122 @@ describe("ephemeral worktree per run (SPA-9275)", () => {
     const removeOps = operations.filter((op) => op.command?.includes("git worktree remove --force"));
     expect(removeOps.length).toBe(2);
   }, 20_000);
+
+  it("releaseRunExecutionWorkspace keeps a dirty worktree instead of removing it (SPA-9275 fail-safe)", async () => {
+    const sourceRepo = await createTempRepo("master");
+    const remoteDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-dirty-remote-"));
+    const remotePath = path.join(remoteDir, "paperclip.git");
+    await execFileAsync("git", ["clone", "--bare", sourceRepo, remotePath]);
+    const cloneRoot = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-dirty-clone-"));
+    const repoRoot = path.join(cloneRoot, "paperclip");
+    await execFileAsync("git", ["clone", remotePath, repoRoot]);
+    await runGit(repoRoot, ["config", "user.email", "paperclip@example.com"]);
+    await runGit(repoRoot, ["config", "user.name", "Paperclip Test"]);
+
+    const runId = `run-${randomUUID()}`;
+    const { recorder } = createWorkspaceOperationRecorderDouble();
+    const realized = await realizeExecutionWorkspace({
+      base: {
+        baseCwd: repoRoot,
+        source: "project_primary",
+        projectId: "project-1",
+        workspaceId: "workspace-1",
+        repoUrl: remotePath,
+        repoRef: "master",
+      },
+      config: {
+        workspaceStrategy: {
+          type: "git_worktree",
+          branchTemplate: "{{issue.identifier}}-{{slug}}",
+        },
+      },
+      issue: { id: "issue-1", identifier: "PAP-9283", title: "dirty worktree kept" },
+      agent: { id: "agent-1", name: "Codex", companyId: "company-1" },
+      heartbeatRunId: runId,
+      ephemeralLifecycle: true,
+      recorder,
+    });
+    // Modify a tracked file WITHOUT committing, and add an untracked file.
+    // README.md is created by createTempRepo and is tracked on master.
+    await fs.writeFile(path.join(realized.worktreePath, "README.md"), "modified but uncommitted\n", "utf8");
+    await fs.writeFile(path.join(realized.worktreePath, "untracked.txt"), "scratch\n", "utf8");
+
+    const release = await releaseRunExecutionWorkspace({
+      repoRoot,
+      worktreePath: realized.worktreePath,
+      branchName: realized.branchName,
+      runId,
+      resolveGitAuth: async () => null,
+      recorder,
+    });
+    expect(release.kept).toBe(true);
+    expect(release.keptReason).toBe("dirty_worktree");
+    expect(release.removed).toBe(false);
+    expect(existsSync(realized.worktreePath)).toBe(true);
+    const readmeContents = await fs.readFile(path.join(realized.worktreePath, "README.md"), "utf8");
+    expect(readmeContents).toBe("modified but uncommitted\n");
+    const untrackedContents = await fs.readFile(path.join(realized.worktreePath, "untracked.txt"), "utf8");
+    expect(untrackedContents).toBe("scratch\n");
+  });
+
+  it("releaseRunExecutionWorkspace keeps a clean worktree when the push fails (SPA-9275 fail-safe)", async () => {
+    const sourceRepo = await createTempRepo("master");
+    const remoteDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-pushfail-remote-"));
+    const remotePath = path.join(remoteDir, "paperclip.git");
+    await execFileAsync("git", ["clone", "--bare", sourceRepo, remotePath]);
+    const cloneRoot = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-pushfail-clone-"));
+    const repoRoot = path.join(cloneRoot, "paperclip");
+    await execFileAsync("git", ["clone", remotePath, repoRoot]);
+    await runGit(repoRoot, ["config", "user.email", "paperclip@example.com"]);
+    await runGit(repoRoot, ["config", "user.name", "Paperclip Test"]);
+
+    const runId = `run-${randomUUID()}`;
+    const { recorder } = createWorkspaceOperationRecorderDouble();
+    const realized = await realizeExecutionWorkspace({
+      base: {
+        baseCwd: repoRoot,
+        source: "project_primary",
+        projectId: "project-1",
+        workspaceId: "workspace-1",
+        repoUrl: remotePath,
+        repoRef: "master",
+      },
+      config: {
+        workspaceStrategy: {
+          type: "git_worktree",
+          branchTemplate: "{{issue.identifier}}-{{slug}}",
+        },
+      },
+      issue: { id: "issue-1", identifier: "PAP-9284", title: "push fail kept" },
+      agent: { id: "agent-1", name: "Codex", companyId: "company-1" },
+      heartbeatRunId: runId,
+      ephemeralLifecycle: true,
+      recorder,
+    });
+    await fs.writeFile(path.join(realized.worktreePath, "feature.txt"), "committed work\n", "utf8");
+    await runGit(realized.worktreePath, ["add", "feature.txt"]);
+    await runGit(realized.worktreePath, ["commit", "-m", "feature"]);
+    const commitSha = (await execFileAsync("git", ["rev-parse", "HEAD"], { cwd: realized.worktreePath })).stdout.trim();
+
+    // Point origin at a path that cannot exist so the push fails.
+    await runGit(repoRoot, ["remote", "set-url", "origin", path.join(remoteDir, "does-not-exist.git")]);
+
+    const release = await releaseRunExecutionWorkspace({
+      repoRoot,
+      worktreePath: realized.worktreePath,
+      branchName: realized.branchName,
+      runId,
+      resolveGitAuth: async () => null,
+      recorder,
+    });
+    expect(release.pushed).toBe(false);
+    expect(release.kept).toBe(true);
+    expect(release.keptReason).toBe("push_failed");
+    expect(release.removed).toBe(false);
+    expect(existsSync(realized.worktreePath)).toBe(true);
+    const headAfter = (await execFileAsync("git", ["rev-parse", "HEAD"], { cwd: realized.worktreePath })).stdout.trim();
+    expect(headAfter).toBe(commitSha);
+  });
 
   it("releaseRunExecutionWorkspaceForHeartbeat is a no-op when the directory is already gone", async () => {
     const repoRoot = await createTempRepo();
@@ -4924,6 +5041,13 @@ describeEmbeddedPostgres("ephemeral worktree per run sweep (SPA-9275)", () => {
         kind: "task",
       });
       const repoRoot = await createTempRepo("master");
+      // SPA-9275 fail-safe: the release path requires the branch push to
+      // succeed before removing a clean worktree, so give this repo a real
+      // `origin` the push can land on.
+      const bareDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-hb-composite-origin-"));
+      const barePath = path.join(bareDir, "origin.git");
+      await execFileAsync("git", ["init", "--bare", barePath]);
+      await runGit(repoRoot, ["remote", "add", "origin", barePath]);
       const runId = `run-${randomUUID()}`;
       const worktreePath = path.join(repoRoot, ".paperclip", "worktrees", "runs", runId);
       const branchName = `PAP-9284-hb-finally`;
