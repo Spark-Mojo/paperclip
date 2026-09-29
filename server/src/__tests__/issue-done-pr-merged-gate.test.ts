@@ -287,6 +287,74 @@ describeEmbeddedPostgres("issue done gate — unmerged PR refuses done (SPA-8957
     });
   });
 
+  // SPA-9323: `owner/repo#N` binds the gate without knowing whether N is a PR
+  // or an ISSUE. A card citing a closed friction ISSUE was unclosable forever.
+  // The resolver now positively discriminates the non-PR case; the gate maps
+  // that one classification to non-blocking and leaves `unknown` blocking.
+  it("issue_done_number_reference_does_not_block: a cited ISSUE number closes the card (SPA-9323)", async () => {
+    const card = await createCard(db, companyId, {
+      assigneeAgentId: agentId,
+      description: "Fixes the gap filed as Spark-Mojo/sparkmojo-internal#779.",
+    });
+    const gate = issueDoneGateService(db, {
+      resolvePullRequestDetails: async () => ({ ...details("unknown"), notAPullRequest: true }),
+    });
+    const decision = await gate.evaluateDoneGate({ id: card.id, companyId, description: card.description });
+    expect(decision).toEqual({ outcome: "allow" });
+  });
+
+  it("a non-PR number in a COMMENT also closes the card (SPA-9323)", async () => {
+    const card = await createCard(db, companyId, { assigneeAgentId: agentId });
+    await issueService(db).addComment(card.id, "Prior friction: Spark-Mojo/sparkmojo-internal#779", {});
+    const gate = issueDoneGateService(db, {
+      resolvePullRequestDetails: async () => ({ ...details("unknown"), notAPullRequest: true }),
+    });
+    expect(await gate.evaluateDoneGate({ id: card.id, companyId })).toEqual({ outcome: "allow" });
+  });
+
+  it("a real unmerged PR still refuses when the probe says it IS a pull request (SPA-9323)", async () => {
+    const card = await createCard(db, companyId, {
+      assigneeAgentId: agentId,
+      description: "PR at Spark-Mojo/paperclip#1160",
+    });
+    const gate = issueDoneGateService(db, {
+      resolvePullRequestDetails: async () => ({ ...details("open", "open"), notAPullRequest: false }),
+    });
+    expect(await gate.evaluateDoneGate({ id: card.id, companyId, description: card.description }))
+      .toMatchObject({ outcome: "refuse", reason: { kind: "open_pull_requests" } });
+  });
+
+  it("404-on-both (private/typo) stays fail-closed: notAPullRequest false keeps unknown blocking (SPA-9323)", async () => {
+    const card = await createCard(db, companyId, {
+      assigneeAgentId: agentId,
+      description: "Reference Spark-Mojo/paperclip#9999",
+    });
+    const gate = issueDoneGateService(db, {
+      resolvePullRequestDetails: async () => ({ ...details("unknown"), notAPullRequest: false }),
+    });
+    expect(await gate.evaluateDoneGate({ id: card.id, companyId, description: card.description }))
+      .toMatchObject({ outcome: "refuse", reason: { kind: "unknown_pull_request_state" } });
+  });
+
+  it("a mixed card (one open PR + one cited ISSUE) still refuses on the PR alone (SPA-9323)", async () => {
+    const card = await createCard(db, companyId, { assigneeAgentId: agentId });
+    await issueService(db).addComment(
+      card.id,
+      "PR: https://github.com/Spark-Mojo/paperclip/pull/1160 and issue Spark-Mojo/sparkmojo-internal#779",
+      {},
+    );
+    const gate = issueDoneGateService(db, {
+      resolvePullRequestDetails: async (_companyId, reference) =>
+        reference.repo === "sparkmojo-internal"
+          ? { ...details("unknown"), notAPullRequest: true }
+          : { ...details("open", "open"), notAPullRequest: false },
+    });
+    const decision = await gate.evaluateDoneGate({ id: card.id, companyId });
+    expect(decision).toMatchObject({ outcome: "refuse" });
+    const refused = (decision as { reason: { pullRequests: { state: string }[] } }).reason.pullRequests;
+    expect(refused.every((entry) => entry.state !== "unknown" || false)).toBe(true);
+  });
+
   it("a deleted comment's PR link does not bind", async () => {
     const card = await createCard(db, companyId, { assigneeAgentId: agentId });
     const added = await issueService(db).addComment(card.id, "PR: https://github.com/Spark-Mojo/paperclip/pull/1170", {});

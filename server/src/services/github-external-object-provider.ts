@@ -275,6 +275,11 @@ function issueSnapshot(identity: GitHubObjectIdentity, body: Record<string, unkn
   const state = asString(body.state) ?? "unknown";
   const stateReason = asString(body.state_reason);
   const authorLogin = asNestedString(body, "user", "login");
+  // SPA-9323: GitHub's issues endpoint answers 200 for BOTH issues and pull
+  // requests, carrying a `pull_request` key only for the latter. Forward that
+  // classification so the done-gate can tell a cited issue from a cited PR
+  // (whose `/pull/N` read 404s) instead of failing closed forever.
+  const isPullRequest = Boolean(body.pull_request);
   const statusKey = state === "closed" && stateReason ? `closed_${stateReason}` : state;
   const statusLabel = state === "closed"
     ? stateReason
@@ -303,6 +308,7 @@ function issueSnapshot(identity: GitHubObjectIdentity, body: Record<string, unkn
       repo: identity.repo,
       number: identity.number,
       state,
+      isPullRequest,
       ...(stateReason ? { stateReason } : {}),
       ...(authorLogin ? { authorLogin } : {}),
     },
