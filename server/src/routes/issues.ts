@@ -92,6 +92,7 @@ import {
   rejectIssueThreadInteractionSchema,
   restoreIssueDocumentRevisionSchema,
   respondIssueThreadInteractionSchema,
+  reviewedPullRequestSchema,
   stalledReviewDecisionSchema,
   submitIssueThreadInteractionVerdictsSchema,
   updateIssueWorkProductSchema,
@@ -124,6 +125,7 @@ import {
   type IssueWakeDiagnosticsResponse,
   type IssueRelationIssueSummary,
   type IssueReviewPolicy,
+  type IssueStageApprovalPullRequest,
   type IssueThreadInteractionCanonicalResolverPolicy,
   type IssueComment,
   type IssueCommentPresentation,
@@ -298,6 +300,12 @@ import {
   redactIssueMonitorExternalRef,
   setIssueExecutionPolicyMonitorScheduledBy,
 } from "../services/issue-execution-policy.js";
+import {
+  issueExecutionPolicyFingerprint,
+  issueStageApprovalService,
+  reviewerChanged,
+  STAGE_APPROVAL_REVIEWER_CHANGED_CODE,
+} from "../services/issue-stage-approvals.js";
 import { parseIssueExecutionWorkspaceSettings } from "../services/execution-workspace-policy.js";
 import type { PluginWorkerManager } from "../services/plugin-worker-manager.js";
 import {
@@ -358,6 +366,7 @@ const updateIssueRouteSchema = updateIssueSchema.extend({
   doneOverride: z.object({
     reason: z.string().trim().min(1).max(2_000),
   }).strict().optional(),
+  reviewedPullRequests: z.array(reviewedPullRequestSchema).max(50).optional(),
 });
 const queuedCommentMutationTargetSchema = z.object({
   queueId: z.string().min(1),
@@ -2055,6 +2064,69 @@ function actorMatchesExecutionParticipant(
   return participant.type === "agent"
     ? participant.agentId === actor.actorId
     : participant.userId === actor.actorId;
+}
+
+type IssueStageApprovalSubject = {
+  executionPolicy?: unknown;
+  executionState?: unknown;
+  status?: string;
+  assigneeAgentId?: string | null;
+  assigneeUserId?: string | null;
+  executionPolicyFingerprint?: string | null;
+};
+
+function issueStageApprovalSubject(issue: IssueStageApprovalSubject) {
+  const policy = normalizeIssueExecutionPolicy(
+    (issue.executionPolicy as never) ?? null,
+  );
+  return {
+    policy,
+    state: parseIssueExecutionState(issue.executionState as never),
+    fingerprint: issueExecutionPolicyFingerprint(policy),
+  };
+}
+
+function issueStageApprovalSnapshotEqual(
+  left: IssueStageApprovalSubject,
+  right: IssueStageApprovalSubject,
+) {
+  const leftSubject = issueStageApprovalSubject(left);
+  const rightSubject = issueStageApprovalSubject(right);
+  return (
+    left.status === right.status &&
+    (left.assigneeAgentId ?? null) === (right.assigneeAgentId ?? null) &&
+    (left.assigneeUserId ?? null) === (right.assigneeUserId ?? null) &&
+    leftSubject.fingerprint === rightSubject.fingerprint &&
+    JSON.stringify(leftSubject.state ?? null) === JSON.stringify(rightSubject.state ?? null)
+  );
+}
+
+function activeStageParticipant(policy: NormalizedExecutionPolicy | null, state: ParsedExecutionState | null) {
+  if (!policy || state?.status !== "pending" || !state.currentStageId) return null;
+  const stage = policy.stages.find((candidate) => candidate.id === state.currentStageId);
+  if (!stage) return null;
+  const participant = state.currentParticipant;
+  if (!participant) return null;
+  const isConfigured = stage.participants.some((candidate) =>
+    candidate.type === "agent"
+      ? candidate.agentId === participant.agentId
+      : candidate.userId === participant.userId,
+  );
+  return isConfigured ? { stage, participant } : null;
+}
+
+function stageApprovalActorIsParticipant(input: {
+  issue: IssueStageApprovalSubject;
+  policy: NormalizedExecutionPolicy | null;
+  actorAgentId: string | null;
+  actorUserId: string | null;
+}) {
+  const { state } = issueStageApprovalSubject(input.issue);
+  const active = activeStageParticipant(input.policy, state);
+  if (!active) return false;
+  return input.actorAgentId
+    ? active.participant.type === "agent" && active.participant.agentId === input.actorAgentId
+    : active.participant.type === "user" && active.participant.userId === input.actorUserId;
 }
 
 // Negation/rejection markers that invalidate an otherwise approval-looking heading.
@@ -12633,6 +12705,7 @@ export function issueRoutes(
         companyId: issue.companyId,
         action: req.body.action,
         note: req.body.note,
+        reviewedPullRequests: req.body.reviewedPullRequests,
         actor: {
           userId: actor.actorId,
           runId: actor.runId,
@@ -12798,6 +12871,7 @@ export function issueRoutes(
         hiddenAt: hiddenAtRaw,
         onBehalfOfUserId: _requestedOnBehalfOfUserId,
         doneOverride: doneOverrideRequested,
+        reviewedPullRequests: reviewedPullRequestsClaim,
         ...updateFields
       } = req.body;
       // SPA-8957: an agent may never supply the done-gate override — a card
@@ -13157,6 +13231,39 @@ export function issueRoutes(
         req.body.executionPolicy !== undefined && monitorChanged,
       );
 
+      const stageApprovalSubject = issueStageApprovalSubject(existing);
+      const isBoardOverrideRelevant =
+        updateFields.status === "done" &&
+        activeStageParticipant(stageApprovalSubject.policy, stageApprovalSubject.state) !== null;
+      const approvalActorIsParticipant =
+        !isBoardOverrideRelevant ||
+        stageApprovalActorIsParticipant({
+          issue: existing,
+          policy: stageApprovalSubject.policy,
+          actorAgentId: actor.agentId ?? null,
+          actorUserId: actor.actorType === "user" ? actor.actorId : null,
+        });
+      let verifiedApprovalPullRequests: IssueStageApprovalPullRequest[] | null = null;
+      if (isBoardOverrideRelevant && approvalActorIsParticipant) {
+        const stageApprovalSvc = issueStageApprovalService(db);
+        const hasBoundPrs = await stageApprovalSvc.hasBoundPullRequests({
+          id: existing.id,
+          companyId: existing.companyId,
+          description: existing.description,
+        });
+        if (hasBoundPrs) {
+          const verified = await stageApprovalSvc.verifyReviewedPullRequests({
+            issue: {
+              id: existing.id,
+              companyId: existing.companyId,
+              description: existing.description,
+            },
+            claim: reviewedPullRequestsClaim,
+          });
+          verifiedApprovalPullRequests = verified.pullRequests;
+        }
+      }
+
       const transition = applyIssueExecutionPolicyTransition({
         issue: existing,
         policy: nextExecutionPolicy,
@@ -13181,6 +13288,7 @@ export function issueRoutes(
         reviewRequest: reviewRequest === undefined ? undefined : reviewRequest,
         monitorExplicitlyUpdated:
           req.body.executionPolicy !== undefined && monitorChanged,
+        approvalPullRequests: verifiedApprovalPullRequests,
       });
       const decisionId = transition.decision ? randomUUID() : null;
       if (decisionId) {
@@ -13594,6 +13702,20 @@ export function issueRoutes(
         }
         return true;
       };
+      const assertLockedStageApprovalUnchanged = async (
+        tx: Parameters<typeof svc.update>[2],
+      ) => {
+        if (!verifiedApprovalPullRequests) return true;
+        const lockedIssue = await svc.getByIdForUpdate(id, tx);
+        if (!lockedIssue) return false;
+        if (!issueStageApprovalSnapshotEqual(existing, lockedIssue)) {
+          throw reviewerChanged({
+            issueId: id,
+            code: STAGE_APPROVAL_REVIEWER_CHANGED_CODE,
+          });
+        }
+        return true;
+      };
       const persistReviewTransitionActivity = async (
         tx: Parameters<typeof svc.update>[2],
         updated: NonNullable<Awaited<ReturnType<typeof svc.update>>>,
@@ -13681,6 +13803,7 @@ export function issueRoutes(
       const shouldUseTransactionalIssueUpdate =
         Boolean(commentAttachmentIds?.length) ||
         Boolean(decision) ||
+        Boolean(verifiedApprovalPullRequests) ||
         shouldRelayStop ||
         persistReviewActivityTransactionally ||
         reviewPolicySensitiveMutationRequested;
@@ -13692,6 +13815,7 @@ export function issueRoutes(
               !(await assertLockedReviewPolicyAllowsMutation(tx))
             )
               return null;
+            if (!(await assertLockedStageApprovalUnchanged(tx))) return null;
             const updated = await updateIssue(tx);
             if (!updated) return null;
             if (commentAttachmentIds?.length) {
@@ -17614,6 +17738,24 @@ export function issueRoutes(
       let comment: Awaited<ReturnType<typeof svc.addComment>>;
       let goalCommentSteered = false;
       if (shouldAutoApproveReviewComment) {
+        let verifiedCommentApprovalPullRequests: IssueStageApprovalPullRequest[] | null = null;
+        const commentStageApprovalSvc = issueStageApprovalService(db);
+        const hasCommentBoundPrs = await commentStageApprovalSvc.hasBoundPullRequests({
+          id: currentIssue.id,
+          companyId: currentIssue.companyId,
+          description: currentIssue.description,
+        });
+        if (hasCommentBoundPrs) {
+          const verified = await commentStageApprovalSvc.verifyReviewedPullRequests({
+            issue: {
+              id: currentIssue.id,
+              companyId: currentIssue.companyId,
+              description: currentIssue.description,
+            },
+            claim: req.body.reviewedPullRequests,
+          });
+          verifiedCommentApprovalPullRequests = verified.pullRequests;
+        }
         const transition = applyIssueExecutionPolicyTransition({
           issue: currentIssue,
           policy: currentExecutionPolicy,
@@ -17624,6 +17766,7 @@ export function issueRoutes(
             userId: actor.actorType === "user" ? actor.actorId : null,
           },
           commentBody: req.body.body,
+          approvalPullRequests: verifiedCommentApprovalPullRequests,
         });
         const decisionId = transition.decision ? randomUUID() : null;
         if (decisionId) {

@@ -10611,6 +10611,26 @@ export function issueService(db: Db) {
         !doneGateOverride &&
         !doneGateBypass
       ) {
+        const { issueStageApprovalService } = await import("./issue-stage-approvals.js");
+        const approvalGate = await issueStageApprovalService(db).evaluateStageApprovalGate({
+          issue: {
+            id: existing.id,
+            companyId: existing.companyId,
+            description: typeof issueData.description === "string"
+              ? issueData.description
+              : existing.description,
+            executionPolicy: existing.executionPolicy,
+            executionState: issueData.executionState !== undefined
+              ? issueData.executionState
+              : existing.executionState,
+          },
+        });
+        if (approvalGate.outcome === "refuse") {
+          throw unprocessable(
+            `Issue cannot be marked done: ${approvalGate.reason}.`,
+            approvalGate.details,
+          );
+        }
         const { issueDoneGateService } = await import("./issue-done-gate.js");
         const gate = issueDoneGateService(db);
         const decision = await gate.evaluateDoneGate({

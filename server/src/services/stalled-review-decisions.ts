@@ -1,6 +1,6 @@
 import { and, eq } from "drizzle-orm";
 import { issues, type Db } from "@paperclipai/db";
-import type { StalledReviewDecisionAction } from "@paperclipai/shared";
+import type { IssueStageApprovalPullRequest, StalledReviewDecisionAction } from "@paperclipai/shared";
 import { conflict, notFound } from "../errors.js";
 import {
   logActivity,
@@ -8,6 +8,11 @@ import {
   type ActivityPublication,
 } from "./activity-log.js";
 import { executionIssueCondition } from "./issue-visibility.js";
+import {
+  applyIssueExecutionPolicyTransition,
+  normalizeIssueExecutionPolicy,
+} from "./issue-execution-policy.js";
+import { issueStageApprovalService } from "./issue-stage-approvals.js";
 import {
   executeIssuePostCommitActions,
   issueService,
@@ -24,6 +29,7 @@ export interface DecideStalledReviewInput {
   companyId: string;
   action: StalledReviewDecisionAction;
   note?: string;
+  reviewedPullRequests?: IssueStageApprovalPullRequest[] | null;
   actor: StalledReviewDecisionActor;
 }
 
@@ -31,6 +37,29 @@ export function stalledReviewDecisionService(db: Db) {
   const svc = issueService(db);
   return {
     decide: async (input: DecideStalledReviewInput) => {
+      let verifiedApprovalPullRequests: IssueStageApprovalPullRequest[] | null = null;
+      if (input.action === "approve") {
+        const stageApprovalSvc = issueStageApprovalService(db);
+        const issueForApproval = await svc.getById(input.issueId);
+        if (issueForApproval && issueForApproval.companyId === input.companyId) {
+          const hasBoundPrs = await stageApprovalSvc.hasBoundPullRequests({
+            id: issueForApproval.id,
+            companyId: issueForApproval.companyId,
+            description: issueForApproval.description,
+          });
+          if (hasBoundPrs) {
+            const verified = await stageApprovalSvc.verifyReviewedPullRequests({
+              issue: {
+                id: issueForApproval.id,
+                companyId: issueForApproval.companyId,
+                description: issueForApproval.description,
+              },
+              claim: input.reviewedPullRequests,
+            });
+            verifiedApprovalPullRequests = verified.pullRequests;
+          }
+        }
+      }
       const postCommitActivityPublications: ActivityPublication[] = [];
       const postCommitIssueActions: IssuePostCommitAction[] = [];
       const result = await db.transaction(async (tx) => {
@@ -74,11 +103,34 @@ export function stalledReviewDecisionService(db: Db) {
             )
           : null;
         const status = input.action === "approve" ? "done" : "todo";
+        const executionPolicy = normalizeIssueExecutionPolicy(
+          lockedIssue.executionPolicy ?? null,
+        );
+        const transition =
+          input.action === "approve" && executionPolicy
+            ? applyIssueExecutionPolicyTransition({
+                issue: lockedIssue,
+                policy: executionPolicy,
+                previousPolicy: executionPolicy,
+                requestedStatus: "done",
+                requestedAssigneePatch: {},
+                actor: { agentId: null, userId: input.actor.userId },
+                commentBody: input.note ?? null,
+                approvalPullRequests: verifiedApprovalPullRequests,
+              })
+            : { patch: {} as Record<string, unknown> };
+        const nextStatus =
+          typeof transition.patch.status === "string"
+            ? (transition.patch.status as string)
+            : status;
         const updated = await svc.update(
           lockedIssue.id,
           {
-            status,
+            status: nextStatus,
             actorUserId: input.actor.userId,
+            ...(Object.keys(transition.patch).length > 0
+              ? { ...transition.patch, status: nextStatus }
+              : {}),
           },
           tx,
           postCommitActivityPublications,
@@ -114,7 +166,7 @@ export function stalledReviewDecisionService(db: Db) {
           issueId: updated.id,
           details: {
             action: input.action,
-            status,
+            status: nextStatus,
             identifier: updated.identifier,
             commentId: comment?.id ?? null,
             authorUserId: comment ? input.actor.userId : null,
