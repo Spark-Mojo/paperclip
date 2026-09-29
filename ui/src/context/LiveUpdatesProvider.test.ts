@@ -1688,6 +1688,58 @@ describe("dispatchLiveEventToSubscribers", () => {
   });
 });
 
+describe("SPA-9282 — no-change run status toasts are suppressed", () => {
+  function makeGate() {
+    return {
+      cooldownHits: new Map<string, number[]>(),
+      suppressUntil: 0,
+      runErrorBursts: new Map<string, number>(),
+      terminalRunStatusLastToastedAt: new Map<string, number>(),
+    };
+  }
+
+  it("admits the first failed toast for a run id", () => {
+    const gate = makeGate();
+    expect(
+      __liveUpdatesTestUtils.shouldSuppressNoChangeRunStatusToast(gate, "run-1", "failed"),
+    ).toBe(false);
+  });
+
+  it("suppresses a second failed toast for the same run id within the dedupe window", () => {
+    const gate = makeGate();
+    gate.terminalRunStatusLastToastedAt.set("run-1:failed", Date.now());
+    expect(
+      __liveUpdatesTestUtils.shouldSuppressNoChangeRunStatusToast(gate, "run-1", "failed"),
+    ).toBe(true);
+  });
+
+  it("admits a toast when the status changes (failed -> cancelled)", () => {
+    const gate = makeGate();
+    gate.terminalRunStatusLastToastedAt.set("run-1:failed", Date.now());
+    expect(
+      __liveUpdatesTestUtils.shouldSuppressNoChangeRunStatusToast(gate, "run-1", "cancelled"),
+    ).toBe(false);
+  });
+
+  it("admits a toast when the run id changes", () => {
+    const gate = makeGate();
+    gate.terminalRunStatusLastToastedAt.set("run-1:failed", Date.now());
+    expect(
+      __liveUpdatesTestUtils.shouldSuppressNoChangeRunStatusToast(gate, "run-2", "failed"),
+    ).toBe(false);
+  });
+
+  it("ignores non-terminal statuses so queued/running events still pass through", () => {
+    const gate = makeGate();
+    expect(
+      __liveUpdatesTestUtils.shouldSuppressNoChangeRunStatusToast(gate, "run-1", "running"),
+    ).toBe(false);
+    expect(
+      __liveUpdatesTestUtils.shouldSuppressNoChangeRunStatusToast(gate, "run-1", "queued"),
+    ).toBe(false);
+  });
+});
+
 describe("task subtree notification context", () => {
   const root = { id: "root", companyId: "company", identifier: "PAP-204", assigneeAgentId: "parent-agent" };
   const descendants = [{ id: "child", identifier: "PAP-205", assigneeAgentId: "child-agent", executionRunId: "child-run" }];
