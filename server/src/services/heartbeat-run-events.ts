@@ -1,4 +1,4 @@
-import { and, asc, eq, or, sql } from "drizzle-orm";
+import { and, asc, desc, eq, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { heartbeatRunEvents, heartbeatRuns } from "@paperclipai/db";
 import { nativeSha256 } from "./native-runtime/canonical.js";
@@ -19,6 +19,7 @@ export interface AppendHeartbeatRunEventInput {
     scheduledRetryAttempt: number;
     maxAttempts: number;
   };
+  retrySuppression?: boolean;
   nativeSource?: {
     sourceInstanceId: string;
     sourceEventId: string;
@@ -78,6 +79,30 @@ export async function appendHeartbeatRunEvent(
       .then((rows) => rows[0] ?? null);
     if (!run || run.companyId !== input.companyId || run.agentId !== input.agentId) {
       throw new Error("heartbeat_run_event_binding_mismatch");
+    }
+
+    if (input.retrySuppression && !input.nativeSource) {
+      const existing = await tx
+        .select()
+        .from(heartbeatRunEvents)
+        .where(and(
+          eq(heartbeatRunEvents.runId, input.runId),
+          eq(heartbeatRunEvents.companyId, input.companyId),
+          eq(heartbeatRunEvents.agentId, input.agentId),
+          eq(heartbeatRunEvents.seq, sql`(select max(seq) from heartbeat_run_events where run_id = ${input.runId})`),
+          eq(heartbeatRunEvents.eventType, input.eventType),
+          sql`${heartbeatRunEvents.message} is not distinct from ${input.message ?? null}`,
+          sql`${heartbeatRunEvents.stream} is not distinct from ${input.stream ?? null}`,
+          sql`${heartbeatRunEvents.level} is not distinct from ${input.level ?? null}`,
+          sql`${heartbeatRunEvents.color} is not distinct from ${input.color ?? null}`,
+          sql`${heartbeatRunEvents.payload} is not distinct from ${input.payload ? JSON.stringify(input.payload) : null}::jsonb`,
+        ))
+        .orderBy(desc(heartbeatRunEvents.seq))
+        .limit(1)
+        .then((rows) => rows[0] ?? null);
+      if (existing) {
+        return { row: existing, disposition: "duplicate" as const, highestContiguousSourceSeq: 0 };
+      }
     }
 
     if (input.retryExhaustion && !input.nativeSource) {
