@@ -13,6 +13,7 @@ import type { ExecutionContinuationEnvelope } from "@paperclipai/shared";
 import { sanitizeQuarantinedCommentForHigherTrust } from "./source-trust.js";
 import { hasConversationContinuationPolicy } from "./conversation-continuation.js";
 import { queuedCommentIdsFromWakePayload } from "./issue-queued-comment-queue.js";
+import { logger } from "../middleware/logger.js";
 
 const object = (v: unknown): Record<string, unknown> =>
   v && typeof v === "object" && !Array.isArray(v)
@@ -135,26 +136,31 @@ export async function buildExecutionContinuation(input: {
             and(
               eq(heartbeatRuns.companyId, companyId),
               eq(heartbeatRuns.id, sourceRunId),
-              sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${issueId}`,
+              !explicitUserSource && triggerInteraction?.sourceRunId === sourceRunId
+                ? undefined
+                : sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${issueId}`,
             ),
           )
       )[0]
     : null;
+  if (explicitUserSource && !sourceRun)
+    throw new Error("continuation_user_authorization_missing");
   if (sourceRunId && !sourceRun)
-    throw new Error(explicitUserSource ? "continuation_user_authorization_missing" : "continuation_source_context_missing");
-  const originCommentIds = [
+    logger.warn({ companyId, issueId, sourceRunId }, "continuation source run unavailable; using issue history");
+  const sameIssueSource = sourceRun?.context?.issueId === issueId ? sourceRun : null;
+  const originCandidates = [
     ...new Set([
       ...continuationOriginCommentIds(input.context),
-      ...continuationOriginCommentIds(sourceRun?.context),
+      ...continuationOriginCommentIds(sameIssueSource?.context),
       ...(triggerInteraction?.originCommentIds ?? []),
       ...(triggerInteraction?.sourceCommentId
         ? [triggerInteraction.sourceCommentId]
         : []),
     ]),
   ];
-  // Missing source rows cannot silently become a claim of complete context.
-  if (originCommentIds.some((id) => !rows.some((row) => row.id === id)))
-    throw new Error("continuation_source_context_missing");
+  const originCommentIds = originCandidates.filter((id) => rows.some((row) => row.id === id));
+  if (originCommentIds.length !== originCandidates.length)
+    logger.warn({ companyId, issueId, missingOriginCount: originCandidates.length - originCommentIds.length }, "continuation origin comments unavailable; using issue history");
   const messages = rows.map((row) => {
     const safe = input.exposeLowTrustRaw
       ? row
@@ -346,8 +352,8 @@ export async function buildExecutionContinuation(input: {
     // from requestContext and encodes it in the fenced, non-authoritative
     // continuation-evidence section. It cannot supply objective or authority.
     completedWork: input.summary ??
-      string(object(object(sourceRun?.result).nativeResult).summary)?.slice(0, 32_000) ??
-      string(object(sourceRun?.result).summary)?.slice(0, 32_000) ?? null,
+      string(object(object(sameIssueSource?.result).nativeResult).summary)?.slice(0, 32_000) ??
+      string(object(sameIssueSource?.result).summary)?.slice(0, 32_000) ?? null,
     completedActions,
     unresolvedInteractionIds: interactions
       .filter((row) => row.status === "pending")
