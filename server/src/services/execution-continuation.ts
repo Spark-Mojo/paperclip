@@ -136,6 +136,7 @@ export async function buildExecutionContinuation(input: {
             and(
               eq(heartbeatRuns.companyId, companyId),
               eq(heartbeatRuns.id, sourceRunId),
+              // Retry and interrupted run context must belong to this issue; only this issue's interaction may reference a cross-card creator, whose work is not imported.
               !explicitUserSource && triggerInteraction?.sourceRunId === sourceRunId
                 ? undefined
                 : sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${issueId}`,
