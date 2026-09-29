@@ -43,6 +43,37 @@ export const EXHAUSTED_RETRY_REWAKE_WAKE_REASON = "issue_exhausted_retry_rewake"
 export const EXHAUSTED_RETRY_REWAKE_SOURCE = "issue.exhausted_retry_rewake";
 export const EXHAUSTED_RETRY_REWAKE_EPISODE_EVIDENCE_KEY = "exhaustedRetryRewakeEpisode";
 
+export const EXHAUSTED_RETRY_REWAKE_KEY_PREFIX = "exhausted_retry_rewake:";
+export const ORPHANED_RETRY_REWAKE_KEY_PREFIX = "orphaned_retry_rewake:";
+
+export function isEpisodeIdempotencyConflict(
+  error: unknown,
+  keyPrefix: string,
+): boolean {
+  if (!error || typeof error !== "object") return false;
+  const candidate = error as {
+    code?: string;
+    constraint?: string;
+    constraint_name?: string;
+    cause?: unknown;
+  };
+  const family = keyPrefix.replace(/:+$/, "");
+  const sources: Array<Record<string, unknown>> = [candidate];
+  const cause = candidate.cause;
+  if (cause && typeof cause === "object") sources.push(cause as Record<string, unknown>);
+
+  for (const source of sources) {
+    if (source.code !== "23505") continue;
+    const constraint = source.constraint ?? source.constraint_name;
+    if (typeof constraint === "string") {
+      return constraint.includes(family);
+    }
+    const message = source.message;
+    if (typeof message === "string") return message.includes(family);
+  }
+  return false;
+}
+
 /** Read at call time, never at module load: tests set the env after import. */
 function exhaustedRetryRewakeDelayMs() {
   return Math.max(
@@ -75,8 +106,7 @@ export type ExhaustedRetryEpisodeFacts = {
   retryBudgetExhausted: boolean;
   /** `finishedAt` of the newest run in the episode, if recorded. */
   latestFinishedAt: Date | null;
-  /** Re-wakes already spent on this episode. */
-  episodeRewakeCount: number;
+  episodeRewakeDispatched: boolean;
   /** An already-active recovery action has consumed its budget. */
   recoveryBudgetExhausted: boolean;
   hasLiveExecutionPath: boolean;
@@ -134,7 +164,7 @@ export function decideExhaustedRetryRewake(
   if (!facts.retryBudgetExhausted) {
     return { kind: "suppressed", reason: "retry_budget_remaining" };
   }
-  if (facts.episodeRewakeCount >= EXHAUSTED_RETRY_REWAKE_MAX_ATTEMPTS) {
+  if (facts.episodeRewakeDispatched) {
     return { kind: "suppressed", reason: "episode_already_rewoken" };
   }
   if (facts.recoveryBudgetExhausted) {
@@ -200,15 +230,16 @@ export function buildExhaustedRetryRewakeEpisodeKey(input: {
 
 /**
  * Stable idempotency key for the episode's single re-wake. The insert is the
- * budget: two concurrent sweeps race on the partial unique index behind
- * `agent_wakeup_requests.idempotency_key` and exactly one wins.
+ * budget: two concurrent sweeps race on
+ * `agent_wakeup_requests_exhausted_retry_rewake_idempotency_uq` and exactly one
+ * wins.
  */
 export function buildExhaustedRetryRewakeIdempotencyKey(input: {
   companyId: string;
   issueId: string;
   episodeKey: string;
 }) {
-  return `${input.episodeKey}:rewake`;
+  return `${EXHAUSTED_RETRY_REWAKE_KEY_PREFIX}${input.companyId}:${input.issueId}:${input.episodeKey}:rewake`;
 }
 
 /**
@@ -276,7 +307,7 @@ export type OrphanedRetryFacts = {
   runStatus: string | null;
   runErrorCode: string | null;
   latestFinishedAt: Date | null;
-  episodeRewakeCount: number;
+  episodeRedispatchDispatched: boolean;
   recoveryBudgetExhausted: boolean;
   hasNewerRun: boolean;
   exhaustedRetryBudgetSpent: boolean;
@@ -322,7 +353,7 @@ export function decideOrphanedRetryRewake(
   if (facts.exhaustedRetryBudgetSpent) {
     return { kind: "suppressed", reason: "exhausted_retry_budget_spent" };
   }
-  if (facts.episodeRewakeCount >= ORPHANED_RETRY_REWAKE_MAX_ATTEMPTS) {
+  if (facts.episodeRedispatchDispatched) {
     return { kind: "suppressed", reason: "episode_already_redispatched" };
   }
   if (facts.recoveryBudgetExhausted) {
@@ -372,7 +403,7 @@ export function buildOrphanedRetryRewakeIdempotencyKey(input: {
   issueId: string;
   episodeKey: string;
 }) {
-  return `${input.episodeKey}:redispatch`;
+  return `${ORPHANED_RETRY_REWAKE_KEY_PREFIX}${input.companyId}:${input.issueId}:${input.episodeKey}:redispatch`;
 }
 
 export function orphanedRetryRewakeReplacementContext(input: {

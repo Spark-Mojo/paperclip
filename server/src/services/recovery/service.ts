@@ -136,8 +136,10 @@ import {
 import {
   BOUNDED_TRANSIENT_RETRY_REASON,
   EXHAUSTED_RETRY_REWAKE_ISSUE_STATUSES,
+  EXHAUSTED_RETRY_REWAKE_KEY_PREFIX,
   EXHAUSTED_RETRY_REWAKE_SOURCE,
   EXHAUSTED_RETRY_REWAKE_WAKE_REASON,
+  ORPHANED_RETRY_REWAKE_KEY_PREFIX,
   ORPHANED_RETRY_REWAKE_SOURCE,
   ORPHANED_RETRY_REWAKE_WAKE_REASON,
   buildExhaustedRetryRewakeEpisodeKey,
@@ -147,6 +149,7 @@ import {
   decideExhaustedRetryRewake,
   decideOrphanedRetryRewake,
   exhaustedRetryRewakeEpisodeContext,
+  isEpisodeIdempotencyConflict,
   isOrphanedRetryRun,
   orphanedRetryRewakeReplacementContext,
   readExhaustedRetryRewakeEpisode,
@@ -2115,6 +2118,11 @@ export function recoveryService(
       issueId: input.issue.id,
       exhaustedRunId: exhaustedRun.id,
     });
+    const idempotencyKey = buildExhaustedRetryRewakeIdempotencyKey({
+      companyId: input.issue.companyId,
+      issueId: input.issue.id,
+      episodeKey,
+    });
 
     const [
       hasLivePath,
@@ -2123,8 +2131,9 @@ export function recoveryService(
       unresolvedBlockerIds,
       invocationBudgetBlocked,
       pauseHeld,
-      existingEpisodeRuns,
+      episodeRuns,
       activeAction,
+      episodeRewakeDispatched,
     ] = await Promise.all([
       hasActiveExecutionPath(input.issue.companyId, input.issue.id, input.agentId),
       hasQueuedIssueWake(input.issue.companyId, input.issue.id, input.agentId),
@@ -2136,12 +2145,9 @@ export function recoveryService(
         input.issue.companyId,
         input.issue.id,
       ),
-      // The episode's re-wake count is read back from run context rather than
-      // from the wake row, so a re-sweep after a restart still sees it. The
-      // query deliberately ALSO matches the exhausted run itself so the delay
-      // can be anchored on the episode's newest finished run; the re-wake count
-      // is therefore the number of runs carrying the episode marker, EXCLUDING
-      // the exhausted run that defines the episode.
+      // The delay is anchored on the episode's newest finished run, so the
+      // query deliberately ALSO matches the exhausted run that defines the
+      // episode.
       db
         .select({ id: heartbeatRuns.id, finishedAt: heartbeatRuns.finishedAt })
         .from(heartbeatRuns)
@@ -2157,23 +2163,20 @@ export function recoveryService(
         .orderBy(desc(heartbeatRuns.finishedAt), desc(heartbeatRuns.createdAt))
         .limit(1),
       recoveryActionsSvc.getActiveForIssue(input.issue.companyId, input.issue.id),
-    ]);
-
-    // The re-wake dispatches its own run, which carries the episode marker. A
-    // re-sweep therefore sees at least one marker run and must not re-wake
-    // again. The exhausted run itself carries no marker, so it does not count.
-    const episodeRewakeCount = (
-      await db
-        .select({ id: heartbeatRuns.id })
-        .from(heartbeatRuns)
+      db
+        .select({ id: agentWakeupRequests.id })
+        .from(agentWakeupRequests)
         .where(
           and(
-            eq(heartbeatRuns.companyId, input.issue.companyId),
-            sql`${heartbeatRuns.contextSnapshot} -> 'exhaustedRetryRewakeEpisode' ->> 'episodeKey' = ${episodeKey}`,
+            eq(agentWakeupRequests.companyId, input.issue.companyId),
+            eq(agentWakeupRequests.agentId, input.agentId),
+            eq(agentWakeupRequests.idempotencyKey, idempotencyKey),
           ),
         )
         .limit(1)
-    ).length;
+        .then((rows) => rows.length > 0),
+    ]);
+
     const recoveryBudgetExhausted = Boolean(
       activeAction && isRecoveryActionBudgetExhausted(activeAction),
     );
@@ -2184,10 +2187,8 @@ export function recoveryService(
       classificationKind: input.classification.kind,
       retryBudgetExhausted: true,
       latestFinishedAt:
-        existingEpisodeRuns[0]?.finishedAt instanceof Date
-          ? existingEpisodeRuns[0].finishedAt
-          : null,
-      episodeRewakeCount,
+        episodeRuns[0]?.finishedAt instanceof Date ? episodeRuns[0].finishedAt : null,
+      episodeRewakeDispatched,
       recoveryBudgetExhausted,
       hasLiveExecutionPath: hasLivePath,
       hasQueuedWake,
@@ -2225,11 +2226,7 @@ export function recoveryService(
         source: "automation",
         triggerDetail: "system",
         reason: EXHAUSTED_RETRY_REWAKE_WAKE_REASON,
-        idempotencyKey: buildExhaustedRetryRewakeIdempotencyKey({
-          companyId: input.issue.companyId,
-          issueId: input.issue.id,
-          episodeKey,
-        }),
+        idempotencyKey,
         payload: withRecoveryContext(
           {
             issueId: input.issue.id,
@@ -2252,15 +2249,10 @@ export function recoveryService(
         ),
       })
       .catch((error: unknown) => {
-        // The budget is the insert. A losing racer means this episode's re-wake
-        // already exists, which is a successful no-op, not a sweep failure.
-        const conflict = unwrapDatabaseConflictError(error);
-        if (
-          conflict?.code === "23505" &&
-          (conflict.constraint?.includes("exhausted_retry_rewake") ||
-            conflict.constraint_name?.includes("exhausted_retry_rewake") ||
-            conflict.message?.includes("exhausted_retry_rewake"))
-        ) {
+        // The budget is the insert. A losing racer means this episode's
+        // re-wake already exists, which is a successful no-op, not a sweep
+        // failure.
+        if (isEpisodeIdempotencyConflict(error, EXHAUSTED_RETRY_REWAKE_KEY_PREFIX)) {
           return null;
         }
         throw error;
@@ -2326,6 +2318,11 @@ export function recoveryService(
       issueId: input.issue.id,
       rootRunId,
     });
+    const idempotencyKey = buildOrphanedRetryRewakeIdempotencyKey({
+      companyId: input.issue.companyId,
+      issueId: input.issue.id,
+      episodeKey,
+    });
 
     const [
       hasLivePath,
@@ -2338,6 +2335,7 @@ export function recoveryService(
       episodeRuns,
       activeAction,
       exhaustedEpisode,
+      episodeRedispatchDispatched,
     ] = await Promise.all([
       hasActiveExecutionPath(input.issue.companyId, input.issue.id, input.agentId),
       hasQueuedIssueWake(input.issue.companyId, input.issue.id, input.agentId),
@@ -2373,7 +2371,6 @@ export function recoveryService(
           id: heartbeatRuns.id,
           finishedAt: heartbeatRuns.finishedAt,
           createdAt: heartbeatRuns.createdAt,
-          carriesMarker: sql<boolean>`(${heartbeatRuns.contextSnapshot} -> 'orphanedRetryRedispatchEpisode' ->> 'episodeKey' = ${episodeKey})`,
         })
         .from(heartbeatRuns)
         .where(
@@ -2387,20 +2384,36 @@ export function recoveryService(
         )
         .orderBy(desc(heartbeatRuns.createdAt)),
       recoveryActionsSvc.getActiveForIssue(input.issue.companyId, input.issue.id),
+      // SPA-9351: scope to this issue and the orphan's own retry lineage. A
+      // company-wide marker match suppressed unrelated cards.
       db
         .select({ id: heartbeatRuns.id })
         .from(heartbeatRuns)
         .where(
           and(
             eq(heartbeatRuns.companyId, input.issue.companyId),
+            sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${input.issue.id}`,
+            inArray(heartbeatRuns.id, lineageRunIds),
             sql`(${heartbeatRuns.contextSnapshot} -> 'exhaustedRetryRewakeEpisode' ->> 'exhaustedRunId') is not null`,
+          ),
+        )
+        .limit(1)
+        .then((rows) => rows.length > 0),
+      // The budget is the durable receipt for this exact episode.
+      db
+        .select({ id: agentWakeupRequests.id })
+        .from(agentWakeupRequests)
+        .where(
+          and(
+            eq(agentWakeupRequests.companyId, input.issue.companyId),
+            eq(agentWakeupRequests.agentId, input.agentId),
+            eq(agentWakeupRequests.idempotencyKey, idempotencyKey),
           ),
         )
         .limit(1)
         .then((rows) => rows.length > 0),
     ]);
 
-    const episodeRewakeCount = episodeRuns.filter((row) => row.carriesMarker).length;
     const latestFinishedAt =
       episodeRuns
         .map((row) => row.finishedAt)
@@ -2411,7 +2424,7 @@ export function recoveryService(
       runStatus: orphanRun.status,
       runErrorCode: orphanRun.errorCode ?? null,
       latestFinishedAt,
-      episodeRewakeCount,
+      episodeRedispatchDispatched,
       recoveryBudgetExhausted:
         Boolean(activeAction) && isRecoveryActionBudgetExhausted(activeAction!),
       hasNewerRun,
@@ -2465,33 +2478,12 @@ export function recoveryService(
       }),
     };
 
-    const claimed = await db
-      .update(heartbeatRuns)
-      .set({
-        contextSnapshot: sql`${heartbeatRuns.contextSnapshot} || ${JSON.stringify(episodeContext)}::jsonb`,
-        updatedAt: new Date(),
-      })
-      .where(
-        and(
-          eq(heartbeatRuns.id, orphanRun.id),
-          eq(heartbeatRuns.companyId, input.issue.companyId),
-          sql`(${heartbeatRuns.contextSnapshot} -> 'orphanedRetryRedispatchEpisode' ->> 'episodeKey') is null`,
-        ),
-      )
-      .returning({ id: heartbeatRuns.id })
-      .then((rows) => rows[0] ?? null);
-    if (!claimed) return "suppressed";
-
     const queued = await deps
       .enqueueWakeup(input.agentId, {
         source: "automation",
         triggerDetail: "system",
         reason: ORPHANED_RETRY_REWAKE_WAKE_REASON,
-        idempotencyKey: buildOrphanedRetryRewakeIdempotencyKey({
-          companyId: input.issue.companyId,
-          issueId: input.issue.id,
-          episodeKey,
-        }),
+        idempotencyKey,
         payload: withRecoveryContext(
           { issueId: input.issue.id, ...episodeContext },
           "normal_model",
@@ -2514,13 +2506,7 @@ export function recoveryService(
         },
       })
       .catch((error: unknown) => {
-        const conflict = unwrapDatabaseConflictError(error);
-        if (
-          conflict?.code === "23505" &&
-          (conflict.constraint?.includes("orphaned_retry_rewake") ||
-            conflict.constraint_name?.includes("orphaned_retry_rewake") ||
-            conflict.message?.includes("orphaned_retry_rewake"))
-        ) {
+        if (isEpisodeIdempotencyConflict(error, ORPHANED_RETRY_REWAKE_KEY_PREFIX)) {
           return null;
         }
         throw error;

@@ -39,7 +39,10 @@ import {
   decideExhaustedRetryRewake,
   decideOrphanedRetryRewake,
   exhaustedRetryRewakeEpisodeContext,
+  EXHAUSTED_RETRY_REWAKE_KEY_PREFIX,
+  isEpisodeIdempotencyConflict,
   isOrphanedRetryRun,
+  ORPHANED_RETRY_REWAKE_KEY_PREFIX,
   orphanedRetryRewakeEpisodeContext,
   orphanedRetryRewakeReplacementContext,
   readExhaustedRetryRewakeEpisode,
@@ -67,7 +70,7 @@ function eligible(overrides: Partial<ExhaustedRetryEpisodeFacts> = {}): Exhauste
     classificationKind: "transient_infra",
     retryBudgetExhausted: true,
     latestFinishedAt: LONG_AGO,
-    episodeRewakeCount: 0,
+    episodeRewakeDispatched: false,
     recoveryBudgetExhausted: false,
     hasLiveExecutionPath: false,
     hasQueuedWake: false,
@@ -121,7 +124,7 @@ describe("SPA-9351 shape 1: decideExhaustedRetryRewake", () => {
     it("does not re-wake an episode that already spent its re-wake", () => {
       expect(
         decideExhaustedRetryRewake(
-          eligible({ episodeRewakeCount: EXHAUSTED_RETRY_REWAKE_MAX_ATTEMPTS }),
+          eligible({ episodeRewakeDispatched: true }),
         ),
       ).toEqual({ kind: "suppressed", reason: "episode_already_rewoken" });
     });
@@ -261,7 +264,7 @@ describe("SPA-9351 shape 1: decideExhaustedRetryRewake", () => {
     // silently drop the marker while the individual cases still pass.
     expect(decideExhaustedRetryRewake(eligible()).kind).toBe("rewake");
     expect(
-      decideExhaustedRetryRewake(eligible({ episodeRewakeCount: 1 })).kind,
+      decideExhaustedRetryRewake(eligible({ episodeRewakeDispatched: true })).kind,
     ).toBe("suppressed");
     expect(
       decideExhaustedRetryRewake(eligible({ classificationKind: "non_retryable" })).kind,
@@ -275,7 +278,7 @@ function orphanedEligible(overrides: Partial<OrphanedRetryFacts> = {}): Orphaned
     runStatus: "interrupted",
     runErrorCode: "orphaned_running_run",
     latestFinishedAt: LONG_AGO,
-    episodeRewakeCount: 0,
+    episodeRedispatchDispatched: false,
     recoveryBudgetExhausted: false,
     hasNewerRun: false,
     exhaustedRetryBudgetSpent: false,
@@ -340,7 +343,7 @@ describe("SPA-9351 shape 4: decideOrphanedRetryRewake", () => {
     expect(ORPHANED_RETRY_REWAKE_MAX_ATTEMPTS).toBe(1);
     expect(
       decideOrphanedRetryRewake(
-        orphanedEligible({ episodeRewakeCount: ORPHANED_RETRY_REWAKE_MAX_ATTEMPTS }),
+        orphanedEligible({ episodeRedispatchDispatched: true }),
       ),
     ).toEqual({ kind: "suppressed", reason: "episode_already_redispatched" });
   });
@@ -473,6 +476,68 @@ describe("SPA-9351 shape 4: decideOrphanedRetryRewake", () => {
     expect(readOrphanedRetryRewakeEpisode(context)?.episodeKey).toBe(orphanEpisode);
     expect(readExhaustedRetryRewakeEpisode(context)?.exhaustedRunId).toBe("run-a");
   });
+
+  describe("durable wake receipt is the budget", () => {
+    it("carries the company and issue in the key, so the index can scope on them", () => {
+      const episodeKey = buildExhaustedRetryRewakeEpisodeKey({
+        companyId: "c1",
+        issueId: "i1",
+        exhaustedRunId: "run-a",
+      });
+      const key = buildExhaustedRetryRewakeIdempotencyKey({
+        companyId: "c1",
+        issueId: "i1",
+        episodeKey,
+      });
+      expect(key).toContain("c1");
+      expect(key).toContain("i1");
+      expect(key.startsWith(EXHAUSTED_RETRY_REWAKE_KEY_PREFIX)).toBe(true);
+    });
+
+    it("gives the orphaned-retry key its own index namespace", () => {
+      const episodeKey = buildOrphanedRetryRewakeEpisodeKey({
+        companyId: "c1",
+        issueId: "i1",
+        rootRunId: "root-1",
+      });
+      const key = buildOrphanedRetryRewakeIdempotencyKey({
+        companyId: "c1",
+        issueId: "i1",
+        episodeKey,
+      });
+      expect(key.startsWith(ORPHANED_RETRY_REWAKE_KEY_PREFIX)).toBe(true);
+      expect(key.startsWith(EXHAUSTED_RETRY_REWAKE_KEY_PREFIX)).toBe(false);
+    });
+
+    it.each([
+      [
+        "agent_wakeup_requests_exhausted_retry_rewake_idempotency_uq",
+        EXHAUSTED_RETRY_REWAKE_KEY_PREFIX,
+      ],
+      [
+        "agent_wakeup_requests_orphaned_retry_rewake_idempotency_uq",
+        ORPHANED_RETRY_REWAKE_KEY_PREFIX,
+      ],
+    ] as const)("classifies a 23505 on %s as a lost race, not a dispatch failure", (constraint, prefix) => {
+      expect(isEpisodeIdempotencyConflict({ code: "23505", constraint }, prefix)).toBe(true);
+      // The sibling namespace's index is a different episode's race.
+      const sibling =
+        prefix === EXHAUSTED_RETRY_REWAKE_KEY_PREFIX
+          ? "agent_wakeup_requests_orphaned_retry_rewake_idempotency_uq"
+          : "agent_wakeup_requests_exhausted_retry_rewake_idempotency_uq";
+      expect(isEpisodeIdempotencyConflict({ code: "23505", constraint: sibling }, prefix)).toBe(
+        false,
+      );
+      // A foreign constraint's violation must never be swallowed as a lost
+      // race: that would hide a real dispatch failure.
+      expect(
+        isEpisodeIdempotencyConflict({ code: "23505", constraint: "agent_wakeup_requests_pkey" }, prefix),
+      ).toBe(false);
+      expect(isEpisodeIdempotencyConflict({ code: "23503", constraint }, prefix)).toBe(false);
+      expect(isEpisodeIdempotencyConflict(null, prefix)).toBe(false);
+      expect(isEpisodeIdempotencyConflict("boom", prefix)).toBe(false);
+    });
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -510,35 +575,52 @@ describeEmbeddedPostgres("SPA-9351 shape 1: stranded sweep re-wakes an exhausted
     await db.delete(authUsers);
   });
 
-  async function seedStrandedByExhaustedTransientRetry(options: { agentId: string }) {
-    const companyId = "11111111-1111-4111-8111-111111111111";
-    const issueId = "22222222-2222-4222-8222-222222222222";
-    const exhaustedRunId = "33333333-3333-4333-8333-333333333333";
+  let issueSequence = 0;
 
-    await db.insert(companies).values({
-      id: companyId,
-      name: "Paperclip",
-      issuePrefix: "SPA",
-      requireBoardApprovalForNewAgents: false,
-    });
+  async function seedStrandedEpisode(options: {
+    companyId?: string;
+    agentId: string;
+    issueId: string;
+    exhaustedRunId: string;
+    identifier?: string;
+  }) {
+    const companyId = options.companyId ?? "11111111-1111-4111-8111-111111111111";
+    const { issueId, exhaustedRunId } = options;
+    issueSequence += 1;
+
+    await db
+      .insert(companies)
+      .values({
+        id: companyId,
+        name: `Paperclip ${companyId.slice(0, 4)}`,
+        issuePrefix: "SPA",
+        requireBoardApprovalForNewAgents: false,
+      })
+      .onConflictDoNothing();
     // `authUsers` has no DB defaults on name/email/created_at/updated_at.
-    await db.insert(authUsers).values({
-      id: "local-board",
-      name: "Board",
-      email: "board@local",
-      createdAt: LONG_AGO,
-      updatedAt: LONG_AGO,
-    });
-    await db.insert(agents).values({
-      id: options.agentId,
-      companyId,
-      name: "agent",
-      status: "idle",
-      adapterType: "codex_local",
-      adapterConfig: {},
-      runtimeConfig: {},
-      permissions: {},
-    });
+    await db
+      .insert(authUsers)
+      .values({
+        id: "local-board",
+        name: "Board",
+        email: "board@local",
+        createdAt: LONG_AGO,
+        updatedAt: LONG_AGO,
+      })
+      .onConflictDoNothing();
+    await db
+      .insert(agents)
+      .values({
+        id: options.agentId,
+        companyId,
+        name: `agent ${options.agentId.slice(0, 4)}`,
+        status: "idle",
+        adapterType: "codex_local",
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+      })
+      .onConflictDoNothing();
     await db.insert(issues).values({
       id: issueId,
       companyId,
@@ -547,8 +629,8 @@ describeEmbeddedPostgres("SPA-9351 shape 1: stranded sweep re-wakes an exhausted
       priority: "medium",
       assigneeAgentId: options.agentId,
       executionRunId: null,
-      issueNumber: 1,
-      identifier: "SPA-1",
+      issueNumber: issueSequence,
+      identifier: options.identifier ?? `SPA-${issueSequence}`,
     });
     // Mirrors SPA-8692's real rows: a terminal `failed` run carrying
     // `retryReason: "transient_failure"` (the bounded-transient lane), which
@@ -572,6 +654,14 @@ describeEmbeddedPostgres("SPA-9351 shape 1: stranded sweep re-wakes an exhausted
     });
 
     return { companyId, issueId, exhaustedRunId, agentId: options.agentId };
+  }
+
+  async function seedStrandedByExhaustedTransientRetry(options: { agentId: string }) {
+    return seedStrandedEpisode({
+      agentId: options.agentId,
+      issueId: "22222222-2222-4222-8222-222222222222",
+      exhaustedRunId: "33333333-3333-4333-8333-333333333333",
+    });
   }
 
   it("enqueues exactly one re-wake and never re-submits the exhausted run to the retry scheduler", async () => {
@@ -707,6 +797,167 @@ describeEmbeddedPostgres("SPA-9351 shape 1: stranded sweep re-wakes an exhausted
 
     expect(result.exhaustedRetryRewoken).toBe(0);
     expect(enqueueWakeup).not.toHaveBeenCalled();
+  });
+
+  it("admits exactly one re-wake under concurrent sweeps", async () => {
+    const seeded = await seedStrandedByExhaustedTransientRetry({
+      agentId: "0a0a0a0a-0a0a-40a0-80a0-0a0a0a0a0a0a",
+    });
+    const { recoveryService } = await import("./service.js");
+    const racer = createDb(tempDb!.connectionString);
+
+    const enqueueWakeup = vi.fn(async (_agentId: string, opts: Record<string, unknown>) => {
+      const client = enqueueWakeup.mock.calls.length === 1 ? db : racer;
+      return client
+        .insert(agentWakeupRequests)
+        .values({
+          companyId: seeded.companyId,
+          agentId: seeded.agentId,
+          source: "automation",
+          triggerDetail: "system",
+          reason: String(opts.reason),
+          status: "queued",
+          idempotencyKey: (opts.idempotencyKey as string) ?? null,
+          payload: { issueId: seeded.issueId },
+        })
+        .returning({ id: agentWakeupRequests.id })
+        .then((rows) => rows[0] ?? null)
+        .catch((error: unknown) => {
+          if (isEpisodeIdempotencyConflict(error, EXHAUSTED_RETRY_REWAKE_KEY_PREFIX)) return null;
+          throw error;
+        })
+        .then((row) =>
+          row
+            ? { id: row.id, companyId: seeded.companyId, agentId: seeded.agentId, status: "queued" }
+            : null,
+        );
+    });
+
+    const recovery = recoveryService(db, { enqueueWakeup } as never);
+    const [a, b] = await Promise.all([
+      recovery.reconcileStrandedAssignedIssues(),
+      recovery.reconcileStrandedAssignedIssues(),
+    ]);
+
+    expect([a, b].reduce((n, r) => n + r.exhaustedRetryRewoken, 0)).toBe(1);
+    const queued = await db
+      .select({ id: agentWakeupRequests.id })
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.status, "queued"));
+    expect(queued).toHaveLength(1);
+  });
+
+  it("retries a failed dispatch instead of stranding the card", async () => {
+    const seeded = await seedStrandedByExhaustedTransientRetry({
+      agentId: "0b0b0b0b-0b0b-40b0-80b0-0b0b0b0b0b0b",
+    });
+    const { recoveryService } = await import("./service.js");
+
+    const failing = vi.fn(async () => {
+      throw new Error("wake queue unavailable");
+    });
+    await expect(
+      recoveryService(db, { enqueueWakeup: failing } as never).reconcileStrandedAssignedIssues(),
+    ).rejects.toThrow("wake queue unavailable");
+    expect(failing).toHaveBeenCalledTimes(1);
+
+    const receipts = await db
+      .select({ id: agentWakeupRequests.id })
+      .from(agentWakeupRequests);
+    expect(receipts).toHaveLength(0);
+
+    const recovered = vi.fn(async () => ({
+      id: "0b0b0b0b-0b0b-40b0-80b0-0b0b0b0b0b0c",
+      companyId: seeded.companyId,
+      agentId: seeded.agentId,
+      status: "queued",
+    }));
+    const retryResult = await recoveryService(db, { enqueueWakeup: recovered } as never)
+      .reconcileStrandedAssignedIssues();
+
+    expect(recovered).toHaveBeenCalledTimes(1);
+    expect(retryResult.exhaustedRetryRewoken).toBe(1);
+    console.log("STRANDED-RECOVERY-GATES: shape1-dispatch-failure-retried");
+  });
+
+  it("never re-wakes a card whose episode already holds a durable wake receipt", async () => {
+    const seeded = await seedStrandedByExhaustedTransientRetry({
+      agentId: "0c0c0c0c-0c0c-40c0-80c0-0c0c0c0c0c0c",
+    });
+    const { recoveryService } = await import("./service.js");
+    const episodeKey = buildExhaustedRetryRewakeEpisodeKey({
+      companyId: seeded.companyId,
+      issueId: seeded.issueId,
+      exhaustedRunId: seeded.exhaustedRunId,
+    });
+
+    // A dispatched re-wake produced a terminal receipt. That receipt — not a
+    // marker on some run — is what proves the episode's budget is spent.
+    await db.insert(agentWakeupRequests).values({
+      companyId: seeded.companyId,
+      agentId: seeded.agentId,
+      source: "automation",
+      triggerDetail: "system",
+      reason: EXHAUSTED_RETRY_REWAKE_WAKE_REASON,
+      status: "failed",
+      idempotencyKey: buildExhaustedRetryRewakeIdempotencyKey({
+        companyId: seeded.companyId,
+        issueId: seeded.issueId,
+        episodeKey,
+      }),
+      payload: { issueId: seeded.issueId },
+    });
+
+    const enqueueWakeup = vi.fn(async () => ({
+      id: "0c0c0c0c-0c0c-40c0-80c0-0c0c0c0c0c0e",
+      companyId: seeded.companyId,
+      agentId: seeded.agentId,
+      status: "queued",
+    }));
+    const result = await recoveryService(db, { enqueueWakeup } as never)
+      .reconcileStrandedAssignedIssues();
+
+    expect(enqueueWakeup).not.toHaveBeenCalled();
+    expect(result.exhaustedRetryRewoken).toBe(0);
+  });
+
+  it("does not read another card's wake receipt as this card's budget", async () => {
+    const seeded = await seedStrandedByExhaustedTransientRetry({
+      agentId: "0d0d0d0d-0d0d-40d0-80d0-0d0d0d0d0d0d",
+    });
+    const { recoveryService } = await import("./service.js");
+    const otherEpisodeKey = buildExhaustedRetryRewakeEpisodeKey({
+      companyId: seeded.companyId,
+      issueId: "0d0d0d0d-0d0d-40d0-80d0-0d0d0d0d0e01",
+      exhaustedRunId: "0d0d0d0d-0d0d-40d0-80d0-0d0d0d0d0d0f",
+    });
+    await db.insert(agentWakeupRequests).values({
+      companyId: seeded.companyId,
+      agentId: seeded.agentId,
+      source: "automation",
+      triggerDetail: "system",
+      reason: EXHAUSTED_RETRY_REWAKE_WAKE_REASON,
+      status: "failed",
+      idempotencyKey: buildExhaustedRetryRewakeIdempotencyKey({
+        companyId: seeded.companyId,
+        issueId: "0d0d0d0d-0d0d-40d0-80d0-0d0d0d0d0e01",
+        episodeKey: otherEpisodeKey,
+      }),
+      payload: { issueId: "0d0d0d0d-0d0d-40d0-80d0-0d0d0d0d0e01" },
+    });
+
+    const enqueueWakeup = vi.fn(async () => ({
+      id: "0d0d0d0d-0d0d-40d0-80d0-0d0d0d0d0d10",
+      companyId: seeded.companyId,
+      agentId: seeded.agentId,
+      status: "queued",
+    }));
+    const result = await recoveryService(db, { enqueueWakeup } as never)
+      .reconcileStrandedAssignedIssues();
+
+    expect(enqueueWakeup).toHaveBeenCalledTimes(1);
+    expect(result.exhaustedRetryRewoken).toBe(1);
+    console.log("STRANDED-RECOVERY-GATES: shape1-receipt-scope-isolated");
   });
 });
 
@@ -1121,6 +1372,245 @@ describeEmbeddedPostgres("SPA-9351 shape 4: sweep re-dispatches a run orphaned b
 
     expect(result.orphanedRetryRedispatched).toBe(0);
     expect(enqueueWakeup).not.toHaveBeenCalled();
+  });
+
+  it("re-claims the episode when the dispatch throws", async () => {
+    const seeded = await seedLiveRetryAcrossRestart({
+      agentId: "1a1a1a1a-1a1a-41a1-81a1-1a1a1a1a1a1a",
+      issueId: "1a2a2a2a-1a2a-42a2-82a2-1a2a2a2a2a2a",
+      rootRunId: "1a3a3a3a-1a3a-43a3-83a3-1a3a3a3a3a3a",
+      retryRunId: "1a4a4a4a-1a4a-44a4-84a4-1a4a4a4a4a4a",
+    });
+    await simulateRestartOrphanCleanup(seeded);
+
+    const { recoveryService } = await import("./service.js");
+    const failing = vi.fn(async () => {
+      throw new Error("wake queue unavailable");
+    });
+    await expect(
+      recoveryService(db, { enqueueWakeup: failing } as never).reconcileStrandedAssignedIssues(),
+    ).rejects.toThrow("wake queue unavailable");
+    expect(failing).toHaveBeenCalledTimes(1);
+
+    // No wake receipt and no pre-enqueue marker: the episode is unspent.
+    const receipts = await db
+      .select({ id: agentWakeupRequests.id })
+      .from(agentWakeupRequests);
+    expect(receipts).toHaveLength(0);
+    const [orphan] = await db
+      .select({
+        marker: sql<string | null>`${heartbeatRuns.contextSnapshot} -> 'orphanedRetryRedispatchEpisode' ->> 'episodeKey'`,
+      })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, seeded.retryRunId));
+    expect(orphan?.marker).toBeNull();
+
+    const recovered = vi.fn(async () => ({
+      id: "1a5a5a5a-1a5a-45a5-85a5-1a5a5a5a5a5a",
+      companyId: seeded.companyId,
+      agentId: seeded.agentId,
+      status: "queued",
+    }));
+    const retried = await recoveryService(db, { enqueueWakeup: recovered } as never)
+      .reconcileStrandedAssignedIssues();
+
+    expect(recovered).toHaveBeenCalledTimes(1);
+    expect(retried.orphanedRetryRedispatched).toBe(1);
+  });
+
+  it("re-claims the episode when the dispatch returns null without a receipt", async () => {
+    const seeded = await seedLiveRetryAcrossRestart({
+      agentId: "2a1a1a1a-2a1a-41a1-81a1-2a1a1a1a1a1a",
+      issueId: "2a2a2a2a-2a2a-42a2-82a2-2a2a2a2a2a2a",
+      rootRunId: "2a3a3a3a-2a3a-43a3-83a3-2a3a3a3a3a3a",
+      retryRunId: "2a4a4a4a-2a4a-44a4-84a4-2a4a4a4a4a4a",
+    });
+    await simulateRestartOrphanCleanup(seeded);
+
+    const { recoveryService } = await import("./service.js");
+    const nullEnqueue = vi.fn(async () => null);
+    const first = await recoveryService(db, { enqueueWakeup: nullEnqueue } as never)
+      .reconcileStrandedAssignedIssues();
+    expect(first.orphanedRetryRedispatched).toBe(0);
+    expect(nullEnqueue).toHaveBeenCalledTimes(1);
+
+    const recovered = vi.fn(async () => ({
+      id: "2a5a5a5a-2a5a-45a5-85a5-2a5a5a5a5a5a",
+      companyId: seeded.companyId,
+      agentId: seeded.agentId,
+      status: "queued",
+    }));
+    const second = await recoveryService(db, { enqueueWakeup: recovered } as never)
+      .reconcileStrandedAssignedIssues();
+
+    expect(recovered).toHaveBeenCalledTimes(1);
+    expect(second.orphanedRetryRedispatched).toBe(1);
+  });
+
+  it("treats a persisted skipped receipt as a spent episode", async () => {
+    const seeded = await seedLiveRetryAcrossRestart({
+      agentId: "3a1a1a1a-3a1a-41a1-81a1-3a1a1a1a1a1a",
+      issueId: "3a2a2a2a-3a2a-42a2-82a2-3a2a2a2a2a2a",
+      rootRunId: "3a3a3a3a-3a3a-43a3-83a3-3a3a3a3a3a3a",
+      retryRunId: "3a4a4a4a-3a4a-44a4-84a4-3a4a4a4a4a4a",
+    });
+    await simulateRestartOrphanCleanup(seeded);
+    const episodeKey = buildOrphanedRetryRewakeEpisodeKey({
+      companyId: seeded.companyId,
+      issueId: seeded.issueId,
+      rootRunId: seeded.rootRunId,
+    });
+    await db.insert(agentWakeupRequests).values({
+      companyId: seeded.companyId,
+      agentId: seeded.agentId,
+      source: "automation",
+      triggerDetail: "system",
+      reason: ORPHANED_RETRY_REWAKE_WAKE_REASON,
+      status: "skipped",
+      idempotencyKey: buildOrphanedRetryRewakeIdempotencyKey({
+        companyId: seeded.companyId,
+        issueId: seeded.issueId,
+        episodeKey,
+      }),
+      payload: { issueId: seeded.issueId },
+    });
+
+    const { recoveryService } = await import("./service.js");
+    const enqueueWakeup = vi.fn(async () => null);
+    const result = await recoveryService(db, { enqueueWakeup } as never)
+      .reconcileStrandedAssignedIssues();
+
+    expect(enqueueWakeup).not.toHaveBeenCalled();
+    expect(result.orphanedRetryRedispatched).toBe(0);
+  });
+
+  it("admits exactly one replacement under concurrent dispatches", async () => {
+    const seeded = await seedLiveRetryAcrossRestart({
+      agentId: "4a1a1a1a-4a1a-41a1-81a1-4a1a1a1a1a1a",
+      issueId: "4a2a2a2a-4a2a-42a2-82a2-4a2a2a2a2a2a",
+      rootRunId: "4a3a3a3a-4a3a-43a3-83a3-4a3a3a3a4a3a",
+      retryRunId: "4a4a4a4a-4a4a-44a4-84a4-4a4a4a4a4a4a",
+    });
+    await simulateRestartOrphanCleanup(seeded);
+    const { recoveryService } = await import("./service.js");
+    const episodeKey = buildOrphanedRetryRewakeEpisodeKey({
+      companyId: seeded.companyId,
+      issueId: seeded.issueId,
+      rootRunId: seeded.rootRunId,
+    });
+
+    // Two independent clients so the race is a real cross-transaction race,
+    // not two awaits on one pooled connection.
+    const racer = createDb(tempDb!.connectionString);
+    const enqueueWakeup = vi.fn(async (_agentId: string, opts: Record<string, unknown>) => {
+      const client = enqueueWakeup.mock.calls.length === 1 ? db : racer;
+      return client
+        .insert(agentWakeupRequests)
+        .values({
+          companyId: seeded.companyId,
+          agentId: seeded.agentId,
+          source: "automation",
+          triggerDetail: "system",
+          reason: String(opts.reason),
+          status: "queued",
+          idempotencyKey: (opts.idempotencyKey as string) ?? null,
+          payload: { issueId: seeded.issueId },
+        })
+        .returning({ id: agentWakeupRequests.id })
+        .then((rows) => rows[0] ?? null)
+        .catch((error: unknown) => {
+          if (isEpisodeIdempotencyConflict(error, ORPHANED_RETRY_REWAKE_KEY_PREFIX)) return null;
+          throw error;
+        })
+        .then((row) =>
+          row
+            ? { id: row.id, companyId: seeded.companyId, agentId: seeded.agentId, status: "queued" }
+            : null,
+        );
+    });
+
+    const recovery = recoveryService(db, { enqueueWakeup } as never);
+    const [a, b] = await Promise.all([
+      recovery.reconcileStrandedAssignedIssues(),
+      recovery.reconcileStrandedAssignedIssues(),
+    ]);
+
+    expect([a, b].reduce((n, r) => n + r.orphanedRetryRedispatched, 0)).toBe(1);
+    const queued = await db
+      .select({ id: agentWakeupRequests.id })
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.status, "queued"));
+    expect(queued).toHaveLength(1);
+  });
+
+  it("does not let an unrelated card's shape-1 recovery suppress this one", async () => {
+    const seeded = await seedLiveRetryAcrossRestart({
+      agentId: "5a1a1a1a-5a1a-41a1-81a1-5a1a1a1a5a1a",
+      issueId: "5a2a2a2a-5a2a-42a2-82a2-5a2a2a2a5a2a",
+      rootRunId: "5a3a3a3a-5a3a-43a3-83a3-5a3a3a3a5a3a",
+      retryRunId: "5a4a4a4a-5a4a-44a4-84a4-5a4a4a4a5a4a",
+    });
+    await simulateRestartOrphanCleanup(seeded);
+
+    // A different agent, a different card, same company: it spent shape 1's
+    // budget on its own failure episode.
+    await db.insert(agents).values({
+      id: "5a5a5a5a-5a5a-45a5-85a5-5a5a5a5a5a5a",
+      companyId: seeded.companyId,
+      name: "unrelated-agent",
+      status: "idle",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    await db.insert(issues).values({
+      id: "5a6a6a6a-5a6a-46a6-86a6-5a6a6a6a5a6a",
+      companyId: seeded.companyId,
+      title: "Unrelated card that shape 1 already re-woke",
+      status: "in_progress",
+      priority: "medium",
+      assigneeAgentId: "5a5a5a5a-5a5a-45a5-85a5-5a5a5a5a5a5a",
+      issueNumber: 77,
+      identifier: "SPA-77",
+    });
+    await db.insert(heartbeatRuns).values({
+      id: "5a7a7a7a-5a7a-47a7-87a7-5a7a7a7a5a7a",
+      companyId: seeded.companyId,
+      agentId: "5a5a5a5a-5a5a-45a5-85a5-5a5a5a5a5a5a",
+      invocationSource: "automation",
+      status: "failed",
+      errorCode: "adapter_failed",
+      startedAt: LONG_AGO,
+      finishedAt: LONG_AGO,
+      contextSnapshot: {
+        issueId: "5a6a6a6a-5a6a-46a6-86a6-5a6a6a6a5a6a",
+        wakeReason: EXHAUSTED_RETRY_REWAKE_WAKE_REASON,
+        ...exhaustedRetryRewakeEpisodeContext({
+          episodeKey: buildExhaustedRetryRewakeEpisodeKey({
+            companyId: seeded.companyId,
+            issueId: "5a6a6a6a-5a6a-46a6-86a6-5a6a6a6a5a6a",
+            exhaustedRunId: "5a8a8a8a-5a8a-48a8-88a8-5a8a8a8a5a8a",
+          }),
+          exhaustedRunId: "5a8a8a8a-5a8a-48a8-88a8-5a8a8a8a5a8a",
+          errorCode: "adapter_failed",
+        }),
+      },
+    });
+
+    const { recoveryService } = await import("./service.js");
+    const enqueueWakeup = vi.fn(async () => ({
+      id: "5a9a9a9a-5a9a-49a9-89a9-5a9a9a9a5a9a",
+      companyId: seeded.companyId,
+      agentId: seeded.agentId,
+      status: "queued",
+    }));
+    const result = await recoveryService(db, { enqueueWakeup } as never)
+      .reconcileStrandedAssignedIssues();
+
+    expect(result.orphanedRetryRedispatched).toBe(1);
+    expect(result.issueIds).toContain(seeded.issueId);
+    console.log("STRANDED-RECOVERY-GATES: shape4-episode-scope-isolated");
   });
 });
 
