@@ -19603,6 +19603,14 @@ export function heartbeatService(
         .where(eq(issues.id, issueId))
         .limit(1);
 
+      // The actionless path has no run to join, so its one remaining proof is
+      // whether a genuine recovery action or retained execution lease holds the
+      // issue right now. The drain re-checks this under the issue lock too.
+      const currentRecoveryBlockerActive =
+        reference.kind === "actionless_recovery"
+          ? (await getExecutionBlocker(db, wake.companyId, issueId)) !== null
+          : false;
+
       const decision = decideDeferredWakeBackstop({
         wakeStatus: wake.status,
         blockingReference: reference,
@@ -19615,6 +19623,7 @@ export function heartbeatService(
         wakeAgentIsAssignee: issue?.assigneeAgentId === wake.agentId,
         wakeCompanyIsActive: companyStatus === "active",
         referenceUnresolvable,
+        currentRecoveryBlockerActive,
       });
 
       if (decision.kind === "suppressed") {
@@ -19622,13 +19631,17 @@ export function heartbeatService(
         continue;
       }
 
-      // Go through the real release admission rather than flipping the status
-      // by hand: promotion must create the run, take the issue lock, and apply
-      // the post-commit dispatch effects, or the wake would sit in `queued`
-      // forever with nothing dispatching it. The wrapper returns void, so
-      // success is read back off the wake row itself.
+      // An actionless wait has no finishing run to release, so it drains the
+      // queue directly under the issue lock instead. Both routes keep every
+      // guard and both read success back off the wake row, because a bare
+      // status flip would leave the wake in `queued` with nothing dispatching.
       let released = false;
-      if (blockingRunRow) {
+      if (decision.blockingRunId === null) {
+        released = await reconcileDeferredWakeAfterDeferral(wake.id).catch((err) => {
+          logger.warn({ err, wakeId: wake.id }, "deferred-wake backstop failed to promote an actionless wait");
+          return false;
+        });
+      } else if (blockingRunRow) {
         await releaseIssueExecutionAndPromote(blockingRunRow, {
           suppressImmediateRecovery: true,
         }).catch((err) => {
@@ -26522,6 +26535,57 @@ export function heartbeatService(
     }
   }
 
+  /**
+   * SPA-9351 shape 3: re-admit one deferred wake after its deferral committed.
+   *
+   * Admission reads the issue's live holder before it writes the deferred row,
+   * so a run that ends between that read and the commit leaves the row with no
+   * run-end event left to wait for. This re-drives that exact wake id through
+   * the wake-queue drain under the issue's own row lock, which re-applies the
+   * live-owner, assignee, terminal-card, recovery-blocker, pause-hold, and
+   * invokability guards, and claims the row with the same compare-and-set the
+   * release path uses — so a concurrent sweep and this call cannot both
+   * dispatch it. It never synthesizes a finishing run and never clears a lock
+   * a live run still holds.
+   */
+  async function reconcileDeferredWakeAfterDeferral(wakeId: string): Promise<boolean> {
+    const [wake] = await db
+      .select({
+        id: agentWakeupRequests.id,
+        companyId: agentWakeupRequests.companyId,
+        agentId: agentWakeupRequests.agentId,
+        status: agentWakeupRequests.status,
+        issueId: sql`${agentWakeupRequests.payload}->>'issueId'`,
+      })
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.id, wakeId))
+      .limit(1);
+    const issueId = readNonEmptyString(wake?.issueId);
+    if (!wake || wake.status !== "deferred_issue_execution" || !issueId) return false;
+
+    const { outcome, postCommitEffects } = await wakeQueue
+      .drainDeferredWakeQueue({
+        companyId: wake.companyId,
+        issueId,
+        wakeAgentId: wake.agentId,
+        wakeId: wake.id,
+        now: new Date(),
+      })
+      .catch((err) => {
+        logger.warn({ err, wakeId }, "deferred-wake post-deferral re-admission failed");
+        return { outcome: { kind: "not_promoted" as const }, postCommitEffects: [] };
+      });
+    await applyWakeQueuePostCommitEffects(postCommitEffects);
+    if (outcome.kind !== "promoted") return false;
+
+    const [after] = await db
+      .select({ status: agentWakeupRequests.status, runId: agentWakeupRequests.runId })
+      .from(agentWakeupRequests)
+      .where(and(eq(agentWakeupRequests.id, wakeId), eq(agentWakeupRequests.companyId, wake.companyId)))
+      .limit(1);
+    return after?.status === "queued" && Boolean(after.runId);
+  }
+
   async function releaseIssueExecutionAndPromote(
     run: Pick<typeof heartbeatRuns.$inferSelect, "id" | "companyId">,
     options: { suppressImmediateRecovery?: boolean } = {},
@@ -27087,6 +27151,11 @@ export function heartbeatService(
       const agentNameKey = normalizeAgentNameKey(agent.name);
 
       const cancelledRunsToEmit: (typeof heartbeatRuns.$inferSelect)[] = [];
+      // Deferred rows this admission established. The live holder that forced
+      // the deferral can end before this transaction commits, and then no
+      // run-end event exists to promote the row, so each one is re-driven once
+      // after the commit.
+      const deferredWakeIdsForFreshAdmission: string[] = [];
 
       const outcome = await db
         .transaction(async (tx) => {
@@ -28184,6 +28253,9 @@ export function heartbeatService(
               };
             }
             if (admission.kind === "deferred") {
+              if (admission.deferredWakeId) {
+                deferredWakeIdsForFreshAdmission.push(admission.deferredWakeId);
+              }
               return { kind: "deferred" as const };
             }
             // admission.kind === "proceed": no active run absorbed this wake,
@@ -28561,6 +28633,18 @@ export function heartbeatService(
           });
           await applyWakeQueuePostCommitEffects(postCommitEffects);
         }
+      }
+
+      // SPA-9351 shape 3. The deferral decision above read the live holder
+      // before this row committed; a holder that ended in between leaves the row
+      // with no run-end event left to wait for, which is the whole stranding.
+      // Re-drive it now, after the commit, through the guarded drain. It is
+      // error-isolated: a failure here must never change this wake's outcome,
+      // and the startup and periodic sweeps remain the durable backstop.
+      for (const deferredWakeId of new Set(deferredWakeIdsForFreshAdmission)) {
+        await reconcileDeferredWakeAfterDeferral(deferredWakeId).catch((err) => {
+          logger.warn({ err, wakeId: deferredWakeId }, "post-deferral re-admission failed");
+        });
       }
 
       if (outcome.kind === "durable") {
@@ -30013,6 +30097,7 @@ export function heartbeatService(
 
     resumeQueuedRuns,
     reconcileStaleDeferredWakes,
+    reconcileDeferredWakeAfterDeferral,
 
     scheduleBoundedRetry: async (
       runId: string,

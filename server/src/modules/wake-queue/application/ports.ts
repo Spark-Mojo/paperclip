@@ -240,6 +240,33 @@ export interface IssueLockWriter {
   ): Promise<ReleaseTransactionResult & { run: RunSnapshot }>;
 }
 
+/**
+ * Locks an issue's deferred-wake queue directly, for a caller that must
+ * promote one specific wake when no run ended to release it. It reuses the
+ * same drain, the same claim, and the same finalization as the release path,
+ * so every guard the release enforces still applies. It never synthesizes a
+ * finishing run and never clears an execution lock a live run still holds.
+ */
+export interface DeferredWakeQueueDrainInput {
+  companyId: string;
+  issueId: string;
+  /** The drain is scoped to this agent; a wake for any other agent is not a candidate. */
+  wakeAgentId: string;
+  /** The exact wake to promote, so a drain never promotes a different row. */
+  wakeId: string;
+  now: Date;
+}
+
+export type DeferredWakeQueueDrainOutcome =
+  | { kind: "promoted"; runId: string }
+  | { kind: "not_promoted" };
+
+export interface DeferredWakeQueueDrainWriter {
+  drainDeferredWakeQueue(
+    input: DeferredWakeQueueDrainInput,
+  ): Promise<{ outcome: DeferredWakeQueueDrainOutcome; postCommitEffects: PostCommitEffect[] }>;
+}
+
 export type StrandedAssignedIssueEscalationInput = {
   issue: IssueSnapshot;
   previousStatus: "todo" | "in_progress" | "in_review";
@@ -374,7 +401,16 @@ export type WakeAdmissionHeartbeatHelpers = {
 export type AdmitWakeBehindIssueExecutionResult =
   | { kind: "proceed" }
   | { kind: "coalesced"; run: Record<string, unknown> }
-  | { kind: "deferred" };
+  | {
+      kind: "deferred";
+      /**
+       * The deferred row this admission wrote or merged into, so the caller can
+       * re-drive that exact wake after its own transaction commits. `null` when
+       * the row was not established by this call, e.g. a durable receipt
+       * returned by the reader.
+       */
+      deferredWakeId: string | null;
+    };
 
 /** Read-only lookups the admission use case needs, each scoped to a company. */
 export interface WakeAdmissionReader {
@@ -442,7 +478,7 @@ export interface WakeAdmissionWriter {
       coalescedReceipt?: CoalescedDeferredAdmissionReceipt;
     },
   ): Promise<void>;
-  /** Queues a new deferred wake behind the active execution run. */
+  /** Queues a new deferred wake behind the active execution run, returning its id. */
   insertNewDeferredWake(
     scope: TransactionScope,
     input: {
@@ -456,5 +492,5 @@ export interface WakeAdmissionWriter {
       idempotencyKey: string | null;
       durableReceipt?: DurableWakeAdmissionReceipt;
     },
-  ): Promise<void>;
+  ): Promise<string>;
 }

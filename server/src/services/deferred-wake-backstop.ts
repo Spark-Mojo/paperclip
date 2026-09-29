@@ -26,12 +26,16 @@ import { TERMINAL_HEARTBEAT_RUN_STATUSES } from "./issues.js";
 
 export const DEFERRED_WAKE_BACKSTOP_WAKE_REASON = "issue_execution_promoted";
 
+/** The `executionWait.reason` an actionless recovery deferral carries. */
+export const DEFERRED_WAKE_ACTIONLESS_RECOVERY_REASON = "execution_recovery";
+
 /** Bound the page so a pathological backlog cannot monopolize a scheduler tick. */
 export const DEFERRED_WAKE_BACKSTOP_CANDIDATE_LIMIT = 50;
 
 export type DeferredWakeBlockingReference =
   | { kind: "run"; runId: string }
   | { kind: "recovery_action"; recoveryActionId: string }
+  | { kind: "actionless_recovery" }
   | { kind: "unresolved" };
 
 export type DeferredWakeBackstopFacts = {
@@ -51,10 +55,12 @@ export type DeferredWakeBackstopFacts = {
   wakeCompanyIsActive: boolean;
   /** The referenced run was never resolvable, so we cannot prove terminality. */
   referenceUnresolvable: boolean;
+  /** A genuine recovery action or retained execution lease holds the issue now. */
+  currentRecoveryBlockerActive: boolean;
 };
 
 export type DeferredWakeBackstopDecision =
-  | { kind: "promote"; blockingRunId: string }
+  | { kind: "promote"; blockingRunId: string | null }
   | { kind: "suppressed"; reason: DeferredWakeBackstopSuppressReason };
 
 export type DeferredWakeBackstopSuppressReason =
@@ -65,6 +71,7 @@ export type DeferredWakeBackstopSuppressReason =
   | "no_blocking_reference"
   | "reference_unresolvable"
   | "blocking_run_live"
+  | "recovery_blocker_active"
   | "newer_execution_owner";
 
 /**
@@ -107,6 +114,23 @@ export function decideDeferredWakeBackstop(
   if (facts.blockingReference.kind === "unresolved") {
     return { kind: "suppressed", reason: "no_blocking_reference" };
   }
+
+  if (facts.blockingReference.kind === "actionless_recovery") {
+    // No run to prove terminal, so eligibility rests entirely on the CURRENT
+    // state of the issue. A live owner is the one case a stale "no action"
+    // payload must never win, and a genuine recovery action or retained lease
+    // is the hold the wait itself was written for.
+    if (
+      facts.issueExecutionRunId !== null
+    ) {
+      return { kind: "suppressed", reason: "newer_execution_owner" };
+    }
+    if (facts.currentRecoveryBlockerActive) {
+      return { kind: "suppressed", reason: "recovery_blocker_active" };
+    }
+    return { kind: "promote", blockingRunId: null };
+  }
+
   if (facts.referenceUnresolvable) {
     return { kind: "suppressed", reason: "reference_unresolvable" };
   }
@@ -163,6 +187,9 @@ export function readDeferredWakeBlockingReference(
   const recoveryActionId = readString(executionWait?.recoveryActionId);
   if (recoveryActionId) {
     return { kind: "recovery_action", recoveryActionId };
+  }
+  if (readString(executionWait?.reason) === DEFERRED_WAKE_ACTIONLESS_RECOVERY_REASON) {
+    return { kind: "actionless_recovery" };
   }
 
   return { kind: "unresolved" };
