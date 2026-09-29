@@ -11527,6 +11527,15 @@ export function issueRoutes(
     async (req, res) => {
       const companyId = req.params.companyId as string;
       assertCompanyAccess(req, companyId);
+      if (req.body?.projectId) {
+        const project = await projectsSvc.getById(req.body.projectId);
+        if (!project || project.companyId !== companyId) {
+          throw unprocessable(
+            "projectId does not belong to this company",
+            { field: "projectId" },
+          );
+        }
+      }
       if (isSkillTestScopedActor(req)) {
         res.status(403).json({
           error: "Skill-test run tokens cannot create issues.",
