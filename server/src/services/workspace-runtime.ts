@@ -4103,12 +4103,15 @@ export async function ensurePersistedExecutionWorkspaceAvailable(input: {
     ) {
       // SPA-9437: the persisted cwd belongs to a different repo than the
       // current project workspace's repo. Tear down the OLD worktree when
-      // safe (clean + recoverable branch tip). The "tore_down" return
-      // signals "this binding is unprovisionable" — the caller returns
-      // null, the allocator's SPA-9315 path provisions a fresh workspace
-      // against the NEW repo. On refuse paths the helper throws
-      // `WorkspaceRuntimeValidationFailure` so the recovery sweep / operator
-      // can act on dirty or unreachable worktree state.
+      // safe (clean + recoverable branch tip) and signal "this binding is
+      // unprovisionable" via the SPA-9315 typed error so the allocator's
+      // `provisionExecutionWorkspaceForFreshnessDecision` recognizes it and
+      // provisions a fresh workspace against the NEW repo. The OLD row is
+      // left as a dead `active` binding (its on-disk leaf is gone) — the
+      // reaper picks it up when the source issue goes terminal. On refuse
+      // paths the helper throws `WorkspaceRuntimeValidationFailure` so the
+      // recovery sweep / operator can act on dirty or unreachable worktree
+      // state.
       const torn = await tearDownPersistedWorktreeBoundToOtherRepo({
         reuseWorktreePath,
         persistedRepoRoot,
@@ -4119,7 +4122,14 @@ export async function ensurePersistedExecutionWorkspaceAvailable(input: {
         recorder: input.recorder ?? null,
         resolveGitAuth: input.resolveGitAuth ?? null,
       });
-      if (torn === "tore_down") return null;
+      if (torn === "tore_down") {
+        throw new ExecutionWorkspaceNotProvisionableError({
+          executionWorkspaceId: input.workspace.id ?? null,
+          workspaceStatus: input.workspace.status ?? null,
+          cwd: reuseWorktreePath,
+          strategy: "git_worktree",
+        });
+      }
       // "skipped_not_a_checkout" → fall through to the existing validation
       // path so the right error surfaces for non-git providers.
     }
