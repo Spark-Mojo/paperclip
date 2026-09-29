@@ -4667,6 +4667,49 @@ describe("ephemeral worktree per run (SPA-9275)", () => {
     expect(untrackedContents).toBe("scratch\n");
   });
 
+  it("releaseRunExecutionWorkspace keeps a dirty worktree that is not registered under the given repoRoot (SPA-9275 fail-safe)", async () => {
+    const repoRoot = await createTempRepo("master");
+    const otherRepoRoot = await createTempRepo("master");
+    const runId = `run-${randomUUID()}`;
+    const { recorder } = createWorkspaceOperationRecorderDouble();
+    const realized = await realizeExecutionWorkspace({
+      base: {
+        baseCwd: repoRoot,
+        source: "project_primary",
+        projectId: "project-1",
+        workspaceId: "workspace-1",
+        repoUrl: null,
+        repoRef: "master",
+      },
+      config: {
+        workspaceStrategy: {
+          type: "git_worktree",
+          branchTemplate: "{{issue.identifier}}-{{slug}}",
+        },
+      },
+      issue: { id: "issue-1", identifier: "PAP-9285", title: "repo root mismatch kept" },
+      agent: { id: "agent-1", name: "Codex", companyId: "company-1" },
+      heartbeatRunId: runId,
+      ephemeralLifecycle: true,
+      recorder,
+    });
+    await fs.writeFile(path.join(realized.worktreePath, "wip.txt"), "uncommitted work\n", "utf8");
+
+    // Release against a repoRoot that does not list this worktree.
+    const release = await releaseRunExecutionWorkspace({
+      repoRoot: otherRepoRoot,
+      worktreePath: realized.worktreePath,
+      branchName: null,
+      runId,
+      resolveGitAuth: async () => null,
+      recorder,
+    });
+    expect(release.removed).toBe(false);
+    expect(release.kept).toBe(true);
+    expect(release.keptReason).toBe("dirty_worktree");
+    expect(await fs.readFile(path.join(realized.worktreePath, "wip.txt"), "utf8")).toBe("uncommitted work\n");
+  });
+
   it("releaseRunExecutionWorkspace keeps a clean worktree when the push fails (SPA-9275 fail-safe)", async () => {
     const sourceRepo = await createTempRepo("master");
     const remoteDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-pushfail-remote-"));
