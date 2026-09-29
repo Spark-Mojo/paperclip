@@ -13,6 +13,7 @@ import {
 } from "../dev-server-status.js";
 import { logger } from "../middleware/logger.js";
 import { getServerInfoSnapshot, type ServerInfoSnapshot } from "../server-info.js";
+import { readInstalledGitCommit } from "../installed-git-commit.js";
 import {
   getCloudStackContext,
   isCloudManagedInstance,
@@ -125,6 +126,7 @@ export function healthRoutes(
     authReady: boolean;
     companyDeletionEnabled: boolean;
     serverInfo?: ServerInfoSnapshot;
+    installedCommitPath?: string;
     databaseBackupHealth?: InspectDatabaseBackupHealthOptions;
     runtimeEnv?: CloudInstanceEnv;
   } = {
@@ -256,6 +258,7 @@ export function healthRoutes(
     // one, unlike the fuller `serverInfo` block. Deploy tooling (and anyone)
     // can read which commit this server is running without authenticating.
     const commit = serverInfo.git.available ? serverInfo.git.fullSha : null;
+    const installedCommit = readInstalledGitCommit(opts.installedCommitPath);
     const exposeDevServerDetails =
       exposeFullDetails || hasDevServerStatusToken(req.get("x-paperclip-dev-server-status-token"));
     // Workspace readiness names the instance and execution workspace that
@@ -278,6 +281,7 @@ export function healthRoutes(
               version: serverVersion,
               serverVersion: serverVersion,
               commit,
+              ...(installedCommit ? { installedCommit } : {}),
               serverInfo,
               ...(cloud ? { cloud } : {}),
               ...(hiddenSettings.length ? { hiddenSettings } : {}),
@@ -286,6 +290,7 @@ export function healthRoutes(
               status: healthStatus,
               deploymentMode: opts.deploymentMode,
               commit,
+              ...(installedCommit ? { installedCommit } : {}),
               ...(cloud ? { cloud } : {}),
               ...(hiddenSettings.length ? { hiddenSettings } : {}),
             },
@@ -308,6 +313,7 @@ export function healthRoutes(
         version: serverVersion,
         serverVersion,
         commit,
+        ...(installedCommit ? { installedCommit } : {}),
         error: "database_unreachable",
         ...(exposeFullDetails ? { serverInfo } : {}),
         ...(workspace ? { workspace } : {}),
@@ -394,6 +400,7 @@ export function healthRoutes(
         deploymentExposure: opts.deploymentExposure,
         localAiLoginSupported: supportsLocalAiLogin(opts),
         commit,
+        ...(installedCommit ? { installedCommit } : {}),
         bootstrapStatus,
         bootstrapInviteActive,
         ...(redactedDatabaseBackup ? { databaseBackup: redactedDatabaseBackup } : {}),
@@ -414,6 +421,7 @@ export function healthRoutes(
       version: serverVersion,
       serverVersion,
       commit,
+      ...(installedCommit ? { installedCommit } : {}),
       deploymentMode: opts.deploymentMode,
       deploymentExposure: opts.deploymentExposure,
         localAiLoginSupported: supportsLocalAiLogin(opts),
