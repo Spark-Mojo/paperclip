@@ -1,4 +1,5 @@
 import { remoteTerminationReceipt } from "./remote-execution-termination.js";
+import { TERMINAL_LEASE_LOCAL_EPHEMERAL_DEFAULT_TTL_MS } from "./terminal-environment-leases.js";
 import { createHash, randomUUID } from "node:crypto";
 import { and, eq, inArray, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
@@ -1108,6 +1109,11 @@ function createLocalEnvironmentDriver(db: Db): EnvironmentRuntimeDriver {
         heartbeatRunId: input.heartbeatRunId,
         leasePolicy: "ephemeral",
         provider: "local",
+        // SPA-9423: local ephemeral leases carry a finite expiry so a stale
+        // lease row whose owner is provably terminal can never live forever.
+        // The sweep's reclaim predicate is terminal-owner proof; this bound
+        // is a staleness hint, never an authorization to destroy a live run.
+        expiresAt: new Date(Date.now() + TERMINAL_LEASE_LOCAL_EPHEMERAL_DEFAULT_TTL_MS),
         metadata: {
           ...(input.agentId ? { agentId: input.agentId } : {}),
           driver: input.environment.driver,
