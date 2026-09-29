@@ -108,4 +108,20 @@ Known-redundant ahead-commits on the branch: `2fb9c6f880` (SPA-9140) and `8ed6a7
 ## Base sync
 
 - Two merges landed: `a5c1100385` (base `fd57a5d0cb` — the original 116-commit base) and `09941266b2` (base `172c6ce891` — the further-moved base, PRs #109/#111).
-- PR head will be moved from `88743de936` (unmergeable, `mergeable: false`) to local HEAD `09941266b2` on push. Mergeability after push is confirmed by the Docker-sha-bound merge attempt on the fresh head (Dex's PUT), or by `gh pr view` after push; re-verify (step 5) runs against the pushed head before the hand-off to Dex.
+- PR head was moved from `88743de936` (unmergeable, `mergeable: false`) and pushed; PR #108 is `MERGEABLE` at the final head.
+
+## CI surface expansion (SPA-9275-fixture completion)
+
+The merged head triggered the fork's full CI matrix for the FIRST time (the SPA-9275 head `88743de936` had zero check-runs). The matrix surfaced four real test failures; all four were reproduced and triaged:
+
+- **SPA-9275-ATTRIBUTABLE (also broken at `88743de936`; fixed on this branch):**
+  1. `server-startup-feedback-export.test.ts` — `server/src/index.ts` calls `reconcileEphemeralWorktreesOnStartup` (SPA-9275 startup wiring) but the test's `vi.mock("../services/index.js")` did not export it → file-level mock error, 16 tests failed. Fixed: added `reconcileEphemeralWorktreesOnStartup: vi.fn(async () => ({ reposScanned: 0, reaper: {...}, sweep: {...}, totalErrors: [] }))` matching the real return shape (`workspace-runtime.ts:5183`). Suite now 20/20.
+  2. `instance-settings-service.test.ts` — the strict `toEqual` on the fully-normalized settings object did not include SPA-9275's new `enableEphemeralWorktreePerRun: false` (emitted by `instance-settings.ts:268`/`:309`). Fixed: added the key to the expected object. Suite now 26/26.
+- **PRE-EXISTING BASE FAILURES (confirmed byte-identical at base head `172c6ce891` in a clean base worktree; NOT fixed, out of scope):**
+  3. `issue-dependency-wakeups-routes.test.ts` "does not enqueue a second wake when the blocker is already done" — expects 200, gets 409. Fails identically on base.
+  4. `packages/db/src/migration-snapshot-drift.test.ts` — `ENOENT 0281_snapshot.json`: base ships migrations 0280/0281 but meta snapshots stop at 0279. Fails identically on base (`git diff 172c6ce891 HEAD -- packages/db/src/migrations/` is empty — the dir is byte-identical).
+- **Workflow/infra-level reds** (`ci/policy`, `ci/verify`, `ci/e2e`, chat shard row-lock): generic runner/key/runner-environment artifacts, not attributable to the PR content.
+
+Post-fix local runs (same env as the gate-9 runs): startup suite 20/20, settings suite 26/26, server `tsc` EXIT=0, and the full gate-9 trio unchanged at **415 passed / 6 failed of 421** with the 6 failures the same pre-existing `realizeExecutionWorkspace` config-seeding set verified at base head `172c6ce891`.
+
+The fixture edits are SPA-9275-completion (the SPA-9275 PR would have had to carry them to pass CI on any repo that runs checks) — test fixtures, not product code; required by the card's step 3 "full test surface" obligation against the final head.
