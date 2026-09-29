@@ -1594,6 +1594,16 @@ describe("renderPaperclipWakePrompt", () => {
     );
   });
 
+  it.each([
+    ["agent", DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE],
+    ["conversation", DEFAULT_PAPERCLIP_CONVERSATION_PROMPT_TEMPLATE],
+  ])("restricts run scratch directories to disposable temporary files in the %s prompt", (_name, template) => {
+    const clause = "Use `PAPERCLIP_SCRATCH_DIR` / `PAPERCLIP_RUN_SCRATCH_DIR` only for disposable temporary files. Never place a git worktree or uncommitted deliverable work there: Paperclip removes the run-owned directory after the run ends. Use the assigned card worktree for deliverable work.";
+
+    expect(template).toContain(clause);
+    expect(template).not.toContain("for temporary scratch files");
+  });
+
   it("keeps the default local-agent prompt action-oriented", () => {
     expect(DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE).toContain(
       "Start actionable work in this heartbeat",
