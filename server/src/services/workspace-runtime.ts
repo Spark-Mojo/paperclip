@@ -4900,21 +4900,27 @@ export async function releaseRunExecutionWorkspace(input: {
   // durably captured in a local ref that outlives the worktree directory,
   // so the original branch's push outcome no longer gates removal.
   //
-  // The dirty check only applies to a path git actually knows as a
-  // registered worktree of `repoRoot` (`git worktree list`). A directory
-  // that was never registered (e.g. a crash before `git worktree add`
-  // completed, or the stale-lock retry path below) is not a worktree to
-  // protect — `git status` run from inside it would report against
-  // whichever real working tree it happens to be nested under, which is
-  // not what "dirty" means here. That case falls through to the existing
-  // remove/retry/fs.rm cleanup unchanged.
+  // A registered worktree of `repoRoot` (`git worktree list`) is always
+  // checked. An unregistered directory with no `.git` entry (e.g. a crash
+  // before `git worktree add` completed) holds no git state and falls
+  // through to the remove/retry/fs.rm cleanup. An unregistered directory
+  // that still has a `.git` entry (repoRoot mismatch, pruned admin dir) is
+  // checked directly, and kept when that check fails.
   const isDirty = input.rescued
     ? false
     : await listLinkedGitWorktreePaths(input.repoRoot)
       .catch(() => new Set<string>())
       .then(async (linkedPaths) => {
         const resolvedWorktreePath = await resolvePathForWorktreeComparison(input.worktreePath);
-        if (!linkedPaths.has(resolvedWorktreePath)) return false;
+        if (!linkedPaths.has(resolvedWorktreePath)) {
+          // Not registered under this repoRoot. A plain directory with no
+          // `.git` entry holds no git state and may be removed. A directory
+          // that still carries `.git` is a worktree we cannot vouch for (repoRoot
+          // mismatch, pruned admin dir): check it directly and keep it if the
+          // check fails, never fs.rm it blind.
+          const hasGitEntry = await fs.stat(path.join(input.worktreePath, ".git")).then(() => true).catch(() => false);
+          if (!hasGitEntry) return false;
+        }
         return runGit(["status", "--porcelain", "--untracked-files=all"], input.worktreePath)
           .then((value) => value.trim().length > 0)
           .catch(() => true);
