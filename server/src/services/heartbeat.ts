@@ -26155,7 +26155,13 @@ export function heartbeatService(
                 resolveGitAuth: ephemeralRunGitAuth,
                 recorder: ephemeralRunRecorder,
               });
-              if (!releaseResult.removed || releaseResult.errors.length > 0) {
+              // SPA-9275 fail-safe: `kept: true` means the release deliberately
+              // preserved a dirty or unpushed worktree instead of destroying
+              // it — this is expected, working behavior, not a cleanup
+              // failure, and must never be escalated toward `cleanup_failed`
+              // or retried in a loop from here. Only a genuinely incomplete
+              // removal (kept: false, removed: false) warrants a warning.
+              if (!releaseResult.removed && !releaseResult.kept) {
                 logger.warn(
                   {
                     runId: run.id,
@@ -26167,15 +26173,27 @@ export function heartbeatService(
                   },
                   "ephemeral run worktree cleanup did not finish cleanly",
                 );
+              } else if (releaseResult.kept) {
+                logger.info(
+                  {
+                    runId: run.id,
+                    worktreePath: ephemeralRunCleanup.worktreePath,
+                    keptReason: releaseResult.keptReason,
+                  },
+                  "ephemeral run worktree kept (not removed) to avoid losing state",
+                );
               }
               if (latestRun) {
+                const message = releaseResult.removed
+                  ? "ephemeral run worktree cleaned"
+                  : releaseResult.kept
+                    ? `ephemeral run worktree kept: ${releaseResult.keptReason}`
+                    : `ephemeral run worktree cleanup incomplete: ${releaseResult.errors.join(" | ")}`;
                 await appendRunEvent(latestRun, {
                   eventType: "lifecycle",
                   stream: "system",
-                  level: releaseResult.removed ? "info" : "warn",
-                  message: releaseResult.removed
-                    ? "ephemeral run worktree cleaned"
-                    : `ephemeral run worktree cleanup incomplete: ${releaseResult.errors.join(" | ")}`,
+                  level: releaseResult.removed || releaseResult.kept ? "info" : "warn",
+                  message,
                   payload: {
                     worktreePath: ephemeralRunCleanup.worktreePath,
                     branchName: ephemeralRunCleanup.branchName,
@@ -26183,6 +26201,8 @@ export function heartbeatService(
                     removed: releaseResult.removed,
                     retriedRemoval: releaseResult.retriedRemoval,
                     archived: releaseResult.archived,
+                    kept: releaseResult.kept,
+                    keptReason: releaseResult.keptReason,
                     errors: releaseResult.errors,
                   },
                 }).catch(() => undefined);
