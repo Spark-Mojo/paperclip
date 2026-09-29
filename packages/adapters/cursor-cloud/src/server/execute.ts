@@ -26,6 +26,7 @@ import {
   renderTemplate,
   stringifyPaperclipWakePayload,
 } from "@paperclipai/adapter-utils/server-utils";
+import { applyPaperclipWakePayloadEnv } from "@paperclipai/adapter-utils/wake-payload-env";
 
 type CursorCloudSession = {
   cursorAgentId: string;
@@ -104,7 +105,7 @@ function formatRunError(err: unknown): string {
   return String(err);
 }
 
-function buildWakeEnv(ctx: AdapterExecutionContext, configEnv: Record<string, string>): Record<string, string> {
+async function buildWakeEnv(ctx: AdapterExecutionContext, configEnv: Record<string, string>): Promise<Record<string, string>> {
   const { runId, agent, context, authToken } = ctx;
   const env: Record<string, string> = {
     ...configEnv,
@@ -133,7 +134,21 @@ function buildWakeEnv(ctx: AdapterExecutionContext, configEnv: Record<string, st
   if (approvalId) env.PAPERCLIP_APPROVAL_ID = approvalId;
   if (approvalStatus) env.PAPERCLIP_APPROVAL_STATUS = approvalStatus;
   if (linkedIssueIds.length > 0) env.PAPERCLIP_LINKED_ISSUE_IDS = linkedIssueIds.join(",");
-  if (wakePayloadJson) env.PAPERCLIP_WAKE_PAYLOAD_JSON = wakePayloadJson;
+  // SPA-9259: cap the inline env copy of the wake payload. The cloud env
+  // runs on Cursor's remote machines, so a staged host file would be
+  // unreadable — oversized payloads drop the env copy; the wake prompt in
+  // the agent prompt still carries the payload content.
+  const wakePayloadEnv = await applyPaperclipWakePayloadEnv(env, {
+    runId,
+    wakePayloadJson,
+    executionTargetIsRemote: true,
+  });
+  if (wakePayloadEnv.mode !== "inline") {
+    await ctx.onLog(
+      "stdout",
+      `[paperclip] Wake payload (${wakePayloadEnv.byteLength} bytes) exceeds the inline env limit; env copy dropped (cloud execution); the wake prompt still carries the payload content.\n`,
+    );
+  }
   if (issueWorkMode) env.PAPERCLIP_ISSUE_WORK_MODE = issueWorkMode;
   if (authToken) {
     env.PAPERCLIP_API_KEY = authToken;
@@ -393,7 +408,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     ...(repoStartingRef ? { startingRef: repoStartingRef } : {}),
     ...(repoPullRequestUrl ? { prUrl: repoPullRequestUrl } : {}),
   }];
-  const remoteEnv = buildWakeEnv(ctx, envConfig);
+  const remoteEnv = await buildWakeEnv(ctx, envConfig);
   const session = readSession(runtime.sessionParams) ?? (runtime.sessionId
     ? {
         cursorAgentId: runtime.sessionId,
