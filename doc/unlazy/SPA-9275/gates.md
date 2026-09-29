@@ -70,7 +70,7 @@
 
 # SPA-9285 re-merge verification (results against merged head)
 
-Merged head verified: **`f25c402178`** (the branch head at verification dispatch; = `09941266b2` + three `doc/unlazy/SPA-9275/gates.md` doc commits: `43201aab6d`, `3a0d96cd10`, `f25c402178`). Test results below were produced against `09941266b2`; the only differences to the verified head are the gates-ledger doc commits themselves (this ledger, plus the doc-only commits), so all results carry. Base synced: `09941266b2` merges base `172c6ce891` (PRs #109/#111) onto the SPA-9275 branch.
+Merged head verified: **`9b5cd86268`** (the branch head at verification dispatch for the fixture-completion delta; = `09941266b2` + four `doc/unlazy/SPA-9275/gates.md` doc commits `43201aab6d`/`3a0d96cd10`/`f25c402178`/`ad4cda3849` + the SPA-9275 fixture-completion commit `9b5cd86268`). All code+test results below were produced against `09941266b2` plus the two fixture edits now in `9b5cd86268` (startup mock + settings `toEqual`); the only other differences to the verified head are gates-ledger doc commits, so all results carry. Base synced: `09941266b2` merges base `172c6ce891` (PRs #109/#111) onto the SPA-9275 branch.
 
 Known-redundant ahead-commits on the branch: `2fb9c6f880` (SPA-9140) and `8ed6a7122a` (SPA-9282) mirror later base PRs #87/#111. Cosmetic history; the merged tree is identical to the base's canonical copies. Not a merge risk — confirmed `MERGEABLE` at `43201aab6d`. Reviewers should not flag these as drift.
 
