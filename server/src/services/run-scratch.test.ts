@@ -1,7 +1,7 @@
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   HEARTBEAT_RUN_SCRATCH_MARKER,
   buildHeartbeatRunScratchEnv,
@@ -18,6 +18,7 @@ async function trackScratch(scratch: HeartbeatRunScratch) {
 }
 
 afterEach(async () => {
+  vi.restoreAllMocks();
   await Promise.all(
     Array.from(cleanupDirs, (dir) =>
       fs.rm(dir, { recursive: true, force: true }).catch(() => undefined),
@@ -36,12 +37,94 @@ describe("heartbeat run scratch cleanup", () => {
       issueIdentifier: "PAP-13071",
       now: new Date("2026-07-08T00:00:00.000Z"),
     }));
-    await fs.writeFile(path.join(scratch.dir, "tool-cache.txt"), "cache");
 
     const result = await cleanupHeartbeatRunScratch({ scratch });
 
     expect(result).toEqual({ removed: true, dir: scratch.dir });
     await expect(fs.stat(scratch.dir)).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it.each(["deliverable.ts", "tool-cache.txt", ".git", "nested", "link"])(
+    "retains scratch containing %s regardless of file type",
+    async (name) => {
+      const scratch = await trackScratch(await prepareHeartbeatRunScratch({
+        companyId: "company-1",
+        agentId: "agent-1",
+        runId: "run-1",
+      }));
+      const target = path.join(scratch.dir, name);
+      if (name === "nested") {
+        await fs.mkdir(path.join(target, "worktree"), { recursive: true });
+        await fs.writeFile(path.join(target, "worktree", ".git"), "gitdir: /outside/repo");
+        await fs.writeFile(path.join(target, "worktree", "deliverable.ts"), "uncommitted");
+      } else if (name === "link") {
+        await fs.symlink("/nonexistent-deliverable", target);
+      } else {
+        await fs.writeFile(target, "uncommitted");
+      }
+
+      const result = await cleanupHeartbeatRunScratch({ scratch });
+
+      expect(result).toMatchObject({ removed: false, dir: scratch.dir, reason: "protected_content" });
+      expect(result).toHaveProperty("recoveryAction", expect.stringContaining("durable workspace"));
+      await expect(fs.lstat(target)).resolves.toBeDefined();
+      if (name === "deliverable.ts") {
+        expect(await fs.readFile(target, "utf8")).toBe("uncommitted");
+        await fs.unlink(target);
+        expect(await cleanupHeartbeatRunScratch({ scratch })).toEqual({ removed: true, dir: scratch.dir });
+      }
+    },
+  );
+
+  it("retains scratch when content enumeration fails", async () => {
+    const scratch = await trackScratch(await prepareHeartbeatRunScratch({
+      companyId: "company-1",
+      agentId: "agent-1",
+      runId: "run-1",
+    }));
+    const scan = vi.spyOn(fs, "readdir").mockRejectedValueOnce(new Error("cannot inspect"));
+
+    const result = await cleanupHeartbeatRunScratch({ scratch });
+
+    expect(scan).toHaveBeenCalledWith(scratch.dir);
+    expect(result).toMatchObject({ removed: false, dir: scratch.dir, reason: "content_check_failed" });
+    await expect(fs.stat(scratch.dir)).resolves.toBeDefined();
+  });
+
+  it("does not delete content created after enumeration", async () => {
+    const scratch = await trackScratch(await prepareHeartbeatRunScratch({
+      companyId: "company-1", agentId: "agent-1", runId: "run-1",
+    }));
+    const unlink = fs.unlink.bind(fs);
+    vi.spyOn(fs, "unlink").mockImplementationOnce(async (target) => {
+      await fs.writeFile(path.join(scratch.dir, "late-deliverable.ts"), "late work");
+      await unlink(target);
+    });
+
+    expect(await cleanupHeartbeatRunScratch({ scratch })).toMatchObject({
+      removed: false, reason: "content_check_failed",
+    });
+    expect(await fs.readFile(path.join(scratch.dir, "late-deliverable.ts"), "utf8")).toBe("late work");
+    expect(JSON.parse(await fs.readFile(scratch.markerPath, "utf8"))).toEqual(scratch.metadata);
+  });
+
+  it("preserves empty directories as potentially valuable content", async () => {
+    const scratch = await trackScratch(await prepareHeartbeatRunScratch({
+      companyId: "company-1",
+      agentId: "agent-1",
+      runId: "run-1",
+    }));
+    await fs.mkdir(path.join(scratch.dir, "deliverables"));
+    expect(await cleanupHeartbeatRunScratch({ scratch })).toMatchObject({ reason: "protected_content" });
+    await expect(fs.stat(path.join(scratch.dir, "deliverables"))).resolves.toBeDefined();
+  });
+
+  it("returns missing for scratch already removed", async () => {
+    const scratch = await trackScratch(await prepareHeartbeatRunScratch({
+      companyId: "company-1", agentId: "agent-1", runId: "run-1",
+    }));
+    await fs.rm(scratch.dir, { recursive: true });
+    expect(await cleanupHeartbeatRunScratch({ scratch })).toEqual({ removed: false, dir: scratch.dir, reason: "missing" });
   });
 
   it("preserves paperclip-named directories without the ownership marker", async () => {
