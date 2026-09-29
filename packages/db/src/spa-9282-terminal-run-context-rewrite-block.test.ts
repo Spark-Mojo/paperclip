@@ -195,7 +195,7 @@ describeEmbeddedPostgres("SPA-9282 terminal-run context_rewrite block trigger", 
   );
 
   it(
-    "audit trigger captures UPDATE on the five observed ids",
+    "audit trigger captures UPDATE on terminal rows (id-agnostic)",
     async () => {
       const database = await startEmbeddedPostgresTestDatabase(
         "paperclip-spa-9282-audit-",
@@ -207,24 +207,25 @@ describeEmbeddedPostgres("SPA-9282 terminal-run context_rewrite block trigger", 
       await ensureBlockAndAuditTriggersInstalled(sql);
 
       const { companyId, agentId } = await seedCompanyAgent(sql);
+      const auditRunId = "b36824a3-0000-0000-0000-000000000000";
       await sql`
         INSERT INTO heartbeat_runs (
           id, company_id, agent_id, status, liveness_state,
           context_snapshot, updated_at, created_at
         ) VALUES (
-          ${TERMINAL_RUN_ID}::uuid, ${companyId}::uuid, ${agentId}::uuid,
+          ${auditRunId}::uuid, ${companyId}::uuid, ${agentId}::uuid,
           'failed', 'failed', null, NOW(), NOW()
         )
       `;
       await sql`
         UPDATE heartbeat_runs
-        SET context_snapshot = NULL, updated_at = NOW()
-        WHERE id = ${TERMINAL_RUN_ID}::uuid
+        SET context_snapshot = ${sql.json({"phase":"audited"})}, updated_at = NOW()
+        WHERE id = ${auditRunId}::uuid
       `;
       const audit = await sql`
         SELECT run_id, status, liveness_state
         FROM heartbeat_run_writer_audit
-        WHERE run_id = ${TERMINAL_RUN_ID}::uuid
+        WHERE run_id = ${auditRunId}::uuid
         ORDER BY id DESC
         LIMIT 1
       ` as Array<{ run_id: string; status: string; liveness_state: string }>;
