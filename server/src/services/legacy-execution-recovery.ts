@@ -62,29 +62,40 @@ export async function terminalizeLegacyExecution(input: {
     (typeof run.contextSnapshot?.issueId === "string"
       ? run.contextSnapshot.issueId
       : null);
-  // SPA-9282: the recovery sweep runs every HEARTBEAT_SCHEDULER_INTERVAL_MS
-  // (default 30s) and re-enters this terminalize path on every tick. The
-  // status CAS below (inArray(status, fromStatuses ?? [run.status])) allows
-  // re-writes against an already-terminal row, so without this guard the
-  // function rewrites updated_at and a fresh executionStatusDeliveryId on
-  // every pass and the UI toasts the row as a fresh failure (Steve/Argus
-  // "failing every 30 s"). executionStatusDeliveryId is null on the first
-  // call and set forever after, so it is the canonical once-write marker
-  // for this terminalize path: read it from the LIVE row (the input
-  // `run` snapshot is stale across periodic sweep ticks), and skip when
-  // it is already populated, unless the caller's patch carries fields
-  // that genuinely still need writing.
+  // SPA-9282 (cycle 4): the delivery-id latch below was structurally defeated
+  // by the status-delivery cycle. deliverExecutionStatuses (a 15s sweep)
+  // publishes heartbeat.run.status and then CLEARS executionStatusDeliveryId
+  // to null, so on the next periodic reconciliation pass (recovery stranded
+  // sweep, quota monitor recovery, continuation recovery) the latch read
+  // false, this function rewrote updated_at + a fresh delivery id on the
+  // already-terminal row, setRunStatus published it, and the UI toasted the
+  // run as a fresh failure — every ~15-40s, forever (the "Steve/Argus
+  // failing all day" toasts; proven live by heartbeat_run_writer_audit:
+  // 157 execution_status_delivery_id cycles on the five observed runs).
+  // The canonical once marker must survive the publish-and-clear cycle, so
+  // it lives in result_json.executionTerminalizedAt, written in the same
+  // update that first terminalizes the run. An empty-patch re-terminalize
+  // of a marked run is a hard no-op regardless of delivery id.
   const [liveRow] = await db
-    .select({ executionStatusDeliveryId: heartbeatRuns.executionStatusDeliveryId })
+    .select({
+      executionStatusDeliveryId: heartbeatRuns.executionStatusDeliveryId,
+      resultJson: heartbeatRuns.resultJson,
+    })
     .from(heartbeatRuns)
     .where(and(
       eq(heartbeatRuns.id, run.id),
       eq(heartbeatRuns.companyId, run.companyId),
     ))
     .limit(1);
+  const terminalizedMarker = (liveRow?.resultJson as Record<string, unknown> | null)
+    ?.executionTerminalizedAt;
+  const hasSubstantivePatch = Boolean(patch && Object.keys(patch).length > 0);
+  if (typeof terminalizedMarker === "string" && !hasSubstantivePatch) {
+    return null;
+  }
   const deliveryAlreadySet = typeof liveRow?.executionStatusDeliveryId === "string"
     && liveRow.executionStatusDeliveryId.length > 0;
-  if (deliveryAlreadySet && (!patch || Object.keys(patch).length === 0)) {
+  if (deliveryAlreadySet && !hasSubstantivePatch) {
     return null;
   }
   return db.transaction(async (tx) => {
@@ -100,6 +111,17 @@ export async function terminalizeLegacyExecution(input: {
           )
           .for("update")
       : [];
+    // Base the merged result_json on the LIVE row read above (the input `run`
+    // snapshot is stale across periodic sweep ticks), merge any caller patch
+    // result_json on top, then stamp the once marker. The marker survives the
+    // status-delivery publish-and-clear cycle that defeats the delivery-id
+    // latch.
+    const patchResultJson = (patch?.resultJson ?? null) as Record<string, unknown> | null;
+    const mergedResultJson = {
+      ...((liveRow?.resultJson as Record<string, unknown> | null) ?? {}),
+      ...(patchResultJson ?? {}),
+      executionTerminalizedAt: new Date().toISOString(),
+    };
     const [updated] = await tx
       .update(heartbeatRuns)
       .set({
@@ -107,6 +129,7 @@ export async function terminalizeLegacyExecution(input: {
         ...patch,
         executionStatusDeliveryId: randomUUID(),
         updatedAt: new Date(),
+        resultJson: mergedResultJson,
       })
       .where(
         and(
