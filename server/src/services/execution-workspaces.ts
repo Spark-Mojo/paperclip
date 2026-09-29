@@ -3282,6 +3282,9 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
               id: row.id,
               mode: row.mode,
               strategyType: row.strategyType,
+              // SPA-9315: carried so an unrestorable workspace names its row
+              // status in the rebuild-failure diagnostic.
+              status: row.status,
               cwd: row.cwd,
               providerRef: row.providerRef,
               projectId: row.projectId,

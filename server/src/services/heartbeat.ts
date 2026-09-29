@@ -370,6 +370,9 @@ import {
   type RealizedExecutionWorkspace,
   type RuntimeServiceRef,
   type UnresolvedWorkspaceBaseRefError,
+  // SPA-9315: discriminated against a generic WorkspaceValidationFailure so a
+  // provably-unrestorable reuse binding falls back fresh instead of failing setup.
+  ExecutionWorkspaceNotProvisionableError,
   sanitizeRuntimeServiceBaseEnv,
 } from "./workspace-runtime.js";
 import {
@@ -2768,6 +2771,31 @@ function isWorkspaceValidationFailure(
     maybe.resultJson &&
     typeof maybe.resultJson === "object" &&
     !Array.isArray(maybe.resultJson),
+  );
+}
+
+/**
+ * SPA-9315: the identifying fields of an
+ * `ExecutionWorkspaceNotProvisionableError`, carried structurally so this
+ * module can discriminate the failure without depending on the concrete
+ * class identity across module boundaries.
+ */
+type ExecutionWorkspaceNotProvisionableBinding = {
+  executionWorkspaceId: string | null;
+  workspaceStatus: string | null;
+  cwd: string;
+  strategy: string;
+};
+
+function isExecutionWorkspaceNotProvisionableError(
+  error: unknown,
+): error is ExecutionWorkspaceNotProvisionableError {
+  if (error instanceof ExecutionWorkspaceNotProvisionableError) return true;
+  const maybe = error as { name?: unknown; cwd?: unknown; strategy?: unknown } | null;
+  return (
+    maybe?.name === "ExecutionWorkspaceNotProvisionableError" &&
+    typeof maybe.cwd === "string" &&
+    typeof maybe.strategy === "string"
   );
 }
 
@@ -6085,20 +6113,48 @@ export async function provisionExecutionWorkspaceForFreshnessDecision<
 
   let restored: T | null = null;
   let reuseFailure: string | null = null;
+  /**
+   * SPA-9315: set when the restore proved the bound workspace can never be
+   * re-provisioned (a live row whose on-disk directory is gone). Such a binding
+   * is dead in exactly the sense SPA-7090 meant — restore can never succeed — so
+   * the run refuses it and provisions fresh instead of failing setup. The
+   * generic `null` result below is NOT that proof and still throws.
+   */
+  let unprovisionableBinding: ExecutionWorkspaceNotProvisionableBinding | null = null;
   try {
     restored = (await input.restoreExistingWorkspace?.()) ?? null;
   } catch (error) {
-    if (isWorkspaceValidationFailure(error)) {
+    if (isExecutionWorkspaceNotProvisionableError(error)) {
+      unprovisionableBinding = error;
+    } else if (isWorkspaceValidationFailure(error)) {
       throw error;
+    } else {
+      reuseFailure = formatInheritedExecutionWorkspaceReuseFailure({
+        reason: "inherited_workspace_reuse_failed",
+        issueRef: input.issueRef,
+        runId: input.runId,
+        executionWorkspaceId: input.existingExecutionWorkspaceId,
+        workspaceConfigFreshness: input.workspaceConfigFreshness,
+        cause: error,
+      });
     }
-    reuseFailure = formatInheritedExecutionWorkspaceReuseFailure({
-      reason: "inherited_workspace_reuse_failed",
-      issueRef: input.issueRef,
-      runId: input.runId,
-      executionWorkspaceId: input.existingExecutionWorkspaceId,
-      workspaceConfigFreshness: input.workspaceConfigFreshness,
-      cause: error,
-    });
+  }
+
+  if (unprovisionableBinding) {
+    // The SPA-7090 refusal is decided on the row's status, which still reads
+    // live here. Refuse the binding, provision fresh, and name the dead binding
+    // so the operator can repair or archive the row without reading restore logs.
+    const executionWorkspace = await input.realizeWorkspace();
+    return {
+      executionWorkspace,
+      reusedExecutionWorkspace: null,
+      policy,
+      freshFallbackForStaleReuse: true,
+      freshFallbackWarning: formatUnprovisionableReuseFallbackWarning({
+        issueRef: input.issueRef,
+        binding: unprovisionableBinding,
+      }),
+    };
   }
 
   if (!restored) {
@@ -6146,6 +6202,28 @@ function formatStaleReuseFallbackWarning(input: {
     `reuse_existing binding on issue ${issueLabel} was refused and a fresh execution workspace was ` +
     `provisioned instead of failing setup (SPA-7090). The stale binding is inert; no action needed.` +
     branchLine
+  );
+}
+
+/**
+ * SPA-9315: the SPA-7090-style named comment for a reuse binding whose row
+ * still reads live but whose on-disk directory was torn down. It names the
+ * workspace, the status the SPA-7090 gate admitted it on, and the missing
+ * directory, so the operator can repair or archive the row directly.
+ */
+function formatUnprovisionableReuseFallbackWarning(input: {
+  issueRef: WorkspaceReuseIssueRef;
+  binding: ExecutionWorkspaceNotProvisionableBinding;
+}) {
+  const issueLabel = input.issueRef?.identifier ?? input.issueRef?.id ?? "unknown issue";
+  const workspaceLabel = input.binding.executionWorkspaceId ?? "unknown workspace";
+  const statusLabel = input.binding.workspaceStatus ?? "unknown status";
+  return (
+    `Execution workspace \`${workspaceLabel}\` is still recorded as ${statusLabel}, but its on-disk ` +
+    `directory \`${input.binding.cwd}\` is gone, so the ${input.binding.strategy} workspace cannot be ` +
+    `restored. Its reuse_existing binding on issue ${issueLabel} was refused and a fresh execution ` +
+    `workspace was provisioned instead of failing setup (SPA-9315). The stale binding is inert; ` +
+    `no action needed for this run.`
   );
 }
 
@@ -21643,6 +21721,9 @@ export function heartbeatService(
                     mode: reusableExistingExecutionWorkspace.mode,
                     strategyType:
                       reusableExistingExecutionWorkspace.strategyType,
+                    // SPA-9315: carried so an unrestorable reuse binding can name
+                    // the row status the SPA-7090 gate admitted it on.
+                    status: reusableExistingExecutionWorkspace.status,
                     cwd: reusableExistingExecutionWorkspace.cwd,
                     providerRef: reusableExistingExecutionWorkspace.providerRef,
                     projectId: reusableExistingExecutionWorkspace.projectId,

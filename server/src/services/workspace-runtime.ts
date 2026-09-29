@@ -192,6 +192,63 @@ export class WorkspaceRuntimeValidationFailure extends Error {
   }
 }
 
+/**
+ * SPA-9315: a persisted execution workspace whose row still reads live
+ * (`active` / `idle` / `in_review`) but whose realization is provably gone.
+ *
+ * The SPA-7090 refusal keys on the row's STATUS, so a row that reads `active`
+ * while its on-disk directory was torn down passes that gate and reaches the
+ * restore path. For a non-`git_worktree` strategy there is no restore arm to
+ * reach: the SPA-8870 restore-from-origin logic is gated behind
+ * `strategy === "git_worktree"`. Such a workspace can never be restored, and
+ * the caller's only correct move is to refuse the binding and provision fresh
+ * rather than fail setup.
+ *
+ * This is deliberately a SUBCLASS of `WorkspaceRuntimeValidationFailure` and
+ * not a new top-level code: the two other callers of
+ * `ensurePersistedExecutionWorkspaceAvailable`
+ * (routes/execution-workspaces.ts, services/execution-workspaces.ts) already
+ * treat its result as a hard failure, so they keep their existing
+ * fail-closed handling. The subclass exists so the heartbeat provisioning
+ * layer can tell "provably unprovisionable" apart from a generic
+ * `null` restore result, which still fails loudly.
+ */
+export class ExecutionWorkspaceNotProvisionableError extends WorkspaceRuntimeValidationFailure {
+  executionWorkspaceId: string | null;
+  workspaceStatus: string | null;
+  cwd: string;
+  strategy: string;
+
+  constructor(input: {
+    executionWorkspaceId?: string | null;
+    workspaceStatus?: string | null;
+    cwd: string;
+    strategy: string;
+  }) {
+    const workspaceLabel = input.executionWorkspaceId ?? "unknown workspace";
+    const statusLabel = input.workspaceStatus ?? "unknown status";
+    super(
+      `Execution workspace "${workspaceLabel}" is ${statusLabel} but its on-disk directory ` +
+        `\`${input.cwd}\` no longer exists, so the ${input.strategy} workspace cannot be restored.`,
+      {
+        workspaceValidation: {
+          reason: "execution_workspace_not_provisionable",
+          reasonCode: "missing_on_disk_directory",
+          executionWorkspaceId: input.executionWorkspaceId ?? null,
+          workspaceStatus: input.workspaceStatus ?? null,
+          cwd: input.cwd,
+          strategy: input.strategy,
+        },
+      },
+    );
+    this.name = "ExecutionWorkspaceNotProvisionableError";
+    this.executionWorkspaceId = input.executionWorkspaceId ?? null;
+    this.workspaceStatus = input.workspaceStatus ?? null;
+    this.cwd = input.cwd;
+    this.strategy = input.strategy;
+  }
+}
+
 export interface RuntimeServiceRef {
   id: string;
   companyId: string;
@@ -3712,6 +3769,8 @@ export async function ensurePersistedExecutionWorkspaceAvailable(input: {
     id?: string | null;
     mode: string | null | undefined;
     strategyType: string | null | undefined;
+    /** SPA-9315: the row's live status, carried for unrestorable-binding diagnostics. */
+    status?: string | null | undefined;
     cwd: string | null | undefined;
     providerRef: string | null | undefined;
     projectId: string | null | undefined;
@@ -3762,7 +3821,21 @@ export async function ensurePersistedExecutionWorkspaceAvailable(input: {
 
   if (strategy !== "git_worktree") {
     if (!await directoryExists(cwd)) {
-      return null;
+      // SPA-9315: a non-git_worktree workspace has no restore arm — the
+      // SPA-8870 restore-from-origin logic below is gated behind
+      // `strategy === "git_worktree"`. A missing directory is therefore
+      // provably unrestorable, not a transient "nothing realized" result, so
+      // signal it as a typed failure the caller can discriminate. Returning
+      // null here (the pre-SPA-9315 behavior) made the heartbeat provisioning
+      // layer raise the generic `inherited_workspace_reuse_unavailable` error
+      // and fail setup, because SPA-7090's refusal gate keys on the row status
+      // and this row still reads `active`.
+      throw new ExecutionWorkspaceNotProvisionableError({
+        executionWorkspaceId: input.workspace.id ?? null,
+        workspaceStatus: input.workspace.status ?? null,
+        cwd,
+        strategy,
+      });
     }
     return realized;
   }
