@@ -23,6 +23,7 @@ const mockSummarySlotService = vi.hoisted(() => ({
   listRevisions: vi.fn(),
   generate: vi.fn(),
   write: vi.fn(),
+  isSummarizerBuiltInAgent: vi.fn(),
 }));
 
 const mockLogActivity = vi.hoisted(() => vi.fn());
@@ -126,6 +127,7 @@ describe("summary slot routes", () => {
       document: { id: "doc-1", companyId, format: "markdown", body: "# Summary" },
       revision: { id: "rev-1", documentId: "doc-1", revisionNumber: 1 },
     });
+    mockSummarySlotService.isSummarizerBuiltInAgent.mockResolvedValue(false);
   });
 
   describe("read routes", () => {
@@ -227,8 +229,31 @@ describe("summary slot routes", () => {
       expect(mockSummarySlotService.generate).not.toHaveBeenCalled();
     });
 
-    it("denies generate for agent actors", async () => {
+    it("denies generate for agent actors that are not the built-in Summarizer", async () => {
       const app = await createApp(agentActor);
+      const res = await request(app).post(
+        `/api/companies/${companyId}/summary-slots/project/header/generate`,
+      ).send({});
+      expect(res.status, JSON.stringify(res.body)).toBe(403);
+      expect(res.body.error).toBe("Only board operators or the Summarizer built-in agent can generate summaries.");
+      expect(mockSummarySlotService.generate).not.toHaveBeenCalled();
+    });
+
+    it("accepts generate from the built-in Summarizer agent (routine lane)", async () => {
+      mockSummarySlotService.isSummarizerBuiltInAgent.mockResolvedValue(true);
+      const app = await createApp(agentActor);
+      const res = await request(app).post(
+        `/api/companies/${companyId}/summary-slots/project/header/generate`,
+      ).send({ scopeId: projectId });
+      expect(res.status, JSON.stringify(res.body)).toBe(202);
+      expect(mockSummarySlotService.generate).toHaveBeenCalledWith(
+        { companyId, scopeKind: "project", slotKey: "header", scopeId: projectId },
+        expect.objectContaining({ agentId, userId: null }),
+      );
+    });
+
+    it("denies generate for non-board, non-agent actors", async () => {
+      const app = await createApp({ type: "cloud_tenant", source: "cloud_tenant", companyIds: [companyId] });
       const res = await request(app).post(
         `/api/companies/${companyId}/summary-slots/project/header/generate`,
       ).send({});

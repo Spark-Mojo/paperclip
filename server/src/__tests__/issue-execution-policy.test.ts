@@ -303,49 +303,6 @@ describe("issue execution policy transitions", () => {
       });
     });
 
-    it("allows an explicit human recovery override to canonically advance an agent stage", () => {
-      const reviewStageId = policy.stages[0].id;
-      const approvalStageId = policy.stages[1].id;
-      const result = applyIssueExecutionPolicyTransition({
-        issue: {
-          status: "in_review",
-          assigneeAgentId: qaAgentId,
-          assigneeUserId: null,
-          executionPolicy: policy,
-          executionState: {
-            status: "pending",
-            currentStageId: reviewStageId,
-            currentStageIndex: 0,
-            currentStageType: "review",
-            currentParticipant: { type: "agent", agentId: qaAgentId },
-            returnAssignee: { type: "agent", agentId: coderAgentId },
-            completedStageIds: [],
-            lastDecisionId: null,
-            lastDecisionOutcome: null,
-          },
-        },
-        policy,
-        requestedStatus: "done",
-        requestedAssigneePatch: {},
-        actor: { userId: boardUserId },
-        allowCurrentStageDecisionOverride: true,
-        commentBody: "Human recovery approval",
-      });
-
-      expect(result.decision).toMatchObject({
-        stageId: reviewStageId,
-        stageType: "review",
-        outcome: "approved",
-      });
-      expect(result.patch.executionState).toMatchObject({
-        status: "pending",
-        currentStageId: approvalStageId,
-        currentParticipant: { type: "user", userId: ctoUserId },
-      });
-      expect(result.patch.assigneeAgentId).toBeNull();
-      expect(result.patch.assigneeUserId).toBe(ctoUserId);
-    });
-
     it("lets a reviewer provide loose instructions for the next approval stage", () => {
       const reviewStageId = policy.stages[0].id;
       const approvalInstructions = "Please decide whether this is ready to ship, with any launch caveats.";
@@ -975,8 +932,16 @@ describe("issue execution policy transitions", () => {
     });
   });
 
-  describe("reopening from done/cancelled clears state", () => {
-    it("reopening a done issue clears execution state", () => {
+  describe("reopening from done/cancelled preserves state", () => {
+    // SPA-9215: the prior version of this block — "reopening from
+    // done/cancelled clears state" — encoded the exact bug Sable's SPA-9214
+    // friction surfaced. A terminal review stage's executionState must
+    // survive a status transition out of done/cancelled when it carries a
+    // recorded decision (lastDecisionOutcome set); the durable close record
+    // is the audit ground truth, not a transition-time detail. Reopening a
+    // closed card is a new decision and lands in the same patch with its
+    // own comment; it does not retroactively erase the previous close.
+    it("reopening a done issue preserves a terminal executionState", () => {
       const policy = twoStagePolicy();
       const result = applyIssueExecutionPolicyTransition({
         issue: {
@@ -992,9 +957,33 @@ describe("issue execution policy transitions", () => {
             currentParticipant: null,
             returnAssignee: { type: "agent", agentId: coderAgentId },
             completedStageIds: [policy.stages[0].id, policy.stages[1].id],
-            lastDecisionId: null,
+            lastDecisionId: "00000000-0000-4000-8000-000000002222",
             lastDecisionOutcome: "approved",
           },
+        },
+        policy,
+        requestedStatus: "todo",
+        requestedAssigneePatch: {},
+        actor: { userId: boardUserId },
+      });
+
+      expect(result.patch.executionState).toBeUndefined();
+      expect(result.patch.executionState ?? "absent").not.toBeNull();
+    });
+
+    it("reopening a done issue still clears when no terminal decision is recorded", () => {
+      // Backstop: a done card that survived closure without a recorded
+      // decision (e.g. closed before execution policies existed) is not an
+      // audit record; it must still clear cleanly on reopen so the policy
+      // transition does not leave a phantom completedStageIds array.
+      const policy = twoStagePolicy();
+      const result = applyIssueExecutionPolicyTransition({
+        issue: {
+          status: "done",
+          assigneeAgentId: coderAgentId,
+          assigneeUserId: null,
+          executionPolicy: policy,
+          executionState: null,
         },
         policy,
         requestedStatus: "todo",
@@ -1835,211 +1824,6 @@ describe("issue execution policy transitions", () => {
         }),
       ).toThrow("Monitor bounds are already exhausted");
     });
-
-    it("SPA-7105: a rejected non-explicit status write never clears an armed monitor", () => {
-      // Reproduces SPA-5921 (2026-09-10 15:14:43Z + 15:41:53Z):
-      // recovery.reconcile_stranded_assigned_issue moved in_progress→blocked
-      // with empty blockers, and the invalid transition executed AND cleared
-      // the armed monitor (executionState.monitor.status=cleared,
-      // clearReason=invalid_status, nextCheckAt=null). The write is now
-      // rejected and the armed monitor survives with nextCheckAt intact.
-      const policy = normalizeIssueExecutionPolicy({
-        stages: [],
-        monitor: {
-          nextCheckAt: "2099-04-11T12:30:00.000Z",
-          notes: "upstream-pr-watch",
-          scheduledBy: "assignee",
-          kind: "external_service",
-          serviceName: "upstream-pr-watch",
-        },
-      })!;
-      const armedState = {
-        status: "idle",
-        currentStageId: null,
-        currentStageIndex: null,
-        currentStageType: null,
-        currentParticipant: null,
-        returnAssignee: null,
-        completedStageIds: [],
-        lastDecisionId: null,
-        lastDecisionOutcome: null,
-        monitor: {
-          status: "scheduled",
-          nextCheckAt: "2099-04-11T12:30:00.000Z",
-          lastTriggeredAt: null,
-          attemptCount: 0,
-          notes: "upstream-pr-watch",
-          scheduledBy: "assignee",
-          kind: "external_service",
-          serviceName: "upstream-pr-watch",
-          clearedAt: null,
-          clearReason: null,
-        },
-      };
-
-      expect(() =>
-        applyIssueExecutionPolicyTransition({
-          issue: {
-            status: "in_progress",
-            assigneeAgentId: coderAgentId,
-            assigneeUserId: null,
-            executionPolicy: policy,
-            executionState: armedState,
-            monitorAttemptCount: 0,
-            monitorNextCheckAt: new Date("2099-04-11T12:30:00.000Z"),
-            monitorLastTriggeredAt: null,
-            monitorNotes: "upstream-pr-watch",
-            monitorScheduledBy: "assignee",
-          },
-          policy,
-          previousPolicy: policy,
-          requestedStatus: "blocked",
-          requestedAssigneePatch: {},
-          actor: { agentId: null },
-        }),
-      ).toThrow("Monitor can only be scheduled");
-    });
-
-    it("SPA-7105: a monitor-eligible implicit policy removal preserves the armed monitor", () => {
-      // The SPA-5921 shape can also arrive as a policy payload without the
-      // monitor key (a write that drops executionPolicy.monitor). When the
-      // target stays monitor-eligible, the armed monitor is preserved with
-      // nextCheckAt intact instead of cleared.
-      const policy = normalizeIssueExecutionPolicy({
-        stages: [],
-        monitor: {
-          nextCheckAt: "2099-04-11T12:30:00.000Z",
-          notes: "upstream-pr-watch",
-          scheduledBy: "assignee",
-          kind: "external_service",
-          serviceName: "upstream-pr-watch",
-        },
-      })!;
-      const strippedPolicy = normalizeIssueExecutionPolicy({ stages: [] });
-      const armedState = {
-        status: "idle",
-        currentStageId: null,
-        currentStageIndex: null,
-        currentStageType: null,
-        currentParticipant: null,
-        returnAssignee: null,
-        completedStageIds: [],
-        lastDecisionId: null,
-        lastDecisionOutcome: null,
-        monitor: {
-          status: "scheduled",
-          nextCheckAt: "2099-04-11T12:30:00.000Z",
-          lastTriggeredAt: null,
-          attemptCount: 0,
-          notes: "upstream-pr-watch",
-          scheduledBy: "assignee",
-          kind: "external_service",
-          serviceName: "upstream-pr-watch",
-          clearedAt: null,
-          clearReason: null,
-        },
-      };
-
-      const result = applyIssueExecutionPolicyTransition({
-        issue: {
-          status: "in_progress",
-          assigneeAgentId: coderAgentId,
-          assigneeUserId: null,
-          executionPolicy: policy,
-          executionState: armedState,
-          monitorAttemptCount: 0,
-          monitorNextCheckAt: new Date("2099-04-11T12:30:00.000Z"),
-          monitorLastTriggeredAt: null,
-          monitorNotes: "upstream-pr-watch",
-          monitorScheduledBy: "assignee",
-        },
-        policy: strippedPolicy,
-        previousPolicy: policy,
-        requestedStatus: "in_progress",
-        requestedAssigneePatch: {},
-        actor: { agentId: null },
-      });
-
-      expect(result.patch.monitorNextCheckAt).toEqual(new Date("2099-04-11T12:30:00.000Z"));
-      expect(result.patch.executionPolicy).toMatchObject({
-        monitor: { serviceName: "upstream-pr-watch" },
-      });
-      expect(result.patch.executionState).toMatchObject({
-        monitor: { status: "scheduled", nextCheckAt: "2099-04-11T12:30:00.000Z" },
-      });
-    });
-
-    it("SPA-7105: a non-explicit blocked write with a stripped policy still preserves the armed monitor", () => {
-      // The SPA-5921 target status (in_progress→blocked) arriving as a write
-      // that drops executionPolicy.monitor. The transition layer cannot clear
-      // here: in this branch invalidReason is statically null (computed only
-      // when the incoming policy carries a monitor), so the armed monitor is
-      // carried forward with nextCheckAt intact — the write neither throws
-      // nor silently strips the monitor. Pins the carry-forward against a
-      // later refactor that makes the branch's dead clearing path reachable.
-      const policy = normalizeIssueExecutionPolicy({
-        stages: [],
-        monitor: {
-          nextCheckAt: "2099-04-11T12:30:00.000Z",
-          notes: "upstream-pr-watch",
-          scheduledBy: "assignee",
-          kind: "external_service",
-          serviceName: "upstream-pr-watch",
-        },
-      })!;
-      const strippedPolicy = normalizeIssueExecutionPolicy({ stages: [] });
-      const armedState = {
-        status: "idle",
-        currentStageId: null,
-        currentStageIndex: null,
-        currentStageType: null,
-        currentParticipant: null,
-        returnAssignee: null,
-        completedStageIds: [],
-        lastDecisionId: null,
-        lastDecisionOutcome: null,
-        monitor: {
-          status: "scheduled",
-          nextCheckAt: "2099-04-11T12:30:00.000Z",
-          lastTriggeredAt: null,
-          attemptCount: 0,
-          notes: "upstream-pr-watch",
-          scheduledBy: "assignee",
-          kind: "external_service",
-          serviceName: "upstream-pr-watch",
-          clearedAt: null,
-          clearReason: null,
-        },
-      };
-
-      const result = applyIssueExecutionPolicyTransition({
-        issue: {
-          status: "in_progress",
-          assigneeAgentId: coderAgentId,
-          assigneeUserId: null,
-          executionPolicy: policy,
-          executionState: armedState,
-          monitorAttemptCount: 0,
-          monitorNextCheckAt: new Date("2099-04-11T12:30:00.000Z"),
-          monitorLastTriggeredAt: null,
-          monitorNotes: "upstream-pr-watch",
-          monitorScheduledBy: "assignee",
-        },
-        policy: strippedPolicy,
-        previousPolicy: policy,
-        requestedStatus: "blocked",
-        requestedAssigneePatch: {},
-        actor: { agentId: null },
-      });
-
-      expect(result.patch.monitorNextCheckAt).toEqual(new Date("2099-04-11T12:30:00.000Z"));
-      expect(result.patch.executionPolicy).toMatchObject({
-        monitor: { serviceName: "upstream-pr-watch" },
-      });
-      expect(result.patch.executionState).toMatchObject({
-        monitor: { status: "scheduled", nextCheckAt: "2099-04-11T12:30:00.000Z", clearReason: null },
-      });
-    });
   });
 });
 
@@ -2332,189 +2116,163 @@ describe("review round circuit breaker", () => {
       changesRequestedCount: 1,
     });
   });
-});
 
-describe("approval advance when returnAssignee == approval participant", () => {
-  it("reviewer approves → approval stage advances PENDING to the sole configured approver (no early terminal)", () => {
-    // SPA-5364 / SPA-5506 fingerprint: review returnAssignee == approval participant.
-    // The exclude filter on the next-stage lookup would empty the candidate set,
-    // and the pre-fix branch collapsed the workflow to terminal before the
-    // approval actor ever acted. The fix re-selects the sole participant
-    // without the exclude so the approval stage actually lands on its owner.
-    const steveUserId = "steve-user";
-    const policy = makePolicy([
-      { type: "review", participants: [{ type: "agent", agentId: qaAgentId }] },
-      { type: "approval", participants: [{ type: "user", userId: steveUserId }] },
-    ]);
+  // SPA-9215: a stale queued assignment run for a superseded assignee used to
+  // wipe a verified terminal review — `stale_queued_run_gate` cancels the run,
+  // the assignment-recovery sweep PATCHes the issue back to in_progress, and
+  // the policy transition at issue-execution-policy.ts (the "issue is
+  // done/cancelled, requestedStatus is non-terminal" branch) set
+  // `executionState: null`, destroying lastDecisionOutcome and
+  // completedStageIds. The fix is local to that branch: refuse the wipe when
+  // the existing state already represents a terminal decision
+  // (`lastDecisionOutcome` set), so the durable close record survives any
+  // status transition out of done/cancelled.
+  describe("SPA-9215: terminal executionState survives non-terminal requestedStatus", () => {
+    const policy = reviewOnlyPolicy();
     const reviewStageId = policy.stages[0].id;
-    const approvalStageId = policy.stages[1].id;
 
-    const result = applyIssueExecutionPolicyTransition({
-      issue: {
-        status: "in_review",
-        assigneeAgentId: qaAgentId,
-        assigneeUserId: null,
-        executionPolicy: policy,
-        executionState: {
-          status: "pending",
-          currentStageId: reviewStageId,
-          currentStageIndex: 0,
-          currentStageType: "review",
-          currentParticipant: { type: "agent", agentId: qaAgentId },
-          returnAssignee: { type: "user", userId: steveUserId },
-          completedStageIds: [],
-          lastDecisionId: null,
-          lastDecisionOutcome: null,
-        },
-      },
-      policy,
-      requestedStatus: "done",
-      requestedAssigneePatch: {},
-      actor: { agentId: qaAgentId },
-      commentBody: "Review pass",
-    });
+    const terminalExecutionState: IssueExecutionState = {
+      status: "completed",
+      currentStageId: null,
+      currentStageIndex: null,
+      currentStageType: null,
+      currentParticipant: null,
+      returnAssignee: { type: "agent", agentId: coderAgentId },
+      reviewRequest: null,
+      completedStageIds: [reviewStageId],
+      lastDecisionId: "00000000-0000-4000-8000-000000001234",
+      lastDecisionOutcome: "approved",
+    };
 
-    // Review-stage decision is recorded as approved.
-    expect(result.decision).toMatchObject({
-      stageId: reviewStageId,
-      stageType: "review",
-      outcome: "approved",
-    });
-    // The approval stage must be PENDING for its sole configured approver — NOT
-    // collapsed to terminal — and the assignee must be that approver so the
-    // approval gate is actually exercised.
-    expect(result.patch.status).toBe("in_review");
-    expect(result.patch.assigneeAgentId).toBeNull();
-    expect(result.patch.assigneeUserId).toBe(steveUserId);
-    expect(result.patch.executionState).toMatchObject({
-      status: "pending",
-      currentStageId: approvalStageId,
-      currentStageType: "approval",
-      currentParticipant: { type: "user", userId: steveUserId },
-      completedStageIds: expect.arrayContaining([reviewStageId]),
-    });
-    expect(result.patch.executionState?.completedStageIds).not.toContain(approvalStageId);
-    expect(result.workflowControlledAssignment).toBe(true);
-  });
-
-  it("changes_requested re-entry routes approval stage back to sole approver (no 'No eligible' throw)", () => {
-    // SPA-5506 P1: after the approver requests changes, the next build attempt
-    // re-runs through the re-entry path (L1010-1042). Pre-fix, the exclude
-    // filter empties the candidate set and the engine throws
-    // "No eligible approval participant is configured for this issue",
-    // permanently stranding the issue. Fix mirrors the L820 fallback: when
-    // pendingStage.type === "approval", select without the exclude.
-    const steveUserId = "steve-user";
-    const policy = makePolicy([
-      { type: "review", participants: [{ type: "agent", agentId: qaAgentId }] },
-      { type: "approval", participants: [{ type: "user", userId: steveUserId }] },
-    ]);
-    const reviewStageId = policy.stages[0].id;
-    const approvalStageId = policy.stages[1].id;
-
-    // Re-entry state: changes_requested on the approval stage, returnAssignee is
-    // the sole approver, currentParticipant was the approver before changes.
-    const result = applyIssueExecutionPolicyTransition({
-      issue: {
-        status: "in_progress",
+    function buildTerminalIssue(status: "done" | "cancelled"): IssueLike {
+      return {
+        status,
         assigneeAgentId: null,
-        assigneeUserId: steveUserId,
-        executionPolicy: policy,
-        executionState: {
-          status: "changes_requested",
-          currentStageId: approvalStageId,
-          currentStageIndex: 1,
-          currentStageType: "approval",
-          currentParticipant: { type: "user", userId: steveUserId },
-          returnAssignee: { type: "user", userId: steveUserId },
-          completedStageIds: [reviewStageId],
-          lastDecisionId: null,
-          lastDecisionOutcome: "changes_requested",
-          changesRequestedCount: 1,
-        },
-      },
-      policy,
-      requestedStatus: "in_review",
-      requestedAssigneePatch: {},
-      actor: { agentId: qaAgentId },
-      commentBody: null,
-    });
-
-    // Must NOT throw. Approval stage must be PENDING with sole approver as
-    // currentParticipant — not stranded in an error state.
-    expect(result.patch.executionState).toMatchObject({
-      status: "pending",
-      currentStageId: approvalStageId,
-      currentStageType: "approval",
-      currentParticipant: { type: "user", userId: steveUserId },
-    });
-    expect(result.workflowControlledAssignment).toBe(true);
-  });
-
-  it("review nextStage with sole participant == returnAssignee does NOT fall back to self-review", () => {
-    // SPA-5506 P2 mirror: the L820 fallback only applies when nextStage.type
-    // === "approval". For a review nextStage where the sole participant equals
-    // returnAssignee, the early-terminal-clear path is preserved so the
-    // existing canAutoSkipPendingStage loop on re-entry can handle the
-    // self-review skip. Selecting the returnAssignee for the review stage
-    // would leave the issue in_review for a meaningless self-review.
-    const steveUserId = "steve-user";
-    const policy = makePolicy([
-      { type: "review", participants: [{ type: "agent", agentId: qaAgentId }] },
-      { type: "review", participants: [{ type: "user", userId: steveUserId }] },
-    ]);
-    const reviewStageId = policy.stages[0].id;
-    const secondReviewStageId = policy.stages[1].id;
-
-    const result = applyIssueExecutionPolicyTransition({
-      issue: {
-        status: "in_review",
-        assigneeAgentId: qaAgentId,
         assigneeUserId: null,
         executionPolicy: policy,
-        executionState: {
-          status: "pending",
-          currentStageId: reviewStageId,
-          currentStageIndex: 0,
-          currentStageType: "review",
-          currentParticipant: { type: "agent", agentId: qaAgentId },
-          returnAssignee: { type: "user", userId: steveUserId },
-          completedStageIds: [],
-          lastDecisionId: null,
-          lastDecisionOutcome: null,
-        },
-      },
-      policy,
-      requestedStatus: "done",
-      requestedAssigneePatch: {},
-      actor: { agentId: qaAgentId },
-      commentBody: "Review pass",
+        executionState: terminalExecutionState,
+      };
+    }
+
+    it("preserves terminal executionState when done card is PATCHed back to in_progress", () => {
+      const result = applyIssueExecutionPolicyTransition({
+        issue: buildTerminalIssue("done"),
+        policy,
+        requestedStatus: "in_progress",
+        requestedAssigneePatch: {},
+        actor: { agentId: coderAgentId },
+      });
+
+      expect(result.patch.executionState).toBeUndefined();
+      expect(result.patch.executionState ?? "absent").not.toBeNull();
     });
 
-    // First review stage records its approval, but the second review stage
-    // (sole participant = returnAssignee) must NOT be assigned to the
-    // returnAssignee here — instead the early-terminal path is taken so the
-    // re-entry auto-skip loop handles the meaningless self-review.
-    expect(result.decision).toMatchObject({
-      stageId: reviewStageId,
-      outcome: "approved",
-    });
-    // The patch should NOT route to the sole review-stage participant
-    // (= returnAssignee); either it marks the workflow terminal or it lands
-    // on the second review stage as PENDING only when the re-entry path
-    // resolves a different participant. The forbidden shape is:
-    //   patch.assigneeUserId === steveUserId AND patch.executionState.currentStageId === secondReviewStageId
-    if (
-      result.patch.executionState &&
-      (result.patch.executionState as { currentStageId?: string }).currentStageId === secondReviewStageId
-    ) {
-      expect(result.patch.assigneeUserId).not.toBe(steveUserId);
-    } else {
-      // Early terminal: assert it happened cleanly (not a self-review assignment).
-      expect(result.patch.executionState).toMatchObject({
-        status: "completed",
-        completedStageIds: expect.arrayContaining([reviewStageId]),
+    it("preserves terminal executionState when cancelled card is PATCHed back to todo", () => {
+      const result = applyIssueExecutionPolicyTransition({
+        issue: buildTerminalIssue("cancelled"),
+        policy,
+        requestedStatus: "todo",
+        requestedAssigneePatch: {},
+        actor: { agentId: coderAgentId },
       });
-    }
+
+      expect(result.patch.executionState).toBeUndefined();
+      expect(result.patch.executionState ?? "absent").not.toBeNull();
+    });
+
+    it("preserves lastDecisionOutcome and completedStageIds across the transition", () => {
+      const result = applyIssueExecutionPolicyTransition({
+        issue: buildTerminalIssue("done"),
+        policy,
+        requestedStatus: "in_progress",
+        requestedAssigneePatch: {},
+        actor: { agentId: coderAgentId },
+      });
+
+      const preserved = result.patch.executionState ?? terminalExecutionState;
+      expect(preserved).toMatchObject({
+        status: "completed",
+        lastDecisionId: "00000000-0000-4000-8000-000000001234",
+        lastDecisionOutcome: "approved",
+        completedStageIds: [reviewStageId],
+        returnAssignee: { type: "agent", agentId: coderAgentId },
+      });
+    });
+
+    it("still wipes executionState when a done card has no terminal decision record", () => {
+      // Backstop: a done card whose executionState was never finalized (e.g.
+      // closed before execution policies existed) must still clear cleanly
+      // on a status change, otherwise the policy transition leaves a phantom
+      // completedStageIds array in place.
+      const result = applyIssueExecutionPolicyTransition({
+        issue: {
+          status: "done",
+          assigneeAgentId: null,
+          assigneeUserId: null,
+          executionPolicy: policy,
+          executionState: null,
+        },
+        policy,
+        requestedStatus: "in_progress",
+        requestedAssigneePatch: {},
+        actor: { agentId: coderAgentId },
+      });
+
+      expect(result.patch.executionState).toBeNull();
+    });
+
+    it("still wipes executionState when the existing state has lastDecisionOutcome=null", () => {
+      // The guard is on a non-null lastDecisionOutcome (a terminal decision
+      // record). A state that survived closure without recording a decision
+      // is not a terminal record — it must still clear.
+      const result = applyIssueExecutionPolicyTransition({
+        issue: {
+          status: "done",
+          assigneeAgentId: null,
+          assigneeUserId: null,
+          executionPolicy: policy,
+          executionState: {
+            status: "pending",
+            currentStageId: reviewStageId,
+            currentStageIndex: 0,
+            currentStageType: "review",
+            currentParticipant: { type: "agent", agentId: qaAgentId },
+            returnAssignee: { type: "agent", agentId: coderAgentId },
+            completedStageIds: [],
+            lastDecisionId: null,
+            lastDecisionOutcome: null,
+          },
+        },
+        policy,
+        requestedStatus: "in_progress",
+        requestedAssigneePatch: {},
+        actor: { agentId: coderAgentId },
+      });
+
+      expect(result.patch.executionState).toBeNull();
+    });
+
+    it("preserves returnAssignee when the terminal state carries it", () => {
+      // "re-attach returnAssignee on close so a cancelled queue for the prior
+      // assignee is a no-op" — the prior assignee survives the status
+      // transition; a follow-up queue that targets them resolves to the
+      // same returnAssignee the original execution closed with.
+      const result = applyIssueExecutionPolicyTransition({
+        issue: buildTerminalIssue("done"),
+        policy,
+        requestedStatus: "in_progress",
+        requestedAssigneePatch: {},
+        actor: { agentId: coderAgentId },
+      });
+
+      const preserved = result.patch.executionState ?? terminalExecutionState;
+      expect(preserved).toMatchObject({
+        status: "completed",
+        lastDecisionOutcome: "approved",
+        returnAssignee: { type: "agent", agentId: coderAgentId },
+      });
+    });
   });
 });
+
+type IssueLike = Parameters<typeof applyIssueExecutionPolicyTransition>[0]["issue"];

@@ -29,14 +29,7 @@ export type {
   IssueLivenessState,
 } from "./issue-graph-liveness.js";
 export {
-  RECOVERY_ARMED_MONITOR_MAX_ATTEMPTS,
-  isLiveArmedRecoveryMonitor,
-  readRecoveryArmedMonitorContext,
   recoveryService,
-} from "./service.js";
-export type {
-  LiveArmedRecoveryMonitorInput,
-  RecoveryArmedMonitorContextInput,
 } from "./service.js";
 export {
   DEFAULT_MAX_LIVENESS_CONTINUATION_ATTEMPTS,
@@ -65,8 +58,22 @@ export {
   findExistingFinishSuccessfulRunHandoffWake,
   isSuccessfulRunHandoffValidPathSkip,
   isSuccessfulRunHandoffRequiredNoticeBody,
+  noticeMetadataReferencesRecoveryAction,
 } from "./successful-run-handoff.js";
 export type {
   SuccessfulRunHandoffNotice,
   SuccessfulRunHandoffDecision,
 } from "./successful-run-handoff.js";
+export {
+  DEFAULT_STRANDED_RECOVERY_NOTICE_BODY,
+  buildConfigurationIncompleteRecoveryNoticeSeed,
+  buildExecutionReviewParticipantRecoveryNoticeSeed,
+  buildExecutionReviewParticipantUnavailableNoticeSeed,
+  buildImmediateExecutionPathRecoveryNoticeSeed,
+  buildStrandedRecoveryEscalationNotice,
+  buildWorkspaceValidationRecoveryNoticeSeed,
+} from "./stranded-notice.js";
+export type {
+  StrandedRecoveryEscalationNotice,
+  StrandedRecoveryNoticeSeed,
+} from "./stranded-notice.js";

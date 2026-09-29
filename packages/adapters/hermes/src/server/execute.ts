@@ -30,9 +30,11 @@ import type {
 import {
   runChildProcess,
   buildPaperclipEnv,
+  buildRuntimeToolsEnv,
   renderTemplate,
   ensureAbsoluteDirectory,
   DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE,
+  DEFAULT_PAPERCLIP_CONVERSATION_PROMPT_TEMPLATE,
   joinPromptSections,
   renderPaperclipWakePrompt,
   selectPaperclipTaskMarkdown,
@@ -52,6 +54,7 @@ import {
   detectModel,
   resolveProvider,
 } from "./detect-model.js";
+import { reconcileHermesPaperclipSkills } from "./skills.js";
 
 // ---------------------------------------------------------------------------
 // Config helpers
@@ -138,9 +141,10 @@ export function buildPrompt(
   config: Record<string, unknown>,
   options: { resumedSession?: boolean } = {},
 ): string {
-  const template = cfgString(config.promptTemplate) || HERMES_DEFAULT_PROMPT_TEMPLATE;
-
   const context = (ctx as any).context || {};
+  const template = cfgString(config.promptTemplate) || (context.conversationMode === true
+    ? DEFAULT_PAPERCLIP_CONVERSATION_PROMPT_TEMPLATE
+    : HERMES_DEFAULT_PROMPT_TEMPLATE);
   const taskId = cfgString(context.taskId) || cfgString(context.issueId) || cfgString(ctx.config?.taskId);
   const taskTitle = cfgString(context.taskTitle) || cfgString(ctx.config?.taskTitle) || "";
   const taskBody = cfgString(context.taskBody) || cfgString(ctx.config?.taskBody) || "";
@@ -164,6 +168,7 @@ export function buildPrompt(
     resumedSession: options.resumedSession === true,
   });
   const wakePrompt = renderPaperclipWakePrompt(context.paperclipWake, {
+    conversationMode: context.conversationMode === true,
     resumedSession: options.resumedSession === true,
     // The task-context markdown is the authoritative brief on this lane; keep
     // the wake prompt's description copy out so the prompt carries it once.
@@ -350,6 +355,25 @@ export async function execute(
     (ctx.runtime?.sessionParams as Record<string, unknown> | null)?.sessionId,
   );
 
+  // The server adds this runtime inventory at the run boundary. Requiring the
+  // marker avoids touching a developer's real Hermes home in direct unit or
+  // library calls that did not opt into Paperclip runtime skills.
+  if (Object.prototype.hasOwnProperty.call(config, "paperclipRuntimeSkills")) {
+    try {
+      const selectedSkills = await reconcileHermesPaperclipSkills(config);
+      if (selectedSkills.length > 0) {
+        await ctx.onLog(
+          "stdout",
+          `[hermes] Reconciled ${selectedSkills.length} Paperclip-managed skill(s) into the Hermes skills home.\n`,
+        );
+      }
+    } catch (err) {
+      const reason = err instanceof Error ? err.message : String(err);
+      await ctx.onLog("stderr", `[hermes] Cannot start without the required Paperclip-managed skills: ${reason}\n`);
+      throw err;
+    }
+  }
+
   // ── Resolve provider (defense in depth) ────────────────────────────────
   // Priority chain:
   //   1. Explicit provider in adapterConfig (user override)
@@ -415,9 +439,25 @@ export async function execute(
   }
 
   // ── Build command args ─────────────────────────────────────────────────
-  // Use -Q (quiet) to get clean output: just response + session_id line
+  // Use -Q (quiet) to get clean output: just response + session_id line.
+  //
+  // SPA-8967: stop putting the prompt in argv. A card whose comment
+  // history passes ~117KB used to fail spawn with E2BIG (Linux
+  // posix_spawn enforces ARG_MAX; the run never started). The durable
+  // fix is the engine's promptFileBody handoff
+  // (see `runChildProcess` / `runAdapterExecutionTargetProcess` option
+  // `promptFileBody`). The engine wires two transports so neither adapter
+  // nor CLI flag work is required to pick the prompt up:
+  //   1. writes the body to a run-owned path under PAPERCLIP_PROMPTS_DIR
+  //      and exposes it via PAPERCLIP_RUN_PROMPT_FILE — so any future
+  //      adapter with a `--prompt-file <path>` CLI flag can adopt it; and
+  //   2. pipes the body onto the child's stdin (sourced from
+  //      promptFileBody when no explicit `stdin` is passed) — so Hermes's
+  //      existing `chat -q -` stdin-placeholder convention picks it up.
+  // Hermes's CLI accepts `-` as the prompt slot and reads stdin, so we
+  // point the slot at `-` and let the engine handle both transports.
   const useQuiet = cfgBoolean(config.quiet) === true; // default false
-  const args: string[] = ["chat", "-q", prompt];
+  const args: string[] = ["chat", "-q", "-"];
   if (useQuiet) args.push("-Q");
 
   if (model) {
@@ -467,6 +507,7 @@ export async function execute(
     ...(process.env as Record<string, string>),
     ...(userEnv && typeof userEnv === "object" ? userEnv : {}),
     ...buildPaperclipEnv(ctx.agent),
+    ...buildRuntimeToolsEnv(ctx.runtimeTools),
   };
 
   if (ctx.runId) env.PAPERCLIP_RUN_ID = ctx.runId;
@@ -535,6 +576,15 @@ export async function execute(
   const result = await runChildProcess(ctx.runId, hermesCmd, args, {
     cwd,
     env,
+    // SPA-8967: hand the prompt body to the engine via promptFileBody.
+    // runChildProcess does two things with it: writes it to a run-owned
+    // path under PAPERCLIP_PROMPTS_DIR, sets PAPERCLIP_RUN_PROMPT_FILE on
+    // the child env (so a future `--prompt-file <path>` adapter can adopt
+    // it), AND pipes the body onto the child's stdin (so the existing
+    // `chat -q -` stdin-placeholder convention picks it up). Either
+    // transport on its own ends the SPA-8607 / SPA-8898 E2BIG class;
+    // running both keeps every live adapter's transport contract intact.
+    promptFileBody: prompt,
     timeoutSec,
     graceSec,
     onLog: wrappedOnLog,
@@ -563,6 +613,8 @@ export async function execute(
 
   if (parsed.errorMessage) {
     executionResult.errorMessage = parsed.errorMessage;
+  } else if (!result.timedOut && typeof result.exitCode === "number" && result.exitCode !== 0) {
+    executionResult.errorMessage = `Hermes exited with code ${result.exitCode}`;
   }
 
   if (parsed.usage) {

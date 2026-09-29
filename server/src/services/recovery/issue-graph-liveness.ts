@@ -12,6 +12,9 @@ export type IssueLivenessState =
   | "in_review_without_action_path";
 
 export interface IssueLivenessIssueInput {
+  conversationAgentId?: string | null;
+  conversationUserId?: string | null;
+  conversationState?: string | null;
   id: string;
   companyId: string;
   identifier: string | null;
@@ -44,12 +47,6 @@ export interface IssueLivenessAgentInput {
   title?: string | null;
   status: string;
   reportsTo?: string | null;
-  /**
-   * When the agent was paused. A `paused` status without a pause record is a
-   * stale transition, not a real pause — liveness treats those agents as
-   * invokable (SPA-6514).
-   */
-  pausedAt?: Date | string | null;
 }
 
 export interface IssueLivenessExecutionPathInput {
@@ -152,13 +149,7 @@ function isInvokableAgent(
   agent: IssueLivenessAgentInput | null | undefined,
   agentsById: Map<string, IssueLivenessAgentInput>,
 ) {
-  if (!agent) return false;
-  // SPA-6514: `paused` without a pause record (pausedAt) is a stale status —
-  // pause() always writes pausedAt, so a gap can only come from a legacy or
-  // failed transition. Treat such agents as invokable instead of minting
-  // uninvokable-assignee incidents against agents that are not really paused.
-  if (agent.status === "paused" && !agent.pausedAt) return true;
-  return isAgentInvokable({ agent, agents: [...agentsById.values()] });
+  return Boolean(agent && isAgentInvokable({ agent, agents: [...agentsById.values()] }));
 }
 
 function hasActiveExecutionPath(
@@ -228,6 +219,9 @@ export function classifyIssueReviewPaths(
   const nowMs = readDateMs(input.now ?? new Date()) ?? Date.now();
   const agentsById = new Map(input.agents.map((agent) => [agent.id, agent]));
   const paths: IssueReviewPathFact[] = [];
+  if (issue.conversationAgentId && issue.conversationUserId && issue.conversationState === "waiting") {
+    return [{ kind: "human_reviewer", ref: issue.conversationUserId, userId: issue.conversationUserId, agentId: null, since: null }];
+  }
 
   if (issue.assigneeUserId) {
     paths.push({
@@ -667,17 +661,7 @@ export function classifyIssueGraphLiveness(input: IssueGraphLivenessInput): Issu
     const blockerEligibility = blockerAgent
       ? getAgentWorkEligibility({ agent: blockerAgent, agents: input.agents })
       : null;
-    const blockerIsStalePaused = Boolean(
-      blockerAgent &&
-        blockerAgent.companyId === source.companyId &&
-        blockerAgent.status === "paused" &&
-        !blockerAgent.pausedAt,
-    );
-    if (
-      !blockerAgent ||
-      blockerAgent.companyId !== source.companyId ||
-      (blockerIsStalePaused ? false : !blockerEligibility?.invokable)
-    ) {
+    if (!blockerAgent || blockerAgent.companyId !== source.companyId || !blockerEligibility?.invokable) {
       return finding({
         issue: source,
         state: "blocked_by_uninvokable_assignee",

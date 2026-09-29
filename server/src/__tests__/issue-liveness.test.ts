@@ -252,11 +252,7 @@ describe("issue graph liveness classifier", () => {
         }),
       ],
       relations: blocks,
-      agents: [
-        agent(),
-        manager,
-        agent({ id: "blocker-agent", name: "Paused", status: "paused", pausedAt: new Date("2026-09-14T00:00:00Z") }),
-      ],
+      agents: [agent(), manager, agent({ id: "blocker-agent", name: "Paused", status: "paused" })],
     });
     expect(cancelled[0]?.state).toBe("blocked_by_cancelled_issue");
 
@@ -272,53 +268,9 @@ describe("issue graph liveness classifier", () => {
         }),
       ],
       relations: blocks,
-      agents: [
-        agent(),
-        manager,
-        agent({ id: "blocker-agent", name: "Paused", status: "paused", pausedAt: new Date("2026-09-14T00:00:00Z") }),
-      ],
+      agents: [agent(), manager, agent({ id: "blocker-agent", name: "Paused", status: "paused" })],
     });
     expect(paused[0]?.state).toBe("blocked_by_uninvokable_assignee");
-  });
-
-  it("treats a paused assignee without a pause record (pausedAt unset) as invokable", () => {
-    const findings = classifyIssueGraphLiveness({
-      issues: [
-        issue(),
-        issue({
-          id: blockerId,
-          identifier: "PAP-1704",
-          title: "Stale-paused unblock work",
-          status: "todo",
-          assigneeAgentId: "blocker-agent",
-        }),
-      ],
-      relations: blocks,
-      agents: [agent(), manager, agent({ id: "blocker-agent", name: "Stale paused", status: "paused", pausedAt: null })],
-    });
-
-    expect(findings).toHaveLength(0);
-  });
-
-  it("treats a stale-paused participant as a valid in_review action path", () => {
-    const findings = classifyIssueGraphLiveness({
-      issues: [
-        issue({
-          status: "in_review",
-          executionState: {
-            status: "pending",
-            currentStageId: "stage-1",
-            currentStageIndex: 0,
-            currentStageType: "review",
-            currentParticipant: { type: "agent", agentId: "blocker-agent" },
-          },
-        }),
-      ],
-      relations: [],
-      agents: [agent(), manager, agent({ id: "blocker-agent", name: "Stale paused", status: "paused", pausedAt: null })],
-    });
-
-    expect(findings).toHaveLength(0);
   });
 
   it("detects a cancelled blocker on an assigned todo source", () => {
@@ -490,7 +442,7 @@ describe("issue graph liveness classifier", () => {
         }),
       ],
       relations: [],
-      agents: [agent({ status: "paused", pausedAt: new Date("2026-09-14T00:00:00Z") }), manager],
+      agents: [agent({ status: "paused" }), manager],
     });
 
     expect(findings).toHaveLength(1);

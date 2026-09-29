@@ -3,6 +3,7 @@ import type { Db } from "@paperclipai/db";
 import {
   documentRevisions,
   documents,
+  executionWorkspaces,
   issues,
   projectWorkspaces,
   projects,
@@ -123,7 +124,9 @@ function scopeLabel(scopeKind: SummarySlotScopeKind): string {
     case "project":
       return "project";
     case "project_workspace":
-      return "workspace";
+      return "project workspace";
+    case "execution_workspace":
+      return "execution workspace";
     case "workspaces_overview":
       return "workspaces overview";
     default:
@@ -135,6 +138,22 @@ export function summarySlotService(db: Db) {
   const builtIns = builtInAgentService(db);
   const agents = agentService(db);
   const issuesSvc = issueService(db);
+
+  /**
+   * Single authoritative predicate for "this agent is the company's built-in
+   * Summarizer agent". Shared by the write guard (`assertSummarizerWriter`)
+   * and exposed so the generate route can admit the Summarizer without
+   * re-typing (and drifting from) the marker check.
+   */
+  async function isSummarizerBuiltInAgent(
+    companyId: string,
+    agentId: string | null | undefined,
+  ): Promise<boolean> {
+    if (!agentId) return false;
+    const agent = await agents.getById(agentId);
+    if (!agent || agent.companyId !== companyId) return false;
+    return readBuiltInAgentMarker(agent.metadata)?.key === SUMMARIZER_BUILT_IN_KEY;
+  }
 
   function resolveSelector(input: SummarySlotSelectorInput): ResolvedSelector {
     const parsed = summarySlotScopeSelectorSchema.safeParse({
@@ -173,6 +192,15 @@ export function summarySlotService(db: Db) {
         .select({ id: projectWorkspaces.id })
         .from(projectWorkspaces)
         .where(and(eq(projectWorkspaces.id, sel.scopeId), eq(projectWorkspaces.companyId, sel.companyId)))
+        .then((rows) => rows[0] ?? null);
+      if (!row) throw notFound("Summary target not found");
+      return;
+    }
+    if (sel.scopeKind === "execution_workspace") {
+      const row = await db
+        .select({ id: executionWorkspaces.id })
+        .from(executionWorkspaces)
+        .where(and(eq(executionWorkspaces.id, sel.scopeId), eq(executionWorkspaces.companyId, sel.companyId)))
         .then((rows) => rows[0] ?? null);
       if (!row) throw notFound("Summary target not found");
     }
@@ -299,9 +327,10 @@ export function summarySlotService(db: Db) {
   async function resolveGenerationTargetProject(sel: ResolvedSelector): Promise<{
     projectId: string | null;
     projectWorkspaceId: string | null;
+    executionWorkspaceId: string | null;
   }> {
     if (sel.scopeKind === "project") {
-      return { projectId: sel.scopeId, projectWorkspaceId: null };
+      return { projectId: sel.scopeId, projectWorkspaceId: null, executionWorkspaceId: null };
     }
     if (sel.scopeKind === "project_workspace" && sel.scopeId) {
       const row = await db
@@ -309,14 +338,34 @@ export function summarySlotService(db: Db) {
         .from(projectWorkspaces)
         .where(and(eq(projectWorkspaces.id, sel.scopeId), eq(projectWorkspaces.companyId, sel.companyId)))
         .then((rows) => rows[0] ?? null);
-      return { projectId: row?.projectId ?? null, projectWorkspaceId: sel.scopeId };
+      return {
+        projectId: row?.projectId ?? null,
+        projectWorkspaceId: sel.scopeId,
+        executionWorkspaceId: null,
+      };
     }
-    return { projectId: null, projectWorkspaceId: null };
+    if (sel.scopeKind === "execution_workspace" && sel.scopeId) {
+      const row = await db
+        .select({
+          projectId: executionWorkspaces.projectId,
+          projectWorkspaceId: executionWorkspaces.projectWorkspaceId,
+        })
+        .from(executionWorkspaces)
+        .where(and(eq(executionWorkspaces.id, sel.scopeId), eq(executionWorkspaces.companyId, sel.companyId)))
+        .then((rows) => rows[0] ?? null);
+      return {
+        projectId: row?.projectId ?? null,
+        projectWorkspaceId: row?.projectWorkspaceId ?? null,
+        executionWorkspaceId: sel.scopeId,
+      };
+    }
+    return { projectId: null, projectWorkspaceId: null, executionWorkspaceId: null };
   }
 
   function scopeIssueConditions(sel: ResolvedSelector) {
     if (sel.scopeKind === "project") return [eq(issues.projectId, sel.scopeId!)];
     if (sel.scopeKind === "project_workspace") return [eq(issues.projectWorkspaceId, sel.scopeId!)];
+    if (sel.scopeKind === "execution_workspace") return [eq(issues.executionWorkspaceId, sel.scopeId!)];
     return [];
   }
 
@@ -464,7 +513,7 @@ export function summarySlotService(db: Db) {
       }
     }
 
-    const { projectId, projectWorkspaceId } = await resolveGenerationTargetProject(sel);
+    const { projectId, projectWorkspaceId, executionWorkspaceId } = await resolveGenerationTargetProject(sel);
     const scopeSnapshot = await buildScopeSnapshot(sel, existing?.lastGeneratedAt ?? null);
     const createdAt = new Date();
     const generationVersion = existing?.generatingIssueId ?? existing?.updatedAt.toISOString() ?? "initial";
@@ -472,6 +521,7 @@ export function summarySlotService(db: Db) {
     const created = await issuesSvc.create(sel.companyId, {
       projectId,
       projectWorkspaceId,
+      executionWorkspaceId,
       title: generationIssueTitle(sel, createdAt),
       description: generationIssueDescription(sel, scopeSnapshot),
       status: "todo",
@@ -525,12 +575,7 @@ export function summarySlotService(db: Db) {
     if (!actor.agentId) {
       throw forbidden("Only the Summarizer built-in agent may write summaries");
     }
-    const agent = await agents.getById(actor.agentId);
-    if (!agent || agent.companyId !== sel.companyId) {
-      throw forbidden("Only the Summarizer built-in agent may write summaries");
-    }
-    const marker = readBuiltInAgentMarker(agent.metadata);
-    if (marker?.key !== SUMMARIZER_BUILT_IN_KEY) {
+    if (!(await isSummarizerBuiltInAgent(sel.companyId, actor.agentId))) {
       throw forbidden("Only the Summarizer built-in agent may write summaries");
     }
 
@@ -725,5 +770,6 @@ export function summarySlotService(db: Db) {
     listRevisions,
     generate,
     write,
+    isSummarizerBuiltInAgent,
   };
 }
