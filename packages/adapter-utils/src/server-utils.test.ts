@@ -2270,7 +2270,7 @@ describe("renderPaperclipWakePrompt", () => {
 
     const firstPrompt = renderPaperclipWakePrompt(payload);
     expect(firstPrompt).toContain(
-      "- execution workspace branch: you are running in an execution workspace on branch `PAP-1582-ship-the-fix`. Do not switch, rename, or re-point this branch; keep all commits on it.",
+      "- execution workspace branch: you are running in an execution workspace on branch `PAP-1582-ship-the-fix`. Do not switch, rename, or re-point this branch. Keep every commit you make in this worktree on this branch.",
     );
 
     const resumedPrompt = renderPaperclipWakePrompt(payload, {
@@ -2306,6 +2306,66 @@ describe("renderPaperclipWakePrompt", () => {
     });
 
     expect(prompt).not.toContain("execution workspace branch");
+  });
+
+  it("names the side worktree route for a pre-existing PR head deliverable", () => {
+    const prompt = renderPaperclipWakePrompt({
+      reason: "issue_assigned",
+      issue: {
+        id: "issue-1",
+        identifier: "PAP-9475",
+        title: "Land PR-935 and PR-936 through the sanctioned path",
+        status: "in_progress",
+        description:
+          "PR #935 (head branch juno/pr-935-head) and PR #936 (head branch juno/pr-936-head) must reach MERGED. Both are blocked on unresolved review threads, so fix commits must land on those two head branches.",
+      },
+      executionWorkspace: { branchName: "PAP-9475-land-pr-935-and-936" },
+      commentWindow: {
+        requestedCount: 0,
+        includedCount: 0,
+        missingCount: 0,
+      },
+      comments: [],
+      fallbackFetchNeeded: false,
+    });
+
+    // The pre-existing head branches are reachable without moving the
+    // execution workspace: the prompt must say so, or the woken agent reads
+    // the branch guard as a global commit-placement rule and bounces the card.
+    expect(prompt).toContain("- side worktree route:");
+    expect(prompt).toContain("git worktree add ../<new-dir> -b <new-branch>");
+    expect(prompt).toContain("pre-existing pull-request head");
+    // ...while the branch-movement prohibition, the constraint that actually
+    // has a failure mode, stays in force for the assigned worktree.
+    expect(prompt).toContain("Do not switch, rename, or re-point this branch");
+    expect(prompt).toContain(
+      "Keep every commit you make in this worktree on this branch",
+    );
+    expect(prompt).not.toContain("keep all commits on it");
+  });
+
+  it("keeps the assigned worktree branch switch prohibited", () => {
+    const prompt = renderPaperclipWakePrompt({
+      reason: "issue_assigned",
+      issue: {
+        id: "issue-1",
+        identifier: "PAP-9497",
+        title: "Ship it",
+        status: "in_progress",
+      },
+      executionWorkspace: { branchName: "PAP-9497-ship-it" },
+      commentWindow: {
+        requestedCount: 0,
+        includedCount: 0,
+        missingCount: 0,
+      },
+      comments: [],
+      fallbackFetchNeeded: false,
+    });
+
+    expect(prompt).toContain("Do not switch, rename, or re-point this branch");
+    expect(prompt).toContain("Never `git checkout` or `git switch`");
+    expect(prompt).not.toContain("keep all commits on it");
   });
 
   it("keeps an execution-workspace-only wake payload alive", () => {
