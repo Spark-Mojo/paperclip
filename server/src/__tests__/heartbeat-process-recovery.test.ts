@@ -1089,6 +1089,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     contextSnapshot?: Record<string, unknown>;
     lastOutputAt?: Date | null;
     startedAt?: Date | null;
+    processStartedAt?: Date | null;
   }) {
     const companyId = randomUUID();
     const agentId = randomUUID();
@@ -1148,6 +1149,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       errorCode: input?.runErrorCode ?? null,
       error: input?.runError ?? null,
       startedAt: input?.startedAt ?? now,
+      processStartedAt: input?.processStartedAt ?? null,
       lastOutputAt: input?.lastOutputAt ?? null,
       updatedAt: new Date("2026-03-19T00:00:00.000Z"),
     });
@@ -8531,5 +8533,153 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
 
     const runs = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
     expect(runs).toHaveLength(1);
+  });
+
+  // ------------------------------------------------------------------
+  // SPA-9270 — dead-run liveness grace, pre-launch deadline, cancel-tree
+  //
+  //   (1a) tracked adapter, dead recorded pid, no prior observation →
+  //        stamps processLossObservedAt and stays running (grace started)
+  //   (1b) dead pid, observation stamped > 2 min ago → failed/process_lost
+  //   (1c) pid alive again after an observation → stamp cleared, run stays running
+  //   (2a) tracked adapter, startedAt > 15 min, recorded processStartedAt,
+  //        no pid → failed/workspace_prepare_timeout
+  //   (2b) tracked adapter, fresh startedAt, no pid → NOT reaped by the deadline
+  //   (2c) tracked adapter with pid recorded → untouched by the pre-launch gate
+  // ------------------------------------------------------------------
+
+  it("SPA-9270 (1a): dead recorded pid with no prior observation starts the grace window instead of failing immediately", async () => {
+    const { runId } = await seedRunFixture({
+      adapterType: "codex_local",
+      processPid: 999_999_997,
+      processGroupId: 999_999_997,
+      includeIssue: true,
+    });
+    const heartbeat = heartbeatService(db);
+
+    const result = await heartbeat.reapOrphanedRuns();
+    expect(result).toEqual({ reaped: 0, runIds: [] });
+
+    const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+    expect(run?.status).toBe("running");
+    expect(typeof run?.resultJson?.processLossObservedAt).toBe("string");
+
+    const events = await db
+      .select({ level: heartbeatRunEvents.level, message: heartbeatRunEvents.message })
+      .from(heartbeatRunEvents)
+      .where(eq(heartbeatRunEvents.runId, runId));
+    expect(events.map((e) => e.message).join("\n")).toContain("process-loss grace window started");
+  });
+
+  it("SPA-9270 (1b): pre-stamped process-loss observation past the grace window reaps as process_lost", async () => {
+    const { runId } = await seedRunFixture({
+      adapterType: "codex_local",
+      processPid: 999_999_996,
+      processGroupId: 999_999_996,
+      includeIssue: true,
+    });
+    await preStampProcessLoss(runId);
+
+    const heartbeat = heartbeatService(db);
+    const result = await heartbeat.reapOrphanedRuns();
+
+    expect(result.reaped).toBe(1);
+    expect(result.runIds).toContain(runId);
+    const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+    expect(run?.status).toBe("failed");
+    expect(run?.errorCode).toBe("process_lost");
+  });
+
+  it("SPA-9270 (1c): pid alive again after a grace observation clears the stamp and leaves the run alive", async () => {
+    const child = spawnAliveProcess();
+    try {
+      cleanupPids.add(child.pid);
+      const { runId } = await seedRunFixture({
+        adapterType: "codex_local",
+        processPid: child.pid,
+        processGroupId: child.pid,
+        includeIssue: true,
+      });
+      // Stamp an observation as if an earlier sweep had seen the pid gone.
+      await db
+        .update(heartbeatRuns)
+        .set({ resultJson: { processLossObservedAt: new Date(Date.now() - 60_000).toISOString() } })
+        .where(eq(heartbeatRuns.id, runId));
+
+      const heartbeat = heartbeatService(db);
+      const result = await heartbeat.reapOrphanedRuns();
+      expect(result).toEqual({ reaped: 0, runIds: [] });
+
+      const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+      expect(run?.status).toBe("running");
+      expect(run?.resultJson?.processLossObservedAt).toBeUndefined();
+      expect(isPidAlive(child.pid)).toBe(true);
+    } finally {
+      child.kill();
+    }
+  });
+
+  it("SPA-9270 (2a): tracked adapter with processStartedAt and no pid past the deadline fails as workspace_prepare_timeout", async () => {
+    const startedAt = new Date(Date.now() - (15 * 60 * 1000 + 60_000));
+    const { runId, issueId } = await seedRunFixture({
+      adapterType: "codex_local",
+      processPid: null,
+      processGroupId: null,
+      processStartedAt: startedAt,
+      startedAt,
+      includeIssue: true,
+    });
+    await db.update(issues).set({ executionRunId: runId }).where(eq(issues.id, issueId));
+
+    const heartbeat = heartbeatService(db);
+    const result = await heartbeat.reapOrphanedRuns();
+
+    expect(result.reaped).toBe(1);
+    expect(result.runIds).toContain(runId);
+    const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+    expect(run?.status).toBe("failed");
+    expect(run?.errorCode).toBe("workspace_prepare_timeout");
+    expect(run?.error).toContain("workspace preparation");
+  });
+
+  it("SPA-9270 (2b): tracked adapter with fresh startedAt and no pid is not reaped with the pre-launch error code", async () => {
+    const { runId } = await seedRunFixture({
+      adapterType: "codex_local",
+      processPid: null,
+      processGroupId: null,
+      processStartedAt: new Date(Date.now() - 60_000),
+      startedAt: new Date(Date.now() - 60_000),
+      includeIssue: true,
+    });
+
+    const heartbeat = heartbeatService(db);
+    await heartbeat.reapOrphanedRuns();
+
+    const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+    expect(run?.errorCode).not.toBe("workspace_prepare_timeout");
+  });
+
+  it("SPA-9270 (2c): tracked adapter with a live pid is untouched by the pre-launch gate", async () => {
+    const child = spawnAliveProcess();
+    try {
+      cleanupPids.add(child.pid);
+      const { runId } = await seedRunFixture({
+        adapterType: "codex_local",
+        processPid: child.pid,
+        processGroupId: child.pid,
+        processStartedAt: new Date(Date.now() - 60 * 60 * 1000),
+        startedAt: new Date(Date.now() - 60 * 60 * 1000),
+        includeIssue: true,
+      });
+
+      const heartbeat = heartbeatService(db);
+      const result = await heartbeat.reapOrphanedRuns();
+
+      expect(result.reaped).toBe(0);
+      const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+      expect(run?.status).toBe("running");
+    } finally {
+      child.kill();
+    }
   });
 });
