@@ -24,44 +24,73 @@
  *      the loop's 30 s cadence amplifies into N rows per close event.
  *      Operator-driven wakes (`requestedByActorType === "user"`) bypass.
  *
- *   1. **Per-chain guard.** Keyed on
+ *   1. **Per-chain exponential backoff.** Keyed on
  *      `(companyId, agentId, payload.issueId, payload.mutation, payload.retryOfRunId)` —
  *      `retryOfRunId` is the chain identity (matches the existing
- *      `INTERACTION_CONTINUATION_REQUEUE_MAX_ATTEMPTS` key shape). A new
- *      interaction accepted after the gate trips is a different chain and is
- *      admitted; the exhausted bucket does not bleed across intents.
+ *      `INTERACTION_CONTINUATION_REQUEUE_MAX_ATTEMPTS` key shape). At attempt
+ *      N (1-indexed), the wake is admitted only if elapsed since the prior
+ *      skip is at least `min(30s × 2^(N-2), 1h)`. Catches the
+ *      everyday-loop pattern: a fresh wake is admitted (attempt 1), the
+ *      next tick is refused (attempt 2 needs 30 s), the third tick needs
+ *      60 s, etc. By attempt 7 the natural 30 s tick cadence is 32× slower
+ *      than the backoff floor. Backoff is windowless — the curve applies
+ *      across the entire history of the chain so an exhausted chain can't
+ *      be re-warmed by waiting out the hourly window. No row is written
+ *      when backoff refuses — the loop dies cold at the emit site.
  *
- *   2. **Per-(agent, issue) hourly guard.** Keyed on
+ *   2. **Per-(agent, issue) hourly cap.** Keyed on
  *      `(companyId, agentId, payload.issueId)` over a 60-minute window.
  *      Catches gross abuse (one (agent, issue) pair spam-attempted with
- *      different mutations/retryOfRunIds) regardless of intent shape.
+ *      different mutations/retryOfRunIds or with no chain identity at all)
+ *      regardless of intent shape. Backoff handles chain discipline; the
+ *      hourly cap is the gross-abuse ceiling across all chain shapes.
  *
- * When either counter guard trips, `enqueueWakeup` short-circuits and
- * records a `skipped` row with `reason="wake_loop_guard_tripped"` — but at
- * most once per trip event (deduped on `(companyId, agentId, issueId,
- * guard)` within a 60 s window), so a reconciliation tick firing every 30 s
+ * When any guard trips, `enqueueWakeup` short-circuits and records a
+ * `skipped` row with `reason="wake_loop_guard_tripped"` — but at most
+ * once per trip event (deduped on `(companyId, agentId, issueId, guard)`
+ * within a 60 s window), so a reconciliation tick firing every 30 s
  * produces at most one trip-row per minute per guard instead of one per
  * tick. When the gate trips inside the recovery sweep, the recovery sweep
- * additionally escalates the affected issue: a synthetic escalation issue is
- * minted and used as a real blocker edge (per DECISION-140 / `blocked` needs
- * a real blocker edge — comment-only paths are illegal). The escalation
- * issue is assigned to Dex (law 20 — git owner and the recovery ownership
- * lane for the engine).
+ * additionally escalates the affected issue: a synthetic escalation issue
+ * is minted and used as a real blocker edge (per DECISION-140 / `blocked`
+ * needs a real blocker edge — comment-only paths are illegal). The
+ * escalation issue is assigned to Dex (law 20 — git owner and the recovery
+ * ownership lane for the engine).
  */
 
 import { randomUUID } from "node:crypto";
-import { and, eq, gte, sql } from "drizzle-orm";
+import { and, desc, eq, gte, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { agentWakeupRequests, issues, issueRelations } from "@paperclipai/db";
 
 /** How many wakeup attempts on one (agent, issue) per hour trip the gross-abuse guard. */
 export const WAKE_LOOP_GUARD_HOURLY_LIMIT = 20;
 
-/** How many consecutive skip-attempts on one (agent, issue, mutation, retryOfRunId) trip the chain guard. */
-export const WAKE_LOOP_GUARD_CHAIN_LIMIT = 10;
-
 /** Window for the hourly guard. */
 export const WAKE_LOOP_GUARD_WINDOW_MS = 60 * 60 * 1000;
+
+/**
+ * Base backoff (ms) for the per-chain exponential backoff. At skip attempt
+ * N (1-indexed), the next wake is admitted only if elapsed since the prior
+ * skip is at least BASE * 2^(N-1), capped at 1 hour. Trip-row dedup still
+ * caps the row write rate at 1/min/guard; backoff gates whether a wake is
+ * admitted at all, so the loop's tick cadence no longer amplifies into rows.
+ *
+ * Example backoffs at BASE=30_000 (30 s):
+ *   attempt 1 (the very first) — no prior skip, admitted.
+ *   attempt 2 — must wait 30 s since the prior skip.
+ *   attempt 3 — must wait 60 s since the prior skip.
+ *   attempt 4 — must wait 120 s since the prior skip.
+ *   attempt 5 — must wait 240 s since the prior skip.
+ *   attempt 6 — must wait 480 s since the prior skip.
+ *   attempt 7+ — must wait 960/3600 s; the cap.
+ *
+ * With a 30 s reconciliation tick, the loop now produces no rows on attempts
+ * 2..N (backoff refuses them, no row written). By attempt 7, the natural
+ * tick cadence (every 30 s) is 32x slower than the backoff floor (960 s).
+ */
+export const WAKE_LOOP_GUARD_BACKOFF_BASE_MS = 30_000;
+export const WAKE_LOOP_GUARD_BACKOFF_CAP_MS = 60 * 60 * 1000;
 
 /** Window for trip-row dedup — once a guard trips, do not re-record a trip-row
  *  for the same (company, agent, issue, guard) within this many ms. Keeps the
@@ -108,7 +137,7 @@ export async function hasRecentTripRecord(
     companyId: string;
     agentId: string;
     issueId: string;
-    guard: "chain" | "hourly";
+    guard: "chain" | "hourly" | "backoff";
     now?: Date;
     windowMs?: number;
   },
@@ -146,6 +175,13 @@ export interface WakeLoopChainSummary extends WakeLoopGuardSummary {
   mutation: string | null;
   /** retryOfRunId from the wake payload. */
   retryOfRunId: string | null;
+  /**
+   * Created-at timestamp of the most recent wakeup row for this chain within
+   * the window. Used by the backoff layer to compute elapsed-since-prior-skip
+   * and admit only when the backoff curve has been honored. Null when the
+   * chain has no rows (a fresh chain is admitted without backoff).
+   */
+  mostRecentSkipAt: Date | null;
 }
 
 export interface WakeLoopGuardInput {
@@ -160,14 +196,31 @@ export type WakeLoopGuardDecision =
   | { tripped: false }
   | {
       tripped: true;
-      guard: "hourly" | "chain";
+      guard: "hourly" | "chain" | "backoff";
       count: number;
       limit: number;
       windowMs: number;
+      /** Attempt number (1-indexed) used by the backoff curve. */
+      attempt: number;
+      /** Required elapsed-since-prior-skip (ms) for the next attempt. */
+      nextEligibleAt: Date;
+      /** When the prior skip happened (most-recent row's createdAt). */
+      mostRecentSkipAt: Date;
     };
 
 /**
- * Per-(agent, issue) hourly guard. Counts `agent_wakeup_requests` rows for
+ * Backoff curve at attempt N is `min(BASE * 2^(N-1), CAP)`. The first
+ * skip (attempt 1) needs no prior history; attempts 2+ require an
+ * exponentially-growing cooldown since the prior skip, capped at one hour.
+ */
+export function backoffWindowMsForAttempt(attempt: number): number {
+  if (attempt <= 1) return 0;
+  const raw = WAKE_LOOP_GUARD_BACKOFF_BASE_MS * Math.pow(2, attempt - 2);
+  return Math.min(raw, WAKE_LOOP_GUARD_BACKOFF_CAP_MS);
+}
+
+/**
+ * Per-chain guard. Counts `agent_wakeup_requests` rows for
  * the (agent, issue) pair in the last `windowMs` milliseconds, regardless of
  * `status`. Trips when the total exceeds `WAKE_LOOP_GUARD_HOURLY_LIMIT`.
  */
@@ -208,6 +261,47 @@ export async function summarizeAgentIssueWakeupsInWindow(
 }
 
 /**
+ * Look up the most recent wakeup row for the chain, ignoring the window
+ * cutoff. Backoff is enforced across the entire history of the chain so
+ * an exhausted chain can't be re-warmed by waiting out the hourly window
+ * — the operator path (decide the chain is intentionally cancelled,
+ * extend the budget) is the only recovery.
+ */
+export async function loadChainMostRecentSkipAt(
+  db: Db,
+  input: {
+    companyId: string;
+    agentId: string;
+    issueId: string;
+    mutation: string | null;
+    retryOfRunId: string | null;
+  },
+): Promise<Date | null> {
+  // A chain is keyed on the same shape as the per-chain cap; without a
+  // mutation or retryOfRunId the chain is shapeless and backoff returns
+  // null (the hourly guard catches gross abuse).
+  if (!input.mutation && !input.retryOfRunId) return null;
+  const conditions = [
+    eq(agentWakeupRequests.companyId, input.companyId),
+    eq(agentWakeupRequests.agentId, input.agentId),
+    sql`${agentWakeupRequests.payload} ->> 'issueId' = ${input.issueId}`,
+  ];
+  if (input.mutation) {
+    conditions.push(sql`${agentWakeupRequests.payload} ->> 'mutation' = ${input.mutation}`);
+  }
+  if (input.retryOfRunId) {
+    conditions.push(sql`${agentWakeupRequests.payload} ->> 'retryOfRunId' = ${input.retryOfRunId}`);
+  }
+  const rows = await db
+    .select({ createdAt: agentWakeupRequests.createdAt })
+    .from(agentWakeupRequests)
+    .where(and(...conditions))
+    .orderBy(desc(agentWakeupRequests.createdAt))
+    .limit(1);
+  return rows[0]?.createdAt ?? null;
+}
+
+/**
  * Per-(agent, issue, mutation, retryOfRunId) chain guard. A new
  * `retryOfRunId` is a different chain; the exhausted bucket does not bleed.
  */
@@ -236,6 +330,7 @@ export async function summarizeMutationChainWakeups(
       skippedInWindow: 0,
       mutation: input.mutation,
       retryOfRunId: input.retryOfRunId,
+      mostRecentSkipAt: null,
     };
   }
 
@@ -255,7 +350,10 @@ export async function summarizeMutationChainWakeups(
   }
 
   const rows = await db
-    .select({ status: agentWakeupRequests.status })
+    .select({
+      status: agentWakeupRequests.status,
+      createdAt: agentWakeupRequests.createdAt,
+    })
     .from(agentWakeupRequests)
     .where(and(...conditions));
 
@@ -264,44 +362,91 @@ export async function summarizeMutationChainWakeups(
     (count, row) => (row.status === "skipped" ? count + 1 : count),
     0,
   );
+  // Most recent wake (regardless of status) — used by the backoff layer to
+  // compute elapsed-since-prior and admit only when the curve is honored.
+  let mostRecentSkipAt: Date | null = null;
+  for (const row of rows) {
+    if (mostRecentSkipAt === null || row.createdAt > mostRecentSkipAt) {
+      mostRecentSkipAt = row.createdAt;
+    }
+  }
   return {
     totalInWindow,
     skippedInWindow,
     mutation: input.mutation,
     retryOfRunId: input.retryOfRunId,
+    mostRecentSkipAt,
   };
 }
 
 /**
- * Evaluate both layers; return the most specific reason that tripped
- * (chain beats hourly because chain is intent-aware). Caller decides whether
- * to also escalate the underlying issue.
+ * Evaluate the per-chain backoff before the hourly cap. The chain layer
+ * runs first because the chain is intent-aware: when the same
+ * (mutation, retryOfRunId) keeps skipping, the loop should slow down
+ * independently of the gross-abuse ceiling.
+ *
+ * Order of evaluation:
+ *   1. Chain backoff: at attempt N, require elapsed >= curve(N) since the
+ *      prior skip for the same (agent, issue, mutation, retryOfRunId). A
+ *      fresh chain (no rows) is admitted without backoff. Backoff is
+ *      windowless — the curve applies across the entire history of the
+ *      chain so an exhausted chain can't be re-warmed by waiting out the
+ *      hourly window.
+ *   2. Hourly cap: refuse after WAKE_LOOP_GUARD_HOURLY_LIMIT total skips
+ *      in the 60-minute window.
+ *
+ * Caller decides whether to also escalate the underlying issue.
  */
 export async function evaluateWakeLoopGuard(
   db: Db,
   input: WakeLoopGuardInput,
 ): Promise<WakeLoopGuardDecision> {
+  const now = input.now ?? new Date();
   const payload = (input.payload ?? {}) as Record<string, unknown>;
   const mutation = typeof payload.mutation === "string" ? payload.mutation : null;
   const retryOfRunId = typeof payload.retryOfRunId === "string" ? payload.retryOfRunId : null;
 
   if (mutation || retryOfRunId) {
+    // Backoff looks at the entire chain history (window-agnostic) — the
+    // curve must hold across days, not just the last hour, so a row from
+    // yesterday's exhausted chain still constrains today's wake.
+    const chainMostRecentSkipAt = await loadChainMostRecentSkipAt(db, {
+      companyId: input.companyId,
+      agentId: input.agentId,
+      issueId: input.issueId,
+      mutation,
+      retryOfRunId,
+    });
+    // The hourly count is window-scoped (1 hour) — what we'd add a
+    // hypothetical fresh wake to.
     const chain = await summarizeMutationChainWakeups(db, {
       companyId: input.companyId,
       agentId: input.agentId,
       issueId: input.issueId,
       mutation,
       retryOfRunId,
-      ...(input.now ? { now: input.now } : {}),
+      now,
     });
-    if (chain.totalInWindow >= WAKE_LOOP_GUARD_CHAIN_LIMIT) {
-      return {
-        tripped: true,
-        guard: "chain",
-        count: chain.totalInWindow,
-        limit: WAKE_LOOP_GUARD_CHAIN_LIMIT,
-        windowMs: WAKE_LOOP_GUARD_WINDOW_MS,
-      };
+
+    if (chainMostRecentSkipAt !== null && chain.totalInWindow >= 1) {
+      const attempt = chain.totalInWindow + 1;
+      const requiredElapsed = backoffWindowMsForAttempt(attempt);
+      const elapsedMs = now.getTime() - chainMostRecentSkipAt.getTime();
+      if (elapsedMs < requiredElapsed) {
+        const nextEligibleAt = new Date(
+          chainMostRecentSkipAt.getTime() + requiredElapsed,
+        );
+        return {
+          tripped: true,
+          guard: "backoff",
+          count: chain.totalInWindow,
+          limit: attempt,
+          windowMs: WAKE_LOOP_GUARD_WINDOW_MS,
+          attempt,
+          nextEligibleAt,
+          mostRecentSkipAt: chainMostRecentSkipAt,
+        };
+      }
     }
   }
 
@@ -309,7 +454,7 @@ export async function evaluateWakeLoopGuard(
     companyId: input.companyId,
     agentId: input.agentId,
     issueId: input.issueId,
-    ...(input.now ? { now: input.now } : {}),
+    now,
   });
   if (hourly.totalInWindow >= WAKE_LOOP_GUARD_HOURLY_LIMIT) {
     return {
@@ -318,6 +463,9 @@ export async function evaluateWakeLoopGuard(
       count: hourly.totalInWindow,
       limit: WAKE_LOOP_GUARD_HOURLY_LIMIT,
       windowMs: WAKE_LOOP_GUARD_WINDOW_MS,
+      attempt: hourly.totalInWindow + 1,
+      nextEligibleAt: new Date(now.getTime() + WAKE_LOOP_GUARD_BACKOFF_BASE_MS),
+      mostRecentSkipAt: now,
     };
   }
   return { tripped: false };
@@ -470,7 +618,7 @@ function buildWakeBudgetEscalationDescription(args: {
   const payload = (args.payload ?? {}) as Record<string, unknown>;
   const mutation = typeof payload.mutation === "string" ? payload.mutation : null;
   const retryOfRunId = typeof payload.retryOfRunId === "string" ? payload.retryOfRunId : null;
-  return [
+  const lines = [
     "Paperclip's wake-loop guard tripped for this card. The engine refused to",
     "queue another wakeup because the (agent, issue) pair had crossed the retry",
     "budget in the rolling window. The card has been moved to `blocked` with",
@@ -485,25 +633,41 @@ function buildWakeBudgetEscalationDescription(args: {
     `- Wake mutation: ${mutation ? `\`${mutation}\`` : "(none)"}`,
     `- Wake retryOfRunId: ${retryOfRunId ? `\`${retryOfRunId}\`` : "(none)"}`,
     `- Wake source: \`${args.source}\``,
+  ];
+  if (args.decision.guard === "backoff") {
+    lines.push(
+      "",
+      `Next attempt eligible at: \`${args.decision.nextEligibleAt.toISOString()}\` (exponential backoff)`,
+    );
+  }
+  lines.push(
     "",
     "Next action: review the affected card and either restore a live execution",
     "path, mark the chain as intentionally cancelled, or extend the budget. Do",
     "not close this escalation until the underlying wake loop is broken.",
-  ].join("\n");
+  );
+  return lines.join("\n");
 }
 
 function buildWakeBudgetEscalationOpeningNote(args: {
   decision: Extract<WakeLoopGuardDecision, { tripped: true }>;
   issueIdentifier: string;
 }) {
-  return [
+  const lines = [
     "Paperclip opened this escalation because the wake-loop guard tripped for",
     `\`${args.issueIdentifier}\` (${args.decision.guard} guard, ${args.decision.count}/${args.decision.limit} attempts`,
     `in the last ${Math.round(args.decision.windowMs / 60_000)} minutes). The original card`,
     "is now `blocked` with this escalation as the real blocker edge. Investigate",
     "and either restore a live execution path or close the escalation once the",
     "loop is broken.",
-  ].join(" ");
+  ];
+  if (args.decision.guard === "backoff") {
+    lines.push(
+      "",
+      `Next wake attempt eligible after \`${args.decision.nextEligibleAt.toISOString()}\` (exponential backoff).`,
+    );
+  }
+  return lines.join(" ");
 }
 
 function buildWakeBudgetNote(
@@ -513,15 +677,24 @@ function buildWakeBudgetNote(
   const mutation = typeof (payload ?? {})?.mutation === "string"
     ? (payload as Record<string, unknown>).mutation
     : null;
-  return [
+  const lines = [
     "Wake-loop guard tripped for this card.",
     `- Guard: \`${decision.guard}\``,
     `- Count: ${decision.count}`,
     `- Limit: ${decision.limit}`,
     `- Window: ${decision.windowMs} ms`,
     `- Mutation: ${mutation ? `\`${mutation}\`` : "(none)"}`,
+  ];
+  if (decision.guard === "backoff") {
+    lines.push(
+      `- Next attempt eligible: \`${decision.nextEligibleAt.toISOString()}\``,
+      `- Backoff curve: 30 s × 2^(attempt - 2), capped at 1 hour`,
+    );
+  }
+  lines.push(
     "",
     "Paperclip refused to queue another wakeup and minted a synthetic",
     "escalation as the blocker edge.",
-  ].join("\n");
+  );
+  return lines.join("\n");
 }

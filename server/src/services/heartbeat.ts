@@ -522,7 +522,6 @@ import {
   isTerminalIssueStatusForWake,
   loadIssueStatusForWakeGuard,
   WAKE_LOOP_GUARD_HOURLY_LIMIT,
-  WAKE_LOOP_GUARD_CHAIN_LIMIT,
   WAKE_LOOP_GUARD_WINDOW_MS,
 } from "./wake-loop-guard.js";
 import {

@@ -21,7 +21,8 @@ import {
   evaluateWakeLoopGuard,
   summarizeAgentIssueWakeupsInWindow,
   summarizeMutationChainWakeups,
-  WAKE_LOOP_GUARD_CHAIN_LIMIT,
+  WAKE_LOOP_GUARD_BACKOFF_BASE_MS,
+  WAKE_LOOP_GUARD_BACKOFF_CAP_MS,
   WAKE_LOOP_GUARD_HOURLY_LIMIT,
   WAKE_LOOP_GUARD_WINDOW_MS,
 } from "../services/wake-loop-guard.ts";
@@ -43,7 +44,9 @@ describeEmbeddedPostgres("wake-loop guard", () => {
   beforeAll(async () => {
     tempDb = await startEmbeddedPostgresTestDatabase("paperclip-wake-loop-guard-");
     db = createDb(tempDb.connectionString);
-    heartbeat = heartbeatService(db);
+    heartbeat = heartbeatService(db, {
+      runtimeEnv: { ...process.env, PAPERCLIP_IN_WORKTREE: "false" },
+    });
   }, 20_000);
 
   afterEach(async () => {
@@ -183,32 +186,12 @@ describeEmbeddedPostgres("wake-loop guard", () => {
     expect(chainB.totalInWindow).toBe(3);
   });
 
-  it("evaluateWakeLoopGuard trips the chain guard at 10 skips on the same chain", async () => {
-    const { companyId, agentId, issueId } = await seedCompanyAgentIssue();
-    const retryOfRunId = "e6d552b0-aaaa-bbbb-cccc-ddddeeeeffff";
-    await seedSkippedWakeup({
-      companyId, agentId, issueId,
-      mutation: "interaction",
-      retryOfRunId,
-      count: WAKE_LOOP_GUARD_CHAIN_LIMIT,
-    });
-
-    const decision = await evaluateWakeLoopGuard(db, {
-      companyId, agentId, issueId,
-      payload: { issueId, mutation: "interaction", retryOfRunId },
-    });
-    expect(decision.tripped).toBe(true);
-    if (decision.tripped) {
-      expect(decision.guard).toBe("chain");
-      expect(decision.count).toBe(WAKE_LOOP_GUARD_CHAIN_LIMIT);
-      expect(decision.limit).toBe(WAKE_LOOP_GUARD_CHAIN_LIMIT);
-    }
-  });
-
   it("evaluateWakeLoopGuard trips the hourly guard at 20 across chains", async () => {
     const { companyId, agentId, issueId } = await seedCompanyAgentIssue();
-    // 7 skips on chain A, 7 on chain B, 7 on chain C → 21 total, each chain under
-    // the chain limit but the (agent, issue) hourly guard trips.
+    // 7 skips on chain A, 7 on chain B, 7 on chain C → 21 total. Each chain
+    // is under its own backoff floor for `chain-D` (no prior rows), but the
+    // (agent, issue) hourly guard trips because the bucket holds 21 rows
+    // regardless of chain.
     await seedSkippedWakeup({
       companyId, agentId, issueId,
       mutation: "interaction", retryOfRunId: "chain-A", count: 7,
@@ -234,14 +217,88 @@ describeEmbeddedPostgres("wake-loop guard", () => {
     }
   });
 
+  it("evaluateWakeLoopGuard trips the backoff layer when the chain has a recent prior skip", async () => {
+    const { companyId, agentId, issueId } = await seedCompanyAgentIssue();
+    const retryOfRunId = "e6d552b0-backoff-cur-veee-1111-2222333344";
+    // Seed 1 prior skip 1 s ago — under the chain cap (10), well under the
+    // hourly cap (20), but attempt 2 must wait the backoff floor (30 s).
+    const now = new Date();
+    await db.insert(agentWakeupRequests).values({
+      id: randomUUID(),
+      companyId, agentId,
+      source: "automation",
+      triggerDetail: "system",
+      reason: "issue_dependencies_blocked",
+      payload: { issueId, mutation: "interaction", retryOfRunId },
+      status: "skipped",
+      requestedByActorType: "system",
+      requestedByActorId: "test",
+      createdAt: new Date(now.getTime() - 1_000),
+    });
+
+    const decision = await evaluateWakeLoopGuard(db, {
+      companyId, agentId, issueId,
+      payload: { issueId, mutation: "interaction", retryOfRunId },
+      now,
+    });
+    expect(decision.tripped).toBe(true);
+    if (decision.tripped) {
+      expect(decision.guard).toBe("backoff");
+      expect(decision.count).toBe(1);
+      expect(decision.attempt).toBe(2);
+      expect(decision.limit).toBe(2);
+      // The next-eligible time is the prior skip + 30 s (attempt 2 floor).
+      const gap = decision.nextEligibleAt.getTime() - decision.mostRecentSkipAt.getTime();
+      expect(gap).toBe(WAKE_LOOP_GUARD_BACKOFF_BASE_MS);
+    }
+  });
+
+  it("evaluateWakeLoopGuard admits a chain wake when the backoff curve is honored", async () => {
+    const { companyId, agentId, issueId } = await seedCompanyAgentIssue();
+    const retryOfRunId = "e6d552b0-backoff-coo-led-1111-2222333344";
+    // Seed 1 prior skip 5 minutes ago — well past attempt 2's 30 s floor and
+    // under both caps; the wake must be admitted.
+    const now = new Date();
+    await db.insert(agentWakeupRequests).values({
+      id: randomUUID(),
+      companyId, agentId,
+      source: "automation",
+      triggerDetail: "system",
+      reason: "issue_dependencies_blocked",
+      payload: { issueId, mutation: "interaction", retryOfRunId },
+      status: "skipped",
+      requestedByActorType: "system",
+      requestedByActorId: "test",
+      createdAt: new Date(now.getTime() - 5 * 60 * 1000),
+    });
+
+    const decision = await evaluateWakeLoopGuard(db, {
+      companyId, agentId, issueId,
+      payload: { issueId, mutation: "interaction", retryOfRunId },
+      now,
+    });
+    expect(decision.tripped).toBe(false);
+  });
+
+  it("backoff curve doubles per attempt and caps at 1 hour", async () => {
+    // attempt 2 → 30 s
+    expect(WAKE_LOOP_GUARD_BACKOFF_BASE_MS).toBe(30_000);
+    // attempt 10 (2^8 × 30 s = 7 680 000 ms ≈ 2.13 h) → 1 h cap
+    const ten = WAKE_LOOP_GUARD_BACKOFF_BASE_MS * Math.pow(2, 8);
+    expect(ten).toBeGreaterThan(WAKE_LOOP_GUARD_BACKOFF_CAP_MS);
+    expect(WAKE_LOOP_GUARD_BACKOFF_CAP_MS).toBe(60 * 60 * 1000);
+  });
+
   it("evaluateWakeLoopGuard admits a fresh retryOfRunId when only its own chain is empty", async () => {
     const { companyId, agentId, issueId } = await seedCompanyAgentIssue();
-    // Exhaust the chain guard on `exhausted-chain` (10 rows) AND push the
-    // (agent, issue) bucket above the hourly limit via other chain rows.
+    // Saturate the (agent, issue) bucket above the hourly limit with mixed
+    // chain rows, then verify that `fresh-chain` (an empty chain) trips the
+    // hourly guard — not the chain guard, which only fires for chains that
+    // have their own recent skips.
     await seedSkippedWakeup({
       companyId, agentId, issueId,
       mutation: "interaction", retryOfRunId: "exhausted-chain",
-      count: WAKE_LOOP_GUARD_CHAIN_LIMIT,
+      count: 10,
     });
     await seedSkippedWakeup({
       companyId, agentId, issueId,
@@ -270,10 +327,20 @@ describeEmbeddedPostgres("wake-loop guard", () => {
   it("enqueueWakeup records wake_loop_guard_tripped when the guard trips", async () => {
     const { companyId, agentId, issueId } = await seedCompanyAgentIssue();
     const retryOfRunId = "e6d552b0-deadbeef-cafe-fade-000000000000";
-    await seedSkippedWakeup({
-      companyId, agentId, issueId,
-      mutation: "interaction", retryOfRunId,
-      count: WAKE_LOOP_GUARD_CHAIN_LIMIT,
+    // Seed 1 prior skip 1 s ago — well under the hourly cap, but the next
+    // wake is attempt 2 which needs the 30 s backoff floor.
+    const now = Date.now();
+    await db.insert(agentWakeupRequests).values({
+      id: randomUUID(),
+      companyId, agentId,
+      source: "automation",
+      triggerDetail: "system",
+      reason: "issue_dependencies_blocked",
+      payload: { issueId, mutation: "interaction", retryOfRunId },
+      status: "skipped",
+      requestedByActorType: "system",
+      requestedByActorId: "test",
+      createdAt: new Date(now - 1_000),
     });
 
     const wake = await heartbeat.wakeup(agentId, {
@@ -307,17 +374,27 @@ describeEmbeddedPostgres("wake-loop guard", () => {
     expect(latestSkip?.reason).toBe("wake_loop_guard_tripped");
     const skipPayload = latestSkip?.payload as Record<string, unknown> | null;
     const skipDetails = (skipPayload?.heartbeatSkip ?? {}) as Record<string, unknown>;
-    expect(skipDetails.guard).toBe("chain");
-    expect(skipDetails.count).toBe(WAKE_LOOP_GUARD_CHAIN_LIMIT);
+    expect(skipDetails.guard).toBe("backoff");
+    expect(skipDetails.count).toBe(1);
   });
 
   it("does not insert further wakeup rows once the guard trips (loop dies cold)", async () => {
     const { companyId, agentId, issueId } = await seedCompanyAgentIssue();
     const retryOfRunId = "e6d552b0-11112222-3333-4444-555566667777";
-    await seedSkippedWakeup({
-      companyId, agentId, issueId,
-      mutation: "interaction", retryOfRunId,
-      count: WAKE_LOOP_GUARD_CHAIN_LIMIT,
+    // Seed 1 prior skip 1 s ago — well under the hourly cap, but the next
+    // wake is attempt 2 which needs the 30 s backoff floor.
+    const now = Date.now();
+    await db.insert(agentWakeupRequests).values({
+      id: randomUUID(),
+      companyId, agentId,
+      source: "automation",
+      triggerDetail: "system",
+      reason: "issue_dependencies_blocked",
+      payload: { issueId, mutation: "interaction", retryOfRunId },
+      status: "skipped",
+      requestedByActorType: "system",
+      requestedByActorId: "test",
+      createdAt: new Date(now - 1_000),
     });
 
     const before = await db
@@ -364,7 +441,7 @@ describeEmbeddedPostgres("wake-loop guard", () => {
     // dedup, this loop would still produce 5 rows in this test (one per pass).
     expect(after - before).toBe(1);
 
-    // The single new row is the trip-record for `chain` guard.
+    // The single new row is the trip-record for the backoff guard.
     const recentReason = await db
       .select({ reason: agentWakeupRequests.reason, status: agentWakeupRequests.status })
       .from(agentWakeupRequests)
@@ -475,10 +552,19 @@ describeEmbeddedPostgres("wake-loop guard", () => {
   it("trip-row dedup window: a second guard trip within 60 s writes no new row", async () => {
     const { companyId, agentId, issueId } = await seedCompanyAgentIssue();
     const retryOfRunId = "e6d552b0-dedup-test-1111-2222-3333";
-    await seedSkippedWakeup({
-      companyId, agentId, issueId,
-      mutation: "interaction", retryOfRunId,
-      count: WAKE_LOOP_GUARD_CHAIN_LIMIT,
+    // Seed 1 prior skip 1 s ago — backoff fires on the next wake.
+    const now = Date.now();
+    await db.insert(agentWakeupRequests).values({
+      id: randomUUID(),
+      companyId, agentId,
+      source: "automation",
+      triggerDetail: "system",
+      reason: "issue_dependencies_blocked",
+      payload: { issueId, mutation: "interaction", retryOfRunId },
+      status: "skipped",
+      requestedByActorType: "system",
+      requestedByActorId: "test",
+      createdAt: new Date(now - 1_000),
     });
 
     // First wake — guard trips, one row written.
@@ -529,10 +615,18 @@ describeEmbeddedPostgres("wake-loop guard", () => {
   it("operator-driven wakeups (requestedByActorType=user) bypass the guard", async () => {
     const { companyId, agentId, issueId } = await seedCompanyAgentIssue();
     const retryOfRunId = "e6d552b0-bbbbcccc-dddd-eeee-ffff00001111";
-    await seedSkippedWakeup({
-      companyId, agentId, issueId,
-      mutation: "interaction", retryOfRunId,
-      count: WAKE_LOOP_GUARD_CHAIN_LIMIT,
+    const now = Date.now();
+    await db.insert(agentWakeupRequests).values({
+      id: randomUUID(),
+      companyId, agentId,
+      source: "automation",
+      triggerDetail: "system",
+      reason: "issue_dependencies_blocked",
+      payload: { issueId, mutation: "interaction", retryOfRunId },
+      status: "skipped",
+      requestedByActorType: "system",
+      requestedByActorId: "test",
+      createdAt: new Date(now - 1_000),
     });
 
     // Operator wakes must always pass — a board operator pressing "retry" is
