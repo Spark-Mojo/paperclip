@@ -156,16 +156,48 @@ const support = await getEmbeddedPostgresTestSupport();
       }
     });
 
-    it("rejects handoff history from a different task", async () => {
+    it("does not import handoff history from a different task", async () => {
       const [source] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
       await db.update(heartbeatRuns).set({ contextSnapshot: { issueId: randomUUID() } }).where(eq(heartbeatRuns.id, runId));
       try {
-        await expect(buildExecutionContinuation({ db, companyId, issueId, agentId,
-          context: { interruptedRunId: runId }, summary: null, exposeLowTrustRaw: false }))
-          .rejects.toThrow("continuation_source_context_missing");
+        const envelope = await buildExecutionContinuation({ db, companyId, issueId, agentId,
+          context: { interruptedRunId: runId }, summary: null, exposeLowTrustRaw: false });
+        expect(envelope.completedWork).toBeNull();
+        expect(envelope.completedActions).toEqual([]);
+        expect(envelope.messages.map(row => row.id)).toEqual([notionId, gmailId, laterId]);
       } finally {
         await db.update(heartbeatRuns).set({ contextSnapshot: source.contextSnapshot }).where(eq(heartbeatRuns.id, runId));
       }
+    });
+
+    it("wakes the target card when its interaction was created on another card", async () => {
+      const [source] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+      const [interaction] = await db.select().from(issueThreadInteractions).where(eq(issueThreadInteractions.id, interactionId));
+      await db.update(heartbeatRuns).set({ contextSnapshot: { issueId: randomUUID(), commentId: randomUUID() },
+        resultJson: { nativeResult: { summary: "Work on the other card" } } }).where(eq(heartbeatRuns.id, runId));
+      await db.update(issueThreadInteractions).set({ originCommentIds: [gmailId, randomUUID()], sourceCommentId: null }).where(eq(issueThreadInteractions.id, interactionId));
+      try {
+        const envelope = await buildExecutionContinuation({ db, companyId, issueId, agentId,
+          context: { interactionId, wakeReason: "interaction_resolved" }, summary: null, exposeLowTrustRaw: false });
+        expect(envelope.trigger).toMatchObject({ interactionId, sourceRunId: runId });
+        expect(envelope.interactionOutcomes).toContainEqual(expect.objectContaining({ id: interactionId, status: "accepted" }));
+        expect(envelope.originCommentIds).toEqual([gmailId]);
+        expect(envelope.messages.map(row => row.id)).toEqual([notionId, gmailId, laterId]);
+        expect(envelope.completedWork).toBeNull();
+        expect(envelope.completedActions).toEqual([]);
+      } finally {
+        await db.update(heartbeatRuns).set({ contextSnapshot: source.contextSnapshot, resultJson: source.resultJson }).where(eq(heartbeatRuns.id, runId));
+        await db.update(issueThreadInteractions).set({ originCommentIds: interaction.originCommentIds, sourceCommentId: interaction.sourceCommentId }).where(eq(issueThreadInteractions.id, interactionId));
+      }
+    });
+
+    it("continues if the source run no longer exists", async () => {
+      const missingId = randomUUID();
+      const envelope = await buildExecutionContinuation({ db, companyId, issueId, agentId,
+        context: { retryOfRunId: missingId }, summary: null, exposeLowTrustRaw: false });
+      expect(envelope.trigger.sourceRunId).toBe(missingId);
+      expect(envelope.messages.map(row => row.id)).toEqual([notionId, gmailId, laterId]);
+      expect(envelope.completedWork).toBeNull();
     });
 
     it("keeps instruction-like handoff summaries inside the untrusted evidence boundary", async () => {
@@ -321,18 +353,38 @@ const support = await getEmbeddedPostgresTestSupport();
       expect(freshPrompt).toContain("Read my Notion launch notes.");
       expect(freshPrompt).not.toContain('"resumeDelta"');
     });
-    it("fails closed when required originating context is missing", async () => {
-      await expect(
-        buildExecutionContinuation({
-          db,
-          companyId,
-          issueId,
-          agentId,
-          context: { commentId: randomUUID() },
-          summary: null,
-          exposeLowTrustRaw: false,
-        }),
-      ).rejects.toThrow("continuation_source_context_missing");
+    it("continues from available history when an origin comment is missing", async () => {
+      const envelope = await buildExecutionContinuation({
+        db,
+        companyId,
+        issueId,
+        agentId,
+        context: { commentId: randomUUID() },
+        summary: null,
+        exposeLowTrustRaw: false,
+      });
+      expect(envelope.originCommentIds).toEqual([]);
+      expect(envelope.messages.map(row => row.id)).toEqual([notionId, gmailId, laterId]);
+    });
+
+    it("preserves explicit user continuation authorization on a missing source", async () => {
+      await expect(buildExecutionContinuation({ db, companyId, issueId, agentId,
+        context: { explicitUserContinuation: { previousRunId: randomUUID() } },
+        summary: null, exposeLowTrustRaw: false }))
+        .rejects.toThrow("continuation_user_authorization_missing");
+    });
+
+    it("does not treat a cross-card interaction source as explicit user authorization", async () => {
+      const [source] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+      await db.update(heartbeatRuns).set({ contextSnapshot: { issueId: randomUUID() } }).where(eq(heartbeatRuns.id, runId));
+      try {
+        await expect(buildExecutionContinuation({ db, companyId, issueId, agentId,
+          context: { interactionId, explicitUserContinuation: { previousRunId: runId } },
+          summary: null, exposeLowTrustRaw: false }))
+          .rejects.toThrow("continuation_user_authorization_missing");
+      } finally {
+        await db.update(heartbeatRuns).set({ contextSnapshot: source.contextSnapshot }).where(eq(heartbeatRuns.id, runId));
+      }
     });
     it("rejects another company and an invalidated task owner", async () => {
       await expect(
