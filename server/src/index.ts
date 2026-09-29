@@ -1600,6 +1600,25 @@ async function startServerWithDatabaseTeardown(
       logger.warn({ ...setupCleanup }, "startup environment customImage setup cleanup changed sessions");
     }
 
+    // SPA-9351: a deferred wake whose blocking run ended before the process
+    // restarted never sees a run-end event, so the startup pass is the only
+    // chance to promote it. Ordered after the startup stale-lock sweep for the
+    // same reason as the periodic pass.
+    if (heartbeat && !heartbeatSchedulingSuppression.suppressed) {
+      const deferredWakes = await heartbeat
+        .reconcileStaleDeferredWakes()
+        .catch((err) => {
+          logger.error({ err }, "startup deferred-wake backstop failed");
+          return null;
+        });
+      if (deferredWakes && deferredWakes.promoted > 0) {
+        logger.warn(
+          { ...deferredWakes },
+          "startup deferred-wake backstop promoted stranded wakes",
+        );
+      }
+    }
+
     const toolHealthSweep = await tools.sweepConnectionHealth();
     if (toolHealthSweep.failed > 0) {
       logger.warn({ ...toolHealthSweep }, "startup tool connection health sweep found failing connections");
@@ -1824,6 +1843,15 @@ async function startServerWithDatabaseTeardown(
               const swept = await heartbeat.sweepStaleIssueLocks();
               if (swept.cleared > 0) {
                 logger.warn({ ...swept }, "periodic stale-lock sweeper cleared issue locks");
+              }
+            })
+            // SPA-9351: runs after the stale-lock sweeper so a lock column left
+            // behind by a finished run is cleared before the backstop decides
+            // whether a deferred wake's blocking run is still the live owner.
+            .then(async () => {
+              const promoted = await heartbeat.reconcileStaleDeferredWakes();
+              if (promoted.promoted > 0) {
+                logger.warn({ ...promoted }, "periodic deferred-wake backstop promoted stranded wakes");
               }
             })
             .catch((err) => {

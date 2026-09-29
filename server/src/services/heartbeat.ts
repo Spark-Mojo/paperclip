@@ -382,7 +382,12 @@ import {
   readManagedWorktreeInstanceOwnership,
   WORKTREE_INSTANCE_ROOT_METADATA_KEY,
 } from "./workspace-instance-cleanup.js";
-import { issueService } from "./issues.js";
+import { issueService, TERMINAL_HEARTBEAT_RUN_STATUSES } from "./issues.js";
+import {
+  DEFERRED_WAKE_BACKSTOP_CANDIDATE_LIMIT,
+  decideDeferredWakeBackstop,
+  readDeferredWakeBlockingReference,
+} from "./deferred-wake-backstop.js";
 import {
   blockRunnerGoalRecovery,
   failRunnerGoalAction,
@@ -19469,6 +19474,199 @@ export function heartbeatService(
     }
   }
 
+  /**
+   * SPA-9351: backstop for deferred wakes whose blocking run has already ended.
+   *
+   * Promotion is otherwise purely event-driven (the run-end release drains the
+   * queue), so a row that was already stale when that release shipped is never
+   * promoted. The pre-existing re-drives above are filtered to comment-queue
+   * wakes and resolve the blocker as the *wake agent's* latest run — which is
+   * exactly how SPA-9280 slipped through: its wake addresses the reassigned
+   * assignee, who has no run on the card, so the lookup finds nothing and the
+   * sweep skips it on every tick forever.
+   *
+   * This resolves the blocker from the wake's own recorded reference
+   * (`payload.interruptedRunId`), promotes through the same release admission
+   * so pause holds, leases and invokability still apply, and never displaces a
+   * newer live execution owner.
+   */
+  async function reconcileStaleDeferredWakes() {
+    const result = {
+      checked: 0,
+      promoted: 0,
+      suppressed: 0,
+      candidateLimitSkipped: 0,
+      wakeIds: [] as string[],
+    };
+
+    const candidates = await db
+      .select({ wake: agentWakeupRequests, companyStatus: companies.status })
+      .from(agentWakeupRequests)
+      .innerJoin(
+        issues,
+        and(
+          eq(issues.companyId, agentWakeupRequests.companyId),
+          sql`${issues.id}::text = ${agentWakeupRequests.payload}->>'issueId'`,
+        ),
+      )
+      .innerJoin(companies, eq(companies.id, issues.companyId))
+      .where(
+        and(
+          eq(agentWakeupRequests.status, "deferred_issue_execution"),
+          isNull(agentWakeupRequests.finishedAt),
+        ),
+      )
+      .orderBy(asc(agentWakeupRequests.requestedAt))
+      .limit(DEFERRED_WAKE_BACKSTOP_CANDIDATE_LIMIT);
+
+    for (const { wake, companyStatus } of candidates) {
+      result.checked += 1;
+      const issueId = readNonEmptyString(wake.payload?.issueId);
+      if (!issueId) {
+        result.suppressed += 1;
+        continue;
+      }
+      const reference = readDeferredWakeBlockingReference(wake.payload);
+
+      // Resolve the blocking run from the WAKE's reference, never from the
+      // wake agent's run history: after a reassignment the addressee may have
+      // no run on this card at all, which is the bug being fixed.
+      let blockingRunId: string | null = null;
+      let blockingRunStatus: string | null = null;
+      let blockingRunRow: typeof heartbeatRuns.$inferSelect | null = null;
+      let recoveryActionRunStatus: string | null = null;
+      let referenceUnresolvable = false;
+
+      if (reference.kind === "run") {
+        const [row] = await db
+          .select()
+          .from(heartbeatRuns)
+          .where(
+            and(
+              eq(heartbeatRuns.companyId, wake.companyId),
+              eq(heartbeatRuns.id, reference.runId),
+            ),
+          )
+          .limit(1);
+        if (row) {
+          blockingRunId = row.id;
+          blockingRunStatus = row.status;
+          blockingRunRow = row;
+        } else {
+          referenceUnresolvable = true;
+        }
+      } else if (reference.kind === "recovery_action") {
+        const [action] = await db
+          .select({ evidence: issueRecoveryActions.evidence })
+          .from(issueRecoveryActions)
+          .where(
+            and(
+              eq(issueRecoveryActions.companyId, wake.companyId),
+              eq(issueRecoveryActions.id, reference.recoveryActionId),
+            ),
+          )
+          .limit(1);
+        const evidenceRunId = readNonEmptyString(
+          (parseObject(action?.evidence).runId as string | undefined) ??
+            (parseObject(action?.evidence).sourceRunId as string | undefined),
+        );
+          if (action && evidenceRunId) {
+            const [row] = await db
+              .select()
+              .from(heartbeatRuns)
+              .where(
+                and(
+                  eq(heartbeatRuns.companyId, wake.companyId),
+                  eq(heartbeatRuns.id, evidenceRunId),
+                ),
+              )
+              .limit(1);
+          if (row) {
+            blockingRunId = row.id;
+            recoveryActionRunStatus = row.status;
+            blockingRunRow = row;
+          } else {
+            referenceUnresolvable = true;
+          }
+        } else {
+          referenceUnresolvable = true;
+        }
+      }
+
+      const [issue] = await db
+        .select({
+          status: issues.status,
+          assigneeAgentId: issues.assigneeAgentId,
+          executionRunId: issues.executionRunId,
+        })
+        .from(issues)
+        .where(eq(issues.id, issueId))
+        .limit(1);
+
+      const decision = decideDeferredWakeBackstop({
+        wakeStatus: wake.status,
+        blockingReference: reference,
+        blockingRunStatus,
+        recoveryActionRunStatus,
+        issueExecutionRunId: issue?.executionRunId ?? null,
+        blockingRunStillHoldsLock:
+          issue?.executionRunId != null && issue.executionRunId === blockingRunId,
+        issueStatus: issue?.status ?? "",
+        wakeAgentIsAssignee: issue?.assigneeAgentId === wake.agentId,
+        wakeCompanyIsActive: companyStatus === "active",
+        referenceUnresolvable,
+      });
+
+      if (decision.kind === "suppressed") {
+        result.suppressed += 1;
+        continue;
+      }
+
+      // Go through the real release admission rather than flipping the status
+      // by hand: promotion must create the run, take the issue lock, and apply
+      // the post-commit dispatch effects, or the wake would sit in `queued`
+      // forever with nothing dispatching it. The wrapper returns void, so
+      // success is read back off the wake row itself.
+      let released = false;
+      if (blockingRunRow) {
+        await releaseIssueExecutionAndPromote(blockingRunRow, {
+          suppressImmediateRecovery: true,
+        }).catch((err) => {
+          logger.warn(
+            { err, wakeId: wake.id, runId: decision.blockingRunId },
+            "deferred-wake backstop failed to promote",
+          );
+        });
+        const [after] = await db
+          .select({ status: agentWakeupRequests.status, runId: agentWakeupRequests.runId })
+          .from(agentWakeupRequests)
+          .where(
+            and(
+              eq(agentWakeupRequests.id, wake.id),
+              eq(agentWakeupRequests.companyId, wake.companyId),
+            ),
+          )
+          .limit(1);
+        released = after?.status === "queued" && Boolean(after.runId);
+      }
+
+      if (released) {
+        result.promoted += 1;
+        result.wakeIds.push(wake.id);
+      } else {
+        result.suppressed += 1;
+      }
+    }
+
+    if (result.promoted > 0) {
+      logger.warn(
+        { ...result, wakeIds: undefined },
+        "deferred-wake backstop promoted wakes whose blocking run had already ended (SPA-9351)",
+      );
+    }
+    return result;
+  }
+
   async function recoverActiveSessionGoals() {
     if ((await getSchedulingSuppression()).suppressed) {
       return { scanned: 0, enqueued: 0 };
@@ -29814,6 +30012,7 @@ export function heartbeatService(
     retryScheduledRetryNow,
 
     resumeQueuedRuns,
+    reconcileStaleDeferredWakes,
 
     scheduleBoundedRetry: async (
       runId: string,
