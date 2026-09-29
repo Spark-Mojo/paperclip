@@ -253,6 +253,14 @@ export const INSTANCE_FEATURE_CATALOG: Record<InstanceFeatureKey, FeatureCatalog
     cloudDefault: false,
     selfHostedDefault: false,
   },
+  enableEphemeralWorktreePerRun: {
+    title: "Ephemeral Worktree Per Run (SPA-9275)",
+    description:
+      "Provision one git worktree per heartbeat run (under <worktreeParentDir>/runs/<runId>/) and force-remove it after the run pushes its branch. A startup reaper sweeps orphan run directories whose owning run is no longer live. Default OFF — opt-in via instance settings.",
+    tier: "managed",
+    cloudDefault: false,
+    selfHostedDefault: false,
+  },
 };
 
 export const INSTANCE_FEATURE_KEYS = Object.keys(INSTANCE_FEATURE_CATALOG).sort() as InstanceFeatureKey[];
