@@ -24,7 +24,6 @@ import {
   updateIssueWorkProductSchema,
   type Issue,
   type IssueComment,
-  type IssueThreadInteraction,
   upsertIssueDocumentSchema,
   upsertIssueFeedbackVoteSchema,
 } from "@paperclipai/shared";
@@ -81,6 +80,7 @@ interface IssueUpdateOptions extends BaseClientOptions {
 
 interface IssueCommentOptions extends BaseClientOptions {
   body: string;
+  attachmentId?: string[];
   reopen?: boolean;
   resume?: boolean;
 }
@@ -228,39 +228,11 @@ export function registerIssueCommands(program: Command): void {
       .command("get")
       .description("Get an issue by UUID or identifier (e.g. PC-12)")
       .argument("<idOrIdentifier>", "Issue ID or identifier")
-      .option(
-        "--include-interactions",
-        "Augment output with `pendingInteractions` (default ON for interactive non-JSON use; default OFF for --json to keep scripts stable)",
-      )
-      .option("--no-include-interactions", "Disable pendingInteractions augmentation")
-      .action(async (idOrIdentifier: string, opts: BaseClientOptions & { includeInteractions?: boolean }) => {
+      .action(async (idOrIdentifier: string, opts: BaseClientOptions) => {
         try {
           const ctx = resolveCommandContext(opts);
           const row = await ctx.api.get<Issue>(apiPath`/api/issues/${idOrIdentifier}`);
-          const includeInteractions = opts.includeInteractions ?? (!ctx.json && Boolean(process.stdout.isTTY));
-          if (!includeInteractions) {
-            printOutput(row, { json: ctx.json });
-            return;
-          }
-          // SPA-4971: honest-state filter — pending (unanswered, still live) plus expired
-          // (the unanswered James-facing confirmation that timed out; hiding it repeats the
-          // SPA-4885 blind spot). Terminal statuses (accepted/rejected/answered/cancelled/
-          // failed) stay excluded. Status set lives in @paperclipai/shared
-          // ISSUE_THREAD_INTERACTION_STATUSES.
-          const interactions = await ctx.api.get<IssueThreadInteraction[]>(
-            apiPath`/api/issues/${idOrIdentifier}/interactions`,
-          );
-          const pendingInteractions = (interactions ?? [])
-            .filter((i) => i.status === "pending" || i.status === "expired")
-            .map((i) => ({
-              id: i.id,
-              kind: i.kind,
-              status: i.status,
-              title: i.title ?? null,
-              summary: i.summary ?? null,
-              createdAt: i.createdAt,
-            }));
-          printOutput({ ...row, pendingInteractions }, { json: ctx.json });
+          printOutput(row, { json: ctx.json });
         } catch (err) {
           handleCommandError(err);
         }
@@ -390,6 +362,10 @@ export function registerIssueCommands(program: Command): void {
       .description("Add comment to issue")
       .argument("<issueId>", "Issue ID")
       .requiredOption("--body <text>", "Comment body")
+      .option(
+        "--attachment-id <id...>",
+        "Bind uploaded issue attachments to this comment",
+      )
       .option("--reopen", "Reopen if issue is done/cancelled")
       .option("--resume", "Request explicit follow-up and wake the assignee when resumable")
       .action(async (issueId: string, opts: IssueCommentOptions) => {
@@ -397,6 +373,7 @@ export function registerIssueCommands(program: Command): void {
           const ctx = resolveCommandContext(opts);
           const payload = addIssueCommentSchema.parse({
             body: opts.body,
+            attachmentIds: opts.attachmentId,
             reopen: opts.reopen,
             resume: opts.resume,
           });
