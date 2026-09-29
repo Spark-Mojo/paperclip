@@ -28,3 +28,7 @@ Read SPA-9011 live (backlog): R2 concerns registered execution-workspace cleanup
    RESULT: exit 0, EXPECT matched (empty output).
 
 No lint script exists in root or server package.json; do not invent one.
+
+## CI comparison (2026-09-29)
+
+`gh pr view 118 -R Spark-Mojo/paperclip --json headRefOid,statusCheckRollup` confirms survivor-base predecessor PR #118 head 9e9a05ede909f2646a49ed99aa564a7d4bd5b256 has the same failing review, policy, workspaces-b, serialized 2/9, verify and e2e contexts (run 36546551412). The merge commit itself has no check runs; absence is not a green baseline. PR #123 run 36561673658 has all 12 server shards, Typecheck + Release Registry, and Build green. `gh run view 36561673658 --log-failed` shows workspaces-b EPIPE in unchanged adapter-utils/server-utils.test.ts. Red contexts are existing fork baseline/infra, not scratch-gate regressions. e2e shard 7/8 is additionally red; no claim of a fully green suite. First verifier attempt exhausted its step budget without a verdict/transport block; fresh infra retry required before merge handoff.
