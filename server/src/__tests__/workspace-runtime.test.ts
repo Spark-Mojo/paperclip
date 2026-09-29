@@ -28,6 +28,7 @@ import {
   buildWorkspaceRuntimeDesiredStatePatch,
   cleanupExecutionWorkspaceArtifacts,
   ensurePersistedExecutionWorkspaceAvailable,
+  ExecutionWorkspaceNotProvisionableError,
   ensureServerWorkspaceLinksCurrent,
   ensureRuntimeServicesForRun,
   listConfiguredRuntimeServiceEntries,
@@ -3642,11 +3643,20 @@ describe("realizeExecutionWorkspace", () => {
     });
   }, 15_000);
 
-  it("does not reuse a missing persisted local filesystem workspace", async () => {
+  it("never silently reuses a missing persisted local filesystem workspace (SPA-9315)", async () => {
     const baseCwd = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-workspace-base-"));
     const missingCwd = path.join(baseCwd, "missing-workspace");
 
-    const restored = await ensurePersistedExecutionWorkspaceAvailable({
+    // Pre-SPA-9315 this returned `null`, which the heartbeat provisioning layer
+    // turned into the generic `inherited_workspace_reuse_unavailable` throw and
+    // a `setup_failed` run — because SPA-7090's refusal gate keys on the row
+    // status, and this row still reads `active`. The missing directory is
+    // PROVABLY unrestorable for a non-git_worktree strategy (the SPA-8870
+    // restore-from-origin arm is gated behind git_worktree), so it now signals a
+    // typed failure the caller can discriminate. The invariant this test guards —
+    // "never hand back a workspace that is not on disk" — is unchanged and
+    // stronger: it now fails loudly instead of degrading to a bare null.
+    await expect(ensurePersistedExecutionWorkspaceAvailable({
       base: {
         baseCwd,
         source: "project_primary",
@@ -3656,8 +3666,10 @@ describe("realizeExecutionWorkspace", () => {
         repoRef: null,
       },
       workspace: {
+        id: "workspace-missing",
         mode: "shared_workspace",
         strategyType: "project_primary",
+        status: "active",
         cwd: missingCwd,
         providerRef: null,
         projectId: "project-1",
@@ -3676,9 +3688,56 @@ describe("realizeExecutionWorkspace", () => {
         name: "Codex Coder",
         companyId: "company-1",
       },
-    });
+    })).rejects.toThrow(ExecutionWorkspaceNotProvisionableError);
 
-    expect(restored).toBeNull();
+    // The typed error must remain catchable as a workspace validation failure so
+    // the two other callers of this function keep their fail-closed handling.
+    const error = await ensurePersistedExecutionWorkspaceAvailable({
+      base: {
+        baseCwd,
+        source: "project_primary",
+        projectId: "project-1",
+        workspaceId: null,
+        repoUrl: null,
+        repoRef: null,
+      },
+      workspace: {
+        id: "workspace-missing",
+        mode: "shared_workspace",
+        strategyType: "project_primary",
+        status: "active",
+        cwd: missingCwd,
+        providerRef: null,
+        projectId: "project-1",
+        projectWorkspaceId: null,
+        repoUrl: null,
+        baseRef: null,
+        branchName: null,
+      },
+      issue: {
+        id: "issue-1",
+        identifier: "PAP-453",
+        title: "Missing local workspace",
+      },
+      agent: {
+        id: "agent-1",
+        name: "Codex Coder",
+        companyId: "company-1",
+      },
+    }).catch((caught) => caught);
+
+    expect(error).toBeInstanceOf(ExecutionWorkspaceNotProvisionableError);
+    expect(error.code).toBe("workspace_validation_failed");
+    expect(error.executionWorkspaceId).toBe("workspace-missing");
+    expect(error.workspaceStatus).toBe("active");
+    expect(error.resultJson).toMatchObject({
+      workspaceValidation: {
+        reason: "execution_workspace_not_provisionable",
+        reasonCode: "missing_on_disk_directory",
+        executionWorkspaceId: "workspace-missing",
+        workspaceStatus: "active",
+      },
+    });
   });
 
   it("reprovisions an existing persisted git worktree before manual control starts it", async () => {
