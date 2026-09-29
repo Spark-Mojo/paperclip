@@ -6190,7 +6190,8 @@ function formatStaleReuseFallbackWarning(input: {
   executionWorkspaceId: string | null | undefined;
   workspaceStatus: string | null | undefined;
   branchName: string | null | undefined;
-}) {  const issueLabel = input.issueRef?.identifier ?? input.issueRef?.id ?? "unknown issue";
+}) {
+  const issueLabel = input.issueRef?.identifier ?? input.issueRef?.id ?? "unknown issue";
   const workspaceLabel = input.executionWorkspaceId ?? "unknown workspace";
   const statusLabel = input.workspaceStatus ?? "missing row";
   const branchLine = input.branchName
