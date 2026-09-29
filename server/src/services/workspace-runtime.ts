@@ -4745,12 +4745,36 @@ function releasePortReservation(port: number | null | undefined) {
  * SPA-9275 — release a single ephemeral run worktree.
  *
  * Push the branch the run produced to `origin` (best-effort; never blocks
- * removal), then `git worktree remove --force`, then `git worktree prune`,
- * then `fs.rm` if anything is still on disk. Retries `worktree remove --force`
- * once after a 200ms backoff when a stale git lock blocks the first attempt —
- * the engine's standing rule is that a removal failure must NEVER be `|| true`'d
+ * removal on its own), then — ONLY when the worktree is clean AND the push
+ * either succeeded or was not needed (`branchName` null) — `git worktree
+ * remove --force`, then `git worktree prune`, then `fs.rm` if anything is
+ * still on disk. Retries `worktree remove --force` once after a 200ms
+ * backoff when a stale git lock blocks the first attempt — the engine's
+ * standing rule is that a removal failure must NEVER be `|| true`'d
  * (SPA-7354 / doc/FORK-PATCHES.md row 12 / 717 workspaces stuck `cleanup_failed`
  * today). Failures are returned, never thrown — the caller decides what to do.
+ *
+ * SPA-9275 fail-safe (never remove a dirty or unpushed worktree): before any
+ * removal we run `git status --porcelain --untracked-files=all` in the
+ * worktree. A dirty tree (or a `git status` call that itself fails — treated
+ * as dirty, fail closed), OR a non-null `branchName` whose push did not
+ * succeed, means we KEEP the directory: no `worktree remove`, no `fs.rm`,
+ * nothing destroyed. The caller gets back `removed: false, kept: true,
+ * keptReason: "dirty_worktree" | "push_failed"` instead of a removal attempt.
+ * This also protects `realizeExecutionWorkspace`'s legacy-worktree reuse path:
+ * the first ephemeral run against an already-registered per-card worktree
+ * will refuse to blow away that worktree's dirty state on release.
+ *
+ * Pass `rescued: true` ONLY when a caller (the reaper / sweep, via
+ * `rescueUnpushedRunWorktreeState`) has already captured a rescue branch AND
+ * commit sha for this worktree — that skips BOTH the dirty-tree check and
+ * the push-required check. The working tree's state is already durably
+ * captured in the rescue branch, a local ref that lives in the shared repo
+ * (not the worktree) and survives `git worktree remove`/`fs.rm`, so the
+ * original branch's push outcome no longer matters for data safety — an
+ * orphaned worktree whose origin push fails (no network, no `origin`
+ * configured, a diverged/rejected push) is still safe to discard once
+ * rescued.
  *
  * The function is also invoked by the startup reaper (`reapOrphanedRunWorktrees`)
  * when it finds an `/runs/<runId>/` directory whose owning run is no longer
@@ -4765,11 +4789,22 @@ export async function releaseRunExecutionWorkspace(input: {
   resolveGitAuth?: GitRemoteAuthProvider | null;
   recorder?: WorkspaceOperationRecorder | null;
   now?: () => Date;
+  /**
+   * Set ONLY by a caller that has already rescued this worktree's dirty /
+   * unpushed state to a dedicated rescue branch (rescue branch created AND
+   * commit sha recorded). Skips both the dirty-tree keep check and the
+   * push-required check — the rescue branch is a durable local ref that
+   * survives worktree removal independent of the original branch's push.
+   */
+  rescued?: boolean;
 }): Promise<{
   pushed: boolean;
   removed: boolean;
   retriedRemoval: boolean;
   errors: string[];
+  /** True when removal was deliberately skipped to avoid losing state. */
+  kept: boolean;
+  keptReason?: "dirty_worktree" | "push_failed";
 }> {
   const errors: string[] = [];
   let pushed = false;
@@ -4777,7 +4812,7 @@ export async function releaseRunExecutionWorkspace(input: {
   let retriedRemoval = false;
 
   if (!await directoryExists(input.worktreePath)) {
-    return { pushed: false, removed: true, retriedRemoval: false, errors: [] };
+    return { pushed: false, removed: true, retriedRemoval: false, errors: [], kept: false };
   }
 
   const remoteUrl = input.branchName
@@ -4856,6 +4891,64 @@ export async function releaseRunExecutionWorkspace(input: {
     }
   }
 
+  // SPA-9275 fail-safe: never remove a dirty or unpushed worktree. A dirty
+  // tree (or a `git status` call that itself errors — fail closed, treat as
+  // dirty) OR a branch whose push did not succeed means we keep the
+  // directory rather than risk destroying uncommitted/unpushed state.
+  // `rescued` (set only by a caller that already captured a rescue branch +
+  // commit sha for this worktree) skips BOTH checks: the state is already
+  // durably captured in a local ref that outlives the worktree directory,
+  // so the original branch's push outcome no longer gates removal.
+  //
+  // A registered worktree of `repoRoot` (`git worktree list`) is always
+  // checked. An unregistered directory with no `.git` entry (e.g. a crash
+  // before `git worktree add` completed) holds no git state and falls
+  // through to the remove/retry/fs.rm cleanup. An unregistered directory
+  // that still has a `.git` entry (repoRoot mismatch, pruned admin dir) is
+  // checked directly, and kept when that check fails.
+  const isDirty = input.rescued
+    ? false
+    : await listLinkedGitWorktreePaths(input.repoRoot)
+      .catch(() => new Set<string>())
+      .then(async (linkedPaths) => {
+        const resolvedWorktreePath = await resolvePathForWorktreeComparison(input.worktreePath);
+        if (!linkedPaths.has(resolvedWorktreePath)) {
+          // Not registered under this repoRoot. A plain directory with no
+          // `.git` entry holds no git state and may be removed. A directory
+          // that still carries `.git` is a worktree we cannot vouch for (repoRoot
+          // mismatch, pruned admin dir): check it directly and keep it if the
+          // check fails, never fs.rm it blind.
+          const hasGitEntry = await fs.stat(path.join(input.worktreePath, ".git")).then(() => true).catch(() => false);
+          if (!hasGitEntry) return false;
+        }
+        return runGit(["status", "--porcelain", "--untracked-files=all"], input.worktreePath)
+          .then((value) => value.trim().length > 0)
+          .catch(() => true);
+      });
+  const pushFailed = input.rescued ? false : (input.branchName !== null && !pushed);
+  if (isDirty || pushFailed) {
+    const keptReason: "dirty_worktree" | "push_failed" = isDirty ? "dirty_worktree" : "push_failed";
+    if (input.recorder) {
+      await input.recorder.recordOperation({
+        phase: "worktree_cleanup",
+        cwd: input.worktreePath,
+        metadata: {
+          repoRoot: input.repoRoot,
+          worktreePath: input.worktreePath,
+          branchName: input.branchName,
+          runId: input.runId,
+          cleanupAction: "ephemeral_run_worktree_kept",
+          keptReason,
+        },
+        run: async () => ({
+          status: "succeeded",
+          system: `Kept ephemeral run worktree ${input.worktreePath} (${keptReason})\n`,
+        }),
+      }).catch(() => null);
+    }
+    return { pushed, removed: false, retriedRemoval: false, errors, kept: true, keptReason };
+  }
+
   async function attemptWorktreeRemove(): Promise<boolean> {
     try {
       await recordGitOperation(input.recorder, {
@@ -4903,7 +4996,7 @@ export async function releaseRunExecutionWorkspace(input: {
     await runGit(["worktree", "prune"], input.repoRoot).catch(() => null);
   }
 
-  return { pushed, removed, retriedRemoval, errors };
+  return { pushed, removed, retriedRemoval, errors, kept: false };
 }
 
 /**
@@ -5097,9 +5190,18 @@ export async function reapOrphanedRunWorktrees(input: {
       resolveGitAuth: input.resolveGitAuth ?? null,
       recorder: input.recorder ?? null,
       now,
+      // SPA-9275: a successful rescue already committed the worktree's dirty
+      // state to a local rescue branch, so removal is safe even though the
+      // original worktree's working tree reflects the same (now-committed)
+      // content. Only set this when the rescue captured both a branch AND a
+      // commit sha — a failed/no-op rescue must never suppress the dirty check.
+      rescued: Boolean(rescue.rescueBranch && rescue.rescueCommitSha),
     });
     if (release.removed) {
       removed += 1;
+    } else if (release.kept) {
+      // Deliberately preserved (dirty tree or unpushed branch, and rescue did
+      // not run or did not complete) — not a reaper failure, just a skip.
     } else {
       errors.push(`run ${runId}: removal incomplete — ${release.errors.join(" | ")}`);
     }
@@ -5219,6 +5321,9 @@ export async function sweepTerminalIssueRunWorktrees(input: {
       resolveGitAuth: input.resolveGitAuth ?? null,
       recorder: input.recorder ?? null,
       now,
+      // SPA-9275: see reaper — only skip the dirty check when the rescue
+      // actually captured a branch + commit sha.
+      rescued: Boolean(rescue.rescueBranch && rescue.rescueCommitSha),
     });
     if (release.removed) {
       const closedAt = now();
@@ -5232,6 +5337,9 @@ export async function sweepTerminalIssueRunWorktrees(input: {
         })
         .where(eq(executionWorkspaces.id, row.id));
       archived += 1;
+    } else if (release.kept) {
+      // Deliberately preserved — leave the row's current status untouched so
+      // a later sweep pass retries; not a sweep failure.
     } else {
       errors.push(`workspace ${row.id}: removal incomplete — ${release.errors.join(" | ")}`);
     }
