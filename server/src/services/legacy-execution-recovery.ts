@@ -62,6 +62,31 @@ export async function terminalizeLegacyExecution(input: {
     (typeof run.contextSnapshot?.issueId === "string"
       ? run.contextSnapshot.issueId
       : null);
+  // SPA-9282: the recovery sweep runs every HEARTBEAT_SCHEDULER_INTERVAL_MS
+  // (default 30s) and re-enters this terminalize path on every tick. The
+  // status CAS below (inArray(status, fromStatuses ?? [run.status])) allows
+  // re-writes against an already-terminal row, so without this guard the
+  // function rewrites updated_at and a fresh executionStatusDeliveryId on
+  // every pass and the UI toasts the row as a fresh failure (Steve/Argus
+  // "failing every 30 s"). executionStatusDeliveryId is null on the first
+  // call and set forever after, so it is the canonical once-write marker
+  // for this terminalize path: read it from the LIVE row (the input
+  // `run` snapshot is stale across periodic sweep ticks), and skip when
+  // it is already populated, unless the caller's patch carries fields
+  // that genuinely still need writing.
+  const [liveRow] = await db
+    .select({ executionStatusDeliveryId: heartbeatRuns.executionStatusDeliveryId })
+    .from(heartbeatRuns)
+    .where(and(
+      eq(heartbeatRuns.id, run.id),
+      eq(heartbeatRuns.companyId, run.companyId),
+    ))
+    .limit(1);
+  const deliveryAlreadySet = typeof liveRow?.executionStatusDeliveryId === "string"
+    && liveRow.executionStatusDeliveryId.length > 0;
+  if (deliveryAlreadySet && (!patch || Object.keys(patch).length === 0)) {
+    return null;
+  }
   return db.transaction(async (tx) => {
     await tx.execute(
       sql`select set_config('statement_timeout', '15000', true), set_config('lock_timeout', '1000', true)`,
