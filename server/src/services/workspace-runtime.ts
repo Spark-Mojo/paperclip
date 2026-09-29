@@ -2882,6 +2882,159 @@ async function listLinkedGitWorktreePaths(repoRoot: string): Promise<Set<string>
   return paths;
 }
 
+/**
+ * SPA-9437: tear down a persisted git worktree whose bound repo no longer
+ * matches the current project workspace's repo, so the next realization
+ * picks the NEW repo instead of failing `not_registered` validation.
+ *
+ * Called only when the persisted cwd's repo root (resolved via `git
+ * rev-parse --show-toplevel`) differs from the current project workspace's
+ * `baseCwd` repo root. The OLD worktree is rebuilt as part of the next
+ * `realizeExecutionWorkspace` call against the NEW repo.
+ *
+ * Guarded: refuses to delete a dirty worktree OR a worktree whose branch
+ * tip has no live upstream — both would silently destroy agent work that
+ * has not been delivered yet. Refusal throws a `WorkspaceRuntimeValidationFailure`
+ * so the recovery sweep / board sees a typed error and the next run
+ * produces a clear human-actionable message instead of a silent setup
+ * retry loop.
+ *
+ * `executionWorkspaceId` and `sourceIssue` are present so the validation
+ * payload names the bound row and the source issue — board comments and
+ * recovery records then read like "issue <id> row <workspaceId> bound to
+ * <oldRepo>, current project workspace repo <newRepo>".
+ */
+async function tearDownPersistedWorktreeBoundToOtherRepo(input: {
+  reuseWorktreePath: string;
+  persistedRepoRoot: string;
+  currentRepoRoot: string;
+  branchName: string | null;
+  executionWorkspaceId: string | null;
+  sourceIssue: ExecutionWorkspaceIssueRef | null;
+  recorder: WorkspaceOperationRecorder | null;
+  resolveGitAuth: GitRemoteAuthProvider | null;
+}): Promise<"tore_down" | "skipped_not_a_checkout"> {
+  // Skip the tear-down when the persisted cwd is not a git checkout (it
+  // may be a non-git provider or a corrupted directory). The downstream
+  // validator will throw the right error for that case.
+  if (!await isGitCheckout(input.reuseWorktreePath)) {
+    return "skipped_not_a_checkout";
+  }
+  // Inspect git status BEFORE deciding to delete. We refuse on dirty or
+  // on a branch tip that is not reachable on origin AND not runtime-owned.
+  const status = await runExpensiveGitStatus({
+    args: ["status", "--porcelain=v1", "--untracked-files=all"],
+    cwd: input.reuseWorktreePath,
+    operation: "workspace_runtime.persisted_other_repo_status",
+  });
+  const dirty = status.split(/\r?\n/).some((line) => line.length > 0);
+  if (dirty) {
+    throw new WorkspaceRuntimeValidationFailure(
+      `Persisted git worktree "${input.reuseWorktreePath}" belongs to repo "${input.persistedRepoRoot}", ` +
+        `but the current project workspace is for repo "${input.currentRepoRoot}". The worktree has ` +
+        `uncommitted changes that the engine will not silently destroy. Inspect the worktree, resolve ` +
+        `the changes (commit, stash, or push to origin), then retry the run.`,
+      {
+        workspaceValidation: {
+          reason: "git_worktree_belongs_to_other_repo",
+          reasonCode: "dirty_worktree_in_other_repo",
+          worktreePath: input.reuseWorktreePath,
+          persistedRepoRoot: input.persistedRepoRoot,
+          currentRepoRoot: input.currentRepoRoot,
+          executionWorkspaceId: input.executionWorkspaceId,
+          sourceIssueId: input.sourceIssue?.id ?? null,
+        },
+      },
+    );
+  }
+  // The worktree is clean. Verify the branch tip is recoverable before
+  // deleting the worktree: runtime-owned branches can be recreated on
+  // demand; operator-owned branches must exist on origin or in a local
+  // ref so a future pull can re-attach the tip.
+  if (input.branchName) {
+    const localSha = await runGit(
+      ["rev-parse", "--verify", "--quiet", `refs/heads/${input.branchName}`],
+      input.persistedRepoRoot,
+    ).catch(() => null);
+    const originSha = await runGit(
+      ["rev-parse", "--verify", "--quiet", `refs/remotes/origin/${input.branchName}`],
+      input.persistedRepoRoot,
+    ).catch(() => null);
+    if (!localSha && !originSha) {
+      throw new WorkspaceRuntimeValidationFailure(
+        `Persisted git worktree "${input.reuseWorktreePath}" belongs to repo "${input.persistedRepoRoot}", ` +
+          `but the current project workspace is for repo "${input.currentRepoRoot}". The worktree's ` +
+          `branch "${input.branchName}" was deleted locally and has no \`origin/${input.branchName}\` ref. ` +
+          `Push the branch or restore it on origin before retrying the run, or attach a different branch ` +
+          `to the card explicitly.`,
+        {
+          workspaceValidation: {
+            reason: "git_worktree_belongs_to_other_repo",
+            reasonCode: "branch_unreachable_in_other_repo",
+            worktreePath: input.reuseWorktreePath,
+            persistedRepoRoot: input.persistedRepoRoot,
+            currentRepoRoot: input.currentRepoRoot,
+            branchName: input.branchName,
+            executionWorkspaceId: input.executionWorkspaceId,
+            sourceIssueId: input.sourceIssue?.id ?? null,
+          },
+        },
+      );
+    }
+  }
+  // Safe path: clean worktree AND branch tip is recoverable. Remove the
+  // worktree from the OLD repo's `git worktree list`. `git worktree
+  // remove --force` is required because the worktree is in a different
+  // repo than the current `repoRoot`; without --force, git refuses on
+  // a worktree whose `.git` file points elsewhere. We do NOT delete the
+  // branch ref — `branchCreatedByRuntime` is intentionally NOT touched
+  // here, so a future `realizeExecutionWorkspace` against the NEW repo
+  // can attach the same branch verbatim. The OLD repo's worktree list
+  // is pruned so subsequent `git worktree list` calls do not return the
+  // removed path.
+  try {
+    await recordGitOperation(input.recorder, {
+      phase: "worktree_cleanup",
+      args: ["worktree", "remove", "--force", input.reuseWorktreePath],
+      cwd: input.persistedRepoRoot,
+      metadata: {
+        worktreePath: input.reuseWorktreePath,
+        persistedRepoRoot: input.persistedRepoRoot,
+        currentRepoRoot: input.currentRepoRoot,
+        cleanupAction: "spa9437_persisted_other_repo_remove",
+      },
+      successMessage: `Tore down persisted git worktree at ${input.reuseWorktreePath} (different repo, SPA-9437)\n`,
+      failureLabel: `git worktree remove --force ${input.reuseWorktreePath}`,
+    });
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    throw new WorkspaceRuntimeValidationFailure(
+      `Persisted git worktree "${input.reuseWorktreePath}" belongs to repo "${input.persistedRepoRoot}", ` +
+        `but the current project workspace is for repo "${input.currentRepoRoot}". The worktree ` +
+        `itself is clean, but \`git worktree remove\` failed: ${message}. Inspect and remove it by hand, ` +
+        `then retry the run.`,
+      {
+        workspaceValidation: {
+          reason: "git_worktree_belongs_to_other_repo",
+          reasonCode: "worktree_remove_failed",
+          worktreePath: input.reuseWorktreePath,
+          persistedRepoRoot: input.persistedRepoRoot,
+          currentRepoRoot: input.currentRepoRoot,
+          executionWorkspaceId: input.executionWorkspaceId,
+          sourceIssueId: input.sourceIssue?.id ?? null,
+          removeError: message,
+        },
+      },
+    );
+  }
+  // Prune the OLD repo's worktree list so a subsequent validator cannot
+  // accidentally re-discover the removed path. Best-effort — a prune
+  // failure on the OLD repo is harmless (the row is gone from disk) and
+  // does not block the next realization.
+  await runGit(["worktree", "prune"], input.persistedRepoRoot).catch(() => {});
+  return "tore_down";
+}
+
 export async function inspectManagedGitWorktreeBranch(input: {
   worktreePath: string;
   expectedBranchName: string | null | undefined;
@@ -3929,6 +4082,47 @@ export async function ensurePersistedExecutionWorkspaceAvailable(input: {
     const reuseBaseRef = input.workspace.baseRef ?? input.base.repoRef ?? null;
     const reuseWorktreePath = realized.worktreePath ?? cwd;
     const repairWarnings: string[] = [];
+    // SPA-9437: the persisted cwd belongs to a different repo than the
+    // current project workspace's repo. The issue's `projectWorkspaceId`
+    // changed after the workspace was realized, so the OLD worktree's `.git`
+    // points into the OLD repo's `.git/worktrees/`. Reusing it as if it
+    // belonged to the NEW repo would silently lose the persisted
+    // execution-workspace semantics and the next validator pass would
+    // throw `not_registered`. Tear down the OLD worktree only when it is
+    // safe to do so (clean AND its branch tip is recoverable); otherwise
+    // surface a typed validation failure so the recovery sweep / operator
+    // can act on it.
+    const persistedCwd = await inspectManagedGitWorktreeBranch({
+      worktreePath: reuseWorktreePath,
+      expectedBranchName: realized.branchName,
+    });
+    const persistedRepoRoot = persistedCwd.repoRoot ?? null;
+    if (
+      persistedRepoRoot
+      && path.resolve(persistedRepoRoot) !== path.resolve(repoRoot)
+    ) {
+      // SPA-9437: the persisted cwd belongs to a different repo than the
+      // current project workspace's repo. Tear down the OLD worktree when
+      // safe (clean + recoverable branch tip). The "tore_down" return
+      // signals "this binding is unprovisionable" — the caller returns
+      // null, the allocator's SPA-9315 path provisions a fresh workspace
+      // against the NEW repo. On refuse paths the helper throws
+      // `WorkspaceRuntimeValidationFailure` so the recovery sweep / operator
+      // can act on dirty or unreachable worktree state.
+      const torn = await tearDownPersistedWorktreeBoundToOtherRepo({
+        reuseWorktreePath,
+        persistedRepoRoot,
+        currentRepoRoot: repoRoot,
+        branchName: realized.branchName,
+        executionWorkspaceId: input.workspace.id ?? null,
+        sourceIssue: input.issue,
+        recorder: input.recorder ?? null,
+        resolveGitAuth: input.resolveGitAuth ?? null,
+      });
+      if (torn === "tore_down") return null;
+      // "skipped_not_a_checkout" → fall through to the existing validation
+      // path so the right error surfaces for non-git providers.
+    }
     if (await isGitCheckout(reuseWorktreePath) && realized.branchCreatedByRuntime) {
       // Branch-coherence repair may check out another branch, adopt a forward
       // branch, or move the recorded ref from a detached HEAD. Those repairs
