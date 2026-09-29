@@ -141,6 +141,14 @@ describe("server info snapshot", () => {
     });
   });
 
+  it("uses a bundled server stamp before a foreign working-directory git commit", () => {
+    const snapshot = createServerInfoSnapshot({
+      gitCommand: gitCommandFor("aaaaaaa", "Unrelated checkout"),
+      buildCommitCommand: () => "b".repeat(40),
+    });
+    expect(snapshot.git).toMatchObject({ fullSha: "b".repeat(40) });
+  });
+
   it("uses deployment commit metadata when the runtime has no git directory", () => {
     const snapshot = createServerInfoSnapshot({
       now: new Date("2026-06-26T00:00:00.000Z"),
