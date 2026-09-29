@@ -11220,53 +11220,70 @@ async function createNewRepo() {
 }
 
 describe("ensurePersistedExecutionWorkspaceAvailable SPA-9437 project workspace rebind", () => {
-  it("re-realizes a clean persisted git worktree when bound to a different repo (SPA-9437)", async () => {
+  it("tears down a clean persisted git worktree bound to a different repo and signals unprovisionable (SPA-9437)", async () => {
     const branchName = "PAP-9437-clean-rebind";
     const { oldRepo, oldWorktreePath } = await createOldRepoWorktree(branchName);
     const newRepo = await createNewRepo();
 
-    const restored = await ensurePersistedExecutionWorkspaceAvailable({
-      base: {
-        baseCwd: newRepo,
-        source: "project_primary",
-        projectId: "project-1",
-        workspaceId: "workspace-new",
-        repoUrl: null,
-        repoRef: "HEAD",
-      },
-      workspace: {
-        id: "execution-workspace-spa9437-clean",
-        mode: "isolated_workspace",
-        strategyType: "git_worktree",
-        cwd: oldWorktreePath,
-        providerRef: oldWorktreePath,
-        projectId: "project-1",
-        projectWorkspaceId: "workspace-old",
-        repoUrl: null,
-        baseRef: "HEAD",
-        branchName,
-        metadata: RUNTIME_OWNED_GIT_BRANCH_METADATA,
-      },
-      issue: {
-        id: "issue-spa9437-clean",
-        identifier: "PAP-9437",
-        title: "SPA-9437 clean rebind realizes against the new repo",
-      },
-      agent: {
-        id: "agent-1",
-        name: "Codex Coder",
-        companyId: "company-1",
-      },
-    });
+    let error: unknown = null;
+    try {
+      await ensurePersistedExecutionWorkspaceAvailable({
+        base: {
+          baseCwd: newRepo,
+          source: "project_primary",
+          projectId: "project-1",
+          workspaceId: "workspace-new",
+          repoUrl: null,
+          repoRef: "HEAD",
+        },
+        workspace: {
+          id: "execution-workspace-spa9437-clean",
+          mode: "isolated_workspace",
+          strategyType: "git_worktree",
+          cwd: oldWorktreePath,
+          providerRef: oldWorktreePath,
+          projectId: "project-1",
+          projectWorkspaceId: "workspace-old",
+          repoUrl: null,
+          baseRef: "HEAD",
+          branchName,
+          metadata: RUNTIME_OWNED_GIT_BRANCH_METADATA,
+        },
+        issue: {
+          id: "issue-spa9437-clean",
+          identifier: "PAP-9437",
+          title: "SPA-9437 clean rebind realizes against the new repo",
+        },
+        agent: {
+          id: "agent-1",
+          name: "Codex Coder",
+          companyId: "company-1",
+        },
+      });
+    } catch (err) {
+      error = err;
+    }
 
-    // The OLD worktree path no longer maps to the OLD repo (SPA-9437 tore it
-    // down via `git worktree remove --force`). The validator rejects the
-    // returned shape because the leaf is gone; callers must re-realize
-    // through the allocator. Confirm that:
-    //   (a) the OLD repo's worktree list no longer contains the OLD path, AND
-    //   (b) the OLD path is absent on disk so a fresh `realizeExecutionWorkspace`
-    //       against the NEW repo can lay down a fresh worktree.
-    expect(restored).toBeNull();
+    // SPA-9437 tears down the OLD worktree (clean + runtime-owned branch) and
+    // throws the SPA-9315 typed error so the allocator's freshness-decision
+    // path provisions a fresh workspace against the NEW repo. The error code
+    // matches the existing "unprovisionable binding" signal — the consumer
+    // recognizes it via `isExecutionWorkspaceNotProvisionableError`.
+    expect(error).toBeInstanceOf(ExecutionWorkspaceNotProvisionableError);
+    if (!(error instanceof ExecutionWorkspaceNotProvisionableError)) throw new Error("unreachable");
+    expect(error.code).toBe("workspace_validation_failed");
+    expect(error.executionWorkspaceId).toBe("execution-workspace-spa9437-clean");
+    expect(error.cwd).toBe(oldWorktreePath);
+    expect(error.strategy).toBe("git_worktree");
+    expect(error.resultJson.workspaceValidation).toMatchObject({
+      reason: "execution_workspace_not_provisionable",
+      reasonCode: "missing_on_disk_directory",
+      executionWorkspaceId: "execution-workspace-spa9437-clean",
+      strategy: "git_worktree",
+    });
+    // (a) the OLD repo's worktree list no longer contains the OLD path, AND
+    // (b) the OLD path is absent on disk so a fresh `realizeExecutionWorkspace`
+    //     against the NEW repo can lay down a fresh worktree.
     await expect(fs.stat(oldWorktreePath)).rejects.toThrow();
     const listedWorktrees = await readGit(oldRepo, ["worktree", "list", "--porcelain"]);
     expect(listedWorktrees).not.toContain(oldWorktreePath);
