@@ -78,6 +78,7 @@ import {
   instanceSettingsService,
   reconcileBuiltInAgentsOnStartup,
   reconcileCodexLocalManagedHomesOnStartup,
+  reconcileEphemeralWorktreesOnStartup,
   reconcilePersistedRuntimeServicesOnStartup,
   routineService,
   statusCardService,
@@ -1038,6 +1039,30 @@ async function startServerWithDatabaseTeardown(
     })
     .catch((err) => {
       logger.error({ err }, "startup reconciliation of persisted runtime services failed");
+    });
+
+  // SPA-9275: ephemeral worktree reaper + terminal-issue sweep run on every
+  // engine boot. Reclaims orphan `/runs/<runId>/` directories whose owning
+  // run is no longer live and archives done/cancelled card worktrees (incl.
+  // the `cleanup_failed` backlog). This is the actual fix for the 203 GB /
+  // 168-worktree HDD load. Periodic re-runs are out of scope for this
+  // change — startup is sufficient for the steady-state contract; a
+  // scheduler is a follow-up.
+  void reconcileEphemeralWorktreesOnStartup(db as any)
+    .then((result) => {
+      if (result.reaper.removed > 0 || result.sweep.archived > 0) {
+        logger.warn(
+          {
+            reposScanned: result.reposScanned,
+            reaper: result.reaper,
+            sweep: result.sweep,
+          },
+          "SPA-9275: reclaimed ephemeral worktrees and archived done/cancelled card worktrees",
+        );
+      }
+    })
+    .catch((err) => {
+      logger.error({ err }, "SPA-9275 ephemeral worktree reconciliation failed");
     });
 
   // Backfill auth.json into any already-isolated codex_local managed home that

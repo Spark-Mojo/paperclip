@@ -85,6 +85,9 @@ export const instanceExperimentalSettingsSchema = z.object({
   enableWorktreeRunExecution: z.boolean().default(false),
   worktreeRunExecutionActivatedAt: z.string().datetime().nullable().default(null),
   worktreeRunExecutionActivationInstanceId: z.string().min(1).nullable().default(null),
+  // SPA-9275: ephemeral worktree per run (push-then-remove, startup reaper,
+  // terminal sweep). Default OFF — opt-in via instance settings.
+  enableEphemeralWorktreePerRun: z.boolean().default(false),
 }).strict();
 
 export const patchInstanceExperimentalSettingsSchema = z

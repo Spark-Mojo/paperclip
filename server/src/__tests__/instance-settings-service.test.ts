@@ -70,6 +70,7 @@ describe("instance settings service", () => {
       enableWorktreeRunExecution: false,
       worktreeRunExecutionActivatedAt: null,
       worktreeRunExecutionActivationInstanceId: null,
+      enableEphemeralWorktreePerRun: false,
     });
   });
 

@@ -2223,6 +2223,13 @@ describe("effective run execution workspace config freshness", () => {
       issueRef: { id: "issue-1", identifier: "PAP-42" },
       runId: "run-1",
       workspaceConfigFreshness: decision,
+      staleReuseFallback: allocatorDecision.refusedDeadWorkspaceReuse
+        ? {
+            executionWorkspaceId: allocatorDecision.requestedExecutionWorkspaceId,
+            workspaceStatus: "ready",
+            branchName: null,
+          }
+        : null,
       restoreExistingWorkspace: allocatorDecision.shouldRestoreExistingWorkspace
         ? restoreExistingWorkspace
         : null,
@@ -2233,6 +2240,8 @@ describe("effective run execution workspace config freshness", () => {
     expect(realizeWorkspace).toHaveBeenCalledTimes(1);
     expect(result.executionWorkspace.id).toBe("workspace-fresh");
     expect(result.reusedExecutionWorkspace).toBeNull();
+    expect(result.freshFallbackForStaleReuse).toBe(false);
+    expect(result.freshFallbackWarning).toBeNull();
   });
 
   it("formats a safe workspace operation payload for config drift decisions", () => {
