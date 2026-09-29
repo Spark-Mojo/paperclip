@@ -1529,6 +1529,30 @@ async function startServerWithDatabaseTeardown(
         }
 
         const promotion = await heartbeat.promoteDueScheduledRetries();
+        try {
+          const terminalLeaseResult = await heartbeat.reclaimTerminalEnvironmentLeases();
+          if (
+            terminalLeaseResult.reclaimed > 0 ||
+            terminalLeaseResult.driverFailures.length > 0
+          ) {
+            logger.warn(
+              {
+                reclaimed: terminalLeaseResult.reclaimed,
+                skippedUnknownOwner: terminalLeaseResult.skippedUnknownOwner,
+                skippedLiveOwners: terminalLeaseResult.skippedLiveOwners,
+                skippedCrossCompany: terminalLeaseResult.skippedCrossCompany,
+                skippedOwnershipChanged: terminalLeaseResult.skippedOwnershipChanged,
+                driverFailures: terminalLeaseResult.driverFailures.length,
+              },
+              "startup terminal-environment-lease reclamation changed active lease state",
+            );
+          }
+        } catch (err) {
+          logger.error(
+            { err },
+            "startup terminal-environment-lease reclamation failed - periodic sweep will serve as degraded backstop",
+          );
+        }
         await heartbeat.resumeQueuedRuns();
         const recoveredGoalActions = await heartbeat.recoverPendingSessionGoalActions();
         if (
@@ -1784,6 +1808,44 @@ async function startServerWithDatabaseTeardown(
           // persisted queued work is still being driven forward.
           trackHeartbeatSchedulerWork(heartbeat
             .reapOrphanedRuns({ staleThresholdMs: 5 * 60 * 1000 })
+            .then(() =>
+              heartbeat.reclaimTerminalEnvironmentLeases().then((result) => {
+                if (
+                  result.reclaimed > 0 ||
+                  result.driverFailures.length > 0
+                ) {
+                  logger.warn(
+                    {
+                      reclaimed: result.reclaimed,
+                      skippedUnknownOwner: result.skippedUnknownOwner,
+                      skippedLiveOwners: result.skippedLiveOwners,
+                      skippedCrossCompany: result.skippedCrossCompany,
+                      skippedOwnershipChanged: result.skippedOwnershipChanged,
+                      driverFailures: result.driverFailures.length,
+                    },
+                    "periodic terminal-environment-lease reclamation changed active lease state",
+                  );
+                }
+              }),
+            )
+            .then(() =>
+              heartbeat.reclaimTerminalEnvironmentLeasesForRestart().then((result) => {
+                if (
+                  result.releasedRestartOrphans.length > 0 ||
+                  result.replacedRunIds.length > 0 ||
+                  result.replacementDispatchFailures.length > 0
+                ) {
+                  logger.warn(
+                    {
+                      releasedRestartOrphans: result.releasedRestartOrphans.length,
+                      replacedRunIds: result.replacedRunIds.length,
+                      replacementDispatchFailures: result.replacementDispatchFailures.length,
+                    },
+                    "periodic restart-replacement dispatch observed terminal-environment-lease release",
+                  );
+                }
+              }),
+            )
             .then(() => heartbeat.promoteDueScheduledRetries())
             .then(async (promotion) => {
               await heartbeat.resumeQueuedRuns();
