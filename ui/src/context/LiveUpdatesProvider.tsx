@@ -62,6 +62,15 @@ const TERMINAL_RUN_STATUSES = new Set([
   "cancelled",
   "timed_out",
 ]);
+// SPA-9282: a heartbeat.run.status live event whose status matches the
+// run row's persisted status is a no-op rewrite (the recovery sweep touches
+// updated_at on already-terminal rows when the engine persists an unchanged
+// classification), and must NOT toast as a fresh failure. Terminal status is
+// sticky — once a run has landed in the failed/timed_out bucket, no future
+// event of the same shape can be a real transition, so the dedupe window is
+// effectively unbounded (24h covers a long-lived tab without admitting a
+// legitimate retry attempt of the same id).
+const NO_CHANGE_RUN_TOAST_DEDUPE_MS = 24 * 60 * 60 * 1000;
 
 type LiveUpdatesSocketLike = {
   readyState: number;
@@ -1608,6 +1617,12 @@ interface ToastGate {
   // per burst, not one per run. Map of agentId → timestamp of the last failure
   // toast actually shown for that agent.
   runErrorBursts: Map<string, number>;
+  // SPA-9282: per-run last-toasted timestamp keyed on `${runId}:${status}`.
+  // A terminal status is sticky; re-emitting it cannot be a real transition,
+  // so once we've toasted run X as `failed`, any subsequent heartbeat.run.status
+  // for the same run with the same status within NO_CHANGE_RUN_TOAST_DEDUPE_MS
+  // is a no-op rewrite from the engine, not a fresh failure.
+  terminalRunStatusLastToastedAt: Map<string, number>;
 }
 
 // A burst is 5 minutes: an agent in a start/error loop (Steve's pattern) shows
@@ -1644,15 +1659,36 @@ function recordToastHit(gate: ToastGate, category: string) {
   gate.cooldownHits.set(category, hits);
 }
 
+function shouldSuppressNoChangeRunStatusToast(
+  gate: ToastGate,
+  runId: string,
+  status: string,
+): boolean {
+  if (!RUN_TOAST_STATUSES.has(status)) return false;
+  const key = `${runId}:${status}`;
+  const last = gate.terminalRunStatusLastToastedAt.get(key);
+  if (last === undefined) return false;
+  return Date.now() - last < NO_CHANGE_RUN_TOAST_DEDUPE_MS;
+}
+
+function recordRunStatusToast(gate: ToastGate, runId: string, status: string) {
+  if (!RUN_TOAST_STATUSES.has(status)) return;
+  gate.terminalRunStatusLastToastedAt.set(`${runId}:${status}`, Date.now());
+}
+
 function gatedPushToast(
   gate: ToastGate,
   pushToast: (toast: ToastInput) => string | null,
   category: string,
   toast: ToastInput,
-) {
-  if (shouldSuppressToast(gate, category)) return;
+): boolean {
+  if (shouldSuppressToast(gate, category)) return false;
   const id = pushToast(toast);
-  if (id !== null) recordToastHit(gate, category);
+  if (id !== null) {
+    recordToastHit(gate, category);
+    return true;
+  }
+  return false;
 }
 
 function handleLiveEvent(
@@ -1710,8 +1746,19 @@ function handleLiveEvent(
     if (event.type === "heartbeat.run.status") {
       const toast = buildRunStatusToast(payload, nameOf, event.createdAt);
       const agentId = readString(payload.agentId) ?? "unknown";
-      if (toast && !suppressRunToast && !shouldSuppressRunErrorBurst(gate, agentId)) {
-        gatedPushToast(gate, pushToast, `run-status:${agentId}`, toast);
+      const runIdForDedupe = readString(payload.runId);
+      const statusForDedupe = readString(payload.status);
+      if (
+        toast &&
+        runIdForDedupe &&
+        statusForDedupe &&
+        !suppressRunToast &&
+        !shouldSuppressRunErrorBurst(gate, agentId) &&
+        !shouldSuppressNoChangeRunStatusToast(gate, runIdForDedupe, statusForDedupe)
+      ) {
+        if (gatedPushToast(gate, pushToast, `run-status:${agentId}`, toast)) {
+          recordRunStatusToast(gate, runIdForDedupe, statusForDedupe);
+        }
       }
     }
     return;
@@ -1859,6 +1906,7 @@ export const __liveUpdatesTestUtils = {
   shouldSuppressRunStatusToastForVisibleIssue,
   shouldSuppressAgentStatusToastForVisibleIssue,
   shouldSuppressRunErrorBurst,
+  shouldSuppressNoChangeRunStatusToast,
 };
 
 function canUseLiveSession(sessionStatus: string, hasSession: boolean, deploymentMode?: string) {
@@ -1876,6 +1924,7 @@ export function LiveUpdatesProvider({ children }: { children: ReactNode }) {
     cooldownHits: new Map(),
     suppressUntil: 0,
     runErrorBursts: new Map(),
+    terminalRunStatusLastToastedAt: new Map(),
   });
   const pathnameRef = useRef(location.pathname);
   const { data: session, status: sessionStatus } = useQuery({
