@@ -1,5 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { eq } from "drizzle-orm";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import type { Environment } from "@paperclipai/shared";
 import {
@@ -606,12 +608,16 @@ describeEmbeddedPostgres("terminal environment leases (SPA-9423)", () => {
     // The production restart-replacement dispatcher is also wired into the
     // periodic tick (server/src/index.ts -> heartbeat.reclaimTerminalEnvironmentLeasesForRestart
     // chained after reapOrphanedRuns). That wiring is what makes L4 a real
-    // engine surface, not a test-only exercise.
+    // engine surface, not a test-only exercise. Anchor on the test file's
+    // own location so the read survives non-repo-root CWDs (CI workers).
+    const repoRoot = path.resolve(
+      path.dirname(fileURLToPath(import.meta.url)),
+      "..",
+      "..",
+      "..",
+    );
     const indexSource = await import("node:fs/promises").then((fs) =>
-      fs.readFile(
-        `${process.cwd()}/src/index.ts`,
-        "utf8",
-      ),
+      fs.readFile(path.join(repoRoot, "server", "src", "index.ts"), "utf8"),
     );
     expect(indexSource).toContain(
       "reclaimTerminalEnvironmentLeasesForRestart",
