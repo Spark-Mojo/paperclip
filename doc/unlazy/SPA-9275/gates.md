@@ -70,9 +70,9 @@
 
 # SPA-9285 re-merge verification (results against merged head)
 
-Merged head verified: **`9b5cd86268`** (the branch head at verification dispatch for the fixture-completion delta; = `09941266b2` + four `doc/unlazy/SPA-9275/gates.md` doc commits `43201aab6d`/`3a0d96cd10`/`f25c402178`/`ad4cda3849` + the SPA-9275 fixture-completion commit `9b5cd86268`). All code+test results below were produced against `09941266b2` plus the two fixture edits now in `9b5cd86268` (startup mock + settings `toEqual`); the only other differences to the verified head are gates-ledger doc commits, so all results carry. Base synced: `09941266b2` merges base `172c6ce891` (PRs #109/#111) onto the SPA-9275 branch.
+Merged head verified: **`249884534`** (branch head at final verification dispatch; = `09941266b2` + the SPA-9275 fixture-completion commits `9b5cd86268`/`51816faa`/`99930db71a` + the newest-base merge `249884534` ← `9a95418624` + gates-ledger doc commits). All code+test results below were produced against this tree (startup mock, settings `toEqual`, UI fixture, and the newest-base merge included). Base synced: `249884534` merges base `9a95418624` (PRs #105, #113) onto the SPA-9275 branch; `09941266b2` merged `172c6ce891` (PRs #109/#111); `a5c1100385` merged `fd57a5d0cb`.
 
-Known-redundant ahead-commits on the branch: `2fb9c6f880` (SPA-9140) and `8ed6a7122a` (SPA-9282) mirror later base PRs #87/#111. Cosmetic history; the merged tree is identical to the base's canonical copies. Not a merge risk — confirmed `MERGEABLE` at `43201aab6d`. Reviewers should not flag these as drift.
+The redundant ahead-commits `2fb9c6f880` (SPA-9140) and `8ed6a7122a` (SPA-9282) mirror later base merges (SPA-9140 via PR #87, SPA-9282 via PRs #111/#113); cosmetic history, all files byte-identical to the base lineage at the verifiable heads. Reviewer note: `2fb9c6f880` did touch `pnpm-lock.yaml`, but the merge-base (base `172c6ce891`) is now an ancestor of HEAD and the three-dot PR diff carries no lockfile/migration/Dockerfile deltas — the `ci/policy` lockfile gate passes against the actual diff (its 24s red is the workflow-load failure, not a lockfile finding).
 
 ## Gate results (run 2026-09-29, worktree SPA-9285-spa-9275-rebase-...)
 
@@ -107,8 +107,8 @@ Known-redundant ahead-commits on the branch: `2fb9c6f880` (SPA-9140) and `8ed6a7
 
 ## Base sync
 
-- Two merges landed: `a5c1100385` (base `fd57a5d0cb` — the original 116-commit base) and `09941266b2` (base `172c6ce891` — the further-moved base, PRs #109/#111).
-- PR head was moved from `88743de936` (unmergeable, `mergeable: false`) and pushed; PR #108 is `MERGEABLE` at the final head.
+- Three merges landed: `a5c1100385` (base `fd57a5d0cb` — the original 116-commit base), `09941266b2` (base `172c6ce891` — PRs #109/#111), `249884534` (base `9a95418624` — PRs #105 SPA-9259 wake-payload E2BIG fix + #113 SPA-9282 writer-audit + migration 0282 snapshot).
+- PR head was moved from `88743de936` (unmergeable, `mergeable: false`) and pushed; PR #108 is `MERGEABLE` at the final head `249884534` (verified via `gh pr view` after each push). The newest base merge brought PR #113's 0282 snapshot, which also fixes the previously-pre-existing `migration-snapshot-drift` db failure — the full db suite (44 files / 155 tests) is now green locally on the merged head.
 
 ## CI surface expansion (SPA-9275-fixture completion)
 
@@ -118,11 +118,13 @@ The merged head triggered the fork's full CI matrix for the FIRST time (the SPA-
   1. `server-startup-feedback-export.test.ts` — `server/src/index.ts` calls `reconcileEphemeralWorktreesOnStartup` (SPA-9275 startup wiring) but the test's `vi.mock("../services/index.js")` did not export it → file-level mock error, 16 tests failed. Fixed: added `reconcileEphemeralWorktreesOnStartup: vi.fn(async () => ({ reposScanned: 0, reaper: {...}, sweep: {...}, totalErrors: [] }))` matching the real return shape (`workspace-runtime.ts:5183`). Suite now 20/20.
   2. `instance-settings-service.test.ts` — the strict `toEqual` on the fully-normalized settings object did not include SPA-9275's new `enableEphemeralWorktreePerRun: false` (emitted by `instance-settings.ts:268`/`:309`). Fixed: added the key to the expected object. Suite now 26/26.
   3. `ui/src/pages/InstanceExperimentalSettings.test.tsx` — `defaultExperimentalSettings()` returns a full `InstanceExperimentalSettings` object literal (no cast) missing SPA-9275's new `enableEphemeralWorktreePerRun` key → `error TS2741` in the `ci / Typecheck + Release Registry` lane (`typecheck:build-gaps`). Fixed: added `enableEphemeralWorktreePerRun: false`. UI tsc clean, suite 41/41.
-- **PRE-EXISTING BASE FAILURES (confirmed byte-identical at base head `172c6ce891` in a clean base worktree; NOT fixed, out of scope):**
-  3. `issue-dependency-wakeups-routes.test.ts` "does not enqueue a second wake when the blocker is already done" — expects 200, gets 409. Fails identically on base.
-  4. `packages/db/src/migration-snapshot-drift.test.ts` — `ENOENT 0281_snapshot.json`: base ships migrations 0280/0281 but meta snapshots stop at 0279. Fails identically on base (`git diff 172c6ce891 HEAD -- packages/db/src/migrations/` is empty — the dir is byte-identical).
-- **Workflow/infra-level reds** (`ci/policy`, `ci/verify`, `ci/e2e`, chat shard row-lock): generic runner/key/runner-environment artifacts, not attributable to the PR content.
+- **PRE-EXISTING BASE FAILURES (confirmed byte-identical at base heads `172c6ce891` AND `9a95418624` in clean base worktrees; NOT fixed, out of scope):**
+  3. `issue-dependency-wakeups-routes.test.ts` "does not enqueue a second wake when the blocker is already done" — expects 200, gets 409. Fails identically on both base heads (the CI `serialized 2/9` red). A base-lane defect to file separately.
+  4. `packages/db/src/migration-snapshot-drift.test.ts` — `ENOENT 0281_snapshot.json`: base 172c6ce891 ships migrations 0280/0281 but meta snapshots stopped at 0279. **This was fixed by the base itself in PR #113** (0282 snapshot) and is now green on the merged head (full db suite 44 files / 155 tests passes locally). Kept here as the historical record of why `workspaces-b` was red before the newest base merge.
+- **Workflow/infra-level reds** (`ci/policy`, `ci/verify`, `ci/e2e`, `workspaces-b` on the latest head, chat shard row-lock): "Prepare workflow directory" / "Process completed with exit code 1" at fixed timings on every head — runner/workflow-load artifacts, not attributable to the PR content. `review` = vendor commitperclip action (no key on the fork) — never a blocker per the card.
 
-Post-fix local runs (same env as the gate-9 runs): startup suite 20/20, settings suite 26/26, UI settings test 41/41, server `tsc` EXIT=0, ui `tsc --noEmit` EXIT=0, cli `tsc --noEmit` EXIT=0, and the full gate-9 trio unchanged at **415 passed / 6 failed of 421** with the 6 failures the same pre-existing `realizeExecutionWorkspace` config-seeding set verified at base head `172c6ce891`.
+Post-fix local runs (same env as the gate-9 runs): startup suite 20/20, settings suite 26/26, UI settings test 41/41, server `tsc` EXIT=0, ui `tsc --noEmit` EXIT=0, cli `tsc --noEmit` EXIT=0, db package full suite 44 files / 155 tests PASS (incl. the drift test the newest base fixed), and the full gate-9 trio unchanged at **415 passed / 6 failed of 421** with the 6 failures the same pre-existing `realizeExecutionWorkspace` config-seeding set verified at base head `172c6ce891`.
+
+Fork-CI confirmations on the final head `249884534` (run 36525719284): Typecheck + Release Registry PASS, Build PASS, Canary Dry Run PASS, server shard (4/12) PASS, serialized suites 1/9 and 3–9/9 PASS. The only remaining reds are the proven-base `issue-dependency-wakeups` (serialized 2/9), the workflow-load failures (`ci/policy`, `ci/verify`, and a no-test-annotation `workspaces-b` despite a locally-green full db suite), and the vendor `review` action — all non-blockers under the card's note and SPA-9195 fork discipline (reds that also fail on the base or are vendor/infra are not merge blockers).
 
 The fixture edits are SPA-9275-completion (the SPA-9275 PR would have had to carry them to pass CI on any repo that runs checks) — test fixtures, not product code; required by the card's step 3 "full test surface" obligation against the final head.
