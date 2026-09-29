@@ -10,6 +10,14 @@ export type GitHubPullRequestReference = {
   owner: string;
   repo: string;
   number: number;
+  /**
+   * SPA-9325: this reference was parsed from the ambiguous `owner/repo#N`
+   * prose shorthand (issues and PRs share one number space). Discriminators
+   * may resolve it to "not a PR". An explicit `/pull/N` URL or work-product
+   * reference does NOT set this — the author asserted a PR exists, so a 404
+   * stays fail-closed `unknown` even when the token can read the namespace.
+   */
+  proseShorthand?: boolean;
 };
 
 export type PullRequestMergeState = "merged" | "open" | "unknown";
@@ -40,6 +48,20 @@ export type PullRequestMergeDetails = {
    * repo, cross-account token, or a typo), leaves it false and keeps blocking.
    */
   notAPullRequest?: boolean;
+  /**
+   * SPA-9325: which discriminator positively identified the non-PR.
+   *
+   * `issues_probe` — the `/issues/N` read succeeded (200) and carries no
+   * `pull_request` key. The strongest signal.
+   * `pulls_namespace` — the issues probe could not discriminate (typically a
+   * fine-grained PAT with pulls:read but without issues:read, live on this
+   * engine: `/issues/N` 403s), so the fallback proved the token CAN list the
+   * repo's pull requests (`/repos/o/r/pulls?per_page=1&state=all` → 200).
+   * GitHub numbers issues and PRs in one space and PRs are undeletable, so a
+   * readable PR namespace plus a 404 on `/pulls/N` positively proves N names
+   * no PR. Set ONLY alongside `notAPullRequest: true`.
+   */
+  notAPullRequestReason?: "issues_probe" | "pulls_namespace";
 };
 
 export type PullRequestMergeStateResolver = (
@@ -76,12 +98,15 @@ function addPullRequestReference(
   owner: string,
   repo: string,
   rawNumber: string,
+  proseShorthand: boolean,
 ) {
   const number = Number(rawNumber);
   if (!Number.isSafeInteger(number) || number <= 0) return;
-  const reference = { host: "github.com", owner, repo, number } as const;
   const key = `${owner.toLowerCase()}/${repo.toLowerCase()}#${number}`;
-  if (!references.has(key)) references.set(key, reference);
+  if (references.has(key)) return; // first source wins: an explicit URL claim outranks a shorthand mention
+  const reference: GitHubPullRequestReference = { host: "github.com", owner, repo, number };
+  if (proseShorthand) reference.proseShorthand = true;
+  references.set(key, reference);
 }
 
 export function extractGitHubPullRequestReferences(values: readonly unknown[]) {
@@ -90,11 +115,11 @@ export function extractGitHubPullRequestReferences(values: readonly unknown[]) {
     if (typeof value !== "string" || value.length === 0) continue;
     GITHUB_PULL_REQUEST_URL_PATTERN.lastIndex = 0;
     for (const match of value.matchAll(GITHUB_PULL_REQUEST_URL_PATTERN)) {
-      addPullRequestReference(references, match[1]!, match[2]!, match[3]!);
+      addPullRequestReference(references, match[1]!, match[2]!, match[3]!, false);
     }
     GITHUB_PULL_REQUEST_SHORTHAND_PATTERN.lastIndex = 0;
     for (const match of value.matchAll(GITHUB_PULL_REQUEST_SHORTHAND_PATTERN)) {
-      addPullRequestReference(references, match[2]!, match[3]!, match[4]!);
+      addPullRequestReference(references, match[2]!, match[3]!, match[4]!, true);
     }
   }
   return [...references.values()];
@@ -112,13 +137,14 @@ function readRecord(value: unknown): Record<string, unknown> | null {
  * `confirmedNotPullRequest` is the second argument because it comes from a
  * DIFFERENT endpoint (`/issues/N`) than the snapshot. The gate is deliberately
  * narrow: `notAPullRequest` is set only when the snapshot is the 404
- * (`not_found`) shape AND the issues probe positively showed no `pull_request`
+ * (`not_found`) shape AND the probe positively showed no `pull_request`
  * key. Every other combination — including a 404 on both endpoints — leaves
  * the reference in the fail-closed `unknown` bucket.
  */
 export function mapGitHubPullRequestSnapshot(
   result: ExternalObjectResolveResult,
   confirmedNotPullRequest: boolean,
+  notAPullRequestReason?: "issues_probe" | "pulls_namespace",
 ): PullRequestMergeDetails {
   if (!result.ok) return { state: "unknown", headRef: null, headSha: null };
   const data = readRecord(result.snapshot.data);
@@ -138,7 +164,9 @@ export function mapGitHubPullRequestSnapshot(
     headRef: typeof data?.headRef === "string" ? data.headRef : null,
     headSha: typeof data?.headSha === "string" ? data.headSha : null,
     ...(workProductState ? { workProductState } : {}),
-    ...(notAPullRequest ? { notAPullRequest: true } : {}),
+    ...(notAPullRequest
+      ? { notAPullRequest: true, ...(notAPullRequestReason ? { notAPullRequestReason } : {}) }
+      : {}),
     draft: data?.draft === true,
     baseRef: typeof data?.baseRef === "string" ? data.baseRef : null,
     additions: typeof data?.additions === "number" ? data.additions : null,
@@ -147,12 +175,27 @@ export function mapGitHubPullRequestSnapshot(
   };
 }
 
-export function createPullRequestMergeDetailsResolver(db: Db): PullRequestMergeDetailsResolver {
-  const provider = createGitHubExternalObjectProvider(db);
+export type PullRequestMergeDetailsResolverOptions = {
+  /**
+   * SPA-9325 test seam: build the resolver against an already-configured
+   * provider (fetch/token stubs) instead of one derived from `db`.
+   */
+  provider?: ReturnType<typeof createGitHubExternalObjectProvider>;
+};
+
+export function createPullRequestMergeDetailsResolver(
+  db: Db,
+  opts: PullRequestMergeDetailsResolverOptions = {},
+): PullRequestMergeDetailsResolver {
+  const provider = opts.provider ?? createGitHubExternalObjectProvider(db);
   const resolver = provider.resolvers
     .find((candidate) => candidate.objectType === "pull_request") ?? null;
   const issueResolver = provider.resolvers
     .find((candidate) => candidate.objectType === "issue") ?? null;
+  // SPA-9325: per-repo memo of the namespace probe, so a card citing several
+  // issues from one repo pays at most one `/pulls?per_page=1` request per
+  // gate evaluation (resolver instances are per-gate-evaluation).
+  const pullsReadableByRepo = new Map<string, Promise<boolean>>();
 
   return async (companyId, reference) => {
     if (!resolver) return { state: "unknown", headRef: null, headSha: null };
@@ -165,12 +208,60 @@ export function createPullRequestMergeDetailsResolver(db: Db): PullRequestMergeD
     });
     // SPA-9323: only the ambiguous 404 path costs a second call. A PR that
     // resolves normally is one call, exactly as before.
-    let confirmedNotPullRequest = false;
-    if (result.ok && result.snapshot.statusKey === "not_found" && issueResolver) {
-      confirmedNotPullRequest = await probeIsNotPullRequest(issueResolver, companyId, reference);
+    if (!result.ok || result.snapshot.statusKey !== "not_found") {
+      return mapGitHubPullRequestSnapshot(result, false);
     }
-    return mapGitHubPullRequestSnapshot(result, confirmedNotPullRequest);
+    // Discriminator 1 (SPA-9323): `/issues/N` 200 without a `pull_request` key.
+    const probed = issueResolver
+      ? await probeIsNotPullRequest(issueResolver, companyId, reference)
+      : false;
+    if (probed) return mapGitHubPullRequestSnapshot(result, true, "issues_probe");
+    // Discriminator 2 (SPA-9325), SHORTHAND-ONLY: the issues probe could not
+    // discriminate — on this engine the stored token has pulls:read but not
+    // issues:read, so every `/issues/N` read 403s. For the intrinsically
+    // ambiguous `owner/repo#N` shorthand, prove the token CAN list this repo's
+    // PRs; a readable PR namespace plus the 404 above positively proves N
+    // names no PR (GitHub numbers issues and PRs in one space; PRs are
+    // undeletable). An explicit `/pull/N` URL or work-product reference never
+    // takes this path — the author asserted a PR, a 404 stays fail-closed.
+    if (!reference.proseShorthand) return mapGitHubPullRequestSnapshot(result, false);
+    const repoKey = `${reference.owner.toLowerCase()}/${reference.repo.toLowerCase()}`;
+    let readablePromise = pullsReadableByRepo.get(repoKey);
+    if (!readablePromise) {
+      readablePromise = probePullsReadable(resolver, companyId, reference);
+      pullsReadableByRepo.set(repoKey, readablePromise);
+    }
+    if (await readablePromise) {
+      return mapGitHubPullRequestSnapshot(result, true, "pulls_namespace");
+    }
+    return mapGitHubPullRequestSnapshot(result, false);
   };
+}
+
+/**
+ * SPA-9325: can this token list pull requests in the reference's repo?
+ *
+ * Delegates to the provider resolver's `probeNamespace` (same token, same
+ * headers, same failure mapping as every other GitHub read the gate makes).
+ * Only an HTTP 200 on `GET /repos/o/r/pulls?per_page=1&state=all` proves the
+ * namespace readable; 403 (token lacks pulls:read), 404 (repo invisible),
+ * 429/5xx, and network failures all fail closed. Returns `false` when the
+ * resolver does not expose the probe (older provider shape).
+ */
+export async function probePullsReadable(
+  pullRequestResolver: ExternalObjectResolver,
+  companyId: string,
+  reference: GitHubPullRequestReference,
+): Promise<boolean> {
+  const probe = (pullRequestResolver as ExternalObjectResolver & {
+    probeNamespace?: (companyId: string, identity: { host: string; owner: string; repo: string }) => Promise<boolean>;
+  }).probeNamespace;
+  if (typeof probe !== "function") return false;
+  try {
+    return await probe(companyId, { host: reference.host, owner: reference.owner, repo: reference.repo });
+  } catch {
+    return false;
+  }
 }
 
 /**
