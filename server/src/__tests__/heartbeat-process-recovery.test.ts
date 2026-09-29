@@ -306,6 +306,23 @@ async function spawnOrphanedProcessGroup() {
 }
 
 describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
+
+  // SPA-9270: the reaper starts a 2-minute grace window the first time it
+  // sees a dead recorded pid, and only fails the run once that window has
+  // elapsed. Tests that exercise the post-grace failure path pre-stamp the
+  // observation as if an earlier sweep had already run past the window.
+  async function preStampProcessLoss(runId: string, ageMs = 2 * 60 * 1000 + 5_000) {
+    const observedAt = new Date(Date.now() - ageMs);
+    await db
+      .update(heartbeatRuns)
+      .set({
+        resultJson: { processLossObservedAt: observedAt.toISOString() },
+        updatedAt: observedAt,
+      })
+      .where(eq(heartbeatRuns.id, runId));
+    return observedAt;
+  }
+
   let db!: ReturnType<typeof createDb>;
   let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
   const childProcesses = new Set<ChildProcess>();
@@ -657,6 +674,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       processGroupId: 999_999_997,
       includeIssue: true,
     });
+    await preStampProcessLoss(runId);
     // Simulate the exact race window from codex 3838245812 deterministically:
     // isProcessGroupAlive reads DEAD during the reaper's snapshot phase (so the
     // sweep proceeds to the terminal transition) and ALIVE by the time
@@ -709,6 +727,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       processGroupId: null,
       includeIssue: true,
     });
+    await preStampProcessLoss(runId);
 
     const first = await heartbeat.reapOrphanedRuns();
     expect(first).toEqual({ reaped: 1, runIds: [runId] });
@@ -2016,6 +2035,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       processPid: child.pid ?? null,
       includeIssue: false,
     });
+    await preStampProcessLoss(runId);
     const heartbeat = heartbeatService(db);
 
     const result = await heartbeat.reapOrphanedRuns();
@@ -2085,6 +2105,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
         resumeRequiresNormalModel: true,
       },
     });
+    await preStampProcessLoss(runId);
     const heartbeat = heartbeatService(db);
 
     const result = await heartbeat.reapOrphanedRuns();
@@ -3167,6 +3188,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     const { runId, issueId, companyId } = await seedRunFixture({
       processPid: 999_999_999,
     });
+    await preStampProcessLoss(runId);
     const { leaseId } = await seedEnvironmentLeaseFixture({
       companyId,
       runId,
@@ -3197,6 +3219,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       processPid: orphan.processPid,
       processGroupId: orphan.processGroupId,
     });
+    await preStampProcessLoss(runId);
     const heartbeat = heartbeatService(db);
 
     const result = await heartbeat.reapOrphanedRuns();
@@ -3246,6 +3269,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       processPid: 999_999_999,
       processLossRetryCount: 1,
     });
+    await preStampProcessLoss(runId);
     const resolvedBlockerId = randomUUID();
     const issuePrefix = `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
     await db.insert(issues).values({
@@ -3332,6 +3356,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       runErrorCode: "process_lost",
       runError: "Authorization: Bearer sk-test-recovery-secret",
     });
+    await preStampProcessLoss(runId);
     await db
       .update(issues)
       .set({
@@ -3418,6 +3443,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       processPid: 999_999_999,
       processLossRetryCount: 1,
     });
+    await preStampProcessLoss(runId);
     await db.insert(issueTreeHolds).values({
       companyId,
       rootIssueId: issueId,
@@ -3865,6 +3891,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       })
       .where(eq(heartbeatRuns.id, runId));
     await db.update(issues).set({ status: "in_review" }).where(eq(issues.id, issueId));
+    await preStampProcessLoss(runId);
 
     const heartbeat = heartbeatService(db);
     const result = await heartbeat.reapOrphanedRuns();
@@ -5388,6 +5415,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       runErrorCode: "process_detached",
       runError: "Lost in-memory process handle, but child pid 123 is still alive",
     });
+    await preStampProcessLoss(runId);
     const heartbeat = heartbeatService(db);
 
     const updated = await heartbeat.reportRunActivity(runId);
