@@ -139,6 +139,12 @@ import {
   type RunOutputSilenceSummary,
   type WatchdogDecisionActor,
 } from "../../modules/active-run-watchdog/index.js";
+import {
+  evaluateWakeLoopGuard,
+  escalateWakeBudgetExhausted,
+  isTerminalIssueStatusForWake,
+  loadIssueStatusForWakeGuard,
+} from "../wake-loop-guard.js";
 
 const EXECUTION_PATH_HEARTBEAT_RUN_STATUSES = [
   "queued",
@@ -2136,6 +2142,85 @@ export function recoveryService(
           ).kind !== "clear")
       )
         return null;
+    }
+    // SPA-9280: wake-loop guard at the recovery emit site. The recovery sweep
+    // re-queues wakes every reconciliation tick; if the underlying wake keeps
+    // being skipped (e.g. the blocker is cancelled and never releases), the
+    // sweep has no terminal `heartbeatRuns` signal to trip the existing
+    // continuation-retry gate. The wake-loop guard counts actual
+    // `agent_wakeup_requests` rows — including skipped ones — and on trip
+    // escalates the underlying issue to `blocked` with a synthetic escalation
+    // as the real blocker edge, then stops emitting. Layer A in `enqueueWakeup`
+    // also records the skip; Layer B here makes the loop operator-visible.
+    //
+    // Layer 0: terminal-status guard at the recovery emit. The recovery
+    // sweep's candidates query filters `status IN ('todo','in_progress',
+    // 'in_review')`, but a status transition committed between candidate read
+    // and this call can still leak through. Defense-in-depth: re-read the
+    // issue status here and short-circuit before any wake insert.
+    // payloadPreview mirrors what enqueueWakeup will serialize; "normal_model"
+    // here means scrub hint keys, which a fresh literal already satisfies.
+    const payloadPreview: Record<string, unknown> = {
+      issueId: input.issueId,
+      ...(input.retryOfRunId ? { retryOfRunId: input.retryOfRunId } : {}),
+      ...(input.extraContext ?? {}),
+    };
+    const liveIssueStatus = await loadIssueStatusForWakeGuard(db, input.issueId);
+    if (isTerminalIssueStatusForWake(liveIssueStatus)) {
+      logger.debug(
+        {
+          issueId: input.issueId,
+          agentId: input.agentId,
+          issueStatus: liveIssueStatus,
+          source: input.source,
+        },
+        "recovery sweep refused to enqueue wake for terminal-status issue",
+      );
+      return null;
+    }
+    const agent = await getAgent(input.agentId);
+    if (agent) {
+      const decision = await evaluateWakeLoopGuard(db, {
+        companyId: agent.companyId,
+        agentId: input.agentId,
+        issueId: input.issueId,
+        payload: payloadPreview,
+      });
+      if (decision.tripped) {
+        const escalation = await escalateWakeBudgetExhausted({
+          db,
+          issueId: input.issueId,
+          decision,
+          recoveryOwnerAgentId: input.agentId,
+          payload: payloadPreview,
+          source: input.source,
+          issuesSvc: {
+            create: (companyId, payload) =>
+              issuesSvc.create(companyId, payload as Parameters<typeof issuesSvc.create>[1]),
+            addComment: (issueId, body, actor, options) =>
+              issuesSvc.addComment(
+                issueId,
+                body,
+                actor as Parameters<typeof issuesSvc.addComment>[2],
+                options as Parameters<typeof issuesSvc.addComment>[3],
+              ),
+          },
+        });
+        logger.warn(
+          {
+            issueId: input.issueId,
+            agentId: input.agentId,
+            guard: decision.guard,
+            count: decision.count,
+            limit: decision.limit,
+            escalationKind: escalation.kind,
+            escalationIssueId: escalation.escalationIssueId,
+            source: input.source,
+          },
+          "wake-loop guard tripped in recovery sweep; refused to enqueue wake",
+        );
+        return null;
+      }
     }
     const queued = await deps.enqueueWakeup(input.agentId, {
       source: "automation",
