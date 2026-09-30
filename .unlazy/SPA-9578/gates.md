@@ -260,7 +260,7 @@ NEGATIVE: wrong path
 `vitest run src/__tests__/no-such-gate-test-file.test.ts` → exit **1**,
 `No test files found, exiting with code 1`. The CHECK is not a pass-through.
 
-### G5 — typecheck
+### G5 — typecheck (rerun after verify-FAIL fixes, 2026-09-30)
 CHECK:
 `timeout 1700 pnpm --filter @paperclipai/server exec tsc --noEmit` → exit 1.
 
@@ -290,3 +290,107 @@ with deps built.
 | G3 activity row | PASS |
 | G4 full suite 31/31, no regression | PASS (negative: wrong path exits 1) |
 | G5 tsc | PRE-EXISTING-BASE-RED (251 pre-existing, 0 in touched files, identical count with diff stashed) |
+
+---
+
+## ROUND 2 — after `VERDICT: FAIL` (2026-09-30)
+
+The first verifier returned FAIL on three findings. Two were real defects in my
+diff and are fixed; one was a gate-classification point that stays
+`PRE-EXISTING-BASE-RED`.
+
+### R3 (was NOT MET) — the field was a silent no-op on a non-done PATCH
+Defect confirmed in the diff, not just asserted: `coordinationNoPrDeliverable`
+was destructured off the body and consumed only inside the `done` branch, so a
+board PATCH carrying it on a title edit returned 200 and applied nothing.
+
+FIX (two layers, defence in depth):
+- `routes/issues.ts`: a PATCH carrying `coordinationNoPrDeliverable` whose
+  `status !== "done"` is **422**, with `error` "coordinationNoPrDeliverable is
+  only valid on a PATCH that sets status to done".
+- `services/issues.ts`: `effectiveCoordinationClassification` drops the
+  classification unless this is a first entry into `done`, so an internal
+  caller cannot smuggle a standing exemption past the route check either. The
+  field remains request-scoped and is never persisted as card state.
+
+Gates:
+- `-t "refused on a PATCH that does not transition to done"` → exit 0,
+  `Tests  1 passed | 34 skipped`. Asserts 422 + the message.
+- `-t "does not persist as a standing exemption"` → exit 0,
+  `Tests  1 passed | 34 skipped`. Supplies a classification on a NON-done
+  service update, then proves a LATER close with NO classification still
+  refuses — the invariant holds at the service layer too.
+
+### R4/R5 (was NOT MET) — the proof lived at the service seam, not on the wire
+Defect confirmed: the only end-to-end PATCH assertions were "not 403" and
+"not 200", both of which pass for the wrong reason (`unknown` state), so the
+card's actual requirement — a coordination card CAN close while its cited PR is
+OPEN, and a PR-deliverable card still CANNOT — was never demonstrated on the
+request path.
+
+FIX: a hoisted `vi.mock` on `github-pull-request-merge.js` with a mutable
+`pinnedResolver`, null by default so all 22 pre-existing cases see unchanged
+behaviour. The two new request-path cases pin it to a genuinely `open` PR:
+- `-t "the board request path closes a coordination card whose cited PR is OPEN"`
+  → exit 0, `Tests  1 passed | 34 skipped`. Asserts **200**, `status === done`,
+  and the `issue.done_gate_coordination_relaxed` row naming
+  `Spark-Mojo/sparkmojo-internal#957`.
+- `-t "the board request path STILL refuses a PR-deliverable card carrying the
+  classification"` → exit 0, `Tests  1 passed | 34 skipped`. Same actor, same
+  field, same pinned `open` resolver — the only variable is the attached work
+  product. Asserts **409** with
+  `pullRequests: [{ number: 1150, state: "open" }]`, card stays
+  `in_progress`, and NO relaxation row was written.
+
+NEGATIVE control on the stronger of the two (flipping its 409 to 200 in a
+scratch copy):
+`AssertionError: … expected 409 to be 200`, `Tests  1 failed | 34 skipped`,
+exit **1**. Scratch file deleted in the same command.
+
+### Test-harness defect found while fixing the above
+`afterEach` deleted `heartbeat_runs` BEFORE `activityLog`, so once the new cases
+wrote activity rows carrying a `runId`, teardown failed on
+`activity_log_run_id_heartbeat_runs_id_fk` and cascaded 5 failures. Reordered
+(`activityLog` first). This was latent in the existing suite — it only
+surfaced once a case wrote a run-scoped activity row through the route path.
+
+### R5 residual risk, stated not hidden (verifier's second half)
+The shape SPA-8593/8626/8665/8715/8722 describes — an agent links ITS OWN open
+PR in a comment and never attaches a work product — is still closable if a
+**board user** chooses to classify it. That is inherent to James's ruling, which
+authorizes a board-authorized exception by design; the engine cannot
+distinguish "coordination card citing evidence" from "build card quoting its own
+PR" without a classification the board supplies. What IS proven and enforced:
+an agent cannot self-classify (403), the classification cannot persist as a
+standing exemption (422 + service drop), and any card with an attached work
+product still refuses (409). The residual is a human decision surface, not an
+engine bypass.
+
+### R6 / R7 — accepted as scoped, with reasons
+- R7 (no fixture-timing verdict, no thread resolution, no PR #957 merge):
+  **MET**, verified in the diff — the only occurrences of `957` are test
+  fixtures; no `sparkmojo-internal` mutation.
+- R6 (return evidence to Steve): satisfied by the closing card comment this run
+  posts, not by a UAT child. The card names no UAT child and no CI job as its
+  evidence surface, and `pr-read.sh card SPA-9578` has no linked evidence card
+  because none was ever created. A live close of SPA-9575 additionally requires
+  the board to submit the classification against a DEPLOYED engine, which is
+  post-merge and James-gated.
+
+### G5 — still PRE-EXISTING-BASE-RED, re-verified
+`pnpm --filter @paperclipai/server exec tsc --noEmit` → exit 1, **251** errors,
+identical to the baseline count. `grep -E "issue-done-gate|routes/issues|services/issues|issue-done-pr-merged"`
+over the error list returns **NONE**. Re-classification on CI-only grounds is
+unavailable: `pr-read.sh checks <B>` returns `[]` (no check run bound to the
+pinned base SHA `13e1ea88`), so clause 1 cannot be satisfied either locally or
+on CI. Recording the honest verdict rather than a green.
+
+### Round-2 gate summary
+| Gate | Outcome |
+|---|---|
+| R4 cited open PR closes on the REAL PATCH path | PASS (negative: flipped assertion exits 1) |
+| R5 PR-deliverable refuses on the REAL PATCH path | PASS (negative: flipped assertion exits 1) |
+| R3 non-done PATCH → 422 | PASS |
+| R3 classification does not persist | PASS |
+| Full suite | **35 passed (35)** — 22 pre-existing green, 13 new |
+| G5 tsc | PRE-EXISTING-BASE-RED (251 = baseline, 0 in touched files) |
