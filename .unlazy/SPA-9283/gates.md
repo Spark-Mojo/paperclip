@@ -256,3 +256,44 @@ re-judgement, and the reason this card is not marked done on the strength of one
 The net effect: three card clauses were discharged (G1/G1b, G9, and the #857 closure), one tooling
 defect was found and filed (#1014), and one real engine defect was found and filed (#1013) — none of
 them by the first run.
+
+## G11 Hand-merge path (SPA-9702) — all four clauses, recorded before the handoff
+
+    CHECK: timeout 60 bash -c 'gh api repos/Spark-Mojo/paperclip --jq .allow_auto_merge; gh repo view Spark-Mojo/paperclip --json defaultBranchRef --jq .defaultBranchRef.name; gh api repos/Spark-Mojo/paperclip/pulls/137 --jq .mergeable'
+    EXPECT: allow_auto_merge=false; default branch rebuild/v2026.916.0-survivors; mergeable=true (MERGEABLE, not unknown)
+Result: exit 0; EXPECT matched. All three read live with the repo named explicitly, never inferred from a
+checkout. `gh api repos/Spark-Mojo/paperclip/rulesets` returns 0, so no required-check rule is
+load-bearing; `mergeStateStatus` is deliberately not used as a precondition (SPA-9702 explains why it
+contradicts itself on a base-red fork).
+
+    CLAUSE 1 — head/base pinned atomically by one call:
+        pr-read.sh head 137 --repo Spark-Mojo/paperclip
+        -> H(head)=a4cead23cef22dd239641a9e208167eb35fbc5c3
+           B(base) =6f74b2f05c99354f3c22f893e326c23c23ef494f
+           baseRefName=rebuild/v2026.916.0-survivors
+
+    CLAUSE 2 — conflict state: mergeable=true. A red that reproduces on the base is exempt under
+    blocker discipline; a head-only red refuses.
+
+    CLAUSE 3 — failing-assertion non-touch. The reds are `ci / General tests (server (12/12))` and
+    `ci / Verify serialized server suites (6/9)`, both vitest suites under `server/`. The whole diff
+    is three new files under `.unlazy/SPA-9283/`:
+        git diff --exit-code 6f74b2f05c..a4cead23c -- server packages scripts .github
+        -> exit 0, empty output (no engine, package, script or CI file touched)
+    Causal non-touch is therefore provable, not merely asserted: the diff cannot affect a vitest
+    suite it does not touch.
+
+    CLAUSE 4 — base has no CI run of its own (`gh api .../commits/6f74b2f05c/check-runs --jq
+    .total_count` -> 0), so the ancestor stand-in clause applies. `8aa20505cc71298e305e4184a3aa3eff164ae4c8`
+    is verified an ancestor of the base (`git merge-base --is-ancestor 8aa20505cc 6f74b2f05c` -> 0)
+    and its run `36762282332` fails the SAME TWO checks by check name:
+        failure  ci / General tests (server (12/12))
+        failure  ci / Verify serialized server suites (6/9)
+    Both names match the head reds exactly. The ancestor additionally reds 4 checks that are green or
+    in flight on head (`ci / e2e`, `ci / verify`, `workspaces-b`, `server (11/12)`,
+    `serialized (7/9)`), which is consistent with a partially-flaky fork CI and inconsistent with a
+    red this docs-only diff caused.
+
+    Disposition under SPA-9702: both head reds are `base_red_only`. The `review` check is the vendor
+    `commitperclip` action and is never a blocker on this fork. Verified head SHA to hand to Dex:
+    a4cead23cef22dd239641a9e208167eb35fbc5c3.
