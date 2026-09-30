@@ -16,6 +16,12 @@ export const WORKSPACE_WORKTREE_REQUIRES_PROJECT_REMEDIATION =
 export const WORKSPACE_WORKTREE_REQUIRES_PROJECT_MESSAGE =
   `This task is set to run in an isolated git worktree, but it has no project and no reusable execution workspace to create the worktree from. ${WORKSPACE_WORKTREE_REQUIRES_PROJECT_REMEDIATION}`;
 
+export const AGENT_ROOT_ISSUE_REQUIRES_PROJECT_CODE = "agent_root_issue_requires_project";
+export const AGENT_ROOT_ISSUE_REQUIRES_PROJECT_REMEDIATION =
+  "Name a project on the create (projectId), pass a projectWorkspaceId or executionWorkspaceId the project can be inferred from, or create the task under a parent issue that already has a project.";
+export const AGENT_ROOT_ISSUE_REQUIRES_PROJECT_MESSAGE =
+  `An agent-created task must belong to a project, but this create resolved no project: it is a root task (no parent) and names neither projectId nor a project/execution workspace to infer one from. ${AGENT_ROOT_ISSUE_REQUIRES_PROJECT_REMEDIATION}`;
+
 type WorkspaceStrategyType = ExecutionWorkspaceStrategy["type"];
 
 export type UnrunnableWorktreeIssueRef = {
