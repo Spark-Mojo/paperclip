@@ -92,6 +92,15 @@ export function setBoundedPullRequestCacheEntry<T>(
 
 const GITHUB_PULL_REQUEST_URL_PATTERN = /https:\/\/(?:www\.)?github\.com\/([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+)\/pull\/([1-9][0-9]*)/gi;
 const GITHUB_PULL_REQUEST_SHORTHAND_PATTERN = /(^|[^A-Za-z0-9_.-])([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+)#([1-9][0-9]*)\b/g;
+const PAPERCLIP_PULL_ROUTE_PATTERN = /\[#([1-9][0-9]*)\]\(\/SPA\/pulls\/([1-9][0-9]*)\)/g;
+const ADJACENT_REPO_PATTERN = /^\s*\(\s*(Spark-Mojo)\/([A-Za-z0-9_.-]+)(?=[,\s)])/i;
+
+export function unresolvedPaperclipPullRoutes(value: string): number[] {
+  return [...value.matchAll(PAPERCLIP_PULL_ROUTE_PATTERN)]
+    .filter((match) => match[1] === match[2] && !ADJACENT_REPO_PATTERN.test(value.slice(match.index + match[0].length)))
+    .map((match) => Number(match[2]))
+    .filter((number) => Number.isSafeInteger(number));
+}
 
 function addPullRequestReference(
   references: Map<string, GitHubPullRequestReference>,
@@ -120,6 +129,10 @@ export function extractGitHubPullRequestReferences(values: readonly unknown[]) {
     GITHUB_PULL_REQUEST_SHORTHAND_PATTERN.lastIndex = 0;
     for (const match of value.matchAll(GITHUB_PULL_REQUEST_SHORTHAND_PATTERN)) {
       addPullRequestReference(references, match[2]!, match[3]!, match[4]!, true);
+    }
+    for (const match of value.matchAll(PAPERCLIP_PULL_ROUTE_PATTERN)) {
+      const adjacent = ADJACENT_REPO_PATTERN.exec(value.slice(match.index + match[0].length));
+      if (match[1] === match[2] && adjacent) addPullRequestReference(references, adjacent[1]!, adjacent[2]!, match[2]!, true);
     }
   }
   return [...references.values()];
