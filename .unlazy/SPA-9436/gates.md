@@ -4,7 +4,7 @@
   CHECK: timeout 180 pnpm exec vitest run server/src/__tests__/heartbeat-comment-wake-batching.test.ts -t 'dispatches a resolved cross-card interaction'
   EXPECT: Test Files  1 passed
   NEGATIVE: timeout 180 pnpm exec vitest run server/src/services/execution-continuation.test.ts -t 'does not relax a missing target wake origin for a foreign interaction' (isolated invalid target commentId; assertion requires rejection).
-  RESULT: exit 0, EXPECT matched, 1 passed at 2026-09-30 00:44Z; embedded Postgres + controlled gateway dispatch succeeded and no foreign-card summary reached adapter. NEGATIVE pre-fix exit 1 observed at 20:37Z.
+  RESULT: exit 0, EXPECT matched, 1 passed at 2026-09-30 00:44Z; embedded Postgres + controlled gateway dispatch succeeded and no foreign-card summary reached adapter. Resolved-interaction producer `server/src/routes/issues.ts:2715-2767` emits interaction.sourceCommentId as sourceCommentId, never as context.commentId; interaction creation `server/src/services/issue-thread-interactions.ts:3398-3415` rejects sourceCommentId from another card. `context.commentId` is a separate target-wake origin and must remain fail-closed. Pre-fix negative exit 1 observed at 20:37Z; isolated invalid target origin rejected by test in gate 2.
 
 - Cross-card resolved interaction builds a wake from the target card's history without importing source-card work.
   CHECK: timeout 180 pnpm exec vitest run server/src/services/execution-continuation.test.ts
