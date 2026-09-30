@@ -2607,7 +2607,10 @@ function renderPaperclipWakePromptBody(
   }
   if (!resumedSession && normalized.executionWorkspace?.branchName) {
     lines.push(
-      `- execution workspace branch: you are running in an execution workspace on branch ${markdownInlineCode(normalized.executionWorkspace.branchName)}. Do not switch, rename, or re-point this branch; keep all commits on it.`,
+      `- execution workspace branch: you are running in an execution workspace on branch ${markdownInlineCode(normalized.executionWorkspace.branchName)}. Do not switch, rename, or re-point this branch. Keep every commit you make in this worktree on this branch.`,
+    );
+    lines.push(
+      "- side worktree route: this clause governs only the execution workspace above. If the card's deliverable is commits on some other branch (a pre-existing pull-request head, another card's branch, a rebase, or a follow-up), make those commits in a separate worktree outside this one — `git worktree add ../<new-dir> -b <new-branch> <ref>` — and push from there. Never `git checkout` or `git switch` inside the execution workspace to reach that branch.",
     );
   }
   if (normalized.simplifiedEnglishInteractions) {
