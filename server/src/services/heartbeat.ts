@@ -3859,6 +3859,7 @@ export type ResolvedWorkspaceForRun = {
   workspaceId: string | null;
   repoUrl: string | null;
   repoRef: string | null;
+  defaultRef?: string | null;
   workspaceHints: Array<{
     workspaceId: string;
     cwd: string | null;
@@ -3973,6 +3974,23 @@ export function buildRunWorkspaceHints(
 type ProjectWorkspaceCandidate = {
   id: string;
 };
+
+export function applyProjectWorkspaceDefaultRefToWorktreeStrategy(
+  config: Record<string, unknown>,
+  mode: string,
+  workspace: { defaultRef?: string | null; repoRef: string | null },
+): Record<string, unknown> {
+  const strategy = parseObject(config.workspaceStrategy);
+  if (mode !== "isolated_workspace" || strategy.type !== "git_worktree" || readNonEmptyString(strategy.baseRef)) {
+    return config;
+  }
+  const defaultRef = readNonEmptyString(workspace.defaultRef);
+  if (!defaultRef && !readNonEmptyString(workspace.repoRef)) return config;
+  if (!defaultRef || defaultRef === readNonEmptyString(workspace.repoRef)) {
+    return { ...config, workspaceStrategy: { ...strategy, preferRemoteDefaultBranch: true } };
+  }
+  return { ...config, workspaceStrategy: { ...strategy, baseRef: defaultRef } };
+}
 
 export function prioritizeProjectWorkspaceCandidatesForRun<
   T extends ProjectWorkspaceCandidate,
@@ -12715,6 +12733,7 @@ export function heartbeatService(
             workspaceId: workspace.id,
             repoUrl: workspace.repoUrl,
             repoRef: workspace.repoRef,
+            defaultRef: workspace.defaultRef,
             workspaceHints,
             warnings: [
               preferredWorkspaceWarning,
@@ -12746,6 +12765,7 @@ export function heartbeatService(
         workspaceId: projectWorkspaceRows[0]?.id ?? null,
         repoUrl: projectWorkspaceRows[0]?.repoUrl ?? null,
         repoRef: projectWorkspaceRows[0]?.repoRef ?? null,
+        defaultRef: projectWorkspaceRows[0]?.defaultRef ?? null,
         workspaceHints,
         warnings,
         baseCwdFallback: true,
@@ -21839,11 +21859,15 @@ export function heartbeatService(
         },
       });
       const hostExecutionWorkspaceConfig =
-        stripHostWorkspaceProvisionForLowTrustSandbox({
-          config: mergedConfig,
-          trustPreset,
-          selectedEnvironmentDriver: lowTrustPreflightEnvironmentDriver,
-        });
+        applyProjectWorkspaceDefaultRefToWorktreeStrategy(
+          stripHostWorkspaceProvisionForLowTrustSandbox({
+            config: mergedConfig,
+            trustPreset,
+            selectedEnvironmentDriver: lowTrustPreflightEnvironmentDriver,
+          }),
+          requestedExecutionWorkspaceMode,
+          resolvedWorkspace,
+        );
       const executionWorkspaceBase = {
         baseCwd: resolvedWorkspace.cwd,
         source: resolvedWorkspace.source,
