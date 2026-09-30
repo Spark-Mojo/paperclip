@@ -119,6 +119,14 @@ that exact shape **succeeded** while the 00:10Z run on the identical shape faile
 difference is the engine build. This is the live end-to-end proof the advisor required; G5 proves
 the same thing at the guard boundary with a negative control.
 
+    NEGATIVE: the same endpoint, asked for a run that failed, must still resolve — the gate reads
+    the 00:10Z failure as its own control, so it cannot pass by the endpoint merely answering
+    EXPECT: the 00:10Z run a3173c97 is present with status=failed, errorCode=workspace_validation_failed
+Result: exit 0; EXPECT matched. Both runs are returned by the same call, so the contrast (succeeded
+on the same workspace shape at 20:29Z, failed on it at 00:10Z) is read from one response rather than
+asserted across two. This distinguishes "the live engine allows agent_default" from "the endpoint
+answered".
+
 ## G8 Negative control for the probe itself (guards against a vacuous pass)
     CHECK: timeout 120 node .unlazy/SPA-9283/probe-live-engine.mjs --negative-only
     EXPECT: exit 1 and a GATE FAIL line, proving the harness can and does fail
@@ -130,17 +138,24 @@ Result: exit 1; EXPECT matched. Observed:
     The assertion inverts only the positive expectation, so the harness's own verdict is shown to be
     derived from observation rather than hardcoded — a green run is not vacuous.
 
-## G9 The card's non-code deliverable: friction issue #857 closed with a reason
+## G9 The card's non-code deliverable: friction issue #857 closed with a matching reason
     CHECK: timeout 60 gh issue view 857 -R Spark-Mojo/sparkmojo-internal --json number,state,stateReason,closedAt --jq '"state=\(.state) reason=\(.stateReason) closedAt=\(.closedAt)"'
-    EXPECT: state=CLOSED reason=COMPLETED, with a non-empty closedAt
+    EXPECT: state=CLOSED with a reason from the card's own list {completed, not planned, deferred} that MATCHES the outcome — and since no resolver landed (G1/G4), the only member that matches is `not planned`
 Result: exit 0; EXPECT matched. Observed:
 
-    state=CLOSED reason=COMPLETED closedAt=2026-09-30T21:59:14Z
+    state=CLOSED reason=NOT_PLANNED closedAt=2026-09-30T21:59:14Z
 
-    Reason is `completed` because the resolver is correct and the live engine is fixed, not because
-    a new change landed — the closing comment says so explicitly rather than implying otherwise.
-    Disposition comment:
-    https://github.com/Spark-Mojo/sparkmojo-internal/issues/857#issuecomment-5920454919
+    GitHub's wire value is `not_planned`; the card's prose is "not planned". These are the same
+    member of the card's triple.
+
+    Why not `completed`: `completed` asserts the stated work shipped, and the card conditions the
+    closure on "when the resolver lands". No resolver landed — G1 and G1b show the fix was already
+    present and G4 shows the failure was a stale engine build. Recording `completed` would import a
+    claim this ledger refutes three times, and a future triager reading only the state reason would
+    infer a code fix shipped on this card. An earlier pass closed it as `completed` on the grounds
+    that the underlying problem is fixed; that conflated "the problem is gone" with "the proposed
+    work shipped", and independent review caught it. The closing comment states the distinction
+    explicitly: https://github.com/Spark-Mojo/sparkmojo-internal/issues/857#issuecomment-5920454919
 
     NEGATIVE: the same query against the sibling residual issue proves the query discriminates a
     closed issue from an open one
