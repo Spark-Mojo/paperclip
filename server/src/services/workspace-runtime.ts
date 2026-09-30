@@ -2582,11 +2582,20 @@ async function resolveAuthoritativeBaseRef(
   resolveGitAuth?: GitRemoteAuthProvider | null,
 ): Promise<AuthoritativeBaseRefResolution> {
   const warnings: string[] = [];
-  const detectOrHead = async () => (await detectDefaultBranch(repoRoot, resolveGitAuth)) ?? "HEAD";
-
   const configured = configuredBaseRef?.trim();
   if (!configured || configured === "HEAD") {
-    return { resolved: true, baseRef: await detectOrHead(), warnings, refreshed: false };
+    const remoteHead = await detectDefaultBranch(repoRoot, resolveGitAuth);
+    if (!remoteHead) {
+      return {
+        resolved: false,
+        requestedRef: "refs/remotes/origin/HEAD",
+        recoveryIdentityRef: "refs/remotes/origin/HEAD",
+        attemptedRefs: ["refs/remotes/origin/HEAD"],
+        warnings: ["Could not determine the origin default branch for a new execution workspace."],
+        fetchError: null,
+      };
+    }
+    return { resolved: true, baseRef: remoteHead, warnings, refreshed: false };
   }
 
   // A remote-tracking ref supplied directly (for example `origin/fix/foo`).
@@ -2827,38 +2836,20 @@ async function detectDefaultBranch(
   repoRoot: string,
   resolveGitAuth?: GitRemoteAuthProvider | null,
 ): Promise<string | null> {
-  const originMasterRef = "origin/master";
-  await refreshRemoteTrackingBaseRef(repoRoot, originMasterRef, resolveGitAuth);
-  if (await resolveBaseRefSha(repoRoot, originMasterRef)) {
-    return originMasterRef;
-  }
-
-  // Try the explicit remote HEAD first (set by git clone or git remote set-head)
-  try {
-    const remoteHead = await runGit(
-      ["symbolic-ref", "--quiet", "--short", "refs/remotes/origin/HEAD"],
-      repoRoot,
-    );
-    if (remoteHead) {
-      await refreshRemoteTrackingBaseRef(repoRoot, remoteHead, resolveGitAuth);
-      if (await resolveBaseRefSha(repoRoot, remoteHead)) return remoteHead;
-    }
-  } catch {
-    // Not set — fall through to heuristic
-  }
-
-  // Fallback: check for common default branch names on the remote
-  for (const candidate of ["origin/master", "origin/main", "main", "master"]) {
-    try {
-      await refreshRemoteTrackingBaseRef(repoRoot, candidate, resolveGitAuth);
-      await runGit(["rev-parse", "--verify", `${candidate}^{commit}`], repoRoot);
-      return candidate;
-    } catch {
-      // Not found — try next
-    }
-  }
-
-  return null;
+  const remoteUrl = await runGit(["remote", "get-url", "origin"], repoRoot).catch(() => null);
+  if (!remoteUrl) return null;
+  const auth = resolveGitAuth ? await resolveGitAuth(remoteUrl).catch(() => null) : null;
+  const output = await runGit(
+    [...(auth?.configArgs ?? []), "ls-remote", "--symref", "origin", "HEAD"],
+    repoRoot,
+    auth ? { env: { ...process.env, ...auth.env } } : undefined,
+  ).catch(() => null);
+  const branch = output?.match(/^ref: refs\/heads\/([^\s]+)\s+HEAD$/m)?.[1];
+  if (!branch) return null;
+  const baseRef = `refs/remotes/origin/${branch}`;
+  const warnings = await refreshRemoteTrackingBaseRef(repoRoot, baseRef, resolveGitAuth);
+  if (warnings.length > 0 || !await resolveBaseRefSha(repoRoot, baseRef)) return null;
+  return baseRef;
 }
 
 async function directoryExists(value: string) {
@@ -3449,7 +3440,7 @@ export async function realizeExecutionWorkspace(input: {
   let pendingForwardBranchReconcile: PendingForwardBranchReconcile | null = null;
   const configuredBaseRef = typeof rawStrategy.baseRef === "string" && rawStrategy.baseRef.length > 0
     ? rawStrategy.baseRef
-    : input.base.repoRef ?? null;
+    : null;
   const baseRefResolution = await resolveAuthoritativeBaseRef(repoRoot, configuredBaseRef, input.resolveGitAuth);
   // Keep a usable base ref for the reuse and drift paths even when the ref is
   // unresolved: those paths tolerate a null base-ref SHA and never run
