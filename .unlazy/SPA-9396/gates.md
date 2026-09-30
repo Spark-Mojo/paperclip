@@ -1,5 +1,18 @@
 # SPA-9396 gates — incomplete WIP, 2026-09-30
 
+## PostgreSQL lock diagnostic conversion — 2026-09-30 — HOLD
+
+Converted `server/src/__tests__/zz-probe-9396.test.ts` from a vacuous `/tmp`-writing probe to a test-local embedded-PostgreSQL assertion. Two connections and a post-lock barrier check four writer classes (work-product and comment inserts, work-product URL update, comment soft-delete). Both issue and existing binding row locks must block every writer; single-lock controls must allow a respective writer. This tests PostgreSQL lock primitives, NOT the production approval route's lock acquisition. Database cleanup runs in `finally`. No engine behavior changed.
+
+  CHECK: timeout 300 pnpm exec vitest run server/src/__tests__/zz-probe-9396.test.ts
+  EXPECT: Tests  1 passed (1)
+  RESULT: exit 0, EXPECT matched: Test Files 1 passed (1); Tests 1 passed (1); Duration 17.33s. Re-run after negative restoration: exit 0, 1/1 passed, Duration 16.73s.
+  NEGATIVE: temporarily remove `await lockBindingRows(tx)` from `lockBoth` in the same test fixture, then run `timeout 300 pnpm exec vitest run server/src/__tests__/zz-probe-9396.test.ts`; observed exit 1 at the blocking assertion, expected true but received false. Restored the binding lock immediately afterward. No live board data used.
+
+`timeout 900 pnpm --filter @paperclipai/shared --filter @paperclipai/server typecheck` without cargo on PATH exited 1 (`cargo: not found`); `PATH="$HOME/.cargo/bin:$PATH" timeout 900 pnpm --filter @paperclipai/shared --filter @paperclipai/server typecheck` exited 0 (shared Done; server Done). `timeout 20 git diff --check` exited 0 before this ledger update.
+
+Still missing: route-level PostgreSQL concurrent-writer oracle; production lock discipline; stalled durable approval, changed-head review, contract sync, independent verification, PR, merge, rollout and Sable decision. No safe-to-ship claim.
+
 ## PATCH locked-set continuation, 2026-09-30 — HOLD
 
 The previous PATCH fixture's successful path was a false 500: its `addComment` mock returned undefined, and its bound-set mock expected a second argument instead of capturing the service-factory DB handle. Repaired both fixtures. With the production recheck absent, the same-size, grown and description-change assertions failed at expected 409 versus actual 200; the unchanged positive failed because the transaction handle was never used. Added a transaction-scoped canonical-set/head recheck before PATCH persistence. `timeout 220 pnpm exec vitest run server/src/__tests__/issue-patch-stage-approval-locked-set.test.ts` exited 0, 5/5 passed after implementation. `timeout 600 pnpm exec vitest run server/src/__tests__/issue-patch-stage-approval-locked-set.test.ts server/src/__tests__/issue-comment-stage-approval-lock.test.ts server/src/__tests__/issue-stage-approval-scan-budget.test.ts server/src/__tests__/issue-execution-policy-routes.test.ts server/src/__tests__/issue-done-pr-merged-gate.test.ts` exited 0, 69/69 passed. `export PATH="$HOME/.cargo/bin:$PATH"; timeout 900 pnpm --filter @paperclipai/shared --filter @paperclipai/server typecheck` exited 0 (shared Done, server Done); `git diff --check` exited 0. These modeled-handle checks do NOT establish PostgreSQL binding-row locks, nor durable stalled decisions, changed-head review, or end-to-end security approval. No PR/merge/rollout/decision.

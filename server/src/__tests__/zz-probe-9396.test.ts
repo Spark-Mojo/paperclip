@@ -1,6 +1,5 @@
 import { randomUUID } from "node:crypto";
-import fs from "node:fs";
-import { eq, sql } from "drizzle-orm";
+import { eq } from "drizzle-orm";
 import { describe, expect, it } from "vitest";
 import {
   agents,
@@ -19,12 +18,6 @@ import {
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
 
-const lines: string[] = [];
-const note = (line: string) => {
-  lines.push(line);
-  fs.writeFileSync("/tmp/probe-9396.txt", lines.join("\n") + "\n");
-};
-
 const WAIT_MS = 1500;
 
 function deferred<T>() {
@@ -35,8 +28,8 @@ function deferred<T>() {
   return { promise, resolve };
 }
 
-describeEmbeddedPostgres("PROBE 9396 writer-lock discipline v2", () => {
-  it("probes each binding-write class against each candidate lock", async () => {
+describeEmbeddedPostgres("approval binding writer lock discipline", () => {
+  it("requires both issue and binding row locks for inserts and updates", async () => {
     const tempDb = await startEmbeddedPostgresTestDatabase("paperclip-9396-probe2-");
     const db = createDb(tempDb.connectionString);
     const other = createDb(tempDb.connectionString);
@@ -85,22 +78,8 @@ describeEmbeddedPostgres("PROBE 9396 writer-lock discipline v2", () => {
       .returning()
       .then((rows) => rows[0]!);
 
-    const fk = await db.execute(sql`
-      SELECT conname, condeferrable
-      FROM pg_constraint
-      WHERE conname IN (
-        'issue_work_products_issue_id_issues_id_fk',
-        'issue_comments_issue_id_issues_id_fk'
-      )
-    `);
-    note(`fk: ${JSON.stringify(fk)}`);
 
-    /**
-     * Hold `lock` in tx1, THEN issue the concurrent write from `other`, and
-     * report whether it completed before the lock was released. The write is
-     * only issued after the barrier, so there is no acquisition race.
-     */
-    async function probe(label: string, lock: (tx: any) => Promise<unknown>, write: () => Promise<unknown>) {
+    async function probe(lock: (tx: any) => Promise<unknown>, write: () => Promise<unknown>) {
       const locked = deferred<void>();
       const release = deferred<void>();
       let settled = false;
@@ -127,9 +106,7 @@ describeEmbeddedPostgres("PROBE 9396 writer-lock discipline v2", () => {
       release.resolve();
       await holder;
       await concurrent;
-      note(
-        `${label}: blockedWhileLockHeld=${blockedWhileHeld} errorWhileBlocked=${error ? String(error).slice(0, 80) : "none"}`,
-      );
+      if (error) throw error;
       return blockedWhileHeld;
     }
 
@@ -164,29 +141,19 @@ describeEmbeddedPostgres("PROBE 9396 writer-lock discipline v2", () => {
         .insert(issueComments)
         .values({ companyId: company.id, issueId: card.id, body: "https://github.com/Spark-Mojo/paperclip/pull/4" });
 
-    note("--- lock: issues FOR UPDATE ---");
-    await probe("insert work product", lockIssueRow, insertWorkProduct);
-    await probe("insert comment", lockIssueRow, insertComment);
-    await probe("update work product url", lockIssueRow, updateWorkProductUrl);
-    await probe("soft-delete comment", lockIssueRow, softDeleteComment);
-
-    note("--- lock: binding rows FOR UPDATE ---");
-    await probe("insert work product", lockBindingRows, insertWorkProduct);
-    await probe("insert comment", lockBindingRows, insertComment);
-    await probe("update work product url", lockBindingRows, updateWorkProductUrl);
-    await probe("soft-delete comment", lockBindingRows, softDeleteComment);
-
-    note("--- lock: both issues row AND binding rows ---");
-    const lockBoth = async (tx: any) => {
-      await lockIssueRow(tx);
-      await lockBindingRows(tx);
-    };
-    await probe("insert work product", lockBoth, insertWorkProduct);
-    await probe("insert comment", lockBoth, insertComment);
-    await probe("update work product url", lockBoth, updateWorkProductUrl);
-    await probe("soft-delete comment", lockBoth, softDeleteComment);
-
-    expect(true).toBe(true);
-    await tempDb.cleanup();
+    try {
+      const writers = [insertWorkProduct, insertComment, updateWorkProductUrl, softDeleteComment];
+      const lockBoth = async (tx: any) => {
+        await lockIssueRow(tx);
+        await lockBindingRows(tx);
+      };
+      for (const write of writers) {
+        expect(await probe(lockBoth, write)).toBe(true);
+      }
+      expect(await probe(lockIssueRow, updateWorkProductUrl)).toBe(false);
+      expect(await probe(lockBindingRows, insertWorkProduct)).toBe(false);
+    } finally {
+      await tempDb.cleanup();
+    }
   }, 180_000);
 });
