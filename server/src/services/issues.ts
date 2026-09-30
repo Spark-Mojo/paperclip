@@ -10751,7 +10751,7 @@ export function issueService(db: Db) {
         !doneGateBypass
       ) {
         const { issueStageApprovalService } = await import("./issue-stage-approvals.js");
-        const approvalGate = await issueStageApprovalService(db).evaluateStageApprovalGate({
+        const approvalGate = await issueStageApprovalService(db, { tx: dbOrTx as Db }).evaluateStageApprovalGate({
           issue: {
             id: existing.id,
             companyId: existing.companyId,

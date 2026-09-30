@@ -72,6 +72,33 @@ import {
 export const DONE_GATE_OPEN_PR_REFUSAL = "issue_done_with_unmerged_pull_request";
 
 /**
+ * The binding surface is read under a hard cap, because this file is an
+ * authority surface and an unbounded scan is a DoS vector. A card past either
+ * cap yields a TRUNCATED bound set, which is safe HERE (a missed PR only ever
+ * adds a refusal) and UNSAFE for the stage-approval path, where two different
+ * truncated sets compare equal. Those limits are the done-gate's alone and are
+ * never read from a caller.
+ */
+const WORK_PRODUCT_SCAN_LIMIT = 100;
+const COMMENT_SCAN_LIMIT = 200;
+
+/**
+ * SPA-9396 — truncation-detecting scan budget, for the premerge stage-approval
+ * path. Read `limit + 1`: a full `limit + 1` PROVES the set is truncated (the
+ * query returned more rows than the budget allows), and the caller refuses
+ * rather than comparing two truncated sets. Exactly `limit` rows is NOT
+  * truncation and is served normally.
+ */
+export type BoundPullRequestScanBudget = {
+  workProductLimit: number;
+  commentLimit: number;
+  onTruncated: (surface: "work_products" | "comments", limit: number) => never;
+};
+
+export const APPROVAL_WORK_PRODUCT_SCAN_LIMIT = WORK_PRODUCT_SCAN_LIMIT;
+export const APPROVAL_COMMENT_SCAN_LIMIT = COMMENT_SCAN_LIMIT;
+
+/**
  * SPA-9038: PR links parsed out of card prose (description/comments) bind the
  * gate only when they point at Spark-Mojo repos — our own repos, where an
  * unmerged PR is a real DoD fact for the card. Foreign-repo mentions are
@@ -79,8 +106,8 @@ export const DONE_GATE_OPEN_PR_REFUSAL = "issue_done_with_unmerged_pull_request"
  */
 const SPARK_MOJO_ORG = "spark-mojo";
 
-/** How many recent comments to scan for PR mentions (SPA-9038 bindings). */
-const COMMENT_SCAN_LIMIT = 200;
+/** SPA-9038: how many recent comments to scan for PR mentions. */
+const COMMENT_SCAN_LIMIT_DONE_GATE = 200;
 
 function isSparkMojoRepo(reference: GitHubPullRequestReference): boolean {
   return reference.owner.toLowerCase() === SPARK_MOJO_ORG;
@@ -120,6 +147,17 @@ export type IssueDoneGateServiceOptions = {
     companyId: string,
     reference: GitHubPullRequestReference,
   ) => Promise<PullRequestMergeDetails>;
+  /**
+   * SPA-9396: an OPTIONAL truncation-detecting scan budget. Absent (the
+   * done-gate, and every other consumer), the binding surface is read under
+   * this service's own cap and truncation is neither detected nor reported —
+   * unchanged, because truncation here can only ever cause a refusal. When
+   * present, `listBoundPullRequests` reads `limit + 1` on both surfaces and
+   * calls `onTruncated` (which never returns) the moment the extra row proves
+   * the set is incomplete, so the approval path fails closed instead of
+   * comparing two truncated sets.
+   */
+  seam?: BoundPullRequestScanBudget;
 };
 
 function formatReference(reference: GitHubPullRequestReference) {
@@ -155,6 +193,8 @@ export function issueDoneGateService(db: Db, opts: IssueDoneGateServiceOptions =
     { state: "merged" | "open" | "closed" | "unknown"; checkedAtMs: number }
   >();
   const cacheTtlMs = 60_000;
+
+  const scanBudget = opts.seam ?? null;
 
   async function resolvePullRequestState(
     companyId: string,
@@ -209,7 +249,12 @@ export function issueDoneGateService(db: Db, opts: IssueDoneGateServiceOptions =
       }
     };
 
-    const products = await db
+    const workProductLimit = scanBudget?.workProductLimit ?? WORK_PRODUCT_SCAN_LIMIT;
+    const commentLimit = scanBudget?.commentLimit ?? COMMENT_SCAN_LIMIT;
+    // Truncation detection needs the sentinel row: ask for `limit + 1` and
+    // refuse when all of them come back. Asking for the bare cap would make a
+    // truncated set indistinguishable from a complete one.
+    const workProductRows = await db
       .select({
         url: issueWorkProducts.url,
         externalId: issueWorkProducts.externalId,
@@ -224,7 +269,11 @@ export function issueDoneGateService(db: Db, opts: IssueDoneGateServiceOptions =
         eq(issueWorkProducts.type, "pull_request"),
       ))
       .orderBy(desc(issueWorkProducts.updatedAt))
-      .limit(100);
+      .limit(workProductLimit + 1);
+    if (scanBudget && workProductRows.length > workProductLimit) {
+      scanBudget.onTruncated("work_products", workProductLimit);
+    }
+    const products = workProductRows.slice(0, workProductLimit);
 
     for (const product of products) {
       const values = [
@@ -242,7 +291,7 @@ export function issueDoneGateService(db: Db, opts: IssueDoneGateServiceOptions =
     if (typeof issue.description === "string" && issue.description.length > 0) {
       addProse(issue.description);
     }
-    const commentBodies = await db
+    const commentRows = await db
       .select({ body: issueComments.body })
       .from(issueComments)
       .where(and(
@@ -251,8 +300,11 @@ export function issueDoneGateService(db: Db, opts: IssueDoneGateServiceOptions =
         isNull(issueComments.deletedAt),
       ))
       .orderBy(desc(issueComments.createdAt))
-      .limit(COMMENT_SCAN_LIMIT);
-    for (const row of commentBodies) {
+.limit(commentLimit + 1);
+    if (scanBudget && commentRows.length > commentLimit) {
+      scanBudget.onTruncated("comments", commentLimit);
+    }
+    for (const row of commentRows.slice(0, commentLimit)) {
       addProse(row.body);
     }
     return { references: [...references.values()], unresolved: [...unresolved] };
@@ -375,7 +427,7 @@ export async function listRecentPullRequestCommentMentions(
       eq(issueComments.issueId, issue.id),
     ))
     .orderBy(desc(issueComments.createdAt))
-    .limit(COMMENT_SCAN_LIMIT);
+    .limit(COMMENT_SCAN_LIMIT_DONE_GATE);
   const mentions: string[] = [];
   for (const row of rows) {
     for (const reference of extractGitHubPullRequestReferences([row.body])) {

@@ -138,6 +138,7 @@ const mockDb = vi.hoisted(() => ({
 // Bound pull requests are derived from the issue description; the done-gate
 // scanner is stubbed so the canonical set is a fixture, not a description regex.
 const mockIssueDoneGateService = vi.hoisted(() => ({
+  handles: [] as unknown[],
   listBoundPullRequests: vi.fn(async () => [] as Array<{
     host: string;
     owner: string;
@@ -162,7 +163,12 @@ function registerModuleMocks() {
   }));
 
   vi.doMock("../services/issue-done-gate.js", () => ({
-    issueDoneGateService: () => mockIssueDoneGateService,
+    issueDoneGateService: (handle: unknown) => {
+      mockIssueDoneGateService.handles.push(handle);
+      return mockIssueDoneGateService;
+    },
+    APPROVAL_WORK_PRODUCT_SCAN_LIMIT: 100,
+    APPROVAL_COMMENT_SCAN_LIMIT: 200,
   }));
 
   vi.doMock("../services/github-pull-request-merge.js", () => ({
@@ -348,6 +354,7 @@ describe("comment-path stage approval — locked snapshot and canonical PR set",
     registerModuleMocks();
     vi.clearAllMocks();
     insertedDecisionRows.length = 0;
+    mockIssueDoneGateService.handles.length = 0;
     mockIssueService.assertCheckoutOwner.mockResolvedValue({ adoptedFromRunId: null });
     mockIssueService.findMentionedAgents.mockResolvedValue([]);
     mockIssueService.getRelationSummaries.mockResolvedValue({ blockedBy: [], blocks: [] });
@@ -514,6 +521,7 @@ describe("comment-path stage approval — locked snapshot and canonical PR set",
       });
 
     expect(res.status).toBe(201);
+    expect(mockIssueDoneGateService.handles).toContain(mockTx);
     expect(mockIssueService.addComment).toHaveBeenCalledTimes(1);
     expect(insertedDecisionRows.length).toBe(1);
     // A premerge approval is stage participation, not terminal completion:

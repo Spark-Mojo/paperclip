@@ -17984,7 +17984,7 @@ export function issueRoutes(
                 });
               }
               const lockedBoundSet = (
-                await commentStageApprovalSvc.readBound({
+                await issueStageApprovalService(db, { tx: tx as unknown as typeof db }).readBound({
                   id: lockedIssue.id,
                   companyId: lockedIssue.companyId,
                   description: lockedIssue.description,
