@@ -461,6 +461,49 @@ describeEmbeddedPostgres("heartbeat comment wake batching", () => {
     expect(runs[0]?.id).toBe(runId);
   });
 
+  it("dispatches a resolved cross-card interaction without importing the creator run", async () => {
+    const gateway = await createControlledGatewayServer();
+    const companyId = randomUUID(), agentId = randomUUID(), issueId = randomUUID();
+    const sourceRunId = randomUUID(), interactionId = randomUUID(), commentId = randomUUID();
+    const heartbeat = heartbeatService(db, { runtimeEnv: { PAPERCLIP_IN_WORKTREE: "false" } });
+    try {
+      await db.insert(companies).values({ id: companyId, name: "Cross-card", issuePrefix: "XCC", defaultResponsibleUserId: "responsible-user" });
+      await db.insert(agents).values({ id: agentId, companyId, name: "Gateway Agent", role: "engineer", status: "idle",
+        adapterType: "openclaw_gateway", adapterConfig: { url: gateway.url,
+          headers: { "x-openclaw-token": "gateway-token" }, payloadTemplate: { message: "wake now" }, waitTimeoutMs: 2_000 },
+        runtimeConfig: {}, permissions: {} });
+      await db.insert(issues).values({ id: issueId, companyId, title: "Target card", status: "todo", priority: "medium",
+        responsibleUserId: "responsible-user", assigneeAgentId: agentId, issueNumber: 1, identifier: "XCC-1" });
+      await db.insert(issueComments).values({ id: commentId, companyId, issueId, authorType: "user",
+        authorUserId: "responsible-user", body: "Continue the target card" });
+      await db.insert(heartbeatRuns).values({ id: sourceRunId, companyId, agentId, status: "succeeded",
+        contextSnapshot: { issueId: randomUUID(), commentId: randomUUID() }, resultJson: { summary: "Foreign card work" } });
+      await db.insert(issueThreadInteractions).values({ id: interactionId, companyId, issueId,
+        kind: "request_confirmation", status: "accepted", sourceRunId, originCommentIds: [commentId],
+        payload: { version: 1, prompt: "Continue?" }, result: { version: 1, outcome: "accepted" } });
+      const wake = await heartbeat.wakeup(agentId, { source: "automation", triggerDetail: "system", reason: "issue_commented",
+        requestedByActorType: "user", requestedByActorId: "responsible-user",
+        payload: { issueId, interactionId, interactionKind: "request_confirmation", interactionStatus: "accepted",
+          sourceRunId, mutation: "interaction" },
+        contextSnapshot: { issueId, taskId: issueId, interactionId, interactionKind: "request_confirmation",
+          interactionStatus: "accepted", sourceRunId, wakeReason: "issue_commented" } });
+      expect(wake?.id).toBeTruthy();
+      gateway.releaseFirstWait();
+      await heartbeat.drainActiveRunExecutions();
+      const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, wake!.id));
+      expect(run.status).toBe("succeeded");
+      const message = String(gateway.getAgentPayloads()[0]?.message ?? "");
+      expect(message).toContain("Continue the target card");
+      expect(message).toContain(interactionId);
+      expect(message).toContain("accepted");
+      expect(message).not.toContain("Foreign card work");
+    } finally {
+      gateway.releaseFirstWait();
+      await heartbeat.drainActiveRunExecutions();
+      await gateway.close();
+    }
+  }, 120_000);
+
   it("batches deferred comment wakes and forwards the ordered batch to the next run", async () => {
     const gateway = await createControlledGatewayServer();
     const companyId = randomUUID();
