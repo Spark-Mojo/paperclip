@@ -1061,7 +1061,7 @@ describe("realizeExecutionWorkspace", () => {
     expect(reused.created).toBe(false);
     expect(await readGit(reused.cwd, ["rev-parse", "HEAD"])).toBe(taskHead);
     expect(reused.warnings).toEqual([
-      expect.stringContaining("is behind refs/remotes/origin/master by 1 commit"),
+      expect.stringContaining("is behind origin/master by 1 commit"),
     ]);
   });
 
@@ -1082,7 +1082,7 @@ describe("realizeExecutionWorkspace", () => {
       "uncommitted scratch\n",
     );
     expect(reused.warnings).toEqual([
-      expect.stringContaining("is behind refs/remotes/origin/master by 1 commit"),
+      expect.stringContaining("is behind origin/master by 1 commit"),
     ]);
   });
 
@@ -1107,7 +1107,7 @@ describe("realizeExecutionWorkspace", () => {
       "uncommitted scratch\n",
     );
     expect(reused.warnings).toEqual([
-      expect.stringContaining("is behind refs/remotes/origin/master by 1 commit"),
+      expect.stringContaining("is behind origin/master by 1 commit"),
     ]);
   });
 
@@ -3973,7 +3973,7 @@ describe("realizeExecutionWorkspace", () => {
     // The worktree should have been created successfully from the canonical remote base.
     const worktreeOp = operations.find(op => op.phase === "worktree_prepare" && op.metadata?.created);
     expect(worktreeOp).toBeDefined();
-    expect(worktreeOp!.metadata!.baseRef).toBe("refs/remotes/origin/master");
+    expect(worktreeOp!.metadata!.baseRef).toBe("origin/master");
   }, 10_000);
 
   it("auto-detects the default branch via symbolic-ref when origin/HEAD is set", async () => {
@@ -4022,7 +4022,7 @@ describe("realizeExecutionWorkspace", () => {
     expect(workspace.created).toBe(true);
     const worktreeOp = operations.find(op => op.phase === "worktree_prepare" && op.metadata?.created);
     expect(worktreeOp).toBeDefined();
-    expect(worktreeOp!.metadata!.baseRef).toBe("refs/remotes/origin/main");
+    expect(worktreeOp!.metadata!.baseRef).toBe("origin/master");
   }, 10_000);
 
   it("uses the advertised remote HEAD instead of a stale project repoRef", async () => {
