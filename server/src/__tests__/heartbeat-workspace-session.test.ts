@@ -3450,8 +3450,8 @@ describe("project workspace defaultRef as git worktree base", () => {
   });
 
   it("leaves base selection to the remote when defaultRef is absent or equals the checkout ref", () => {
-    expect(applyProjectWorkspaceDefaultRefToWorktreeStrategy({ workspaceStrategy: { type: "git_worktree" } }, "isolated_workspace", { ...project, defaultRef: null }).workspaceStrategy).toEqual({ type: "git_worktree" });
-    expect(applyProjectWorkspaceDefaultRefToWorktreeStrategy({ workspaceStrategy: { type: "git_worktree" } }, "isolated_workspace", { ...project, defaultRef: project.repoRef }).workspaceStrategy).toEqual({ type: "git_worktree" });
+    expect(applyProjectWorkspaceDefaultRefToWorktreeStrategy({ workspaceStrategy: { type: "git_worktree" } }, "isolated_workspace", { ...project, defaultRef: null }).workspaceStrategy).toEqual({ type: "git_worktree", preferRemoteDefaultBranch: true });
+    expect(applyProjectWorkspaceDefaultRefToWorktreeStrategy({ workspaceStrategy: { type: "git_worktree" } }, "isolated_workspace", { ...project, defaultRef: project.repoRef }).workspaceStrategy).toEqual({ type: "git_worktree", preferRemoteDefaultBranch: true });
   });
 
   it("does not change shared workspaces or adapter-managed strategies", () => {

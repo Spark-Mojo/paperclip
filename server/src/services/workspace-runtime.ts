@@ -2583,8 +2583,11 @@ async function resolveAuthoritativeBaseRef(
 ): Promise<AuthoritativeBaseRefResolution> {
   const warnings: string[] = [];
   const configured = configuredBaseRef?.trim();
-  if (!configured || configured === "HEAD") {
+  if (!configured) {
     const remoteHead = await detectDefaultBranch(repoRoot, resolveGitAuth);
+    if (!remoteHead && !await remoteExists(repoRoot, "origin")) {
+      return { resolved: true, baseRef: "HEAD", warnings, refreshed: false };
+    }
     if (!remoteHead) {
       return {
         resolved: false,
@@ -3440,7 +3443,7 @@ export async function realizeExecutionWorkspace(input: {
   let pendingForwardBranchReconcile: PendingForwardBranchReconcile | null = null;
   const configuredBaseRef = typeof rawStrategy.baseRef === "string" && rawStrategy.baseRef.length > 0
     ? rawStrategy.baseRef
-    : null;
+    : rawStrategy.preferRemoteDefaultBranch === true ? null : input.base.repoRef ?? null;
   const baseRefResolution = await resolveAuthoritativeBaseRef(repoRoot, configuredBaseRef, input.resolveGitAuth);
   // Keep a usable base ref for the reuse and drift paths even when the ref is
   // unresolved: those paths tolerate a null base-ref SHA and never run
