@@ -211,7 +211,7 @@ describe("premerge execution stage approval", () => {
     expect(result.patch.executionState).toMatchObject({
       status: "completed",
       lastDecisionOutcome: "approved",
-      awaitingMerge: true,
+      awaitingMerge: { stageId: policy.stages[0]!.id },
       approvals: [{ stageId: policy.stages[0]!.id, pullRequests }],
     });
   });

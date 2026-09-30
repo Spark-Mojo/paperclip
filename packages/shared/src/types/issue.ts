@@ -707,13 +707,49 @@ export interface IssueStageApprovalPullRequest {
   headSha: string;
 }
 
+/**
+ * SPA-9396 — a review/approval stage's durable participation record.
+ *
+ * Sequencing bookkeeping only: this records WHO took part in the stage and
+ * WHICH pull-request heads they looked at at the time. It is not a security
+ * attestation and carries no verdict about the code's security posture.
+ *
+ * `policyFingerprint` is the digest of the approval-relevant policy revision
+ * that was in force when the approval was recorded. It exists so terminal
+ * completion can refuse an approval the policy has since moved away from; it
+ * says nothing about what was reviewed beyond that binding.
+ *
+ * History is append-only. A later approval of the same stage supersedes the
+ * earlier one (`supersededAt`/`supersededReason`) and never deletes it, so a
+ * voided approval can never be resurrected as if it were live.
+ */
 export interface IssueExecutionStageApproval {
   stageId: string;
   stageType: IssueExecutionStageType;
   reviewerAgentId: string | null;
   reviewerUserId: string | null;
+  /** How the approval entered the record. */
+  recordedBy: IssueStageApprovalRecordedBy;
+  /** Digest of the policy revision approved against; null when none was bound. */
+  policyFingerprint: string | null;
   approvedAt: string;
   pullRequests: IssueStageApprovalPullRequest[];
+  supersededAt: string | null;
+  supersededReason: IssueStageApprovalSupersededReason | null;
+}
+
+export type IssueStageApprovalRecordedBy = "stage_participant";
+
+export type IssueStageApprovalSupersededReason = "fresh_review";
+
+/**
+ * SPA-9396 — set when the final required stage was approved before its pull
+ * request merged. The stage is complete; the card is not. This is the marker
+ * that breaks the approval/merge deadlock, and it is cleared only by a fresh
+ * review of the moved head or by terminal completion.
+ */
+export interface IssueAwaitingMergeState {
+  stageId: string;
 }
 
 export interface IssueExecutionState {
@@ -732,7 +768,7 @@ export interface IssueExecutionState {
   /** Consecutive agent-initiated changes-requested rounds on the current stage. */
   changesRequestedCount?: number;
   approvals?: IssueExecutionStageApproval[];
-  awaitingMerge?: boolean;
+  awaitingMerge?: IssueAwaitingMergeState | null;
 }
 
 export interface IssueExecutionDecision {

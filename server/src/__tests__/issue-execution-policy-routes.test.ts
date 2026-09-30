@@ -24,6 +24,8 @@ const mockHeartbeatService = vi.hoisted(() => ({
   getRun: vi.fn(async () => null),
   getActiveRunForAgent: vi.fn(async () => null),
   cancelRun: vi.fn(async () => null),
+  // SPA-9396: routes/issues.ts sweeps live runs on every status transition.
+  // Without this the transition throws mid-route and masks the assertions.
   cancelLiveRunsForIssue: vi.fn(async () => []),
 }));
 
