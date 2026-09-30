@@ -12910,6 +12910,21 @@ export function issueRoutes(
         });
         return;
       }
+      // SPA-9578: the classification is consumed by ONE gate evaluation — the
+      // first entry into `done`. It is deliberately request-scoped and never
+      // persisted as card state, so it cannot become a standing exemption: a
+      // later close needs a fresh, freshly-audited board decision. Carrying it
+      // on a PATCH that does not transition to `done` would be a silent no-op
+      // the caller could believe was applied, so it is rejected outright.
+      if (
+        coordinationNoPrDeliverableRequested
+        && updateFields.status !== "done"
+      ) {
+        res.status(422).json({
+          error: "coordinationNoPrDeliverable is only valid on a PATCH that sets status to done",
+        });
+        return;
+      }
       if (existing.conversationAgentId && req.actor.type === "board" && commentBody) {
         throw unprocessable("Send conversation messages through the comments endpoint with a clientRequestId");
       }

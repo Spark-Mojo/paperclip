@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { eq } from "drizzle-orm";
 import express from "express";
 import request from "supertest";
-import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   activityLog,
   agents,
@@ -27,6 +27,33 @@ import type { PullRequestMergeDetails } from "../services/github-pull-request-me
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
+
+/**
+ * SPA-9578: the service builds its done-gate resolver internally from
+ * `createPullRequestMergeDetailsResolver`, so a test that drives the REAL
+ * `PATCH /api/issues/{id}` path has no seam to pin the merge state — the test
+ * environment has no GitHub credentials, so every reference resolves
+ * `unknown`. This module mock keeps the production factory intact and lets a
+ * test pin ONE resolver for its duration; `pinnedResolver` is null everywhere
+ * else, so every pre-existing case sees exactly the behaviour it saw before.
+ */
+type MergeDetailsResolver = NonNullable<
+  Parameters<typeof import("../services/github-pull-request-merge.js").createPullRequestMergeDetailsResolver>[1]
+> extends never
+  ? never
+  : ReturnType<typeof import("../services/github-pull-request-merge.js").createPullRequestMergeDetailsResolver>;
+
+let pinnedResolver: MergeDetailsResolver | null = null;
+
+vi.mock("../services/github-pull-request-merge.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../services/github-pull-request-merge.js")>();
+  return {
+    ...actual,
+    createPullRequestMergeDetailsResolver: (
+      ...args: Parameters<typeof actual.createPullRequestMergeDetailsResolver>
+    ) => pinnedResolver ?? actual.createPullRequestMergeDetailsResolver(...args),
+  };
+});
 
 const OWNER_REPO = { owner: "Spark-Mojo", repo: "paperclip" } as const;
 
@@ -117,10 +144,13 @@ describeEmbeddedPostgres("issue done gate — unmerged PR refuses done (SPA-8957
   }, 30_000);
 
   afterEach(async () => {
+    // SPA-9578: the request-path cases write activity rows carrying a runId,
+    // so `activity_log` must be cleared BEFORE `heartbeat_runs` or the
+    // `activity_log_run_id_heartbeat_runs_id_fk` blocks the teardown.
+    await db.delete(activityLog);
     await db.delete(heartbeatRuns);
     await db.delete(issueComments);
     await db.delete(issueWorkProducts);
-    await db.delete(activityLog);
     await db.delete(issues);
   });
 
@@ -648,6 +678,10 @@ describeEmbeddedPostgres("issue done gate — unmerged PR refuses done (SPA-8957
       (req as unknown as { actor: unknown }).actor = {
         type: "board",
         userId: "local-board",
+        // `hasCompanyAccess` admits a board actor via companyIds (or
+        // `source: "local_implicit"`); without one, every company-scoped read
+        // 404s as "Issue not found".
+        companyIds: [companyId],
         companyId,
         runId,
         source: "session",
@@ -889,6 +923,138 @@ describeEmbeddedPostgres("issue done gate — unmerged PR refuses done (SPA-8957
       { coordinationClassification: true },
     );
     expect(serviceDecision).toMatchObject({ outcome: "allow" });
+  });
+
+  it("the board request path closes a coordination card whose cited PR is OPEN (end to end)", async () => {
+    // R4/R5 of the card, proven on the REAL request path, not at the service
+    // seam: a full `PATCH /api/issues/{id}` with `status: done` carrying the
+    // classification, with the GitHub resolver pinned to a genuinely OPEN
+    // cited PR. The card must reach `done`, and the activity row must record
+    // exactly what was relaxed.
+    pinnedResolver = () => details("open", "open");
+    try {
+      const card = await issueService(db).create(companyId, {
+        title: `Coordination card ${randomUUID().slice(0, 8)}`,
+        status: "in_progress",
+        assigneeAgentId: agentId,
+        description:
+          "Obtain a reviewer verdict on https://github.com/Spark-Mojo/sparkmojo-internal/pull/957. Do not merge it.",
+      });
+
+      const boardRun = await db
+        .insert(heartbeatRuns)
+        .values({
+          companyId,
+          agentId,
+          invocationSource: "on_demand",
+          status: "running",
+          contextSnapshot: {},
+        })
+        .returning()
+        .then((rows) => rows[0]!);
+
+      const res = await request(boardActorApp(boardRun.id))
+        .patch(`/api/issues/${card.id}`)
+        .set("X-Paperclip-Run-Id", boardRun.id)
+        .send({ status: "done", coordinationNoPrDeliverable: { reason: COORDINATION_REASON } });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      const after = await db.select().from(issues).where(eq(issues.id, card.id)).then((rows) => rows[0]!);
+      expect(after.status).toBe("done");
+
+      const rows = await db.select().from(activityLog).where(eq(activityLog.entityId, card.id));
+      const row = rows.find((entry) => entry.action === "issue.done_gate_coordination_relaxed");
+      expect(row, "the relaxation must never be silent").toBeTruthy();
+      expect(JSON.stringify(row?.details)).toContain("Spark-Mojo/sparkmojo-internal#957");
+    } finally {
+      pinnedResolver = null;
+    }
+  });
+
+  it("the board request path STILL refuses a PR-deliverable card carrying the classification", async () => {
+    // The negative half of the same request path. Same board actor, same
+    // field, same resolver — the ONLY difference is an attached
+    // `pull_request` work product. This is the bypass class the gate exists
+    // for (SPA-8593/8626/8665/8715/8722), proven on the wire, not at the seam.
+    // Same resolver as the positive case above (`open`), so the ONLY variable
+    // is the attached work product. Without this the case would refuse on
+    // `unknown` and prove nothing about the classification.
+    pinnedResolver = () => details("open", "open");
+    try {
+      const card = await createCard(db, companyId, {
+        assigneeAgentId: agentId,
+        description: "PR at https://github.com/Spark-Mojo/paperclip/pull/1150",
+      });
+      await attachPullRequestWorkProduct(db, card, 1150);
+
+      const boardRun = await startRun(agentId);
+      const res = await request(boardActorApp(boardRun.id))
+        .patch(`/api/issues/${card.id}`)
+        .set("X-Paperclip-Run-Id", boardRun.id)
+        .send({ status: "done", coordinationNoPrDeliverable: { reason: COORDINATION_REASON } });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(409);
+      expect(res.body).toMatchObject({
+        details: expect.objectContaining({
+          code: "issue_done_with_unmerged_pull_request",
+          // The WORK PRODUCT is what still blocks, not the prose link.
+          pullRequests: [expect.objectContaining({ number: 1150, state: "open" })],
+        }),
+      });
+      const after = await db.select().from(issues).where(eq(issues.id, card.id)).then((rows) => rows[0]!);
+      expect(after.status).toBe("in_progress");
+
+      // The refusal must not have written a relaxation row.
+      const rows = await db.select().from(activityLog).where(eq(activityLog.entityId, card.id));
+      expect(rows.find((entry) => entry.action === "issue.done_gate_coordination_relaxed")).toBeFalsy();
+    } finally {
+      pinnedResolver = null;
+    }
+  });
+
+  it("the classification is refused on a PATCH that does not transition to done", async () => {
+    // SPA-9578 invariant: the classification is request-scoped to one gate
+    // evaluation and is never card state. Accepting it on a title edit would be
+    // a silent no-op the caller could believe was applied.
+    const card = await createCard(db, companyId, { assigneeAgentId: agentId });
+    const boardRun = await startRun(agentId);
+
+    const res = await request(boardActorApp(boardRun.id))
+      .patch(`/api/issues/${card.id}`)
+      .set("X-Paperclip-Run-Id", boardRun.id)
+      .send({ title: "renamed", coordinationNoPrDeliverable: { reason: COORDINATION_REASON } });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(422);
+    expect(res.body).toMatchObject({
+      error: expect.stringContaining("only valid on a PATCH that sets status to done"),
+    });
+  });
+
+  it("the classification does not persist as a standing exemption", async () => {
+    // Proves the invariant above at the service layer too: a classification
+    // supplied on a non-done write is dropped, so the NEXT close (which sends
+    // none) still refuses while the cited PR is open.
+    const card = await createCard(db, companyId, {
+      assigneeAgentId: agentId,
+      description: "Evidence: https://github.com/Spark-Mojo/sparkmojo-internal/pull/957",
+    });
+    await issueService(db).update(card.id, {
+      title: "renamed",
+      doneGateCoordinationClassification: {
+        reason: COORDINATION_REASON,
+        actorType: "user",
+        actorId: "local-board",
+        agentId: null,
+        runId: null,
+      },
+    } as never);
+
+    const gate = issueDoneGateService(db, {
+      resolvePullRequestDetails: async () => details("open", "open"),
+    });
+    // No classification on this call: the earlier one must have left no trace.
+    expect(await gate.evaluateDoneGate({ id: card.id, companyId, description: card.description }))
+      .toMatchObject({ outcome: "refuse", reason: { kind: "open_pull_requests" } });
   });
 
   it("a comment-only open PR still refuses WITHOUT the classification (SPA-9038 unchanged)", async () => {

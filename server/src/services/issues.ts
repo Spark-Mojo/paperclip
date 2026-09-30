@@ -10754,6 +10754,16 @@ export function issueService(db: Db) {
         assertTransition(existing.status, issueData.status);
       }
 
+      // SPA-9578: the coordination classification is consumed by exactly one
+      // gate evaluation — the first entry into `done` — and is never card
+      // state. Drop it defensively on any other write so an internal caller
+      // cannot smuggle a standing exemption through this service. The PATCH
+      // route already rejects such a request with 422.
+      const effectiveCoordinationClassification =
+        issueData.status === "done" && existing.status !== "done"
+          ? doneGateCoordinationClassification
+          : undefined;
+
       // SPA-8957 card-close DoD gate: refuse a first entry into `done` while
       // the card's pull_request work products are unmerged (or unverifiable).
       // Skipped entirely when the caller carries an explicit override (only
@@ -10781,7 +10791,7 @@ export function issueService(db: Db) {
           // opens; `unknown` and work-product bindings still refuse.
           {
             coordinationClassification:
-              doneGateCoordinationClassification !== undefined,
+              effectiveCoordinationClassification !== undefined,
           },
         );
         if (decision.outcome === "refuse") {
@@ -10794,7 +10804,7 @@ export function issueService(db: Db) {
               companyId: existing.companyId,
               identifier: existing.identifier,
             },
-            classification: doneGateCoordinationClassification!,
+            classification: effectiveCoordinationClassification!,
             relaxedPullRequests: decision.relaxedPullRequests,
           });
         }
