@@ -19758,7 +19758,7 @@ export function heartbeatService(
             ),
           )
           .limit(1);
-        released = after?.status === "queued" && Boolean(after.runId);
+        released = (after?.status === "queued" || after?.status === "claimed") && Boolean(after.runId);
       }
 
       if (released) {
@@ -26681,7 +26681,7 @@ export function heartbeatService(
       .from(agentWakeupRequests)
       .where(and(eq(agentWakeupRequests.id, wakeId), eq(agentWakeupRequests.companyId, wake.companyId)))
       .limit(1);
-    return after?.status === "queued" && Boolean(after.runId);
+    return (after?.status === "queued" || after?.status === "claimed") && Boolean(after.runId);
   }
 
   async function releaseIssueExecutionAndPromote(

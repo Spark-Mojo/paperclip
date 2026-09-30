@@ -9,7 +9,7 @@
  * drives the real `heartbeatService` backstop against a database.
  */
 import { afterEach, beforeAll, describe, expect, it } from "vitest";
-import { eq } from "drizzle-orm";
+import { eq, sql } from "drizzle-orm";
 import {
   activityLog,
   agentRuntimeState,
@@ -517,6 +517,40 @@ describeEmbeddedPostgres("SPA-9351 shape 2: deferred-wake backstop", () => {
     return { companyId, issueId, blockingRunId, newAssigneeId, previousOwnerId, wakeId };
   }
 
+  it("recognizes a promoted wake claimed before the backstop reads it", { timeout: 60_000 }, async () => {
+    const seeded = await seedStaleDeferredWake({ blockingStatus: "cancelled" });
+    await db.execute(sql`
+      create function spa9351_claim_promoted_wake() returns trigger language plpgsql as $$
+      begin
+        update agent_wakeup_requests set status = 'claimed' where id = new.id;
+        update heartbeat_runs set status = 'running' where id = new.run_id;
+        return new;
+      end $$
+    `);
+    await db.execute(sql`
+      create trigger spa9351_claim_promoted_wake
+      after update of run_id on agent_wakeup_requests
+      for each row when (new.run_id is not null)
+      execute function spa9351_claim_promoted_wake()
+    `);
+    const { heartbeatService } = await import("./heartbeat.js");
+    const heartbeat = heartbeatService(db as never);
+
+    try {
+      const result = await heartbeat.reconcileStaleDeferredWakes();
+      const [wake] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, seeded.wakeId));
+      const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, wake!.runId!));
+
+      expect(wake?.status).toBe("claimed");
+      expect(run?.status).toBe("running");
+      expect(run?.wakeupRequestId).toBe(seeded.wakeId);
+      expect(result.promoted).toBe(1);
+    } finally {
+      await db.execute(sql`drop trigger spa9351_claim_promoted_wake on agent_wakeup_requests`);
+      await db.execute(sql`drop function spa9351_claim_promoted_wake()`);
+    }
+  });
+
   it("promotes a stale deferral the old re-drive could never see", async () => {
     const seeded = await seedStaleDeferredWake({ blockingStatus: "cancelled" });
     const { heartbeatService } = await import("./heartbeat.js");
@@ -531,9 +565,7 @@ describeEmbeddedPostgres("SPA-9351 shape 2: deferred-wake backstop", () => {
       .select()
       .from(agentWakeupRequests)
       .where(eq(agentWakeupRequests.id, seeded.wakeId));
-    // Promotion goes through the real release admission, so the wake becomes
-    // `queued` AND gains a run — a bare status flip would never dispatch.
-    expect(wake?.status).toBe("queued");
+    expect(["queued", "claimed"]).toContain(wake?.status);
     expect(wake?.runId).toBeTruthy();
 
     const [run] = await db
@@ -541,7 +573,7 @@ describeEmbeddedPostgres("SPA-9351 shape 2: deferred-wake backstop", () => {
       .from(heartbeatRuns)
       .where(eq(heartbeatRuns.id, wake!.runId!));
     expect(run?.agentId).toBe(seeded.newAssigneeId);
-    expect(run?.status).toBe("queued");
+    expect(["queued", "running"]).toContain(run?.status);
 
     const [issue] = await db.select().from(issues).where(eq(issues.id, seeded.issueId));
     expect(issue?.executionRunId).toBe(run?.id);
@@ -735,6 +767,40 @@ describeEmbeddedPostgres("SPA-9351 shape 3: actionless recovery waits", () => {
     return { companyId, issueId, assigneeId, wakeId };
   }
 
+  it("re-admits an actionless wake claimed before readback", { timeout: 60_000 }, async () => {
+    const seeded = await seedActionlessDeferredWake();
+    await db.execute(sql`
+      create function spa9351_claim_promoted_wake() returns trigger language plpgsql as $$
+      begin
+        update agent_wakeup_requests set status = 'claimed' where id = new.id;
+        update heartbeat_runs set status = 'running' where id = new.run_id;
+        return new;
+      end $$
+    `);
+    await db.execute(sql`
+      create trigger spa9351_claim_promoted_wake
+      after update of run_id on agent_wakeup_requests
+      for each row when (new.run_id is not null)
+      execute function spa9351_claim_promoted_wake()
+    `);
+    const { heartbeatService } = await import("./heartbeat.js");
+    const heartbeat = heartbeatService(db as never);
+
+    try {
+      const requeued = await heartbeat.reconcileDeferredWakeAfterDeferral(seeded.wakeId);
+      const [wake] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, seeded.wakeId));
+      const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, wake!.runId!));
+
+      expect(wake?.status).toBe("claimed");
+      expect(run?.status).toBe("running");
+      expect(run?.wakeupRequestId).toBe(seeded.wakeId);
+      expect(requeued).toBe(true);
+    } finally {
+      await db.execute(sql`drop trigger spa9351_claim_promoted_wake on agent_wakeup_requests`);
+      await db.execute(sql`drop function spa9351_claim_promoted_wake()`);
+    }
+  });
+
   it("promotes an actionless recovery wait and gives it a real run", async () => {
     const seeded = await seedActionlessDeferredWake();
     const { heartbeatService } = await import("./heartbeat.js");
@@ -747,7 +813,7 @@ describeEmbeddedPostgres("SPA-9351 shape 3: actionless recovery waits", () => {
       .select()
       .from(agentWakeupRequests)
       .where(eq(agentWakeupRequests.id, seeded.wakeId));
-    expect(wake?.status).toBe("queued");
+    expect(["queued", "claimed"]).toContain(wake?.status);
     expect(wake?.runId).toBeTruthy();
 
     const [run] = await db
@@ -755,7 +821,7 @@ describeEmbeddedPostgres("SPA-9351 shape 3: actionless recovery waits", () => {
       .from(heartbeatRuns)
       .where(eq(heartbeatRuns.id, wake!.runId!));
     expect(run?.agentId).toBe(seeded.assigneeId);
-    expect(run?.status).toBe("queued");
+    expect(["queued", "running"]).toContain(run?.status);
 
     const [issue] = await db.select().from(issues).where(eq(issues.id, seeded.issueId));
     expect(issue?.executionRunId).toBe(run?.id);
@@ -769,10 +835,7 @@ describeEmbeddedPostgres("SPA-9351 shape 3: actionless recovery waits", () => {
     expect((await heartbeat.reconcileStaleDeferredWakes()).promoted).toBe(1);
     expect((await heartbeat.reconcileStaleDeferredWakes()).promoted).toBe(0);
 
-    const runs = await db
-      .select({ id: heartbeatRuns.id })
-      .from(heartbeatRuns)
-      .where(eq(heartbeatRuns.status, "queued"));
+    const runs = await db.select({ id: heartbeatRuns.id }).from(heartbeatRuns);
     expect(runs).toHaveLength(1);
   });
 
@@ -910,7 +973,7 @@ describeEmbeddedPostgres("SPA-9351 shape 3: actionless recovery waits", () => {
       .select()
       .from(agentWakeupRequests)
       .where(eq(agentWakeupRequests.id, seeded.wakeId));
-    expect(wake?.status).toBe("queued");
+    expect(["queued", "claimed"]).toContain(wake?.status);
     expect(wake?.runId).toBeTruthy();
     const [run] = await db
       .select()
