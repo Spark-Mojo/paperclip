@@ -10,13 +10,36 @@ residual defect filed as its own issue.
 ## G1 The proposed fix — `agent_default` overrides the strategy default — already exists at HEAD
     CHECK: timeout 30 git grep -n 'mode === "agent_default" ? "adapter_managed"' -- server/src/services/execution-workspace-policy.ts
     EXPECT: two hits, one in resolveEffectiveWorkspaceStrategyType (line 80) and one in resolvePinnedIssueWorkspaceStrategyType (line 98)
-Result: exit 0; EXPECT matched. Both resolvers already return `adapter_managed` when the mode is
-`agent_default`; neither can yield `project_primary` for that mode.
+Result: exit 0, two hits; EXPECT matched. Both resolvers return `adapter_managed` when the mode is
+`agent_default` and no explicit type is set; neither can yield `project_primary` for that mode.
 
-    NEGATIVE: timeout 30 git grep -n 'mode === "agent_default" ? "project_primary"' -- server/src/services/execution-workspace-policy.ts
+    NEGATIVE: timeout 30 git grep -n 'agent_default" ? "project_primary"' -- server/src/services/execution-workspace-policy.ts
     EXPECT: zero hits; exit 1 (the inverted default the friction asks for does not exist anywhere)
 Result: exit 1, empty output; EXPECT matched. Confirmed the same at the pre-fix build
 `5e4ef13673e6` (line 74), so this clause was never the defect.
+
+## G1b An explicit `workspaceStrategy.type` cannot reach those resolvers under `agent_default`
+    CHECK: timeout 120 node .unlazy/SPA-9283/probe-strategy-precedence.mjs
+    EXPECT: the resolvers *do* return project_primary when handed an explicit type, BUT
+             buildExecutionWorkspaceAdapterConfig strips workspaceStrategy for mode=agent_default, so
+             the config the resolvers actually receive yields adapter_managed
+Result: exit 0; EXPECT matched. Observed against the live dist:
+
+    -- resolver called directly with explicit project_primary --
+    resolveEffectiveWorkspaceStrategyType: project_primary
+    resolvePinnedIssueWorkspaceStrategyType: project_primary
+    -- does buildExecutionWorkspaceAdapterConfig strip it? --
+    adapterConfig.workspaceStrategy = undefined
+    has workspaceStrategy key: false
+    agentDefault wins -> adapter_managed
+    unrelated keys preserved: true | workspaceRuntime stripped: true
+
+    This addresses a reviewer challenge that the resolvers' short-circuit (`if type is one of the four
+    known types, return type`) sits *ahead* of the `agent_default` default — true in isolation, but
+    unreachable on the dispatch path. `heartbeat.ts:21511` calls
+    `buildExecutionWorkspaceAdapterConfig`, which at :448 `delete`s `workspaceStrategy` for every mode
+    except `isolated_workspace`; the resolvers are then handed that stripped config. So the mode wins
+    the effective strategy, which is what the card asked for.
 
 ## G2 The claimed "cwd does not exist on disk" is false — the engine materialises it
     CHECK: timeout 30 git grep -n 'await fs.mkdir(cwd, { recursive: true })' -- server/src/services/heartbeat.ts
@@ -25,6 +48,13 @@ Result: exit 0, two hits (2569, 12800); EXPECT matched. heartbeat.ts:12800 mkdir
 `resolveDefaultAgentWorkspaceDir(agent.id)` on the same branch that emits the warning at :12812;
 :12734 does the same for the project-workspace fallback. Present in the pre-fix build too
 (lines 12403 / 12337).
+
+    Cross-checked against the PR head as GitHub serves it, NOT the local checkout, because a
+    reviewer reported these lines absent:
+        gh api repos/Spark-Mojo/paperclip/git/blobs/<blob-sha-of-heartbeat.ts@head> --jq .content \
+          | tr -d '\n' | base64 -d | grep -n 'await fs.mkdir(cwd, { recursive: true })'
+        -> 2569, 12800   (file is 30315 lines at head)
+    Result: reproduced identically. The head file is 30315 lines, not the 10677 the review reported.
 
 ## G3 The failing run's refusal is reproducible, and its cause is a guard the fix removes
     CHECK: timeout 30 git grep -n 'agentDefaultBypassRequested' -- server/src/services/heartbeat.ts
