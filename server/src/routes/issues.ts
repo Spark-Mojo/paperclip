@@ -358,6 +358,22 @@ const updateIssueRouteSchema = updateIssueSchema.extend({
   doneOverride: z.object({
     reason: z.string().trim().min(1).max(2_000),
   }).strict().optional(),
+  /**
+   * SPA-9578: classifies the card as a NON-CODE COORDINATION card — its
+   * deliverable is a coordination outcome, not a merge — so a PR it merely
+   * CITES in prose does not block the close (live gap: SPA-9575 cites PR #957
+   * as evidence and could not close while #957 is open).
+   *
+   * Narrow by construction: it relaxes only prose-derived OPEN references. A
+   * `pull_request` work product, and any merge state the engine could not
+   * verify (`unknown`), still refuse. Requires a reason and, exactly like
+   * `doneOverride`, is never agent-supplied — an agent PATCH carrying it is
+   * 403, so an agent whose own PR is open cannot classify its way out. Recorded
+   * as an `issue.done_gate_coordination_relaxed` activity row.
+   */
+  coordinationNoPrDeliverable: z.object({
+    reason: z.string().trim().min(1).max(2_000),
+  }).strict().optional(),
 });
 const queuedCommentMutationTargetSchema = z.object({
   queueId: z.string().min(1),
@@ -12807,6 +12823,7 @@ export function issueRoutes(
         hiddenAt: hiddenAtRaw,
         onBehalfOfUserId: _requestedOnBehalfOfUserId,
         doneOverride: doneOverrideRequested,
+        coordinationNoPrDeliverable: coordinationNoPrDeliverableRequested,
         ...updateFields
       } = req.body;
       // SPA-8957: an agent may never supply the done-gate override — a card
@@ -12814,6 +12831,17 @@ export function issueRoutes(
       if (doneOverrideRequested && req.actor.type === "agent") {
         res.status(403).json({
           error: "Agents cannot override the unmerged-pull-request done gate; the merge or a board user must close this card",
+        });
+        return;
+      }
+      // SPA-9578: same rule for the coordination classification. It relaxes
+      // only PROSE-cited open PRs, so letting an agent supply it would be a
+      // merge-safety escape for exactly the case the gate exists to catch
+      // (an agent that linked its own PR in a comment and never attached a
+      // work product).
+      if (coordinationNoPrDeliverableRequested && req.actor.type === "agent") {
+        res.status(403).json({
+          error: "Agents cannot classify a card as a non-code coordination card; a board user must classify it",
         });
         return;
       }
@@ -13539,6 +13567,19 @@ export function issueRoutes(
           ? {
             doneGateOverride: {
               reason: doneOverrideRequested.reason,
+              actorType: actor.actorType,
+              actorId: actor.actorId,
+              agentId: actor.agentId ?? null,
+              runId: actor.runId ?? null,
+            },
+          }
+          : {}),
+        // SPA-9578: route-minted coordination classification reaches the
+        // service only for user/board actors (agents were rejected above).
+        ...(coordinationNoPrDeliverableRequested
+          ? {
+            doneGateCoordinationClassification: {
+              reason: coordinationNoPrDeliverableRequested.reason,
               actorType: actor.actorType,
               actorId: actor.actorId,
               agentId: actor.agentId ?? null,

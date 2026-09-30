@@ -549,4 +549,304 @@ describeEmbeddedPostgres("issue done gate — unmerged PR refuses done (SPA-8957
     const after = await db.select().from(issues).where(eq(issues.id, card.id)).then((rows) => rows[0]!);
     expect(after.status).toBe("in_progress");
   });
+
+  // ---------------------------------------------------------------------------
+  // SPA-9578 — the narrow coordination exception James approved in interaction
+  // 753031a2 on 2026-09-30 ("narrow-exception"): "allow a card with an explicit
+  // coordination classification and no PR work product to close, but keep the
+  // close guard for every PR-deliverable card."
+  //
+  // Live gap: SPA-9575 coordinates a reviewer verdict on PR #957 and CITES that
+  // PR as evidence. It has no `pull_request` work product, yet SPA-9038 binds
+  // prose links exactly like work products, so two `done` PATCHes were refused
+  // 409 while #957 is open.
+  // ---------------------------------------------------------------------------
+
+  const COORDINATION_REASON =
+    "Non-code coordination card: the deliverable is a reviewer verdict, not a merge. The cited PR is evidence, not this card's deliverable.";
+
+  function agentActorApp(runId: string) {
+    const app = express();
+    app.use(express.json());
+    app.use((req, _res, next) => {
+      (req as unknown as { actor: unknown }).actor = {
+        type: "agent",
+        agentId,
+        companyId,
+        runId,
+        source: "agent_key",
+      };
+      next();
+    });
+    app.use("/api", issueRoutes(db, {} as never));
+    app.use(errorHandler);
+    return app;
+  }
+
+  function boardActorApp(runId: string) {
+    const app = express();
+    app.use(express.json());
+    app.use((req, _res, next) => {
+      (req as unknown as { actor: unknown }).actor = {
+        type: "board",
+        userId: "local-board",
+        companyId,
+        runId,
+        source: "session",
+      };
+      next();
+    });
+    app.use("/api", issueRoutes(db, {} as never));
+    app.use(errorHandler);
+    return app;
+  }
+
+  async function startRun(agent: string) {
+    return db
+      .insert(heartbeatRuns)
+      .values({
+        companyId,
+        agentId: agent,
+        invocationSource: "on_demand",
+        status: "running",
+        contextSnapshot: {},
+      })
+      .returning()
+      .then((rows) => rows[0]!);
+  }
+
+  it("coordination classification lets a non-code card close with a cited open PR", async () => {
+    // The SPA-9575 shape: the PR is CITED in the description, never attached.
+    const card = await createCard(db, companyId, {
+      assigneeAgentId: agentId,
+      description:
+        "Obtain a reviewer verdict on https://github.com/Spark-Mojo/sparkmojo-internal/pull/957. Do not merge it.",
+    });
+
+    const gate = issueDoneGateService(db, {
+      resolvePullRequestDetails: async () => details("open", "open"),
+    });
+
+    // Without the classification the SPA-9038 prose binding still refuses —
+    // this is the exact state SPA-9575 was stuck in.
+    const withoutClassification = await gate.evaluateDoneGate({
+      id: card.id,
+      companyId,
+      description: card.description,
+    });
+    expect(withoutClassification).toMatchObject({
+      outcome: "refuse",
+      reason: { kind: "open_pull_requests" },
+    });
+
+    // With it, the cited open PR is relaxed and the card closes.
+    const withClassification = await gate.evaluateDoneGate(
+      { id: card.id, companyId, description: card.description },
+      { coordinationClassification: true },
+    );
+    expect(withClassification).toMatchObject({ outcome: "allow" });
+    expect(
+      (withClassification as { relaxedPullRequests?: { reference: { number: number } }[] })
+        .relaxedPullRequests,
+    ).toEqual([expect.objectContaining({ reference: expect.objectContaining({ number: 957 }) })]);
+  });
+
+  it("a PR-deliverable card cannot use the coordination classification to skip merge", async () => {
+    // NEGATIVE CONTROL for the case above. An ATTACHED `pull_request` work
+    // product is the engine's strongest "this PR is the deliverable" signal,
+    // so the classification must not touch it — this card still refuses 409
+    // even with the classification supplied.
+    const card = await createCard(db, companyId, {
+      assigneeAgentId: agentId,
+      description: "PR at https://github.com/Spark-Mojo/paperclip/pull/1150",
+    });
+    await attachPullRequestWorkProduct(db, card, 1150);
+
+    const gate = issueDoneGateService(db, {
+      resolvePullRequestDetails: async () => details("open", "open"),
+    });
+    const decision = await gate.evaluateDoneGate(
+      { id: card.id, companyId, description: card.description },
+      { coordinationClassification: true },
+    );
+    expect(decision).toMatchObject({
+      outcome: "refuse",
+      reason: { kind: "open_pull_requests" },
+    });
+  });
+
+  it("a work product wins over a prose link for the SAME PR (classification cannot unbind it)", async () => {
+    // Dedup must keep the STRONGER signal: a card that both cites and attaches
+    // the same PR is a PR-deliverable card, not a coordination card. Dropping
+    // the work product to qualify would be the bypass this guards.
+    const card = await createCard(db, companyId, {
+      assigneeAgentId: agentId,
+      description: "See https://github.com/Spark-Mojo/paperclip/pull/1181",
+    });
+    await attachPullRequestWorkProduct(db, card, 1181);
+
+    const gate = issueDoneGateService(db, {
+      resolvePullRequestDetails: async () => details("open", "open"),
+    });
+    const bound = await gate.listBoundPullRequests({
+      id: card.id,
+      companyId,
+      description: card.description,
+    });
+    expect(bound).toEqual([
+      expect.objectContaining({ source: "work_product" }),
+    ]);
+    expect(
+      await gate.evaluateDoneGate(
+        { id: card.id, companyId, description: card.description },
+        { coordinationClassification: true },
+      ),
+    ).toMatchObject({ outcome: "refuse", reason: { kind: "open_pull_requests" } });
+  });
+
+  it("coordination classification does not relax an unverifiable (unknown) cited PR", async () => {
+    // Fail-closed survives the exception. `unknown` means the engine could not
+    // verify; a coordination classification asserts intent about the
+    // deliverable, never that a lookup failed.
+    const card = await createCard(db, companyId, {
+      assigneeAgentId: agentId,
+      description: "Evidence: https://github.com/Spark-Mojo/sparkmojo-internal/pull/957",
+    });
+    const gate = issueDoneGateService(db, {
+      resolvePullRequestDetails: async () => details("unknown"),
+    });
+    expect(
+      await gate.evaluateDoneGate(
+        { id: card.id, companyId, description: card.description },
+        { coordinationClassification: true },
+      ),
+    ).toMatchObject({ outcome: "refuse", reason: { kind: "unknown_pull_request_state" } });
+  });
+
+  it("a cited ISSUE number is unaffected by the classification (SPA-9323 still passes)", async () => {
+    const card = await createCard(db, companyId, {
+      assigneeAgentId: agentId,
+      description: "Fixes the gap filed as Spark-Mojo/sparkmojo-internal#779.",
+    });
+    const gate = issueDoneGateService(db, {
+      resolvePullRequestDetails: async () => ({ ...details("unknown"), notAPullRequest: true }),
+    });
+    expect(
+      await gate.evaluateDoneGate(
+        { id: card.id, companyId, description: card.description },
+        { coordinationClassification: true },
+      ),
+    ).toEqual({ outcome: "allow" });
+  });
+
+  it("coordination classification records an activity row with actor, reason and relaxed PRs", async () => {
+    const card = await createCard(db, companyId, {
+      assigneeAgentId: agentId,
+      description: "Evidence: https://github.com/Spark-Mojo/sparkmojo-internal/pull/957",
+    });
+
+    const gate = issueDoneGateService(db, {
+      resolvePullRequestDetails: async () => details("open", "open"),
+    });
+    const decision = await gate.evaluateDoneGate(
+      { id: card.id, companyId, description: card.description },
+      { coordinationClassification: true },
+    );
+    expect(decision).toMatchObject({ outcome: "allow" });
+
+    await gate.recordCoordinationClassification({
+      issue: { id: card.id, companyId, identifier: card.identifier },
+      classification: {
+        reason: COORDINATION_REASON,
+        actorType: "user",
+        actorId: "local-board",
+        agentId: null,
+        runId: null,
+      },
+      relaxedPullRequests: (decision as { relaxedPullRequests: never[] }).relaxedPullRequests,
+    });
+
+    const rows = await db.select().from(activityLog).where(eq(activityLog.entityId, card.id));
+    const row = rows.find((entry) => entry.action === "issue.done_gate_coordination_relaxed");
+    expect(row).toBeTruthy();
+    expect(row?.actorType).toBe("user");
+    expect(row?.details).toMatchObject({
+      gate: "issue_done_with_unmerged_pull_request",
+      scope: "prose_cited_pull_requests_only",
+      reason: COORDINATION_REASON,
+      pullRequests: [expect.objectContaining({ state: "open" })],
+    });
+    expect(JSON.stringify(row?.details)).toContain("Spark-Mojo/sparkmojo-internal#957");
+  });
+
+  it("coordination classification denied for agent actor", async () => {
+    const card = await createCard(db, companyId, {
+      assigneeAgentId: agentId,
+      description: "Evidence: https://github.com/Spark-Mojo/sparkmojo-internal/pull/957",
+    });
+    const agentRun = await startRun(agentId);
+
+    const res = await request(agentActorApp(agentRun.id))
+      .patch(`/api/issues/${card.id}`)
+      .set("X-Paperclip-Run-Id", agentRun.id)
+      .send({ status: "done", coordinationNoPrDeliverable: { reason: COORDINATION_REASON } });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(403);
+    expect(res.body).toMatchObject({
+      error: expect.stringContaining("Agents cannot classify"),
+    });
+    const after = await db.select().from(issues).where(eq(issues.id, card.id)).then((rows) => rows[0]!);
+    expect(after.status).toBe("in_progress");
+  });
+
+  it("coordination classification accepted from a board actor", async () => {
+    // The positive control for the 403 above: the SAME field with a board
+    // actor succeeds, so the refusal discriminates the actor rather than
+    // failing every path. Without this, "403" would be indistinguishable from
+    // "the field is broken".
+    const card = await createCard(db, companyId, {
+      assigneeAgentId: agentId,
+      description: "Evidence: https://github.com/Spark-Mojo/sparkmojo-internal/pull/957",
+    });
+    const boardRun = await startRun(agentId);
+
+    const res = await request(boardActorApp(boardRun.id))
+      .patch(`/api/issues/${card.id}`)
+      .set("X-Paperclip-Run-Id", boardRun.id)
+      .send({ status: "done", coordinationNoPrDeliverable: { reason: COORDINATION_REASON } });
+
+    // The production resolver has no GitHub credentials in the test env, so the
+    // cited PR resolves `unknown` — which the classification deliberately does
+    // NOT relax. That refusal is itself the fail-closed proof; the board path
+    // is proven authorised by the absence of a 403.
+    expect(res.status, JSON.stringify(res.body)).not.toBe(403);
+
+    // Re-run the same PATCH with the resolver pinned to a genuinely open PR by
+    // driving the service directly, which is where the classification applies.
+    const gate = issueDoneGateService(db, {
+      resolvePullRequestDetails: async () => details("open", "open"),
+    });
+    const serviceDecision = await gate.evaluateDoneGate(
+      { id: card.id, companyId, description: card.description },
+      { coordinationClassification: true },
+    );
+    expect(serviceDecision).toMatchObject({ outcome: "allow" });
+  });
+
+  it("a comment-only open PR still refuses WITHOUT the classification (SPA-9038 unchanged)", async () => {
+    // Regression guard: the exception is opt-in. A builder that links its own
+    // open PR in a comment and never classifies still gets the 409 — the
+    // SPA-8593/8626/8665/8715/8722 class stays caught.
+    const card = await createCard(db, companyId, { assigneeAgentId: agentId });
+    await issueService(db).addComment(
+      card.id,
+      "PR up: https://github.com/Spark-Mojo/paperclip/pull/1190",
+      {},
+    );
+    const gate = issueDoneGateService(db, {
+      resolvePullRequestDetails: async () => details("open", "open"),
+    });
+    expect(await gate.evaluateDoneGate({ id: card.id, companyId }))
+      .toMatchObject({ outcome: "refuse", reason: { kind: "open_pull_requests" } });
+  });
 });
