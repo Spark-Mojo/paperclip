@@ -50,11 +50,35 @@ Result: exit 0, two hits (2569, 12800); EXPECT matched. heartbeat.ts:12800 mkdir
 (lines 12403 / 12337).
 
     Cross-checked against the PR head as GitHub serves it, NOT the local checkout, because a
-    reviewer reported these lines absent:
-        gh api repos/Spark-Mojo/paperclip/git/blobs/<blob-sha-of-heartbeat.ts@head> --jq .content \
-          | tr -d '\n' | base64 -d | grep -n 'await fs.mkdir(cwd, { recursive: true })'
-        -> 2569, 12800   (file is 30315 lines at head)
-    Result: reproduced identically. The head file is 30315 lines, not the 10677 the review reported.
+    reviewer reported these lines absent. Three independent routes agree on the size, and the
+    discrepancy against the reviewer's figure has a mechanical cause:
+
+        gh api -H "Accept: application/vnd.github.raw" \
+            "repos/Spark-Mojo/paperclip/contents/server/src/services/heartbeat.ts?ref=<HEAD>" | wc -l
+            -> 30315
+        git cat-file blob <HEAD>:server/src/services/heartbeat.ts | wc -l
+            -> 30315
+        /home/jamesilsley/.config/opencode-fleet-xdg/fleet/pr-read.sh show <HEAD> \
+            server/src/services/heartbeat.ts --repo Spark-Mojo/paperclip | wc -l
+            -> 10676
+
+    The head file is 30315 lines. The 10676 figure is the allowlisted reviewer's
+    `pr-read.sh show` wrapper, which pipes its output through `cap` — `MAX_OUT=400000`,
+    `head -c` — at pr-read.sh:46-48 and again on the `show` branch at :344. The file is
+    1 162 041 bytes, so the read stops 34% of the way in, mid-statement. That is why the wrapper
+    reports "blob not found" on stderr *and* streams a partial file: `set -o pipefail` sees
+    `head -c` exit 0, and the truncation is silent. Measured boundary: wrapper output is exactly
+    400000 bytes, and it does not contain the agent-home mkdir (the second hit, line 12800) that
+    G2's CHECK greps for — only the unrelated hit at 2569, inside the surviving prefix.
+
+    The wrapper's own header comment at pr-read.sh:40 claims `pr-read.sh show <base_sha> <path>`
+    has "no GitHub cap"; that is true of the GitHub API but false of the wrapper, which applies
+    its own. The 400000-byte cap is a documented design choice for the synthesized diff, not a bug
+    in that path — but reusing it on a per-file read primitive is a defect, because a single file
+    over 400 KB cannot be reviewed through the one interface reviewers are told to trust, and the
+    failure is silent. Filed as `sparkmojo-internal#1014` rather than fixed here: this is a fleet
+    harness owned outside this repo, and a card whose scope is a workspace defect is not the place
+    to change the review primitive every verifier depends on.
 
 ## G3 The failing run's refusal is reproducible, and its cause is a guard the fix removes
     CHECK: timeout 30 git grep -n 'agentDefaultBypassRequested' -- server/src/services/heartbeat.ts
@@ -162,6 +186,21 @@ Result: exit 0; EXPECT matched. Observed:
     EXPECT: state=OPEN — so G9's green is not a constant
 Result: exit 0, #1013 reads `state=OPEN reason=`. EXPECT matched.
 
+## G10 The reviewer's unresolvable discrepancy is a wrapper defect, not a wrong claim
+    CHECK: timeout 60 bash -c 'H=51a5724fcab4cc150bc7c3918e16493f1cadb4fe; F=server/src/services/heartbeat.ts; a=$(gh api -H "Accept: application/vnd.github.raw" "repos/Spark-Mojo/paperclip/contents/$F?ref=$H" 2>/dev/null | wc -l); b=$(/home/jamesilsley/.config/opencode-fleet-xdg/fleet/pr-read.sh show $H $F --repo Spark-Mojo/paperclip 2>/dev/null | wc -l); c=$(/home/jamesilsley/.config/opencode-fleet-xdg/fleet/pr-read.sh show $H $F --repo Spark-Mojo/paperclip 2>/dev/null | wc -c); echo "api=$a wrapper_lines=$b wrapper_bytes=$c"'
+    EXPECT: api=30315; wrapper_bytes exactly 400000 (the MAX_OUT cap) and wrapper_lines < api
+Result: exit 0; EXPECT matched. Observed: `api=30315 wrapper_lines=10676 wrapper_bytes=400000`.
+The wrapper's byte count is the round number 400000, which is `MAX_OUT` at pr-read.sh:46 — a cap,
+not the file's real length (1 162 041 bytes per the contents API). The truncation is the whole
+explanation, and it is why the reviewer's surface could not see line 12800.
+
+    NEGATIVE: run the same wrapper read on a file UNDER the cap and confirm the two agree
+    EXPECT: no byte-gap — proving the cap, not the file, explains the difference
+    Result: exit 0; EXPECT matched. `server/src/services/execution-workspace-policy.ts` (20 564
+    bytes, far under 400000) reads identically through the wrapper and via the API — 461 lines each,
+    20 564 bytes each — and its line 80/98 greps match. The defect therefore reproduces on size,
+    not on this file or this path.
+
 ## Residual defect found (not on this card's scope — filed separately)
 
 The advisor flagged, correctly, that green tests do not prove the verifier dispatch works when the
@@ -195,9 +234,25 @@ and the filing of the residual defect as #1013.
 
 ## Review history on this PR
 
-Two independent verifications ran against this card. The first returned FAIL; its two findings are
-recorded and resolved above — R1 (resolver short-circuit) is answered by the new G1b probe and was
-formally **withdrawn** by the second verifier, and R2 (lines absent at head) is refuted from the
-authoritative blob with the reproduction recorded in G2. The second returned FAIL on a third
-finding, R3: the card explicitly requires closing #857 with a reason, and neither the diff nor the
-ledger evidenced it. That was a real miss — the clause is now discharged in G9.
+Four independent verifications ran against this card, each at a fresh head. Every one returned
+non-PASS, and each caught something the others did not — which is the point of independent
+re-judgement, and the reason this card is not marked done on the strength of one green run:
+
+1. **FAIL** — R1: the resolvers short-circuit on an explicit `workspaceStrategy.type` before the
+   `agent_default` default. Answered by G1b; formally **withdrawn** by the second verifier as
+   unreachable on the dispatch path.
+2. **FAIL** — R2: `heartbeat.ts` mkdir and warning absent at head. Refuted from the authoritative
+   blob; the second verifier judged it not material, the third could not resolve it at all.
+3. **FAIL** — R3: the card's #857 closure clause, undischarged. A real miss. Now G9, with
+   `not_planned`; the third verifier's further point — that the reason code must match the outcome,
+   not merely be present — is why the first pass's `completed` was corrected.
+4. **BLOCKED** — the third verifier could not see `heartbeat.ts:12800` and could not reconcile the
+   line count, because the allowlisted read primitive truncates at 400 KB and reports a partial
+   file alongside a "blob not found" message. That was a tooling defect, not a wrong claim; see G10
+   and `sparkmojo-internal#1014`. It is filed rather than fixed here, and it is the reason this
+   ledger quotes the API and `git cat-file` routes alongside the wrapper rather than treating any
+   one surface as sufficient.
+
+The net effect: three card clauses were discharged (G1/G1b, G9, and the #857 closure), one tooling
+defect was found and filed (#1014), and one real engine defect was found and filed (#1013) — none of
+them by the first run.
