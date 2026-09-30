@@ -274,6 +274,64 @@ describeEmbeddedPostgres("issue done gate — unmerged PR refuses done (SPA-8957
     expect(decision).toMatchObject({ outcome: "refuse" });
   });
 
+  it("SPA-9288 relative route refuses an open PR with an adjacent repository identity", async () => {
+    const card = await createCard(db, companyId, { assigneeAgentId: agentId });
+    await issueService(db).addComment(card.id, "PR: [#936](/SPA/pulls/936) (Spark-Mojo/sparkmojo-internal, OPEN, branch juno/spa-9288-verify-merge-actor-bump)", {});
+    const gate = issueDoneGateService(db, {
+      resolvePullRequestDetails: async (_companyId, reference) => {
+        expect(reference).toMatchObject({ owner: "Spark-Mojo", repo: "sparkmojo-internal", number: 936 });
+        return details("open", "open");
+      },
+    });
+    expect(await gate.evaluateDoneGate({ id: card.id, companyId })).toMatchObject({
+      outcome: "refuse",
+      reason: { kind: "open_pull_requests", pullRequests: [{ reference: expect.objectContaining({ owner: "Spark-Mojo", repo: "sparkmojo-internal", number: 936 }) }] },
+    });
+  });
+
+  it("an unresolved relative PR route refuses with a diagnostic, but bare numbers do not bind", async () => {
+    const card = await createCard(db, companyId, { assigneeAgentId: agentId });
+    await issueService(db).addComment(card.id, "PR: [#936](/SPA/pulls/936)", {});
+    const gate = issueDoneGateService(db, { resolvePullRequestDetails: async () => { throw new Error("unresolved route must not be resolved"); } });
+    expect(await gate.evaluateDoneGate({ id: card.id, companyId })).toMatchObject({
+      outcome: "refuse", reason: { kind: "unresolved_pull_request_reference" },
+    });
+    const bare = await createCard(db, companyId, { description: "Unrelated #936, no PR link" });
+    expect(await gate.evaluateDoneGate({ id: bare.id, companyId, description: bare.description })).toEqual({ outcome: "allow" });
+  });
+
+  it("an attached PR work product resolves the same-number relative route", async () => {
+    const card = await createCard(db, companyId);
+    await attachPullRequestWorkProduct(db, card, 936);
+    await issueService(db).addComment(card.id, "PR: [#936](/SPA/pulls/936)", {});
+    const gate = issueDoneGateService(db, { resolvePullRequestDetails: async () => details("open", "open") });
+    expect(await gate.evaluateDoneGate({ id: card.id, companyId })).toMatchObject({
+      outcome: "refuse", reason: { kind: "open_pull_requests", pullRequests: [expect.objectContaining({ reference: expect.objectContaining({ number: 936 }) })] },
+    });
+  });
+
+  it("ambiguous work products cannot resolve a relative route", async () => {
+    const card = await createCard(db, companyId);
+    await attachPullRequestWorkProduct(db, card, 936);
+    await db.insert(issueWorkProducts).values({ companyId, issueId: card.id, type: "pull_request", provider: "github", title: "PR 936", url: "https://github.com/Spark-Mojo/sparkmojo-internal/pull/936", status: "open" });
+    await issueService(db).addComment(card.id, "PR: [#936](/SPA/pulls/936)", {});
+    const gate = issueDoneGateService(db, { resolvePullRequestDetails: async () => details("merged") });
+    expect(await gate.evaluateDoneGate({ id: card.id, companyId })).toMatchObject({ outcome: "refuse", reason: { kind: "unresolved_pull_request_reference", numbers: [936] } });
+  });
+
+  it("mismatched relative link label and target do not bind", async () => {
+    const card = await createCard(db, companyId);
+    await issueService(db).addComment(card.id, "[#1](/SPA/pulls/936) (Spark-Mojo/sparkmojo-internal)", {});
+    const gate = issueDoneGateService(db, { resolvePullRequestDetails: async () => { throw new Error("mismatch must not bind"); } });
+    expect(await gate.evaluateDoneGate({ id: card.id, companyId })).toEqual({ outcome: "allow" });
+  });
+
+  it("an explicit GitHub ISSUE URL is not a PR binding", async () => {
+    const card = await createCard(db, companyId, { description: "Issue: https://github.com/Spark-Mojo/sparkmojo-internal/issues/779" });
+    const gate = issueDoneGateService(db, { resolvePullRequestDetails: async () => { throw new Error("issue URL must not bind"); } });
+    expect(await gate.evaluateDoneGate({ id: card.id, companyId, description: card.description })).toEqual({ outcome: "allow" });
+  });
+
   it("Spark-Mojo PR shorthand in a comment binds (owner/repo#N)", async () => {
     const card = await createCard(db, companyId, { assigneeAgentId: agentId });
     await issueService(db).addComment(card.id, "Review Spark-Mojo/paperclip#1160 please", {});

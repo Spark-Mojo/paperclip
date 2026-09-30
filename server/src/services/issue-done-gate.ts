@@ -11,6 +11,7 @@ import {
   createPullRequestMergeDetailsResolver,
   extractGitHubPullRequestReferences,
   setBoundedPullRequestCacheEntry,
+  unresolvedPaperclipPullRoutes,
   type GitHubPullRequestReference,
   type PullRequestMergeDetails,
 } from "./github-pull-request-merge.js";
@@ -94,7 +95,8 @@ export type DoneGatePullRequestState = {
 
 export type DoneGateBlockedReason =
   | { kind: "open_pull_requests"; pullRequests: DoneGatePullRequestState[] }
-  | { kind: "unknown_pull_request_state"; pullRequests: DoneGatePullRequestState[] };
+  | { kind: "unknown_pull_request_state"; pullRequests: DoneGatePullRequestState[] }
+  | { kind: "unresolved_pull_request_reference"; numbers: number[] };
 
 export type DoneGateDecision =
   | { outcome: "allow" }
@@ -184,6 +186,16 @@ export function issueDoneGateService(db: Db, opts: IssueDoneGateServiceOptions =
     issue: { id: string; companyId: string; description?: string | null },
   ) {
     const references = new Map<string, GitHubPullRequestReference>();
+    const unresolved = new Set<number>();
+    const productReferences: GitHubPullRequestReference[] = [];
+    const addProse = (body: string) => {
+      addExtracted(extractGitHubPullRequestReferences([body]).filter(isSparkMojoRepo));
+      for (const number of unresolvedPaperclipPullRoutes(body)) {
+        const repos = new Set(productReferences.filter((reference) => reference.number === number && isSparkMojoRepo(reference))
+          .map((reference) => `${reference.owner}/${reference.repo}`.toLowerCase()));
+        if (repos.size !== 1) unresolved.add(number);
+      }
+    };
     const addReferences = (values: readonly unknown[]) => {
       for (const reference of extractGitHubPullRequestReferences(values)) {
         const key = formatReference(reference).toLowerCase();
@@ -215,19 +227,20 @@ export function issueDoneGateService(db: Db, opts: IssueDoneGateServiceOptions =
       .limit(100);
 
     for (const product of products) {
-      addReferences([
+      const values = [
         product.url,
         product.externalId,
         product.title,
         product.summary,
         product.metadata ? JSON.stringify(product.metadata) : null,
-      ]);
+      ];
+      productReferences.push(...extractGitHubPullRequestReferences(values));
+      addReferences(values);
     }
 
     // SPA-9038: prose bindings — description first, then recent live comments.
     if (typeof issue.description === "string" && issue.description.length > 0) {
-      addExtracted(extractGitHubPullRequestReferences([issue.description])
-        .filter(isSparkMojoRepo));
+      addProse(issue.description);
     }
     const commentBodies = await db
       .select({ body: issueComments.body })
@@ -240,16 +253,18 @@ export function issueDoneGateService(db: Db, opts: IssueDoneGateServiceOptions =
       .orderBy(desc(issueComments.createdAt))
       .limit(COMMENT_SCAN_LIMIT);
     for (const row of commentBodies) {
-      addExtracted(extractGitHubPullRequestReferences([row.body])
-        .filter(isSparkMojoRepo));
+      addProse(row.body);
     }
-    return [...references.values()];
+    return { references: [...references.values()], unresolved: [...unresolved] };
   }
 
   async function evaluateDoneGate(
     issue: { id: string; companyId: string; description?: string | null },
   ): Promise<DoneGateDecision> {
-    const references = await listBoundPullRequests(issue);
+    const { references, unresolved } = await listBoundPullRequests(issue);
+    if (unresolved.length > 0) {
+      return { outcome: "refuse", reason: { kind: "unresolved_pull_request_reference", numbers: unresolved } };
+    }
     if (references.length === 0) return { outcome: "allow" };
 
     const states: DoneGatePullRequestState[] = [];
@@ -271,6 +286,12 @@ export function issueDoneGateService(db: Db, opts: IssueDoneGateServiceOptions =
 
   /** 409 payload shape — the refusal the card pastes back on the board. */
   function refusalError(reason: DoneGateBlockedReason) {
+    if (reason.kind === "unresolved_pull_request_reference") {
+      return conflict(
+        `Issue cannot be marked done: relative PR link(s) ${reason.numbers.map((number) => `#${number}`).join(", ")} lack an adjacent (Spark-Mojo/repo) identity. Add the repository next to each link or attach a pull_request work product.`,
+        { code: DONE_GATE_OPEN_PR_REFUSAL, pullRequests: [], unresolvedPullRequestNumbers: reason.numbers },
+      );
+    }
     const pullRequests = reason.pullRequests.map((entry) => formatReference(entry.reference));
     const unknown = reason.kind === "unknown_pull_request_state";
     return conflict(
