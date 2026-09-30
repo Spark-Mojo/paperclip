@@ -17,6 +17,7 @@ import {
   heartbeatRuns,
   issueComments,
   issues,
+  projects,
 } from "@paperclipai/db";
 import {
   getEmbeddedPostgresTestSupport,
@@ -34,6 +35,8 @@ import {
   normalizeFleetRunLivenessWindowMs,
 } from "../services/heartbeat.ts";
 import {
+  FLEET_ADMISSION_STALE_MS,
+  deferFleetRunAdmission,
   isInsideFleetRunAdmission,
   runOutsideFleetRunAdmission,
   withFleetRunAdmissionLock,
@@ -172,23 +175,12 @@ describe("fleet run ceiling helpers", () => {
   });
 
   it("counts a running row only with live evidence (stale-run guard)", () => {
-    const base = {
-      recentActivity: false,
-      locallyTracked: false,
-      controllerLeaseLive: false,
-      childKnownDead: false,
-    };
-    // Silent past the window with no controller: dead, never holds a slot.
-    expect(isFleetRunningRowLive(base)).toBe(false);
-    // Recent activity always counts.
-    expect(isFleetRunningRowLive({ ...base, recentActivity: true })).toBe(true);
-    expect(isFleetRunningRowLive({ ...base, recentActivity: true, childKnownDead: true })).toBe(true);
-    // A live controller counts while its child is not known dead.
-    expect(isFleetRunningRowLive({ ...base, locallyTracked: true })).toBe(true);
-    expect(isFleetRunningRowLive({ ...base, controllerLeaseLive: true })).toBe(true);
-    // A controller still awaiting a child that already died is the stuck shape.
-    expect(isFleetRunningRowLive({ ...base, locallyTracked: true, childKnownDead: true })).toBe(false);
-    expect(isFleetRunningRowLive({ ...base, controllerLeaseLive: true, childKnownDead: true })).toBe(false);
+    // Silent past the window with no live recorded child: never holds a slot.
+    expect(isFleetRunningRowLive({ recentActivity: false, recordedChildAlive: false })).toBe(false);
+    // Recent activity counts.
+    expect(isFleetRunningRowLive({ recentActivity: true, recordedChildAlive: false })).toBe(true);
+    // A live recorded child counts however long it has been silent.
+    expect(isFleetRunningRowLive({ recentActivity: false, recordedChildAlive: true })).toBe(true);
   });
 });
 
@@ -225,6 +217,47 @@ describe("fleet run admission lock", () => {
         throw new Error("boom");
       }),
     ).rejects.toThrow("boom");
+    await expect(withFleetRunAdmissionLock(async () => "next")).resolves.toBe("next");
+  });
+
+  it("defers nested admissions to after the section instead of running them inline", async () => {
+    const deferred = new Set<string>();
+    const seenInside: string[] = [];
+    expect(deferFleetRunAdmission("outside")).toBe(false);
+    await withFleetRunAdmissionLock(
+      async () => {
+        expect(deferFleetRunAdmission("agent-a")).toBe(true);
+        expect(deferFleetRunAdmission("agent-b")).toBe(true);
+        expect(deferFleetRunAdmission("agent-a")).toBe(true);
+        seenInside.push(...deferred);
+      },
+      { deferred },
+    );
+    // Collected (deduped) for the owner to drain once it releases its locks.
+    expect([...deferred]).toEqual(["agent-a", "agent-b"]);
+    expect(seenInside).toEqual(["agent-a", "agent-b"]);
+    expect(deferred.has("outside")).toBe(false);
+  });
+
+  it("lets a waiter proceed once a hung holder passes the stale timeout", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
+    try {
+      // A holder whose awaited work never settles (e.g. a hung DB call).
+      void withFleetRunAdmissionLock(() => new Promise<never>(() => {}));
+      let proceeded = false;
+      const waiter = withFleetRunAdmissionLock(async () => {
+        proceeded = true;
+        return "ran";
+      });
+      await vi.advanceTimersByTimeAsync(FLEET_ADMISSION_STALE_MS - 1_000);
+      expect(proceeded).toBe(false);
+      await vi.advanceTimersByTimeAsync(2_000);
+      await expect(waiter).resolves.toBe("ran");
+      expect(proceeded).toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
+    // The lock is free again for later holders.
     await expect(withFleetRunAdmissionLock(async () => "next")).resolves.toBe("next");
   });
 
@@ -314,6 +347,7 @@ describeEmbeddedPostgres("fleet-wide agent run ceiling", () => {
         await db.delete(environmentLeases);
         await db.delete(issueComments);
         await db.delete(issues);
+        await db.delete(projects);
         await db.delete(heartbeatRunEvents);
         await db.delete(activityLog);
         await db.delete(heartbeatRuns);
@@ -669,6 +703,64 @@ describeEmbeddedPostgres("fleet-wide agent run ceiling", () => {
     expect(new Set(executionsOf(seededRunIds))).toEqual(new Set(seededRunIds));
   }, 120_000);
 
+  it("defers a claim's nested re-admission instead of stalling the fleet lock on it", async () => {
+    // Agent A's two queued runs are budget-blocked (their project is paused for
+    // budget), so each claim cancels the run, and the cancel re-admits agent A.
+    // Run inline under the fleet lock, that re-admit waited the full 30s agent
+    // start-lock timeout on A's own lock, per cancelled run, and every other
+    // agent's admission queued behind it. Deferred, B is admitted at once.
+    const companyId = await seedCompany();
+    const projectId = randomUUID();
+    await db.insert(projects).values({
+      id: projectId,
+      companyId,
+      name: "Paused for budget",
+      pausedAt: new Date(),
+      pauseReason: "budget",
+    });
+    const agentA = await seedAgent(companyId, 0);
+    const base = Date.now() - 10 * 60_000;
+    const blockedRunIds: string[] = [];
+    for (let index = 0; index < 2; index += 1) {
+      const runId = randomUUID();
+      await db.insert(heartbeatRuns).values({
+        id: runId,
+        companyId,
+        agentId: agentA,
+        invocationSource: "assignment",
+        triggerDetail: "system",
+        status: "queued",
+        contextSnapshot: { projectId, wakeReason: "issue_assigned" },
+        createdAt: new Date(base + index * 1_000),
+        updatedAt: new Date(base + index * 1_000),
+      });
+      blockedRunIds.push(runId);
+    }
+    const agentB = await seedAgentWithQueuedRun({
+      companyId,
+      index: 1,
+      createdAt: new Date(base + 60_000),
+    });
+
+    const startedAt = Date.now();
+    await heartbeatAtCeilingTwo.resumeQueuedRuns();
+    expect(await waitForExecutionsOf([agentB.runId], 1, 20_000)).toBe(true);
+    const elapsedMs = Date.now() - startedAt;
+    // Well under one 30s agent start-lock timeout.
+    expect(elapsedMs).toBeLessThan(20_000);
+    await settle();
+
+    const rows = await db
+      .select({ id: heartbeatRuns.id, status: heartbeatRuns.status })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.companyId, companyId));
+    const statusOf = new Map(rows.map((row) => [row.id, row.status]));
+    expect(statusOf.get(agentB.runId)).toBe("running");
+    // The budget cancels are existing budget behaviour, not the ceiling.
+    expect(blockedRunIds.map((id) => statusOf.get(id))).toEqual(["cancelled", "cancelled"]);
+    expect(rows.filter((row) => row.status === "running")).toHaveLength(1);
+  }, 120_000);
+
   describe("stale-run guard", () => {
     it("does not let a dead running row consume a slot", async () => {
       const { companyId, seeded } = await seedCompanyWithQueuedRuns(3);
@@ -702,13 +794,37 @@ describeEmbeddedPostgres("fleet-wide agent run ceiling", () => {
       expect((await seededStatuses(seededRunIds)).running).toHaveLength(2);
     }, 120_000);
 
-    it("counts a silent row that still holds a live controller lease", async () => {
+    it("does not count a silent pid-less row on controller ownership alone (hung pre-launch shape)", async () => {
       const { companyId, seeded } = await seedCompanyWithQueuedRuns(3);
       const seededRunIds = seeded.map((s) => s.runId);
-      await seedRunningRow({
+      // Started two hours ago, never recorded a child, but the controller is
+      // still tracking it in-process and renewing its lease: a run hung in
+      // workspace preparation. It must not hold a slot forever.
+      const hungRunId = await seedRunningRow({
         companyId,
         controllerLeaseExpiresAt: new Date(Date.now() + 5 * 60 * 1000),
       });
+      runningProcesses.set(hungRunId, {
+        child: {} as never,
+        graceSec: 1,
+        processGroupId: null,
+      });
+
+      await heartbeatAtCeilingTwo.resumeQueuedRuns();
+      expect(await waitForExecutionsOf(seededRunIds, 2)).toBe(true);
+      await settle();
+
+      const statuses = await seededStatuses(seededRunIds);
+      expect(statuses.running).toHaveLength(2);
+      expect(statuses.queued).toHaveLength(1);
+    }, 120_000);
+
+    it("counts a silent row whose recorded child process is still alive", async () => {
+      const { companyId, seeded } = await seedCompanyWithQueuedRuns(3);
+      const seededRunIds = seeded.map((s) => s.runId);
+      // Silent for two hours and no controller lease, but the recorded pid is
+      // alive (this test process stands in for a detached adapter child).
+      await seedRunningRow({ companyId, processPid: process.pid });
 
       await heartbeatAtCeilingTwo.resumeQueuedRuns();
       expect(await waitForExecutionsOf(seededRunIds, 1)).toBe(true);

@@ -62,31 +62,50 @@ export async function withAgentStartLock<T>(agentId: string, fn: () => Promise<T
 // ---------------------------------------------------------------------------
 
 const FLEET_ADMISSION_SLOW_WARN_MS = 30_000;
+// A holder that never settles (for example a database call that hangs with no
+// lock_timeout) must not freeze admission for the whole instance until a
+// restart. After this long a waiter logs an error and proceeds. Because the
+// admission path recounts the fleet budget before every claim, an overlap after
+// a stale release risks a small over-admit, never a permanent stall.
+export const FLEET_ADMISSION_STALE_MS = 120_000;
 
 type FleetLock = { promise: Promise<void>; startedAtMs: number };
 
 let fleetRunAdmissionLock: FleetLock | null = null;
 
-// The admission critical section can call back into itself: claiming or
-// releasing an issue execution applies post-commit wake effects, and a
-// `run_queued` effect calls startNextQueuedRunForAgent again. Awaiting the
-// lock's own in-flight marker from inside its holder would deadlock, so nested
-// acquisitions on the same async context run inline (the outer hold already
-// provides exclusivity). A module boolean cannot distinguish nested from
-// concurrent callers; async context can.
-const fleetRunAdmissionContext = new AsyncLocalStorage<true>();
+// The admission critical section can call back into admission: claiming or
+// cancelling a queued run applies post-commit wake effects, and a `run_queued`
+// effect or a cancel's same-agent re-admit calls startNextQueuedRunForAgent
+// again. Running that nested admission inline is wrong twice over: it claims
+// fleet slots the outer budget never sees, and it waits on per-agent start
+// locks while holding the fleet lock (a 30s self-wait for the same agent, a
+// circular wait for another agent whose own admission is waiting on the fleet
+// lock). So nested admissions are DEFERRED: the section's store collects the
+// agent ids and the caller re-runs them after it has released every lock. The
+// store is per outermost section, carried by async context; a module variable
+// cannot tell a nested caller from a concurrent one.
+type FleetAdmissionStore = { deferred: Set<string> };
+const fleetRunAdmissionContext = new AsyncLocalStorage<FleetAdmissionStore>();
 
 /**
- * Wait for the current holder to finish. Unlike the per-agent stale guard, this
- * never releases the lock early: the fleet ceiling must stay exclusive until the
- * holder's "count running -> claim" finishes, otherwise two waiters can read the
- * same free slot and both claim it. The stored promise is the holder's settled
- * marker (resolves on success and on error), so a normal holder always releases
- * it; a long hold is logged for visibility but the waiter still waits.
+ * Wait for the current holder to finish. The fleet ceiling must stay exclusive
+ * until the holder's "count running -> claim" finishes, so a slow holder is
+ * waited out (with a warning). Only a holder that has run past
+ * FLEET_ADMISSION_STALE_MS is treated as hung: the waiter logs an error and
+ * proceeds rather than stalling every agent forever.
  */
 async function awaitFleetLockOwner(lock: FleetLock) {
   const heldMs = Date.now() - lock.startedAtMs;
-  let timer: ReturnType<typeof setTimeout> | null = null;
+  const remainingMs = FLEET_ADMISSION_STALE_MS - heldMs;
+  if (remainingMs <= 0) {
+    logger.error(
+      { lockScope: "fleet-run-admission", heldMs },
+      "fleet run admission lock stale; continuing admission",
+    );
+    return;
+  }
+  let warnTimer: ReturnType<typeof setTimeout> | null = null;
+  let staleTimer: ReturnType<typeof setTimeout> | null = null;
   const warnSlow = () =>
     logger.warn(
       { lockScope: "fleet-run-admission", heldMs: Date.now() - lock.startedAtMs },
@@ -95,25 +114,53 @@ async function awaitFleetLockOwner(lock: FleetLock) {
   if (heldMs >= FLEET_ADMISSION_SLOW_WARN_MS) {
     warnSlow();
   } else {
-    timer = setTimeout(warnSlow, FLEET_ADMISSION_SLOW_WARN_MS - heldMs);
-    timer.unref?.();
+    warnTimer = setTimeout(warnSlow, FLEET_ADMISSION_SLOW_WARN_MS - heldMs);
+    warnTimer.unref?.();
   }
+  let timedOut = false;
   try {
-    await lock.promise;
+    await Promise.race([
+      lock.promise,
+      new Promise<void>((resolve) => {
+        staleTimer = setTimeout(() => {
+          timedOut = true;
+          resolve();
+        }, remainingMs);
+        (staleTimer as { unref?: () => void }).unref?.();
+      }),
+    ]);
   } finally {
-    if (timer) clearTimeout(timer);
+    if (warnTimer) clearTimeout(warnTimer);
+    if (staleTimer) clearTimeout(staleTimer);
+  }
+  if (timedOut) {
+    logger.error(
+      { lockScope: "fleet-run-admission", staleMs: FLEET_ADMISSION_STALE_MS },
+      "fleet run admission lock timed out; continuing admission",
+    );
   }
 }
 
-export async function withFleetRunAdmissionLock<T>(fn: () => Promise<T>): Promise<T> {
-  // Re-entrant call from inside the current critical section: the lock is
-  // already held on this async context, so run inline.
+/**
+ * Run `fn` as the instance-wide admission critical section.
+ *
+ * `options.deferred` is the caller's collector for nested admissions requested
+ * while `fn` runs (see deferFleetRunAdmission). The caller drains it after it
+ * has released this lock and any per-agent lock it holds.
+ */
+export async function withFleetRunAdmissionLock<T>(
+  fn: () => Promise<T>,
+  options: { deferred?: Set<string> } = {},
+): Promise<T> {
+  // Defensive: a nested acquisition on the same async context is already
+  // covered by the outer hold, so run inline instead of awaiting our own marker.
   if (fleetRunAdmissionContext.getStore()) {
     return fn();
   }
+  const store: FleetAdmissionStore = { deferred: options.deferred ?? new Set() };
   const previous = fleetRunAdmissionLock;
   const waitForPrevious = previous ? awaitFleetLockOwner(previous) : Promise.resolve();
-  const run = waitForPrevious.then(() => fleetRunAdmissionContext.run(true, fn));
+  const run = waitForPrevious.then(() => fleetRunAdmissionContext.run(store, fn));
   const marker = run.then(
     () => undefined,
     () => undefined,
@@ -130,17 +177,28 @@ export async function withFleetRunAdmissionLock<T>(fn: () => Promise<T>): Promis
 
 /** True while the caller runs inside a fleet admission critical section. */
 export function isInsideFleetRunAdmission() {
-  return fleetRunAdmissionContext.getStore() === true;
+  return fleetRunAdmissionContext.getStore() !== undefined;
+}
+
+/**
+ * Inside a fleet admission critical section, record `key` (an agent id) for
+ * admission after the section's owner releases its locks, and return true.
+ * Outside a section, do nothing and return false: the caller admits normally.
+ */
+export function deferFleetRunAdmission(key: string): boolean {
+  const store = fleetRunAdmissionContext.getStore();
+  if (!store) return false;
+  store.deferred.add(key);
+  return true;
 }
 
 /**
  * Detach `fn` from the current fleet admission context.
  *
- * Reentrancy is only correct while the critical section that owns the lock is
- * still running. A fire-and-forget execution spawned from a lock holder must not
- * carry the marker past that section, or its later promotion would run admission
- * inline after the lock was released and let two count-and-claim windows
- * overlap. `exit` runs `fn` (and the async work it creates) without the marker.
+ * A fire-and-forget execution spawned from a lock holder must not carry the
+ * section's store past that section, or its later promotions would be deferred
+ * into a collector nobody drains any more. `exit` runs `fn` (and the async work
+ * it creates) without the store.
  */
 export function runOutsideFleetRunAdmission<T>(fn: () => T): T {
   return fleetRunAdmissionContext.exit(fn);
