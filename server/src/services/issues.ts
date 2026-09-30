@@ -10544,6 +10544,21 @@ export function issueService(db: Db) {
          * completions (watchdog evaluation folds). Never settable from HTTP.
          */
         doneGateBypass?: boolean;
+        /**
+         * SPA-9578: user/board classification of this card as a NON-CODE
+         * COORDINATION card. Relaxes only PROSE-cited open pull requests for
+         * this transition; a `pull_request` work product and any `unknown`
+         * merge state still refuse. Only the PATCH route mints this and only
+         * for user/board actors (an agent PATCH is 403 there); recorded as an
+         * `issue.done_gate_coordination_relaxed` activity row.
+         */
+        doneGateCoordinationClassification?: {
+          reason: string;
+          actorType: "agent" | "user" | "board";
+          actorId: string | null;
+          agentId: string | null;
+          runId: string | null;
+        };
       },
       dbOrTx: any = db,
       postCommitActivityPublications?: ActivityPublication[],
@@ -10591,6 +10606,7 @@ export function issueService(db: Db) {
         companyGuard,
         doneGateOverride,
         doneGateBypass,
+        doneGateCoordinationClassification,
         ...issueData
       } = data;
       if (
@@ -10654,6 +10670,16 @@ export function issueService(db: Db) {
         assertTransition(existing.status, issueData.status);
       }
 
+      // SPA-9578: the coordination classification is consumed by exactly one
+      // gate evaluation — the first entry into `done` — and is never card
+      // state. Drop it defensively on any other write so an internal caller
+      // cannot smuggle a standing exemption through this service. The PATCH
+      // route already rejects such a request with 422.
+      const effectiveCoordinationClassification =
+        issueData.status === "done" && existing.status !== "done"
+          ? doneGateCoordinationClassification
+          : undefined;
+
       // SPA-8957 card-close DoD gate: refuse a first entry into `done` while
       // the card's pull_request work products are unmerged (or unverifiable).
       // Skipped entirely when the caller carries an explicit override (only
@@ -10668,16 +10694,35 @@ export function issueService(db: Db) {
       ) {
         const { issueDoneGateService } = await import("./issue-done-gate.js");
         const gate = issueDoneGateService(db);
-        const decision = await gate.evaluateDoneGate({
-          id: existing.id,
-          companyId: existing.companyId,
-          // SPA-9038: the card's own description can carry binding PR links.
-          description: typeof issueData.description === "string"
-            ? issueData.description
-            : existing.description,
-        });
+        const decision = await gate.evaluateDoneGate(
+          {
+            id: existing.id,
+            companyId: existing.companyId,
+            // SPA-9038: the card's own description can carry binding PR links.
+            description: typeof issueData.description === "string"
+              ? issueData.description
+              : existing.description,
+          },
+          // SPA-9578: only a user/board classification narrows prose-cited
+          // opens; `unknown` and work-product bindings still refuse.
+          {
+            coordinationClassification:
+              effectiveCoordinationClassification !== undefined,
+          },
+        );
         if (decision.outcome === "refuse") {
           throw gate.refusalError(decision.reason);
+        }
+        if (decision.relaxedPullRequests && decision.relaxedPullRequests.length > 0) {
+          await gate.recordCoordinationClassification({
+            issue: {
+              id: existing.id,
+              companyId: existing.companyId,
+              identifier: existing.identifier,
+            },
+            classification: effectiveCoordinationClassification!,
+            relaxedPullRequests: decision.relaxedPullRequests,
+          });
         }
       }
       if (doneGateOverride) {
