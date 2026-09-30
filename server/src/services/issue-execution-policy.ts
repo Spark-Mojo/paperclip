@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import type {
   IssueExecutionDecision,
   IssueExecutionMonitorClearReason,
@@ -512,6 +512,32 @@ function stageHasParticipant(stage: IssueExecutionStage, participant: IssueExecu
   return stage.participants.some((candidate) => principalsEqual(candidate, participant));
 }
 
+/**
+ * SPA-9396 — the approval-relevant digest of a policy: mode plus each stage's
+ * id, type, approval count and participants. Computed here (and again in the
+ * approvals service, which imports this module) so recording an approval and
+ * validating it later cannot drift onto two different definitions.
+ */
+function issueExecutionPolicyFingerprint(
+  policy: IssueExecutionPolicy | null,
+): string | null {
+  if (!policy) return null;
+  const canonical = {
+    mode: policy.mode,
+    stages: policy.stages.map((stage) => ({
+      id: stage.id,
+      type: stage.type,
+      approvalsNeeded: stage.approvalsNeeded,
+      participants: stage.participants.map((participant) => ({
+        type: participant.type,
+        agentId: participant.agentId ?? null,
+        userId: participant.userId ?? null,
+      })),
+    })),
+  };
+  return createHash("sha256").update(JSON.stringify(canonical)).digest("hex");
+}
+
 function patchForPrincipal(principal: IssueExecutionStagePrincipal | null) {
   if (!principal) {
     return { assigneeAgentId: null, assigneeUserId: null };
@@ -521,25 +547,45 @@ function patchForPrincipal(principal: IssueExecutionStagePrincipal | null) {
     : { assigneeAgentId: null, assigneeUserId: principal.userId ?? null };
 }
 
+/**
+ * SPA-9396 — append a fresh approval record for the stage being approved and
+ * supersede (never delete) the stage's prior live approval.
+ *
+ * Sequencing bookkeeping only. The record captures who took part, the policy
+ * revision they approved against, and the pull-request heads they named. It
+ * asserts no security posture; `recordedBy` is always `stage_participant`
+ * because only a configured participant of the stage reaches this function.
+ */
 function recordStageApproval(input: {
   previous: IssueExecutionState | null;
   stage: IssueExecutionStage;
   reviewer: IssueExecutionStagePrincipal | null;
+  policyFingerprint: string | null;
   pullRequests: IssueStageApprovalPullRequest[];
   approvedAt: Date;
 }): IssueExecutionStageApproval[] {
-  const carried = (input.previous?.approvals ?? []).filter(
-    (approval) => approval.stageId !== input.stage.id,
+  const history = (input.previous?.approvals ?? []).map((approval) =>
+    approval.stageId === input.stage.id && !approval.supersededAt
+      ? {
+          ...approval,
+          supersededAt: input.approvedAt.toISOString(),
+          supersededReason: "fresh_review" as const,
+        }
+      : approval,
   );
   return [
-    ...carried,
+    ...history,
     {
       stageId: input.stage.id,
       stageType: input.stage.type,
       reviewerAgentId: input.reviewer?.type === "agent" ? input.reviewer.agentId ?? null : null,
       reviewerUserId: input.reviewer?.type === "user" ? input.reviewer.userId ?? null : null,
+      recordedBy: "stage_participant" as const,
+      policyFingerprint: input.policyFingerprint,
       approvedAt: input.approvedAt.toISOString(),
       pullRequests: input.pullRequests,
+      supersededAt: null,
+      supersededReason: null,
     },
   ];
 }
@@ -693,6 +739,92 @@ function canAutoSkipPendingStage(input: {
   }
   return input.stage.participants.length > 0 &&
     input.stage.participants.every((participant) => principalsEqual(participant, input.returnAssignee));
+}
+
+/**
+ * SPA-9396 — a premerge stage approval that has been superseded by a moved
+ * pull-request head. The stage is already durably complete; only its
+ * participation record needs refreshing, and the stage must NOT restart
+ * implementation or re-enter the chain at stage one.
+ *
+ * Returns null ONLY when the caller made no fresh-review claim at all, which
+ * leaves the ordinary completed-state no-op (#7893) untouched.
+ *
+ * Once a caller supplies a non-empty pull-request claim against an already
+ * completed execution it is making an explicit fresh-review REQUEST, and that
+ * request must always resolve to an authorization decision. Silently returning
+ * null for an unauthorized actor would convert a rejected review into a no-op
+ * that a caller can read as a close — the stage-approval failure mode this
+ * path exists to prevent. Every other preconditions-miss below therefore
+ * throws rather than falling through.
+ */
+function applyFreshStageReview(input: {
+  patch: Record<string, unknown>;
+  policy: IssueExecutionPolicy;
+  existingState: IssueExecutionState;
+  actor: IssueExecutionStagePrincipal | null;
+  approvalPullRequests: readonly IssueStageApprovalPullRequest[] | null | undefined;
+  approvalRecordedAt: Date;
+  commentBody: string | null | undefined;
+}): TransitionResult | null {
+  const { patch, policy, existingState, actor } = input;
+  const awaitingMerge = existingState.awaitingMerge;
+  const approvalPullRequests = input.approvalPullRequests ?? [];
+  if (approvalPullRequests.length === 0) return null;
+
+  const stage = awaitingMerge
+    ? policy.stages.find((candidate) => candidate.id === awaitingMerge.stageId) ?? null
+    : null;
+  if (!stage) {
+    throw unprocessable(
+      "Only the active reviewer can record a fresh stage approval: this execution already completed and names no awaiting-merge stage to re-approve.",
+    );
+  }
+  if (!(existingState.completedStageIds ?? []).includes(stage.id)) {
+    throw unprocessable(
+      "Only the active reviewer can record a fresh stage approval: the awaiting-merge stage is not recorded as completed on this execution.",
+    );
+  }
+  if (!actor || !stageHasParticipant(stage, actor)) {
+    throw unprocessable(
+      "Only the active reviewer can record a fresh stage approval: the actor is not a participant of the approved stage.",
+    );
+  }
+
+  if (!input.commentBody?.trim()) {
+    throw unprocessable(`Approving a review or approval stage requires a comment. ${STAGE_DECISION_COMMENT_HINT}`);
+  }
+
+  const approvals = recordStageApproval({
+    previous: existingState,
+    stage,
+    reviewer: actor,
+    policyFingerprint: issueExecutionPolicyFingerprint(policy),
+    pullRequests: [...approvalPullRequests],
+    approvedAt: input.approvalRecordedAt,
+  });
+
+  patch.executionState = {
+    ...existingState,
+    status: COMPLETED_STATUS,
+    currentStageId: null,
+    currentStageIndex: null,
+    currentStageType: null,
+    currentParticipant: null,
+    lastDecisionOutcome: "approved",
+    changesRequestedCount: 0,
+    approvals,
+    awaitingMerge: { stageId: stage.id },
+  };
+  return {
+    patch,
+    decision: {
+      stageId: stage.id,
+      stageType: stage.type,
+      outcome: "approved",
+      body: input.commentBody.trim(),
+    },
+  };
 }
 
 function applyIssueExecutionStageTransition(input: TransitionInput): TransitionResult {
@@ -855,6 +987,7 @@ function applyIssueExecutionStageTransition(input: TransitionInput): TransitionR
               previous: existingState,
               stage: activeStage,
               reviewer: currentParticipant,
+              policyFingerprint: issueExecutionPolicyFingerprint(input.policy),
               pullRequests: approvalPullRequests,
               approvedAt: input.approvalRecordedAt ?? new Date(),
             });
@@ -865,7 +998,7 @@ function applyIssueExecutionStageTransition(input: TransitionInput): TransitionR
             patch.executionState = {
               ...approvedState,
               approvals,
-              awaitingMerge: true,
+              awaitingMerge: { stageId: activeStage.id },
             };
             return {
               patch,
@@ -895,6 +1028,7 @@ function applyIssueExecutionStageTransition(input: TransitionInput): TransitionR
             previous: existingState,
             stage: activeStage,
             reviewer: currentParticipant,
+            policyFingerprint: issueExecutionPolicyFingerprint(input.policy),
             pullRequests: input.approvalPullRequests ?? [],
             approvedAt: input.approvalRecordedAt ?? new Date(),
           });
@@ -1066,6 +1200,16 @@ function applyIssueExecutionStageTransition(input: TransitionInput): TransitionR
   // A workflow whose execution already completed is terminal for approve/done:
   // closing the issue must not restart the chain at the first stage (#7893).
   if (requestedStatus === "done" && existingState?.status === COMPLETED_STATUS) {
+    const freshReview = applyFreshStageReview({
+      patch,
+      policy: input.policy,
+      existingState,
+      actor,
+      approvalPullRequests: input.approvalPullRequests,
+      approvalRecordedAt: input.approvalRecordedAt ?? new Date(),
+      commentBody: input.commentBody,
+    });
+    if (freshReview) return freshReview;
     return { patch };
   }
 

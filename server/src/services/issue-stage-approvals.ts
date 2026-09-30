@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import type { Db } from "@paperclipai/db";
 import type {
   IssueExecutionPolicy,
+  IssueExecutionStageApproval,
   IssueStageApprovalPullRequest,
 } from "@paperclipai/shared";
 import { conflict, unprocessable } from "../errors.js";
@@ -277,7 +278,11 @@ export function issueStageApprovalService(db: Db, opts: IssueStageApprovalServic
 
     const state = parseIssueExecutionState(input.issue.executionState);
     const approvals = state?.approvals ?? [];
-    const approvalsByStage = new Map(approvals.map((approval) => [approval.stageId, approval]));
+    const approvalsByStage = new Map<string, IssueExecutionStageApproval>();
+    for (const stage of policy.stages) {
+      const live = liveStageApproval(approvals, stage.id);
+      if (live) approvalsByStage.set(stage.id, live);
+    }
 
     const bound = await readBound(input.issue);
     const reviewable = new Set<string>();
@@ -293,16 +298,72 @@ export function issueStageApprovalService(db: Db, opts: IssueStageApprovalServic
       return { outcome: "allow" };
     }
 
+    const currentFingerprint = issueExecutionPolicyFingerprint(policy);
     const missing: string[] = [];
+    const nonParticipants: string[] = [];
+
+    // The policy fingerprint is checked FIRST and across every stage before any
+    // per-stage verdict is produced. A policy edited after an approval was
+    // authorized (participants, stage set, order) is a larger violation than
+    // any single stage's evidence, and it also invalidates the participant set
+    // the reviewer would be judged against — checking participation first would
+    // report the policy change as a reviewer problem and mask the real drift.
+    for (const stage of policy.stages) {
+      const approval = liveStageApproval(approvals, stage.id);
+      if (!approval) continue;
+      if (approval.policyFingerprint !== currentFingerprint) {
+        return {
+          outcome: "refuse",
+          reason: "this card's execution policy changed after the stage approval was authorized; re-read the policy and approve again",
+          details: {
+            code: STAGE_APPROVAL_POLICY_CHANGED_CODE,
+            authorizedPolicyFingerprint: approval.policyFingerprint,
+            currentPolicyFingerprint: currentFingerprint,
+          },
+        };
+      }
+    }
+
     for (const stage of policy.stages) {
       const approval = approvalsByStage.get(stage.id);
       if (!approval || approval.stageType !== stage.type) {
         missing.push(stage.id);
         continue;
       }
+      // A reviewer who is not a participant of THIS stage is not missing
+      // evidence — it is a record that cannot have been produced by a
+      // legitimate review, so it refuses under its own code rather than
+      // asking for a re-approval that would land in the same state.
       if (!stageHasReviewer(stage, approval)) {
-        missing.push(stage.id);
+        nonParticipants.push(stage.id);
+        continue;
       }
+    }
+    if (nonParticipants.length > 0) {
+      return {
+        outcome: "refuse",
+        reason: "every stage approval on this card must be recorded by a participant of that stage",
+        details: { code: STAGE_APPROVAL_REVIEWER_CHANGED_CODE, stages: nonParticipants },
+      };
+    }
+    // A stage whose every recorded approval has been superseded has NO live
+    // approval. That is distinct from a stage never approved: the record
+    // existed and was deliberately voided, so treating it as an advisory
+    // "missing" refusal would let a caller ignore the refusal and close on a
+    // voided decision. Fail closed with a thrown conflict instead.
+    const voidedOnlyStages = policy.stages
+      .filter((stage) => {
+        if (approvalsByStage.has(stage.id)) return false;
+        return approvals.some(
+          (approval) => approval.stageId === stage.id && approval.supersededAt,
+        );
+      })
+      .map((stage) => stage.id);
+    if (voidedOnlyStages.length > 0) {
+      throw conflict(
+        "Issue cannot be marked done from this approval: a required stage's approval was superseded and no live approval remains for it. Record a fresh approval for that stage before closing.",
+        { code: STAGE_APPROVAL_MISSING_CODE, stages: voidedOnlyStages },
+      );
     }
     if (missing.length > 0) {
       return {
@@ -368,6 +429,26 @@ export function issueStageApprovalService(db: Db, opts: IssueStageApprovalServic
   }
 
   return { verifyReviewedPullRequests, hasBoundPullRequests, evaluateStageApprovalGate, readBound };
+}
+
+/**
+ * SPA-9396 — the live approval for a stage: the last recorded entry for that
+ * stage that has not been superseded. Later array position wins any tie on
+ * timestamp, so the result is deterministic and never reads a clock.
+ *
+ * A superseded approval is never live again, so a voided record cannot be
+ * resurrected as current review evidence.
+ */
+export function liveStageApproval(
+  approvals: readonly IssueExecutionStageApproval[] | null | undefined,
+  stageId: string,
+): IssueExecutionStageApproval | null {
+  let live: IssueExecutionStageApproval | null = null;
+  for (const approval of approvals ?? []) {
+    if (approval.stageId !== stageId || approval.supersededAt) continue;
+    live = approval;
+  }
+  return live;
 }
 
 function stageHasReviewer(

@@ -540,6 +540,16 @@ export type IssueExecutionMonitorRecoveryPolicy =
 export const ISSUE_EXECUTION_STATE_STATUSES = ["idle", "pending", "changes_requested", "completed"] as const;
 export type IssueExecutionStateStatus = (typeof ISSUE_EXECUTION_STATE_STATUSES)[number];
 
+// SPA-9396 — how a stage approval entered its durable record, and why an
+// earlier approval of the same stage stopped being live. Sequencing
+// bookkeeping only; neither list carries a security-posture meaning.
+export const ISSUE_STAGE_APPROVAL_RECORDED_BY = ["stage_participant"] as const;
+export type IssueStageApprovalRecordedBy = (typeof ISSUE_STAGE_APPROVAL_RECORDED_BY)[number];
+
+export const ISSUE_STAGE_APPROVAL_SUPERSEDED_REASONS = ["fresh_review"] as const;
+export type IssueStageApprovalSupersededReason =
+  (typeof ISSUE_STAGE_APPROVAL_SUPERSEDED_REASONS)[number];
+
 export const ISSUE_EXECUTION_MONITOR_STATE_STATUSES = ["scheduled", "triggered", "cleared"] as const;
 export type IssueExecutionMonitorStateStatus = (typeof ISSUE_EXECUTION_MONITOR_STATE_STATUSES)[number];
 

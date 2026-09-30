@@ -21,6 +21,8 @@ import {
   ISSUE_RECOVERY_ACTION_OWNER_TYPES,
   ISSUE_RECOVERY_ACTION_STATUSES,
   ISSUE_REVIEW_POLICIES,
+  ISSUE_STAGE_APPROVAL_RECORDED_BY,
+  ISSUE_STAGE_APPROVAL_SUPERSEDED_REASONS,
   ISSUE_WORK_MODES,
   clampIssueRequestDepth,
   ISSUE_STATUSES,
@@ -514,8 +516,17 @@ export const issueExecutionStageApprovalSchema = z.object({
   stageType: z.enum(ISSUE_EXECUTION_STAGE_TYPES),
   reviewerAgentId: z.string().guid().nullable(),
   reviewerUserId: z.string().nullable(),
+  recordedBy: z.enum(ISSUE_STAGE_APPROVAL_RECORDED_BY).default("stage_participant"),
+  policyFingerprint: z.string().regex(/^[0-9a-f]{64}$/).nullable().default(null),
   approvedAt: z.string().datetime(),
   pullRequests: z.array(reviewedPullRequestSchema).default([]),
+  supersededAt: z.string().datetime().nullable().default(null),
+  supersededReason: z.enum(ISSUE_STAGE_APPROVAL_SUPERSEDED_REASONS).nullable().default(null),
+});
+
+/** SPA-9396 — a stage completed before its pull request merged. */
+export const issueAwaitingMergeStateSchema = z.object({
+  stageId: z.string().guid(),
 });
 
 export const issueExecutionStateSchema = z.object({
@@ -532,7 +543,7 @@ export const issueExecutionStateSchema = z.object({
   monitor: issueExecutionMonitorStateSchema.optional().nullable(),
   changesRequestedCount: z.number().int().nonnegative().optional().default(0),
   approvals: z.array(issueExecutionStageApprovalSchema).optional(),
-  awaitingMerge: z.boolean().optional(),
+  awaitingMerge: issueAwaitingMergeStateSchema.nullable().optional(),
 });
 
 export const issueRecoveryActionReadModelSchema = z.object({
