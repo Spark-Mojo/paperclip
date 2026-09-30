@@ -1,5 +1,9 @@
 # SPA-9396 gates — incomplete WIP, 2026-09-30
 
+## Ty Gate 0 continuation, 2026-09-30
+
+Reproduced each G2 failure in isolation with the default 15s Vitest timeout: the first test timed out at 15.9s; the second at 15.0s. With `--testTimeout=90000`, each passed its actual refusal assertions after 18.5s and 16.5s respectively. Running the whole route file at 120s passed 19/19; its first dynamic `createApp()` import took 17.8s and subsequent route tests took about 1s each. The cause is cold route-module import/transform under the test clock, not an application transaction hang. Changed only these two tests' individual timeout to 60s, preserving the default `CHECK:` and its authorization assertions. `timeout 300 pnpm exec vitest run server/src/__tests__/issue-execution-policy-routes.test.ts server/src/__tests__/issue-done-pr-merged-gate.test.ts` exited 0: Test Files 2 passed; Tests 41 passed (41); `git diff --check` exited 0. The first assertion returned 403 `review_policy_denied` for locked `human_only` and verified no update; the second returned 422 `invalid_issue_disposition` and verified no update. A deliberate negative fixture for these assertions is still required under WORKFLOW; do not call the entire ledger green yet. No feature implementation or PR this session.
+
 ## Steve arbitration pass, 2026-09-30 (manager arbitration of the implementer-session cap)
 
 Two of the escalation's stated blockers were re-derived and corrected. One safety claim does NOT clear.
