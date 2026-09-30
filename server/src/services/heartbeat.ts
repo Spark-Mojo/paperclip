@@ -532,7 +532,11 @@ import {
 } from "./recovery/review-path-recovery.js";
 import { resolveRequiredSuccessfulRunHandoffOnValidPath } from "./successful-run-handoff-state.js";
 import { taskWatchdogService } from "./task-watchdogs.js";
-import { withAgentStartLock } from "./agent-start-lock.js";
+import {
+  runOutsideFleetRunAdmission,
+  withAgentStartLock,
+  withFleetRunAdmissionLock,
+} from "./agent-start-lock.js";
 import {
   evaluateAgentInvokability,
   evaluateAgentInvokabilityFromDb,
@@ -646,6 +650,117 @@ const MAX_RUN_EVENT_PAYLOAD_DEPTH = 6;
 const HEARTBEAT_MAX_CONCURRENT_RUNS_DEFAULT = AGENT_DEFAULT_MAX_CONCURRENT_RUNS;
 const HEARTBEAT_MAX_CONCURRENT_RUNS_MIN = 1;
 const HEARTBEAT_MAX_CONCURRENT_RUNS_MAX = 50;
+
+// Fleet-wide ceiling on concurrently RUNNING agent runs for the whole instance
+// (ported from upstream paperclipai/paperclip#13621).
+//
+// OFF unless the operator sets PAPERCLIP_MAX_CONCURRENT_AGENT_RUNS. With it
+// unset, run admission is exactly the per-agent behaviour: no fleet count, no
+// fleet lock, no ordering change. `heartbeat.maxConcurrentRuns` is per agent, so
+// with N agents at a per-agent cap of 1 the instance can still run N at once;
+// this knob bounds the instance on a constrained host. Clamped to 1..50 when
+// set; unparseable values mean "no ceiling".
+const HEARTBEAT_FLEET_MAX_CONCURRENT_RUNS_MIN = 1;
+const HEARTBEAT_FLEET_MAX_CONCURRENT_RUNS_MAX = 50;
+
+/** No ceiling. The fleet term is skipped unless the operator opts in. */
+export const FLEET_MAX_CONCURRENT_RUNS_DEFAULT: number | null = null;
+export const FLEET_MAX_CONCURRENT_RUNS_ENV_VAR =
+  "PAPERCLIP_MAX_CONCURRENT_AGENT_RUNS";
+
+// Stale-run guard for the fleet count. A row can sit in status `running` after
+// its process died (the reaper cannot always prove ownership is gone, e.g.
+// SPA-9270). Counting such rows against the fleet ceiling would leak slots
+// until admission deadlocks for every agent. A `running` row therefore only
+// consumes a fleet slot when it shows live evidence; see
+// isFleetRunningRowLive. The activity window is configurable.
+export const FLEET_RUN_LIVENESS_WINDOW_ENV_VAR =
+  "PAPERCLIP_FLEET_RUN_LIVENESS_WINDOW_MS";
+export const FLEET_RUN_LIVENESS_WINDOW_DEFAULT_MS = 10 * 60 * 1000;
+const FLEET_RUN_LIVENESS_WINDOW_MIN_MS = 60 * 1000;
+const FLEET_RUN_LIVENESS_WINDOW_MAX_MS = 24 * 60 * 60 * 1000;
+
+// Env values always arrive as strings, which `asNumber` treats as absent.
+// Parse both shapes here.
+function readFiniteNumber(value: unknown): number | null {
+  if (typeof value === "number") return Number.isFinite(value) ? value : null;
+  if (typeof value === "string") {
+    const trimmed = value.trim();
+    if (trimmed === "") return null;
+    const parsed = Number(trimmed);
+    return Number.isFinite(parsed) ? parsed : null;
+  }
+  return null;
+}
+
+export function normalizeFleetMaxConcurrentRuns(value: unknown): number | null {
+  const parsed = readFiniteNumber(value);
+  if (parsed === null) return FLEET_MAX_CONCURRENT_RUNS_DEFAULT;
+  return Math.max(
+    HEARTBEAT_FLEET_MAX_CONCURRENT_RUNS_MIN,
+    Math.min(HEARTBEAT_FLEET_MAX_CONCURRENT_RUNS_MAX, Math.floor(parsed)),
+  );
+}
+
+export function normalizeFleetRunLivenessWindowMs(value: unknown): number {
+  const parsed = readFiniteNumber(value);
+  if (parsed === null) return FLEET_RUN_LIVENESS_WINDOW_DEFAULT_MS;
+  return Math.max(
+    FLEET_RUN_LIVENESS_WINDOW_MIN_MS,
+    Math.min(FLEET_RUN_LIVENESS_WINDOW_MAX_MS, Math.floor(parsed)),
+  );
+}
+
+/**
+ * Whether a `running` heartbeat row consumes a fleet slot.
+ *
+ * - Recent activity (output, start, process start, native phase change, or any
+ *   row write within the window) always counts: the run is demonstrably alive.
+ * - Otherwise the row counts only if a controller still owns it (tracked by
+ *   this process, or a live legacy controller lease) AND its recorded child
+ *   process is not known to be gone. A controller that is still awaiting a
+ *   child that already died is exactly the stuck-`running` shape; it must not
+ *   hold a slot.
+ * - Anything else (no controller evidence and silent past the window) is
+ *   treated as dead and does not count.
+ *
+ * The guard fails open: a live-but-silent run with no controller evidence
+ * (e.g. a native run with no output for longer than the window) can be
+ * excluded, which may briefly over-admit. That is preferred over a dead row
+ * permanently eating a slot and stalling admission fleet-wide.
+ */
+export function isFleetRunningRowLive(input: {
+  recentActivity: boolean;
+  locallyTracked: boolean;
+  controllerLeaseLive: boolean;
+  childKnownDead: boolean;
+}) {
+  if (input.recentActivity) return true;
+  if (!input.locallyTracked && !input.controllerLeaseLive) return false;
+  return !input.childKnownDead;
+}
+
+/**
+ * How many queued runs this agent may claim right now. The lower of the
+ * per-agent cap and the remaining fleet-wide budget wins, so the fleet cap is a
+ * hard ceiling rather than a suggestion.
+ */
+export function computeAvailableRunSlots(input: {
+  agentMaxConcurrentRuns: number;
+  agentRunningRuns: number;
+  /** null means no fleet ceiling; only the per-agent cap applies. */
+  fleetMaxConcurrentRuns: number | null;
+  fleetRunningRuns: number;
+}) {
+  const agentSlots = input.agentMaxConcurrentRuns - input.agentRunningRuns;
+  if (input.fleetMaxConcurrentRuns === null) {
+    return Math.max(0, agentSlots);
+  }
+  return Math.max(
+    0,
+    Math.min(agentSlots, input.fleetMaxConcurrentRuns - input.fleetRunningRuns),
+  );
+}
 const LIVENESS_BOOKKEEPING_ACTIVITY_ACTIONS = [
   "environment.lease_acquired",
   "environment.lease_released",
@@ -17132,6 +17247,55 @@ export function heartbeatService(
     return Number(count ?? 0);
   }
 
+  function fleetMaxConcurrentRuns() {
+    return normalizeFleetMaxConcurrentRuns(
+      runtimeEnv[FLEET_MAX_CONCURRENT_RUNS_ENV_VAR],
+    );
+  }
+
+  // Fleet-wide counterpart of countRunningRunsForAgent: running runs across the
+  // whole instance that show live evidence (see isFleetRunningRowLive). Read
+  // from the DB rather than an in-process counter so a restart cannot reset the
+  // ceiling, and filtered so a dead `running` row cannot eat a slot forever.
+  // Only used when a fleet ceiling is configured.
+  async function countRunningRunsGlobal() {
+    const windowMs = normalizeFleetRunLivenessWindowMs(
+      runtimeEnv[FLEET_RUN_LIVENESS_WINDOW_ENV_VAR],
+    );
+    const activityCutoff = new Date(Date.now() - windowMs);
+    const rows = await db
+      .select({
+        id: heartbeatRuns.id,
+        processPid: heartbeatRuns.processPid,
+        processGroupId: heartbeatRuns.processGroupId,
+        controllerLeaseLive: sql<boolean>`coalesce(${heartbeatRuns.controllerLeaseExpiresAt} > clock_timestamp(), false)`,
+        recentActivity: sql<boolean>`coalesce(greatest(${heartbeatRuns.lastOutputAt}, ${heartbeatRuns.startedAt}, ${heartbeatRuns.processStartedAt}, ${heartbeatRuns.nativePhaseUpdatedAt}, ${heartbeatRuns.updatedAt}, ${heartbeatRuns.createdAt}) >= ${activityCutoff.toISOString()}::timestamptz, false)`,
+      })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.status, "running"));
+    let live = 0;
+    for (const row of rows) {
+      const hasChildIdentity =
+        row.processPid !== null || row.processGroupId !== null;
+      const childKnownDead =
+        hasChildIdentity &&
+        !isProcessAlive(row.processPid) &&
+        !isProcessGroupAlive(row.processGroupId);
+      if (
+        isFleetRunningRowLive({
+          recentActivity: row.recentActivity === true,
+          locallyTracked:
+            runningProcesses.has(row.id) || activeRunExecutions.has(row.id),
+          controllerLeaseLive: row.controllerLeaseLive === true,
+          childKnownDead,
+        })
+      ) {
+        live += 1;
+      }
+    }
+    return live;
+  }
+
   async function withChatControlRecoveryGate(
     run: typeof heartbeatRuns.$inferSelect,
     stage: "claim" | "dispatch",
@@ -19451,7 +19615,7 @@ export function heartbeatService(
       });
     }
 
-    const queuedRuns = await db
+    const queuedRunsQuery = db
       .select({ agentId: heartbeatRuns.agentId })
       .from(heartbeatRuns)
       .innerJoin(companies, eq(companies.id, heartbeatRuns.companyId))
@@ -19462,6 +19626,17 @@ export function heartbeatService(
           cutoff ? gte(heartbeatRuns.createdAt, cutoff) : undefined,
         ),
       );
+    // With a fleet ceiling the sweep decides which waiting ticket gets a freed
+    // slot, so visit agents oldest-ticket first; otherwise agents that sort late
+    // could starve. Without a ceiling every agent is admitted anyway, so the
+    // query is left exactly as before.
+    const queuedRuns =
+      fleetMaxConcurrentRuns() === null
+        ? await queuedRunsQuery
+        : await queuedRunsQuery.orderBy(
+            asc(heartbeatRuns.createdAt),
+            asc(heartbeatRuns.id),
+          );
 
     const agentIds = [...new Set(queuedRuns.map((r) => r.agentId))];
     for (const agentId of agentIds) {
@@ -19778,6 +19953,10 @@ export function heartbeatService(
     if ((await getSchedulingSuppression()).suppressed) return [];
     const cutoff = await getWorktreeExecutionCutoff();
 
+    // Read once per admission; null (the default) keeps admission exactly as
+    // before: per-agent cap only, no fleet count, no fleet lock.
+    const fleetCeiling = fleetMaxConcurrentRuns();
+
     return withAgentStartLock(agentId, async () => {
       const agent = await getAgent(agentId);
       if (!agent) return [];
@@ -19885,16 +20064,49 @@ export function heartbeatService(
         return left.createdAt.getTime() - right.createdAt.getTime();
       });
 
-      const claimedRuns: Array<typeof heartbeatRuns.$inferSelect> = [];
-      for (const queuedRun of prioritizedRuns) {
-        if (claimedRuns.length >= availableSlots) break;
-        const claimed = await claimQueuedRun(queuedRun, companyAgents);
-        if (claimed) claimedRuns.push(claimed);
-      }
+      const claimQueuedRunsUpTo = async (slots: number) => {
+        const claimedRuns: Array<typeof heartbeatRuns.$inferSelect> = [];
+        for (const queuedRun of prioritizedRuns) {
+          if (claimedRuns.length >= slots) break;
+          const claimed = await claimQueuedRun(queuedRun, companyAgents);
+          if (claimed) claimedRuns.push(claimed);
+        }
+        return claimedRuns;
+      };
+      // With a fleet ceiling, "count fleet running -> claim" must be atomic
+      // across agents, so it runs under the process-wide admission lock and the
+      // slot budget is re-derived inside it. Everything above (agent lookup,
+      // invokability, queued-run selection and ordering) stays outside the lock
+      // so a slow or cascading step for one agent cannot stall every agent.
+      // Over-cap runs are simply not claimed: they stay `queued` and are
+      // re-admitted by run completion or the periodic resumeQueuedRuns sweep.
+      const claimedRuns =
+        fleetCeiling === null
+          ? await claimQueuedRunsUpTo(availableSlots)
+          : await withFleetRunAdmissionLock(async () => {
+              const fleetSlots = computeAvailableRunSlots({
+                agentMaxConcurrentRuns: policy.maxConcurrentRuns,
+                agentRunningRuns: await countRunningRunsForAgent(agentId),
+                fleetMaxConcurrentRuns: fleetCeiling,
+                fleetRunningRuns: await countRunningRunsGlobal(),
+              });
+              if (fleetSlots <= 0) return [];
+              return claimQueuedRunsUpTo(fleetSlots);
+            });
       if (claimedRuns.length === 0) return [];
 
       for (const claimedRun of claimedRuns) {
-        const execution = executeRun(claimedRun.id).catch((err) => {
+        // With a fleet ceiling, spawn the execution outside the admission
+        // context. Otherwise the fire-and-forget run inherits the lock's
+        // reentrancy marker and a later promotion from it would run admission
+        // inline after this lock was released, letting two count-and-claim
+        // sections overlap.
+        const startExecution = () => executeRun(claimedRun.id);
+        const execution = (
+          fleetCeiling === null
+            ? startExecution()
+            : runOutsideFleetRunAdmission(startExecution)
+        ).catch((err) => {
           logger.error(
             { err, runId: claimedRun.id },
             "queued heartbeat execution failed",
