@@ -130,6 +130,23 @@ Result: exit 1; EXPECT matched. Observed:
     The assertion inverts only the positive expectation, so the harness's own verdict is shown to be
     derived from observation rather than hardcoded — a green run is not vacuous.
 
+## G9 The card's non-code deliverable: friction issue #857 closed with a reason
+    CHECK: timeout 60 gh issue view 857 -R Spark-Mojo/sparkmojo-internal --json number,state,stateReason,closedAt --jq '"state=\(.state) reason=\(.stateReason) closedAt=\(.closedAt)"'
+    EXPECT: state=CLOSED reason=COMPLETED, with a non-empty closedAt
+Result: exit 0; EXPECT matched. Observed:
+
+    state=CLOSED reason=COMPLETED closedAt=2026-09-30T21:59:14Z
+
+    Reason is `completed` because the resolver is correct and the live engine is fixed, not because
+    a new change landed — the closing comment says so explicitly rather than implying otherwise.
+    Disposition comment:
+    https://github.com/Spark-Mojo/sparkmojo-internal/issues/857#issuecomment-5920454919
+
+    NEGATIVE: the same query against the sibling residual issue proves the query discriminates a
+    closed issue from an open one
+    EXPECT: state=OPEN — so G9's green is not a constant
+Result: exit 0, #1013 reads `state=OPEN reason=`. EXPECT matched.
+
 ## Residual defect found (not on this card's scope — filed separately)
 
 The advisor flagged, correctly, that green tests do not prove the verifier dispatch works when the
@@ -155,7 +172,17 @@ this card's scope is the reported defect and its DoD is already met.
 
 ## Scope note
 
-This is a **no-code-change** card. The card's proposed fix (G1) and its factual premise (G2) were
-both already satisfied at HEAD; the reported failure was served by a build predating SPA-9139 (G4).
-Writing a resolver change would have been a fix to working code. The git tree is therefore clean
-and the deliverable is this ledger plus the issue disposition.
+This is a **no-code-change** card. The card's proposed fix (G1, G1b) and its factual premise (G2)
+were both already satisfied at HEAD; the reported failure was served by a build predating SPA-9139
+(G4). Writing a resolver change would have been a fix to working code. The engine diff is therefore
+empty and the deliverables are this ledger, the two probes, the closure of #857 with a reason (G9),
+and the filing of the residual defect as #1013.
+
+## Review history on this PR
+
+Two independent verifications ran against this card. The first returned FAIL; its two findings are
+recorded and resolved above — R1 (resolver short-circuit) is answered by the new G1b probe and was
+formally **withdrawn** by the second verifier, and R2 (lines absent at head) is refuted from the
+authoritative blob with the reproduction recorded in G2. The second returned FAIL on a third
+finding, R3: the card explicitly requires closing #857 with a reason, and neither the diff nor the
+ledger evidenced it. That was a real miss — the clause is now discharged in G9.
