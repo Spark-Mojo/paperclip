@@ -13725,6 +13725,15 @@ export function issueRoutes(
             code: STAGE_APPROVAL_REVIEWER_CHANGED_CODE,
           });
         }
+        const lockedApprovalSvc = issueStageApprovalService(db, { tx: tx as unknown as Db });
+        await lockedApprovalSvc.verifyReviewedPullRequests({
+          issue: {
+            id: lockedIssue.id,
+            companyId: lockedIssue.companyId,
+            description: lockedIssue.description,
+          },
+          claim: verifiedApprovalPullRequests,
+        });
         return true;
       };
       const persistReviewTransitionActivity = async (

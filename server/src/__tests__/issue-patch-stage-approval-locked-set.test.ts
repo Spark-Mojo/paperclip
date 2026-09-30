@@ -167,7 +167,11 @@ function registerModuleMocks() {
   vi.doMock("../services/issue-done-gate.js", () => ({
     issueDoneGateService: (handle: unknown) => {
       mockIssueDoneGateService.handles.push(handle);
-      return mockIssueDoneGateService;
+      return {
+        ...mockIssueDoneGateService,
+        listBoundPullRequests: (issue: { id: string; companyId: string; description?: string | null }) =>
+          mockIssueDoneGateService.listBoundPullRequests(issue, handle),
+      };
     },
     APPROVAL_WORK_PRODUCT_SCAN_LIMIT: 100,
     APPROVAL_COMMENT_SCAN_LIMIT: 200,
@@ -340,6 +344,7 @@ describe("PATCH stage approval — canonical PR set rechecked under the lock", (
     insertedDecisionRows.length = 0;
     mockIssueDoneGateService.handles.length = 0;
     mockIssueService.assertCheckoutOwner.mockResolvedValue({ adoptedFromRunId: null });
+    mockIssueService.addComment.mockResolvedValue({ id: "99999999-9999-4999-8999-999999999999", body: "Reviewed the current head." });
     mockIssueService.findMentionedAgents.mockResolvedValue([]);
     mockIssueService.getRelationSummaries.mockResolvedValue({ blockedBy: [], blocks: [] });
     mockIssueService.listWakeableBlockedDependents.mockResolvedValue([]);
@@ -473,8 +478,9 @@ describe("PATCH stage approval — canonical PR set rechecked under the lock", (
         return [pr(1202)];
       },
     );
+    let detailReads = 0;
     mockGithubMerge.createPullRequestMergeDetailsResolver.mockImplementation(
-      () => async () => ({ state: "open", headRef: null, headSha: otherHead }),
+      () => async () => ({ state: "open", headRef: null, headSha: ++detailReads > 3 ? otherHead : reviewedHead }),
     );
     mockIssueService.update.mockImplementation(
       async (_id: string, patch: Record<string, unknown>) => ({ ...preTx, ...patch }),
