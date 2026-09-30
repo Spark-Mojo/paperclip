@@ -198,6 +198,26 @@ const support = await getEmbeddedPostgresTestSupport();
       expect(envelope.completedWork).toBeNull();
     });
 
+    it("continues with a stale auxiliary run when the interaction source is present", async () => {
+      const envelope = await buildExecutionContinuation({ db, companyId, issueId, agentId,
+        context: { interactionId, interruptedRunId: randomUUID() }, summary: null, exposeLowTrustRaw: false });
+      expect(envelope.trigger.sourceRunId).toBe(runId);
+      expect(envelope.messages.map(row => row.id)).toEqual([notionId, gmailId, laterId]);
+    });
+
+    it("rejects a foreign interrupted run even when an interaction source takes precedence", async () => {
+      const foreignRunId = randomUUID();
+      await db.insert(heartbeatRuns).values({ id: foreignRunId, companyId, agentId,
+        status: "interrupted", contextSnapshot: { issueId: randomUUID() } });
+      try {
+        await expect(buildExecutionContinuation({ db, companyId, issueId, agentId,
+          context: { interactionId, interruptedRunId: foreignRunId }, summary: null, exposeLowTrustRaw: false }))
+          .rejects.toThrow("continuation_source_context_missing");
+      } finally {
+        await db.delete(heartbeatRuns).where(eq(heartbeatRuns.id, foreignRunId));
+      }
+    });
+
     it("does not relax a missing target wake origin for a foreign interaction", async () => {
       const [source] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
       await db.update(heartbeatRuns).set({ contextSnapshot: { issueId: randomUUID() } }).where(eq(heartbeatRuns.id, runId));
