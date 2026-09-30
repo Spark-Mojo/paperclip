@@ -3973,7 +3973,7 @@ describe("realizeExecutionWorkspace", () => {
     // The worktree should have been created successfully from the canonical remote base.
     const worktreeOp = operations.find(op => op.phase === "worktree_prepare" && op.metadata?.created);
     expect(worktreeOp).toBeDefined();
-    expect(worktreeOp!.metadata!.baseRef).toBe("origin/master");
+    expect(worktreeOp!.metadata!.baseRef).toBe("refs/remotes/origin/master");
   }, 10_000);
 
   it("auto-detects the default branch via symbolic-ref when origin/HEAD is set", async () => {
@@ -3986,9 +3986,7 @@ describe("realizeExecutionWorkspace", () => {
     await runGit(repoRoot, ["branch", "-f", "master"]);
     await runGit(repoRoot, ["push", "-u", "origin", "main", "master"]);
     await runGit(repoRoot, ["fetch", "origin"]);
-    // Explicitly set refs/remotes/origin/HEAD to exercise the symbolic-ref path
-    // (git remote set-head -a requires the remote to advertise HEAD, so we set it manually)
-    await runGit(repoRoot, ["remote", "set-head", "origin", "main"]);
+    await runGit(bareRemote, ["symbolic-ref", "HEAD", "refs/heads/main"]);
 
     const { recorder, operations } = createWorkspaceOperationRecorderDouble();
 
@@ -4024,7 +4022,47 @@ describe("realizeExecutionWorkspace", () => {
     expect(workspace.created).toBe(true);
     const worktreeOp = operations.find(op => op.phase === "worktree_prepare" && op.metadata?.created);
     expect(worktreeOp).toBeDefined();
-    expect(worktreeOp!.metadata!.baseRef).toBe("origin/master");
+    expect(worktreeOp!.metadata!.baseRef).toBe("refs/remotes/origin/main");
+  }, 10_000);
+
+  it("uses the advertised remote HEAD instead of a stale project repoRef", async () => {
+    const repoRoot = await createTempRepo("master");
+    const bareRemote = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-worktree-rebuild-"));
+    await runGit(bareRemote, ["init", "--bare"]);
+    await runGit(repoRoot, ["remote", "add", "origin", bareRemote]);
+    await runGit(repoRoot, ["push", "origin", "master"]);
+    await runGit(repoRoot, ["branch", "rebuild"]);
+    await runGit(repoRoot, ["push", "origin", "rebuild"]);
+    await runGit(bareRemote, ["symbolic-ref", "HEAD", "refs/heads/rebuild"]);
+    const { recorder, operations } = createWorkspaceOperationRecorderDouble();
+    const input = {
+      base: { baseCwd: repoRoot, source: "project_primary" as const, projectId: "project-1", workspaceId: "workspace-1", repoUrl: null, repoRef: "origin/master" },
+      config: { workspaceStrategy: { type: "git_worktree" } },
+      issue: { id: "issue-rebuild", identifier: "PAP-9405", title: "Remote rebuild base" },
+      agent: { id: "agent-1", name: "Coder", companyId: "company-1" },
+      recorder,
+    };
+    const workspace = await realizeExecutionWorkspace(input);
+    expect(workspace.created).toBe(true);
+    expect(operations.find(op => op.phase === "worktree_prepare" && op.metadata?.created)?.metadata?.baseRef).toBe("refs/remotes/origin/rebuild");
+  }, 10_000);
+
+  it("refuses to create a worktree when the remote does not advertise HEAD", async () => {
+    const repoRoot = await createTempRepo("master");
+    const bareRemote = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-worktree-no-head-"));
+    await runGit(bareRemote, ["init", "--bare"]);
+    await runGit(repoRoot, ["remote", "add", "origin", bareRemote]);
+    await runGit(repoRoot, ["push", "origin", "master"]);
+    await runGit(bareRemote, ["symbolic-ref", "HEAD", "refs/heads/missing"]);
+    const { operations, recorder } = createWorkspaceOperationRecorderDouble();
+    await expect(realizeExecutionWorkspace({
+      base: { baseCwd: repoRoot, source: "project_primary", projectId: "project-1", workspaceId: "workspace-1", repoUrl: null, repoRef: "origin/master" },
+      config: { workspaceStrategy: { type: "git_worktree" } },
+      issue: { id: "issue-no-head", identifier: "PAP-9406", title: "No remote HEAD" },
+      agent: { id: "agent-1", name: "Coder", companyId: "company-1" },
+      recorder,
+    })).rejects.toThrow();
+    expect(operations.some(op => op.phase === "worktree_prepare" && op.metadata?.created)).toBe(false);
   }, 10_000);
 
   it("removes a created git worktree and branch during cleanup", async () => {

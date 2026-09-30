@@ -21,6 +21,7 @@ import {
   mergeExecutionWorkspaceMetadataForPersistence,
   mergeCoalescedContextSnapshot,
   preflightLowTrustWorkspaceIsolation,
+  applyProjectWorkspaceDefaultRefToWorktreeStrategy,
   prioritizeProjectWorkspaceCandidatesForRun,
   parseSessionCompactionPolicy,
   provisionExecutionWorkspaceForFreshnessDecision,
@@ -3432,6 +3433,31 @@ describe("prioritizeProjectWorkspaceCandidatesForRun", () => {
     expect(
       prioritizeProjectWorkspaceCandidatesForRun(rows, "workspace-9").map((row) => row.id),
     ).toEqual(["workspace-1", "workspace-2"]);
+  });
+});
+
+describe("project workspace defaultRef as git worktree base", () => {
+  const project = { repoRef: "refs/remotes/origin/master", defaultRef: "refs/remotes/origin/rebuild/v2026.916.0-survivors" };
+
+  it("selects the workspace default without changing its checkout ref", () => {
+    const config = applyProjectWorkspaceDefaultRefToWorktreeStrategy({ workspaceStrategy: { type: "git_worktree" } }, "isolated_workspace", project);
+    expect(config.workspaceStrategy).toEqual({ type: "git_worktree", baseRef: project.defaultRef });
+    expect(project.repoRef).toBe("refs/remotes/origin/master");
+  });
+
+  it("preserves explicit issue baseRef and other strategy fields", () => {
+    expect(applyProjectWorkspaceDefaultRefToWorktreeStrategy({ workspaceStrategy: { type: "git_worktree", baseRef: "refs/remotes/origin/issue", branchTemplate: "card" } }, "isolated_workspace", project).workspaceStrategy).toEqual({ type: "git_worktree", baseRef: "refs/remotes/origin/issue", branchTemplate: "card" });
+  });
+
+  it("leaves base selection to the remote when defaultRef is absent or equals the checkout ref", () => {
+    expect(applyProjectWorkspaceDefaultRefToWorktreeStrategy({ workspaceStrategy: { type: "git_worktree" } }, "isolated_workspace", { ...project, defaultRef: null }).workspaceStrategy).toEqual({ type: "git_worktree" });
+    expect(applyProjectWorkspaceDefaultRefToWorktreeStrategy({ workspaceStrategy: { type: "git_worktree" } }, "isolated_workspace", { ...project, defaultRef: project.repoRef }).workspaceStrategy).toEqual({ type: "git_worktree" });
+  });
+
+  it("does not change shared workspaces or adapter-managed strategies", () => {
+    const config = { workspaceStrategy: { type: "adapter_managed" } };
+    expect(applyProjectWorkspaceDefaultRefToWorktreeStrategy(config, "isolated_workspace", project)).toEqual(config);
+    expect(applyProjectWorkspaceDefaultRefToWorktreeStrategy({ workspaceStrategy: { type: "git_worktree" } }, "shared_workspace", project)).toEqual({ workspaceStrategy: { type: "git_worktree" } });
   });
 });
 
