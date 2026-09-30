@@ -137,14 +137,14 @@ export async function buildExecutionContinuation(input: {
             and(
               eq(heartbeatRuns.companyId, companyId),
               eq(heartbeatRuns.id, sourceRunId),
-              // Retry and interrupted run context must belong to this issue; only this issue's interaction may reference a cross-card creator, whose work is not imported.
-              !explicitUserSource && triggerInteraction?.sourceRunId === sourceRunId
-                ? undefined
-                : sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${issueId}`,
             ),
           )
       )[0]
     : null;
+  // Only this issue's interaction may cite a foreign creator; retry, previous and interrupted runs cannot import foreign task context.
+  if (sourceRun && sourceRun.context?.issueId !== issueId &&
+      (explicitUserSource || triggerInteraction?.sourceRunId !== sourceRunId || input.requireCompleteSourceContext))
+    throw new Error(explicitUserSource ? "continuation_user_authorization_missing" : "continuation_source_context_missing");
   if (input.requireCompleteSourceContext && !sourceRun)
     throw new Error("continuation_source_context_missing");
   if (explicitUserSource && !sourceRun)
@@ -152,18 +152,23 @@ export async function buildExecutionContinuation(input: {
   if (sourceRunId && !sourceRun)
     logger.warn({ companyId, issueId, sourceRunId }, "continuation source run unavailable; using issue history");
   const sameIssueSource = sourceRun?.context?.issueId === issueId ? sourceRun : null;
-  const originCandidates = [
+  const requiredOrigins = [
     ...new Set([
       ...continuationOriginCommentIds(input.context),
       ...continuationOriginCommentIds(sameIssueSource?.context),
-      ...(triggerInteraction?.originCommentIds ?? []),
-      ...(triggerInteraction?.sourceCommentId
-        ? [triggerInteraction.sourceCommentId]
-        : []),
     ]),
   ];
+  const interactionOrigins = [
+    ...new Set([
+      ...(triggerInteraction?.originCommentIds ?? []),
+      ...(triggerInteraction?.sourceCommentId ? [triggerInteraction.sourceCommentId] : []),
+    ]),
+  ];
+  const originCandidates = [...new Set([...requiredOrigins, ...interactionOrigins])];
   const originCommentIds = originCandidates.filter((id) => rows.some((row) => row.id === id));
-  if (input.requireCompleteSourceContext && originCommentIds.length !== originCandidates.length)
+  if (requiredOrigins.some((id) => !originCommentIds.includes(id)) ||
+      (originCommentIds.length !== originCandidates.length &&
+        (input.requireCompleteSourceContext || !triggerInteraction || sameIssueSource)))
     throw new Error("continuation_source_context_missing");
   if (originCommentIds.length !== originCandidates.length)
     logger.warn({ companyId, issueId, missingOriginCount: originCandidates.length - originCommentIds.length }, "continuation origin comments unavailable; using issue history");

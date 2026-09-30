@@ -156,15 +156,13 @@ const support = await getEmbeddedPostgresTestSupport();
       }
     });
 
-    it("does not import handoff history from a different task", async () => {
+    it("rejects handoff history from a different task", async () => {
       const [source] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
       await db.update(heartbeatRuns).set({ contextSnapshot: { issueId: randomUUID() } }).where(eq(heartbeatRuns.id, runId));
       try {
-        const envelope = await buildExecutionContinuation({ db, companyId, issueId, agentId,
-          context: { interruptedRunId: runId }, summary: null, exposeLowTrustRaw: false });
-        expect(envelope.completedWork).toBeNull();
-        expect(envelope.completedActions).toEqual([]);
-        expect(envelope.messages.map(row => row.id)).toEqual([notionId, gmailId, laterId]);
+        await expect(buildExecutionContinuation({ db, companyId, issueId, agentId,
+          context: { interruptedRunId: runId }, summary: null, exposeLowTrustRaw: false }))
+          .rejects.toThrow("continuation_source_context_missing");
       } finally {
         await db.update(heartbeatRuns).set({ contextSnapshot: source.contextSnapshot }).where(eq(heartbeatRuns.id, runId));
       }
@@ -198,6 +196,33 @@ const support = await getEmbeddedPostgresTestSupport();
       expect(envelope.trigger.sourceRunId).toBe(missingId);
       expect(envelope.messages.map(row => row.id)).toEqual([notionId, gmailId, laterId]);
       expect(envelope.completedWork).toBeNull();
+    });
+
+    it("does not relax a missing target wake origin for a foreign interaction", async () => {
+      const [source] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+      await db.update(heartbeatRuns).set({ contextSnapshot: { issueId: randomUUID() } }).where(eq(heartbeatRuns.id, runId));
+      try {
+        await expect(buildExecutionContinuation({ db, companyId, issueId, agentId,
+          context: { interactionId, commentId: randomUUID() }, summary: null, exposeLowTrustRaw: false }))
+          .rejects.toThrow("continuation_source_context_missing");
+      } finally {
+        await db.update(heartbeatRuns).set({ contextSnapshot: source.contextSnapshot }).where(eq(heartbeatRuns.id, runId));
+      }
+    });
+
+    it("does not relax a missing target wake origin when the interaction source is absent", async () => {
+      const [interaction] = await db.select().from(issueThreadInteractions).where(eq(issueThreadInteractions.id, interactionId));
+      await db.update(issueThreadInteractions).set({ sourceRunId: null, originCommentIds: [gmailId, randomUUID()] }).where(eq(issueThreadInteractions.id, interactionId));
+      try {
+        const envelope = await buildExecutionContinuation({ db, companyId, issueId, agentId,
+          context: { interactionId }, summary: null, exposeLowTrustRaw: false });
+        expect(envelope.originCommentIds).toEqual([gmailId]);
+        await expect(buildExecutionContinuation({ db, companyId, issueId, agentId,
+          context: { interactionId, commentId: randomUUID() }, summary: null, exposeLowTrustRaw: false }))
+          .rejects.toThrow("continuation_source_context_missing");
+      } finally {
+        await db.update(issueThreadInteractions).set({ sourceRunId: interaction.sourceRunId, originCommentIds: interaction.originCommentIds }).where(eq(issueThreadInteractions.id, interactionId));
+      }
     });
 
     it("keeps instruction-like handoff summaries inside the untrusted evidence boundary", async () => {
@@ -360,18 +385,10 @@ const support = await getEmbeddedPostgresTestSupport();
         .rejects.toThrow("continuation_source_context_missing");
     });
 
-    it("continues from available history when an origin comment is missing", async () => {
-      const envelope = await buildExecutionContinuation({
-        db,
-        companyId,
-        issueId,
-        agentId,
-        context: { commentId: randomUUID() },
-        summary: null,
-        exposeLowTrustRaw: false,
-      });
-      expect(envelope.originCommentIds).toEqual([]);
-      expect(envelope.messages.map(row => row.id)).toEqual([notionId, gmailId, laterId]);
+    it("fails closed when required originating context is missing", async () => {
+      await expect(buildExecutionContinuation({ db, companyId, issueId, agentId,
+        context: { commentId: randomUUID() }, summary: null, exposeLowTrustRaw: false }))
+        .rejects.toThrow("continuation_source_context_missing");
     });
 
     it("preserves explicit user continuation authorization on a missing source", async () => {
