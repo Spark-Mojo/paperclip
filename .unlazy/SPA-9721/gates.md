@@ -15,3 +15,10 @@
   CHECK: `timeout 30 /home/jamesilsley/.config/opencode-fleet-xdg/fleet/pr-read.sh checks $(gh api repos/Spark-Mojo/paperclip/branches/rebuild%2Fv2026.916.0-survivors --jq .commit.sha) --repo Spark-Mojo/paperclip`
   EXPECT: nonempty rows for the new trunk tip, names transcribed verbatim on card.
   RESULT: pending post-merge; no safe negative for live GitHub scheduler.
+
+- PR #135 CI baseline diagnosis (2026-09-30): `pr-read.sh head 135 --repo Spark-Mojo/paperclip` pinned H=`69e6621727df035ed6c324b270f0ba7a195d571e`, B=`05f3a88e16477cc33033e0d180c8bd4baa64efd1`, baseRefName=`rebuild/v2026.916.0-survivors`. `ci / policy` failed on H at `Reject git push in adapter/runtime code`. Base reproduction in disposable worktree `/srv/bulk/worktrees/SPA-9721-base-check` at pinned B: `timeout 90 node ./scripts/check-no-git-push.mjs` exit 1, same failure signature:
+  `ERROR: \`git push\` (or equivalent remote-mutating git command) found in adapter/runtime code:`
+  `server/src/services/workspace-runtime.ts:4884: ... \`git push origin ${input.branchName} failed\``
+  `server/src/__tests__/workspace-runtime.test.ts:4572: ... includes("git push")`
+  `server/src/__tests__/workspace-runtime.test.ts:4577: ... includes("git push")`
+  Same command on H exit 1 with identical three locations. `git diff 05f3a88e16477cc33033e0d180c8bd4baa64efd1..69e6621727df035ed6c324b270f0ba7a195d571e -- server/src/services/workspace-runtime.ts server/src/__tests__/workspace-runtime.test.ts scripts/check-no-git-push.mjs` emitted no diff: H does not touch the failing assertion or its inputs. This is candidate base-red, not sign-off or merge permission. Gate 2 remains unproven pending a merged trunk tip.
