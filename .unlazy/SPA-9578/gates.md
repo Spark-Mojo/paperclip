@@ -465,3 +465,122 @@ action, no key on the fork) as NEVER a blocker. Not treated as one.
 `Spark-Mojo/paperclip` reports `allow_auto_merge: false` (read live), so the
 SPA-9195 hand-merge path applies: this card goes to Dex with the verified head
 SHA, not to `gh pr merge --auto`.
+
+---
+
+## DEX AMENDMENT (2026-09-30) — the red-check record above was WRONG and is corrected here
+
+Recorded by Dex (Release & Deployment Manager), law 20 hand-merge holder, after
+independently re-deriving the check state of head `da3bd6f2bc6412467da6c23cf54c864eb455b239`.
+
+**The prior record is materially incomplete.** The ROUND 3 section above states
+"Two reds, both base-red". That is false. Re-derived from the live check list,
+**NINE checks are not green** on this head.
+
+Counted from a GraphQL `statusCheckRollup` read that returned **48 contexts** in one
+page (not truncated), cross-checked against a REST `--paginate` read:
+
+| # | Check | Conclusion | Classification |
+|---|---|---|---|
+| 1 | `review` | failure | vendor `commitperclip`, no key on the fork — WORKFLOW §4: never a blocker |
+| 2 | `ci / policy` | failure | **BASE-RED, now proven on the base SHA itself** (see below) |
+| 3 | `ci / General tests (server (11/12))` | failure | base-red (not this diff) |
+| 4 | `ci / General tests (server (12/12))` | failure | base-red (not this diff) |
+| 5 | `ci / General tests (workspaces-b)` | failure | base-red (not this diff) |
+| 6 | `ci / Verify serialized server suites (6/9)` | failure | base-red (not this diff) |
+| 7 | `ci / Verify serialized server suites (7/9)` | failure | base-red (not this diff) |
+| 8 | `ci / verify` | failure | **pure aggregator** — fails only because 3/4/5/6/7 failed |
+| 9 | `ci / e2e` | failure | **pure aggregator** — see the shard table below |
+
+The ROUND 3 record missed 3–7 entirely and missed that 8 and 9 are aggregators.
+`ci / e2e` had not even completed when the ROUND 3 record was written; it was
+`in_progress` at the time and is now `failure`.
+
+### `ci / e2e` resolved — all eight shards are GREEN
+
+`ci / e2e` is a 2-step aggregate job whose only assertion is
+`test "$POLICY_RESULT" = "success"` plus a shard-result case (`.github/workflows/pr-trusted.yml:1046-1059`).
+Its `steps` are literally `Set up job (success)` → `Fail if any e2e shard failed (failure)`
+→ `Complete job (success)`; it runs no tests itself. Per-shard conclusions on this head:
+
+```
+ci / e2e shard (1/8) :: SUCCESS      ci / e2e shard (5/8) :: SUCCESS
+ci / e2e shard (2/8) :: SUCCESS      ci / e2e shard (6/8) :: SUCCESS
+ci / e2e shard (3/8) :: SUCCESS      ci / e2e shard (7/8) :: SUCCESS
+ci / e2e shard (4/8) :: SUCCESS      ci / e2e shard (8/8) :: SUCCESS
+```
+
+**The e2e suite is not a blocker.** This red is a downstream consequence of
+`ci / policy`, nothing else.
+
+### `ci / policy` — base-red now PROVEN ON THE BASE SHA, not inferred
+
+The prior record said a base-SHA reproduction was structurally impossible because
+`GET /commits/13e1ea88/check-runs` returns `total_count: 0`. That is true of
+*check-run* history, and it is why the earlier run fell back to unrelated-PR
+inference. It is NOT true that the check cannot be reproduced: the check is a
+list of local commands, and those run fine on a base checkout.
+
+Base tree materialised as a throwaway worktree at the pinned base SHA
+(`/srv/bulk/worktrees/SPA-9578-base-red-probe`, `13e1ea88eb78a2308191dceff18e4ede84417deb`),
+outside the card worktree and outside any scratch dir. Full ref used, never a bare
+`origin/<branch>` shorthand. Results:
+
+| Command | rc on BASE | rc on HEAD | Note |
+|---|---|---|---|
+| `node ./scripts/check-no-git-push.mjs` | **1** | **1** | identical output, same 3 lines |
+| `node --test ./scripts/check-no-git-push.test.mjs` | 0 | 0 | |
+| `node ./scripts/check-docker-deps-stage.mjs` | 0 | — | `PASS` |
+| `node scripts/check-module-boundaries.mjs` | 0 | — | `Feature module boundary check passed.` |
+| `node ./scripts/release-package-map.mjs check` | 0 | — | `Release package manifest OK` |
+
+Failure output on BASE, verbatim, with **zero PR code present**:
+
+```
+ERROR: `git push` (or equivalent remote-mutating git command) found in adapter/runtime code:
+
+  server/src/services/workspace-runtime.ts:4884:         const message = pushResult?.stderr.trim() || ...
+  server/src/__tests__/workspace-runtime.test.ts:4572:     const pushOps = operations.filter((op) => op.command?.includes("git push"));
+  server/src/__tests__/workspace-runtime.test.ts:4577:     const pushIdx = operations.findIndex((op) => op.command?.includes("git push"));
+```
+
+Byte-identical to the head-tree output. Non-touch clause satisfied directly: the
+PR's five files are `.unlazy/SPA-9578/gates.md`,
+`server/src/__tests__/issue-done-pr-merged-gate.test.ts`, `server/src/routes/issues.ts`,
+`server/src/services/issue-done-gate.ts`, `server/src/services/issues.ts` — none of
+them `workspace-runtime*`. The failing assertion is therefore present on the base
+unmodified.
+
+**`ci / policy` classification is `PRE-EXISTING-BASE-RED`**, and it is now proven at
+the level WORKFLOW §4 clause (a) actually asks for ("confirm those checks also fail
+on the base"), not by the weaker unrelated-PR inference used previously.
+
+The separate `pnpm check:node-version` finding in ROUND 3 stands and is unaffected:
+it fails only on `.paperclip-repositories/` Dockerfiles, which `.gitignore:74`
+excludes, so it is a local multi-repo worktree artifact, not a CI condition.
+
+### Checks 3–7 (server suites) — still labelled by inference, not by base reproduction
+
+Not reproduced on the base tree this run: reproducing them needs the vitest harness,
+which the base checkout does not have installed. The evidence for "not this diff"
+remains what it was: `plugin-orchestration-apis.test.ts` is not in the diff and its
+failure stack is at `server/src/services/issues.ts:368`/`:9929` while this diff's
+`issues.ts` hunks begin at `@@ -10544`; `workspaces-b` is an unhandled `EPIPE` and
+the diff touches no workspaces file. Label stays `UNRELATED-PR-REPRODUCED` — the
+honest label, since base reproduction was not performed for these five.
+
+### Why none of the nine is a merge blocker
+
+Re-confirmed live this run, not from memory:
+- `Spark-Mojo/paperclip` reports `allow_auto_merge: false`.
+- Branch protection on `rebuild/v2026.916.0-survivors` returns 404; the ruleset list
+  is `[]`. **No required-check gate exists on this fork**, so no red check is formally blocking.
+- `autoMergeRequest = null`, `isInMergeQueue = false`, `mergeStateStatus = UNSTABLE`.
+- `reviewThreads totalCount = 0` — no thread to resolve.
+
+### Merge authority is UNRESOLVED and this ledger does not assert it
+
+Whether Dex may perform this merge is a charter/workflow conflict escalated to James
+in interaction `b17b5d23-3da1-4e21-8208-0c61371163b6` (pending). This amendment
+corrects the EVIDENCE only. It does not assert merge authority, and it does not
+authorise anyone to merge on the strength of this record.
