@@ -2580,14 +2580,12 @@ async function resolveAuthoritativeBaseRef(
   repoRoot: string,
   configuredBaseRef: string | null,
   resolveGitAuth?: GitRemoteAuthProvider | null,
+  preferRemoteDefaultBranch = false,
 ): Promise<AuthoritativeBaseRefResolution> {
   const warnings: string[] = [];
   const configured = configuredBaseRef?.trim();
-  if (!configured) {
-    const remoteHead = await detectDefaultBranch(repoRoot, resolveGitAuth);
-    if (!remoteHead && !await remoteExists(repoRoot, "origin")) {
-      return { resolved: true, baseRef: "HEAD", warnings, refreshed: false };
-    }
+  if (preferRemoteDefaultBranch && !configured) {
+    const remoteHead = await detectRemoteDefaultBranch(repoRoot, resolveGitAuth);
     if (!remoteHead) {
       return {
         resolved: false,
@@ -2598,7 +2596,10 @@ async function resolveAuthoritativeBaseRef(
         fetchError: null,
       };
     }
-    return { resolved: true, baseRef: remoteHead, warnings, refreshed: false };
+    return { resolved: true, baseRef: remoteHead, warnings, refreshed: true };
+  }
+  if (!configured || configured === "HEAD") {
+    return { resolved: true, baseRef: (await detectDefaultBranch(repoRoot, resolveGitAuth)) ?? "HEAD", warnings, refreshed: false };
   }
 
   // A remote-tracking ref supplied directly (for example `origin/fix/foo`).
@@ -2835,7 +2836,7 @@ async function isGitCheckout(cwd: string): Promise<boolean> {
   return Boolean(await runGit(["rev-parse", "--git-dir"], cwd).catch(() => null));
 }
 
-async function detectDefaultBranch(
+async function detectRemoteDefaultBranch(
   repoRoot: string,
   resolveGitAuth?: GitRemoteAuthProvider | null,
 ): Promise<string | null> {
@@ -2853,6 +2854,35 @@ async function detectDefaultBranch(
   const warnings = await refreshRemoteTrackingBaseRef(repoRoot, baseRef, resolveGitAuth);
   if (warnings.length > 0 || !await resolveBaseRefSha(repoRoot, baseRef)) return null;
   return baseRef;
+}
+
+async function detectDefaultBranch(
+  repoRoot: string,
+  resolveGitAuth?: GitRemoteAuthProvider | null,
+): Promise<string | null> {
+  const originMasterRef = "origin/master";
+  await refreshRemoteTrackingBaseRef(repoRoot, originMasterRef, resolveGitAuth);
+  if (await resolveBaseRefSha(repoRoot, originMasterRef)) return originMasterRef;
+  try {
+    const remoteHead = await runGit(
+      ["symbolic-ref", "--quiet", "--short", "refs/remotes/origin/HEAD"],
+      repoRoot,
+    );
+    if (remoteHead) {
+      await refreshRemoteTrackingBaseRef(repoRoot, remoteHead, resolveGitAuth);
+      if (await resolveBaseRefSha(repoRoot, remoteHead)) return remoteHead;
+    }
+  } catch {
+  }
+  for (const candidate of ["origin/master", "origin/main", "main", "master"]) {
+    try {
+      await refreshRemoteTrackingBaseRef(repoRoot, candidate, resolveGitAuth);
+      await runGit(["rev-parse", "--verify", `${candidate}^{commit}`], repoRoot);
+      return candidate;
+    } catch {
+    }
+  }
+  return null;
 }
 
 async function directoryExists(value: string) {
@@ -3444,7 +3474,7 @@ export async function realizeExecutionWorkspace(input: {
   const configuredBaseRef = typeof rawStrategy.baseRef === "string" && rawStrategy.baseRef.length > 0
     ? rawStrategy.baseRef
     : rawStrategy.preferRemoteDefaultBranch === true ? null : input.base.repoRef ?? null;
-  const baseRefResolution = await resolveAuthoritativeBaseRef(repoRoot, configuredBaseRef, input.resolveGitAuth);
+  const baseRefResolution = await resolveAuthoritativeBaseRef(repoRoot, configuredBaseRef, input.resolveGitAuth, rawStrategy.preferRemoteDefaultBranch === true);
   // Keep a usable base ref for the reuse and drift paths even when the ref is
   // unresolved: those paths tolerate a null base-ref SHA and never run
   // `git worktree add -b <branch> <baseRef>`. Only the fresh-create path below
