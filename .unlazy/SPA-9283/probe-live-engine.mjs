@@ -11,6 +11,7 @@
 // Usage: node .unlazy/SPA-9283/probe-live-engine.mjs [--negative-only]
 
 import { createRequire } from "node:module";
+import { existsSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
@@ -19,6 +20,17 @@ const DIST = join(
   homedir(),
   ".paperclip/cli/current/node_modules/@paperclipai/server/dist",
 );
+
+// This probe asserts against the engine build that is actually serving runs, which exists only
+// on a Paperclip host. A CI runner or a bare checkout cannot satisfy it, and an absent payload must
+// never read as a pass — so it exits 2 with an explicit NOT RUN verdict instead.
+if (!existsSync(join(DIST, "services/heartbeat.js"))) {
+  console.error(
+    `UNVERIFIABLE: server dist not found at ${DIST}. This probe asserts against the live built ` +
+      "engine and cannot be satisfied from a bare checkout. Treat as NOT RUN, not as passing.",
+  );
+  process.exit(2);
+}
 
 const { assertGitSensitiveAdapterWorkspaceValid } = await import(
   join(DIST, "services/heartbeat.js")
