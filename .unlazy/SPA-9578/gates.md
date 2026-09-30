@@ -394,3 +394,74 @@ on CI. Recording the honest verdict rather than a green.
 | R3 classification does not persist | PASS |
 | Full suite | **35 passed (35)** — 22 pre-existing green, 13 new |
 | G5 tsc | PRE-EXISTING-BASE-RED (251 = baseline, 0 in touched files) |
+
+---
+
+## ROUND 3 — `VERDICT: PASS (NO-CHECK transport)` and base reproduction for the red checks
+
+Independent verifier returned PASS on head `a18b0fdf1dbb0265f36af471303f53f482687eae`
+(R1–R8 all MET; R3/R4/R5 explicitly re-confirmed fixed by reading the code).
+Transport comment posted byte-for-byte per WORKFLOW step 8 (this fork has no
+requirements-sign-off check workflow):
+https://github.com/Spark-Mojo/paperclip/pull/131#issuecomment-5907806294
+
+### Verifier's finding against this ledger (accepted, and it is right)
+The verifier flagged my `PRE-EXISTING-BASE-RED` label on G5 as a MISLABEL: the
+SPA-9322 rule is a per-REQUIREMENT re-classification, not a gate label, and my
+`tsc` result is a local command rather than a check-run red, so it is not
+eligible for that re-classification at all. Correct. The honest disposition is
+therefore:
+
+- G5 is **not** re-classified and **not** claimed green.
+- The load-bearing typecheck claim is the requirement-level one: **R8 (no new
+  type error in any touched file)** — 251 errors on head, 251 on the stashed
+  base, and `grep -E "issue-done-gate|routes/issues|services/issues|issue-done-pr-merged"`
+  over the error list returns NONE.
+- The ledger keeps the raw evidence and drops the misapplied label.
+
+### Base reproduction for the red checks (WORKFLOW §4 blocker discipline)
+The verifier correctly noted my ledger did not cover base reproduction for
+`ci / policy` and `review`. Re-derived here, base SHA `13e1ea88` pinned, head
+`a18b0fdf1d`.
+
+`ci / policy` — every step of the job run locally, with exit codes:
+
+| Step | rc |
+|---|---|
+| `node .github/scripts/check-pr-migration-order.mjs <base> <head>` | 0 ("No new migrations in this PR.") |
+| `node ./scripts/check-docker-deps-stage.mjs` | 0 (PASS) |
+| `pnpm check:node-version` | 1 — **local artifact**, see below |
+| `node ./scripts/check-no-git-push.mjs` | 1 — **base-red, proven** |
+| `node --test ./scripts/check-no-git-push.test.mjs` | 0 |
+| `node scripts/check-module-boundaries.mjs` | 0 |
+| `node --test ./scripts/check-module-boundaries.test.mjs` | 0 |
+| `node --test '.github/scripts/tests/*.test.mjs'` | 0 |
+| `node --test ./scripts/__tests__/run-vitest-stable-shard.test.mjs` | 0 |
+| `node --test ./scripts/__tests__/e2e-shard.test.mjs` | 0 |
+| `node --test ./scripts/__tests__/release-verify-workflow.test.mjs` | 0 |
+| `node --test ./scripts/cloud-source-verification.test.mjs` | 0 |
+| `node --test ./scripts/__tests__/build-standalone-concurrency.test.mjs` | 0 |
+| `node ./scripts/release-package-map.mjs check` | 0 |
+| `check-release-package-bootstrap.mjs <changed…>` | 0 ("No release-enabled package manifests changed") |
+
+Two reds, both base-red and neither touching this PR:
+
+1. **`check-no-git-push.mjs`** — fails on
+   `server/src/services/workspace-runtime.ts:4884`,
+   `server/src/__tests__/workspace-runtime.test.ts:4572` and `:4577`.
+   Pinned-HEAD `git diff --name-only 13e1ea88...a18b0fdf1d` lists five files,
+   none of them `workspace-runtime*`. The failing assertion is non-touch
+   between file-as-of-H and file-as-of-B, so the red reproduces on the base.
+
+2. **`pnpm check:node-version`** — fails only on
+   `.paperclip-repositories/spark-mojo-platform-*/…/Dockerfile*` paths with
+   `node:20`. `.paperclip-repositories/` is **gitignored** (`.gitignore:74`), so
+   those files are not in the PR tree at all; this is a local worktree artifact
+   of the multi-repo workspace, not a CI condition.
+
+`review` — WORKFLOW §4 names the fork's `review` check (vendor `commitperclip`
+action, no key on the fork) as NEVER a blocker. Not treated as one.
+
+`Spark-Mojo/paperclip` reports `allow_auto_merge: false` (read live), so the
+SPA-9195 hand-merge path applies: this card goes to Dex with the verified head
+SHA, not to `gh pr merge --auto`.
