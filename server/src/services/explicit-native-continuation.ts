@@ -234,7 +234,7 @@ export async function admitExplicitNativeContinuation(input: {
   // Prove required task history is available before retiring any hold.
   await buildExecutionContinuation({ db, companyId, issueId, agentId,
     context: { previousRunId: previous.id, wakeCommentId: commentId },
-    summary: null, exposeLowTrustRaw: false });
+    summary: null, exposeLowTrustRaw: false, requireCompleteSourceContext: true });
   if (input.dryRun) return { previousRunId: previous.id, commentId, ...(retry ? { failedRunId: input.failedRunId! } : {}) };
   const authorization = { actorId, commentId, ...(retry ? { failedRunId: input.failedRunId } : {}),
     ...(queuedInterrupt ? { queuedCommentInterruptId: input.queuedCommentInterruptId } : {}),

@@ -45,6 +45,18 @@ const support = await getEmbeddedPostgresTestSupport();
       actorType: "user", actorId: "board", reason: "issue_commented" };
   }
   type Fixture = Awaited<ReturnType<typeof seed>>;
+  it("keeps recovery holds when required task history is missing", async () => {
+    const f = await seed();
+    const missingId = randomUUID();
+    await db.update(heartbeatRuns).set({ contextSnapshot: { issueId: f.issueId, commentId: missingId } })
+      .where(eq(heartbeatRuns.id, f.sourceRunId));
+    await expect(admitExplicitNativeContinuation({ ...f, db }))
+      .rejects.toThrow("continuation_source_context_missing");
+    const [action] = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, f.issueId));
+    expect(action.status).toBe("resolved");
+    expect(action.outcome).toBe("blocked");
+    expect(action.evidence.explicitUserContinuation).toBeUndefined();
+  });
   it.each(["handoff", "foreign_task", "running_source", "different_owner", "mention", "interaction", "chat"])("adopts former-owner comments only during an authorized handoff (%s)", async kind => {
     const f = await seed(), nextAgentId = randomUUID(), queueId = randomUUID();
     await db.delete(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, f.issueId));
