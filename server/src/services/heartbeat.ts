@@ -3869,7 +3869,10 @@ export function applyProjectWorkspaceDefaultRefToWorktreeStrategy(
     return config;
   }
   const defaultRef = readNonEmptyString(workspace.defaultRef);
-  if (!defaultRef || defaultRef === readNonEmptyString(workspace.repoRef)) return config;
+  if (!defaultRef && !readNonEmptyString(workspace.repoRef)) return config;
+  if (!defaultRef || defaultRef === readNonEmptyString(workspace.repoRef)) {
+    return { ...config, workspaceStrategy: { ...strategy, preferRemoteDefaultBranch: true } };
+  }
   return { ...config, workspaceStrategy: { ...strategy, baseRef: defaultRef } };
 }
 

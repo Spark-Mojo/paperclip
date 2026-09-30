@@ -1061,7 +1061,7 @@ describe("realizeExecutionWorkspace", () => {
     expect(reused.created).toBe(false);
     expect(await readGit(reused.cwd, ["rev-parse", "HEAD"])).toBe(taskHead);
     expect(reused.warnings).toEqual([
-      expect.stringContaining("is behind origin/master by 1 commit"),
+      expect.stringContaining("is behind refs/remotes/origin/master by 1 commit"),
     ]);
   });
 
@@ -1082,7 +1082,7 @@ describe("realizeExecutionWorkspace", () => {
       "uncommitted scratch\n",
     );
     expect(reused.warnings).toEqual([
-      expect.stringContaining("is behind origin/master by 1 commit"),
+      expect.stringContaining("is behind refs/remotes/origin/master by 1 commit"),
     ]);
   });
 
@@ -1107,7 +1107,7 @@ describe("realizeExecutionWorkspace", () => {
       "uncommitted scratch\n",
     );
     expect(reused.warnings).toEqual([
-      expect.stringContaining("is behind origin/master by 1 commit"),
+      expect.stringContaining("is behind refs/remotes/origin/master by 1 commit"),
     ]);
   });
 
@@ -4037,7 +4037,7 @@ describe("realizeExecutionWorkspace", () => {
     const { recorder, operations } = createWorkspaceOperationRecorderDouble();
     const input = {
       base: { baseCwd: repoRoot, source: "project_primary" as const, projectId: "project-1", workspaceId: "workspace-1", repoUrl: null, repoRef: "origin/master" },
-      config: { workspaceStrategy: { type: "git_worktree" } },
+      config: { workspaceStrategy: { type: "git_worktree", preferRemoteDefaultBranch: true } },
       issue: { id: "issue-rebuild", identifier: "PAP-9405", title: "Remote rebuild base" },
       agent: { id: "agent-1", name: "Coder", companyId: "company-1" },
       recorder,
@@ -4057,7 +4057,7 @@ describe("realizeExecutionWorkspace", () => {
     const { operations, recorder } = createWorkspaceOperationRecorderDouble();
     await expect(realizeExecutionWorkspace({
       base: { baseCwd: repoRoot, source: "project_primary", projectId: "project-1", workspaceId: "workspace-1", repoUrl: null, repoRef: "origin/master" },
-      config: { workspaceStrategy: { type: "git_worktree" } },
+      config: { workspaceStrategy: { type: "git_worktree", preferRemoteDefaultBranch: true } },
       issue: { id: "issue-no-head", identifier: "PAP-9406", title: "No remote HEAD" },
       agent: { id: "agent-1", name: "Coder", companyId: "company-1" },
       recorder,
