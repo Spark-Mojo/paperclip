@@ -141,6 +141,17 @@ export async function buildExecutionContinuation(input: {
           )
       )[0]
     : null;
+  const otherSourceRunIds = [
+    string(input.context.retryOfRunId),
+    string(input.context.previousRunId),
+    string(input.context.interruptedRunId),
+  ].filter((id): id is string => id !== null && id !== sourceRunId);
+  for (const id of otherSourceRunIds) {
+    const [otherSource] = await db.select({ context: heartbeatRuns.contextSnapshot }).from(heartbeatRuns)
+      .where(and(eq(heartbeatRuns.companyId, companyId), eq(heartbeatRuns.id, id)));
+    if (otherSource && otherSource.context?.issueId !== issueId)
+      throw new Error("continuation_source_context_missing");
+  }
   // Only this issue's interaction may cite a foreign creator; retry, previous and interrupted runs cannot import foreign task context.
   if (sourceRun && sourceRun.context?.issueId !== issueId &&
       (explicitUserSource || triggerInteraction?.sourceRunId !== sourceRunId || input.requireCompleteSourceContext))
