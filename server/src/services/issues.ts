@@ -112,6 +112,9 @@ import {
   parseIssueExecutionWorkspaceSettings,
   parseProjectExecutionWorkspacePolicy,
   resolvePinnedIssueWorkspaceStrategyType,
+  AGENT_ROOT_ISSUE_REQUIRES_PROJECT_CODE,
+  AGENT_ROOT_ISSUE_REQUIRES_PROJECT_MESSAGE,
+  AGENT_ROOT_ISSUE_REQUIRES_PROJECT_REMEDIATION,
   WORKSPACE_WORKTREE_REQUIRES_PROJECT_CODE,
   WORKSPACE_WORKTREE_REQUIRES_PROJECT_MESSAGE,
   WORKSPACE_WORKTREE_REQUIRES_PROJECT_REMEDIATION,
@@ -323,6 +326,49 @@ function workspaceWorktreeRequiresProjectDetails() {
     code: WORKSPACE_WORKTREE_REQUIRES_PROJECT_CODE,
     remediation: WORKSPACE_WORKTREE_REQUIRES_PROJECT_REMEDIATION,
   };
+}
+
+function agentRootIssueRequiresProjectDetails() {
+  return {
+    code: AGENT_ROOT_ISSUE_REQUIRES_PROJECT_CODE,
+    remediation: AGENT_ROOT_ISSUE_REQUIRES_PROJECT_REMEDIATION,
+  };
+}
+
+/**
+ * An agent-authored ROOT create that resolves no project is refused at create
+ * time instead of being stored with `projectId` null. Such a task is born
+ * unbound: it has no project workspace and no execution workspace to be
+ * realized from, so it can only fail later at workspace validation, which
+ * costs a separate repair task to bind it.
+ *
+ * Runs AFTER the `workspaceInheritanceIssueId` inheritance block and after the
+ * explicit `projectWorkspaceId` / `executionWorkspaceId` inference, so a create
+ * that CAN name a project by any legitimate path still wins and is unaffected.
+ *
+ * Scoped deliberately:
+ *  - agent-authored only. A board/UI create keeps its existing behaviour; the
+ *    create route stamps `createdByUserId` and leaves `createdByAgentId` null
+ *    for a user actor, and `sanitizeIssueCreateAttribution` strips a
+ *    client-supplied `createdByUserId` on the agent path, so this pair is the
+ *    actor signal that is already carried on IssueCreateInput.
+ *  - root only (`parentId` null). A child create resolves its project from the
+ *    parent, so it is not the unbound-at-birth case.
+ */
+function assertAgentRootIssueHasProject(input: {
+  projectId: string | null | undefined;
+  parentId: string | null | undefined;
+  createdByAgentId: string | null | undefined;
+  createdByUserId: string | null | undefined;
+}) {
+  if (input.projectId != null) return;
+  if (input.parentId != null) return;
+  if (input.createdByUserId != null) return;
+  if (!input.createdByAgentId) return;
+  throw unprocessable(
+    AGENT_ROOT_ISSUE_REQUIRES_PROJECT_MESSAGE,
+    agentRootIssueRequiresProjectDetails(),
+  );
 }
 
 function assertExplicitPinnedWorktreeIssueRunnable(input: {
@@ -9877,6 +9923,15 @@ export function issueService(db: Db) {
           );
           issueData.projectId = workspace.projectId;
         }
+        // After both inference blocks on purpose: naming a project by any
+        // legitimate path has already won by this point, and only the
+        // root-with-nothing case is left to refuse.
+        assertAgentRootIssueHasProject({
+          projectId: issueData.projectId,
+          parentId: issueData.parentId,
+          createdByAgentId: issueData.createdByAgentId,
+          createdByUserId: issueData.createdByUserId,
+        });
         const projectGoalId = await getProjectDefaultGoalId(
           tx,
           companyId,
