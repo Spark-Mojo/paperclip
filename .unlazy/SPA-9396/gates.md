@@ -8,6 +8,39 @@ Reproduced each G2 failure in isolation with the default 15s Vitest timeout: the
 
 The two earlier negative controls were invalid because a successfully authorized route reached the unconfigured `mockIssueService.update` and returned 404. I temporarily configured a successful update fixture in each test and changed only its authorization input, leaving the original refusal assertion intact. Control 1: locked review policy `anyone` instead of `human_only`, `timeout 180 pnpm exec vitest run server/src/__tests__/issue-execution-policy-routes.test.ts -t 'reauthorizes a terminal verdict against the review policy held under the update lock' --testTimeout=60000` exited 1 at `expect(res.status).toBe(403)` with actual **200** (one failed, 18 skipped). Control 2: pending same-run confirmation interaction instead of no review path, `timeout 180 pnpm exec vitest run server/src/__tests__/issue-execution-policy-routes.test.ts -t 'rejects an agent-authored in_review transition without a review path' --testTimeout=60000` exited 1 at `expect(res.status).toBe(422)` with actual **200** (one failed, 18 skipped). Reverted both temporary fixture edits exactly; `git status --short` empty. Positive `timeout 300 pnpm exec vitest run server/src/__tests__/issue-execution-policy-routes.test.ts server/src/__tests__/issue-done-pr-merged-gate.test.ts` exited 0: 2 files, 41 tests passed, duration 55.10s. `git diff --check` exited 0. Gate 0 is now proven for the existing guards; it does not prove the new approval feature safe. Begin only Steve's bounded implementation scope next.
 
+## Tx-scoped scan-budget continuation — HOLD, 2026-09-30
+
+This run changed the approval-bound-set reader to use the transaction handle for the comment recheck (`routes/issues.ts:17862`) and terminal update gate (`services/issues.ts:10615`). The approval scan now requests a sentinel row at the 100-work-product and 200-comment limits and refuses with `issue_stage_approval_scan_budget_exceeded` if the sentinel exists. The legacy done gate retains the 100/200 effective caps. A malformed recorded SHA fails closed at state parsing; malformed live or claimed SHA also refuses in the approval service. The issue-row `FOR UPDATE` remains. Do not infer serializable isolation or a proven concurrent-INSERT oracle from these unit tests.
+
+  CHECK: timeout 300 pnpm exec vitest run server/src/__tests__/issue-stage-approval-scan-budget.test.ts
+  EXPECT: Tests 19 passed (19)
+  RESULT: exit 0, EXPECT matched: Test Files 1 passed (1), Tests 19 passed (19), Duration 12.52s.
+  NEGATIVE: the first run with a null claim exited 1 (4 failed/15 passed), but the three budget cases failed at `issue_stage_approval_incomplete_pull_request_set` before the scan, so that was an invalid failing control. A later test run with the corrected claim and seam exited 0; no isolated mutation of the production truncation assertion has yet been run. G7/G8 unproven by negative control despite green positives.
+
+  CHECK: timeout 600 pnpm exec vitest run server/src/__tests__/issue-comment-stage-approval-lock.test.ts server/src/__tests__/issue-stage-approvals.test.ts server/src/__tests__/issue-stage-approval-scan-budget.test.ts
+  EXPECT: Tests 40 passed (40)
+  RESULT: exit 0, EXPECT matched: Test Files 3 passed (3), Tests 40 passed (40), Duration 30.12s.
+  NEGATIVE: no isolated mutation of route tx plumbing yet. G7 route integration unproven.
+
+  CHECK: timeout 600 pnpm exec vitest run server/src/__tests__/issue-execution-policy.test.ts server/src/__tests__/issue-execution-policy-routes.test.ts server/src/__tests__/issue-stalled-review-decision-routes.test.ts server/src/__tests__/issue-done-pr-merged-gate.test.ts
+  EXPECT: Tests 132 passed (132)
+  RESULT: exit 0, EXPECT matched: Test Files 4 passed (4), Tests 132 passed (132), Duration 69.81s. Existing regressions, not new stalled approval acceptance.
+  NEGATIVE: Gate 0's isolated alternate-authorization controls are recorded above; no new feature-specific negative for stalled review or terminal close.
+
+  CHECK: export PATH="$HOME/.cargo/bin:$PATH"; timeout 900 pnpm --filter @paperclipai/shared --filter @paperclipai/server typecheck
+  EXPECT: server typecheck: Done
+  RESULT: exit 0, EXPECT matched: packages/shared typecheck: Done; server typecheck: Done. Initial attempt without the narrow transaction cast failed TS2352; rerun after cast exited 0.
+  NEGATIVE: typecheck is not a behavioral guard; no safe isolated negative run.
+
+  CHECK: timeout 20 git diff --check
+  EXPECT: exit 0
+  RESULT: exit 0, output empty before ledger edit; rerun after edit needed.
+  NEGATIVE: no isolated whitespace-error fixture run.
+
+The comment route's positive test now spies on `issueDoneGateService` construction and asserts the bound-set reader receives the exact `mockTx` handle; `timeout 300 pnpm exec vitest run server/src/__tests__/issue-comment-stage-approval-lock.test.ts` exited 0: 1 file / 4 passed, duration 23.73s. The terminal gate now passes `dbOrTx` to the approval service but has no distinct-handle integration test. Negative control for tx route plumbing not yet run.
+
+Still missing: an isolated failing control for sentinel refusal; concurrent binding insert/cap controls; PATCH canonical-set recheck; stalled-review durable decision with correct authenticated reviewer; changed-head fresh-review route; integration oracles; OpenAPI/shared/UI sync; independent final-head verification, engine PR, merge and rollout. This is not safe to ship. The new test file `issue-stage-approval-scan-budget.test.ts` has 19 green unit tests but only modeled handles, not PostgreSQL concurrency.
+
 ## Comment-path implementer result — HOLD, 2026-09-30
 
 New test-first fixture `server/src/__tests__/issue-comment-stage-approval-lock.test.ts` covers four mocked comment approvals; before implementation the refusal cases returned 201 rather than 409. After route edits: `timeout 300 pnpm exec vitest run server/src/__tests__/issue-comment-stage-approval-lock.test.ts` exited 0 (4 passed); the isolated negative disabled the new guard and exited 1 on expected 409 versus actual 201 (2 failed, 2 passed). `timeout 600 pnpm exec vitest run server/src/__tests__/issue-execution-policy-routes.test.ts server/src/__tests__/issue-done-pr-merged-gate.test.ts` exited 0 (41 passed). `export PATH="$HOME/.cargo/bin:$PATH" && timeout 900 pnpm --filter @paperclipai/shared --filter @paperclipai/server typecheck` exited 0 (both Done); `timeout 20 git diff --check` exited 0. These are implementer receipts, not independent acceptance.
