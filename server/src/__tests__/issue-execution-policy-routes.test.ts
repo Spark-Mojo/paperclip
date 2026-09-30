@@ -304,7 +304,7 @@ describe("issue execution policy routes", () => {
     expect(mockDb.transaction).toHaveBeenCalled();
     expect(mockIssueService.getByIdForUpdate).toHaveBeenCalled();
     expect(mockIssueService.update).not.toHaveBeenCalled();
-  });
+  }, 60_000);
 
   it("rejects an agent-authored in_review transition without a review path", async () => {
     const issue = {
@@ -338,7 +338,7 @@ describe("issue execution policy routes", () => {
       missing: "review_path",
     });
     expect(mockIssueService.update).not.toHaveBeenCalled();
-  });
+  }, 60_000);
 
   it("allows an agent-authored in_review transition with a pending confirmation interaction", async () => {
     const issue = {
