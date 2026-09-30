@@ -227,7 +227,7 @@ test("cloud builds start per commit and preserve tag promotion dependencies", ()
   const docker = readFileSync(new URL("../.github/workflows/docker.yml", import.meta.url), "utf8");
   const cloud = readFileSync(new URL("../.github/workflows/docker-cloud.yml", import.meta.url), "utf8");
   const readiness = readFileSync(new URL("../.github/workflows/cloud-readiness.yml", import.meta.url), "utf8");
-  assert.match(readiness, /branches: \[master\]/);
+  assert.match(readiness, /branches: \[rebuild\/v2026\.916\.0-survivors\]/);
   assert.match(readiness, /uses: \.\/\.github\/workflows\/docker-cloud.yml/);
   assert.doesNotMatch(cloud, /^  push:/m);
   assert.match(cloud, /workflow_call:/);
@@ -236,7 +236,7 @@ test("cloud builds start per commit and preserve tag promotion dependencies", ()
   assert.doesNotMatch(cloud, /uses: .*@v\d\b/);
   assert.match(cloud, /cache-to: type=registry,ref=ghcr.io\/\$\{\{ github.repository \}\}:buildcache-cloud-\$\{\{ github.sha \}\},mode=max/);
   const caller = docker.split("  build-and-push-cloud:")[1].split("  promote_canary_channel:")[0];
-  assert.match(caller, /if: github.event_name != 'push' \|\| github.ref != 'refs\/heads\/master'/);
+  assert.match(caller, /if: github.event_name != 'push' \|\| github.ref != 'refs\/heads\/rebuild\/v2026\.916\.0-survivors'/);
   assert.match(caller, /uses: .\/.github\/workflows\/docker-cloud.yml/);
   assert.match(docker.split("  promote_canary_channel:")[1], /needs: \[merge-and-push, build-and-push-cloud\]/);
   const reaping = cloud.indexOf("      - name: Verify cloud PID 1 reaps orphaned processes");

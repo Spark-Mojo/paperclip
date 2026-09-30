@@ -8,6 +8,13 @@
   NEGATIVE GUARD: `timeout 30 node -e 'const fs=require("fs");const t=fs.readFileSync(".github/workflows/docker.yml","utf8").replace("github.ref != '\''refs/heads/rebuild/v2026.916.0-survivors'\''","github.ref != '\''refs/heads/master'\''"); if(t.includes("if: github.event_name != '\''push'\'' || github.ref != '\''refs/heads/rebuild/v2026.916.0-survivors'\''"))process.exit(0); console.error("STALE_GUARD_REJECTED");process.exit(1)'`
   RESULT: CHECK exit 0, `PUSH_FILTERS_OK`; NEGATIVE exit 1, `AssertionError` on in-memory stale `master` fixture; NEGATIVE GUARD exit 1 `STALE_GUARD_REJECTED`. `git diff --check` exit 0.
 
+- Gate 1b: The repository's release-registry test accepts the retargeted workflow while rejecting stale master filters.
+  CHECK: `timeout 120 node --test scripts/preview-artifacts.test.mjs`
+  EXPECT: `# fail 0` and `# pass` greater than zero.
+  NEGATIVE: `timeout 30 node -e 'const assert=require("node:assert/strict");const fs=require("node:fs");const live=fs.readFileSync(".github/workflows/cloud-readiness.yml","utf8");const expected="branches: [rebuild/v2026.916.0-survivors]";assert.ok(live.includes(expected));const stale=live.replace(expected,"branches: [master]");assert.ok(stale.includes(expected),"STALE_MASTER_REJECTED")'`
+  EXPECT NEGATIVE: nonzero assertion on first in-memory stale filter; no live workflow mutation.
+  RESULT: CHECK exit 0, `tests 19`, `pass 19`, `fail 0`; NEGATIVE exit 1, `AssertionError [ERR_ASSERTION]: STALE_MASTER_REJECTED`. Before the fix, CHECK exit 1 at line 230 on stale `/branches: \\[master\\]/`. `timeout 300 pnpm run typecheck` exit 1 due to missing local `cli/node_modules/tsx/dist/cli.mjs` (dependency installation absent); this test-only correction changes no TypeScript.
+
 - Gate 2: New fork trunk tip has actionable check runs and `pr-read.sh` rows with verbatim names.
   CHECK: `timeout 30 gh api repos/Spark-Mojo/paperclip/commits/$(gh api repos/Spark-Mojo/paperclip/branches/rebuild%2Fv2026.916.0-survivors --jq .commit.sha)/check-runs --jq '{total_count,names:[.check_runs[].name]}'`
   EXPECT: `total_count` greater than zero; names include at least one non-skipped push job.
