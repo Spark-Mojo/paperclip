@@ -304,6 +304,8 @@ import {
   issueExecutionPolicyFingerprint,
   issueStageApprovalService,
   reviewerChanged,
+  STAGE_APPROVAL_INCOMPLETE_SET_CODE,
+  STAGE_APPROVAL_POLICY_CHANGED_CODE,
   STAGE_APPROVAL_REVIEWER_CHANGED_CODE,
 } from "../services/issue-stage-approvals.js";
 import { parseIssueExecutionWorkspaceSettings } from "../services/execution-workspace-policy.js";
@@ -2099,6 +2101,15 @@ function issueStageApprovalSnapshotEqual(
     leftSubject.fingerprint === rightSubject.fingerprint &&
     JSON.stringify(leftSubject.state ?? null) === JSON.stringify(rightSubject.state ?? null)
   );
+}
+
+function parseNormalizedLockedPolicy(value: unknown): NormalizedExecutionPolicy | null {
+  if (value == null) return null;
+  try {
+    return normalizeIssueExecutionPolicy(value);
+  } catch {
+    return null;
+  }
 }
 
 function activeStageParticipant(policy: NormalizedExecutionPolicy | null, state: ParsedExecutionState | null) {
@@ -17810,8 +17821,66 @@ export function issueRoutes(
         };
         const postCommitActivityPublications: ActivityPublication[] = [];
         const postCommitIssueActions: IssuePostCommitAction[] = [];
+        const verifiedCommentBoundSet =
+          verifiedCommentApprovalPullRequests === null
+            ? null
+            : (await commentStageApprovalSvc.readBound({
+                id: currentIssue.id,
+                companyId: currentIssue.companyId,
+                description: currentIssue.description,
+              }))
+                  .map((reference) =>
+                    `${reference.owner.toLowerCase()}/${reference.repo.toLowerCase()}#${reference.number}`,
+                  )
+                  .sort();
+        const verifiedCommentPolicyFingerprint = issueExecutionPolicyFingerprint(
+          currentExecutionPolicy,
+        );
         try {
           txResult = await db.transaction(async (tx) => {
+            if (verifiedCommentApprovalPullRequests) {
+              const lockedIssue = await svc.getByIdForUpdate(id, tx);
+              if (!lockedIssue) throw new AutoApprovalIssueMissingError();
+              if (!issueStageApprovalSnapshotEqual(currentIssue, lockedIssue)) {
+                throw reviewerChanged({
+                  issueId: id,
+                  code: STAGE_APPROVAL_REVIEWER_CHANGED_CODE,
+                });
+              }
+              const lockedPolicyFingerprint = issueExecutionPolicyFingerprint(
+                parseNormalizedLockedPolicy(lockedIssue.executionPolicy),
+              );
+              if (lockedPolicyFingerprint !== verifiedCommentPolicyFingerprint) {
+                throw reviewerChanged({
+                  issueId: id,
+                  code: STAGE_APPROVAL_POLICY_CHANGED_CODE,
+                  authorizedPolicyFingerprint: verifiedCommentPolicyFingerprint,
+                  currentPolicyFingerprint: lockedPolicyFingerprint,
+                });
+              }
+              const lockedBoundSet = (
+                await commentStageApprovalSvc.readBound({
+                  id: lockedIssue.id,
+                  companyId: lockedIssue.companyId,
+                  description: lockedIssue.description,
+                })
+              )
+                .map((reference) =>
+                  `${reference.owner.toLowerCase()}/${reference.repo.toLowerCase()}#${reference.number}`,
+                )
+                .sort();
+              if (
+                verifiedCommentBoundSet === null ||
+                JSON.stringify(lockedBoundSet) !== JSON.stringify(verifiedCommentBoundSet)
+              ) {
+                throw reviewerChanged({
+                  issueId: id,
+                  code: STAGE_APPROVAL_INCOMPLETE_SET_CODE,
+                  verifiedPullRequests: verifiedCommentBoundSet,
+                  currentPullRequests: lockedBoundSet,
+                });
+              }
+            }
             const insertedComment = await svc.addComment(
               id,
               req.body.body,
