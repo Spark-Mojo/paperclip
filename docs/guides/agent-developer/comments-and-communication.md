@@ -21,6 +21,66 @@ PATCH /api/issues/{issueId}
 
 When you are the active reviewer or approver for an execution-policy stage, include the decision rationale in this same `PATCH` request. A separate `POST /api/issues/{issueId}/comments` followed by a status-only `PATCH` does not advance the review/approval stage.
 
+## Safe Retries (Idempotency-Key)
+
+A write can succeed on the server and still look like a failure to you: a dropped
+connection, a proxy 502, or a read timeout that lands after the commit. Retrying
+that write then posts the comment twice — and a bisect loop that retries per probe
+multiplies it. Send a key so a retry is a no-op instead of a duplicate:
+
+```
+POST /api/issues/{issueId}/comments
+Idempotency-Key: 7c1f0d1e-6f5a-4a0e-9a3b-2f9d5c8e1b44
+{ "body": "Closing comment for SPA-1234." }
+```
+
+The key is a UUID, is optional, and is honored for **every** actor — agents
+included. It is scoped to `(issue, you, key)`:
+
+- **Same key, same body** — the original comment is returned. Exactly one comment
+  is stored, and the response is the one the first attempt committed.
+- **Same key, different body** — rejected with `409`. A key is a claim about one
+  specific comment, so it cannot be reused for different content.
+- **Different keys** — independent comments, as you would expect.
+- **No key** — ordinary behavior, unchanged. Existing callers are unaffected.
+
+Two concurrent requests carrying the same key are safe: the database resolves the
+race, and both receive the same comment rather than one of them erroring.
+
+Use a fresh UUID per logical comment, and reuse it verbatim on every retry of that
+comment. Do not derive it from the body, a timestamp, or a loop counter — a
+per-iteration key gives every probe its own comment, which is the thing you are
+trying to avoid.
+
+## Counting Comments: Tombstones
+
+`DELETE /api/issues/{issueId}/comments/{commentId}` is a **soft delete**. The row
+is retained and comes back from `GET /api/issues/{issueId}/comments` as an explicit
+tombstone:
+
+- `deletedAt` — when it was deleted. **This is the field that distinguishes a
+  tombstone from a live comment.**
+- `deletedByType`, `deletedByAgentId`, `deletedByUserId`, `deletedByRunId` — who
+  removed it.
+- `body` — empty (`""`) by design, so the removed text is not served again.
+
+Tombstones are returned on purpose: the cleanup is auditable, and a reader can see
+that a comment was withdrawn rather than inferring it from a missing row. So **a
+row count is not a comment count.** To count live comments, filter on the
+tombstone marker:
+
+```bash
+curl -s -H "Authorization: Bearer $PAPERCLIP_API_KEY" \
+  "$PAPERCLIP_API_URL/api/issues/$ISSUE_ID/comments?limit=500&order=asc" \
+  | python3 -c 'import json,sys; rows=json.load(sys.stdin); print(sum(1 for c in rows if not c.get("deletedAt")), "live of", len(rows))'
+```
+
+<Note>
+  The `limit` above is capped at 500 per request and responses are not truncated
+  silently — count with a `limit`/`offset` loop that ends on a short page rather
+  than trusting a single response's length.
+</Note>
+
 ## Comment Style
 
 Use concise markdown with:

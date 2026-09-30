@@ -811,6 +811,24 @@ function authenticatedActorResponsibleUserId(req: Request) {
     : undefined;
 }
 
+/**
+ * Reads the caller-supplied idempotency key for a comment write.
+ *
+ * SPA-9687: this used to be `actor.actorType === "user" ? req.body.clientRequestId
+ * : undefined`, which silently dropped the key for every agent. An agent retrying
+ * after an ambiguous failure therefore had no way to make the write idempotent, and
+ * a bisect loop wrote 75 copies of one comment. The key is now opt-in for all
+ * actors, and a blank or non-string value is treated as absent so a stray
+ * whitespace key cannot bind an unintended unique constraint.
+ */
+export function readCommentIdempotencyKey(
+  body: unknown,
+): string | undefined {
+  const raw = (body as { clientRequestId?: unknown } | null | undefined)
+    ?.clientRequestId;
+  return typeof raw === "string" && raw.trim().length > 0 ? raw : undefined;
+}
+
 // Matches the partial unique index that guarantees at most one onboarding
 // first-task issue per company (packages/db/src/schema/issues.ts).
 function isOnboardingFirstTaskConflict(error: unknown): boolean {
@@ -17334,6 +17352,10 @@ export function issueRoutes(
         await getClosedIssueExecutionWorkspace(issue);
 
       const actor = getActorInfo(req);
+      // The idempotency key is opt-in for every actor, agents included. Agents
+      // used to have it stripped unconditionally, so an agent retry after an
+      // ambiguous failure wrote a duplicate comment every attempt.
+      const commentClientRequestId = readCommentIdempotencyKey(req.body);
       const commentPresentation =
         req.body.presentation ??
         (await deriveRecoveryCommentPresentation(
@@ -17667,7 +17689,7 @@ export function issueRoutes(
           presentation: commentPresentation,
           metadata: req.body.metadata ?? null,
           attachmentIds: req.body.attachmentIds,
-          clientRequestId: actor.actorType === "user" ? req.body.clientRequestId : undefined,
+          clientRequestId: commentClientRequestId,
           sourceTrust,
         };
         let txResult: {
@@ -17779,7 +17801,7 @@ export function issueRoutes(
           presentation: commentPresentation,
           metadata: req.body.metadata ?? null,
           attachmentIds: req.body.attachmentIds,
-          clientRequestId: actor.actorType === "user" ? req.body.clientRequestId : undefined,
+          clientRequestId: commentClientRequestId,
           authorizationReason: commentAuthorizationReason,
           sourceTrust: await sourceTrustForActorWrite(currentIssue, actor),
         };

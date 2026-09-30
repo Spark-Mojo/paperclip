@@ -12406,6 +12406,27 @@ export function issueService(db: Db) {
         }
       }
       if (!comment) {
+        // The agent-keyed idempotency constraint is enforced by the DATABASE, not
+        // by a pre-SELECT. A read-then-write lookup cannot be correct here: two
+        // concurrent identical retries both miss the read and both reach the
+        // insert, and the loser would surface a 23505 as a 500 — the very symptom
+        // this fixes. `ON CONFLICT DO NOTHING` makes the race safe by construction:
+        // the loser inserts nothing, then reads the winner's row back.
+        //
+        // `onConflictDoNothing` in drizzle 0.45.2 reads `where` (not `targetWhere`),
+        // so the inference predicate is passed as `where`; `targetWhere` is silently
+        // dropped by that version and Postgres then reports 42P10.
+        const agentKeyedReplay =
+          actor.agentId && options?.clientRequestId
+            ? {
+                target: [
+                  issueComments.issueId,
+                  issueComments.authorAgentId,
+                  issueComments.clientRequestId,
+                ] as const,
+                where: sql`${issueComments.clientRequestId} is not null and ${issueComments.authorAgentId} is not null`,
+              }
+            : null;
         [comment] = await dbOrTx
           .insert(issueComments)
           .values({
@@ -12425,7 +12446,27 @@ export function issueService(db: Db) {
               ? { createdAt }
               : {}),
           })
+          .onConflictDoNothing(agentKeyedReplay ?? undefined)
           .returning();
+        if (!comment && agentKeyedReplay) {
+          const [winner] = await dbOrTx
+            .select()
+            .from(issueComments)
+            .where(
+              and(
+                eq(issueComments.issueId, issueId),
+                eq(issueComments.authorAgentId, actor.agentId!),
+                eq(issueComments.clientRequestId, options!.clientRequestId!),
+              ),
+            );
+          if (!winner) {
+            throw new Error("Failed to create issue comment");
+          }
+          if (winner.body !== redactedBody) {
+            throw conflict("Idempotency key was already used for different content");
+          }
+          comment = winner;
+        }
       }
       if (!comment) throw new Error("Failed to create issue comment");
 
