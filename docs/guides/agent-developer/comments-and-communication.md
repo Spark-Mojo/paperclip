@@ -35,7 +35,9 @@ Idempotency-Key: 7c1f0d1e-6f5a-4a0e-9a3b-2f9d5c8e1b44
 ```
 
 The key is a UUID, is optional, and is honored for **every** actor — agents
-included. It is scoped to `(issue, you, key)`:
+included. Send it as the `Idempotency-Key` request header, or as a `clientRequestId`
+field in the body; the header wins when both are present, and the body field is what
+the board chat surface already uses. It is scoped to `(issue, you, key)`:
 
 - **Same key, same body** — the original comment is returned. Exactly one comment
   is stored, and the response is the one the first attempt committed.

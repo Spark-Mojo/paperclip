@@ -43,21 +43,48 @@ if (negativeMode && !isMismatchControl && !isDistinctKeysControl) {
 }
 
 describe("readCommentIdempotencyKey (SPA-9687)", () => {
-  it("keeps a caller-supplied key for every actor, not just board users", () => {
-    // The pre-fix route read `actor.actorType === "user" ? ... : undefined`, which
-    // is what stripped the key from agents. This is the pure function that now
-    // decides, and it is actor-blind by construction.
-    const key = randomUUID();
+  // This block is the gate that catches the route->key binding, not just the
+  // helper in isolation. An earlier review found the shipped guide documented an
+  // `Idempotency-Key` HTTP header while the implementation read only the body
+  // field, so an agent following the documentation got no idempotency at all
+  // (review finding D1). Asserting the helper against a body shaped like its own
+  // implementation could never catch that class of defect.
+  const uuidKey = () => randomUUID();
+
+  it("reads the conventional Idempotency-Key request header", () => {
+    const key = uuidKey();
+    expect(readCommentIdempotencyKey({ body: "x" }, { "idempotency-key": key })).toBe(key);
+  });
+
+  it("reads the legacy clientRequestId body field when no header is sent", () => {
+    const key = uuidKey();
+    expect(readCommentIdempotencyKey({ clientRequestId: key }, {})).toBe(key);
     expect(readCommentIdempotencyKey({ clientRequestId: key })).toBe(key);
   });
 
+  it("prefers the header when both are present", () => {
+    const header = uuidKey();
+    const body = uuidKey();
+    expect(readCommentIdempotencyKey({ clientRequestId: body }, { "idempotency-key": header })).toBe(
+      header,
+    );
+  });
+
+  it("falls back to the body field when the header is blank", () => {
+    const key = uuidKey();
+    expect(readCommentIdempotencyKey({ clientRequestId: key }, { "idempotency-key": "  " })).toBe(
+      key,
+    );
+  });
+
   it("treats a blank, whitespace, or non-string key as absent", () => {
-    expect(readCommentIdempotencyKey({ clientRequestId: "" })).toBeUndefined();
-    expect(readCommentIdempotencyKey({ clientRequestId: "   " })).toBeUndefined();
-    expect(readCommentIdempotencyKey({ clientRequestId: 42 })).toBeUndefined();
-    expect(readCommentIdempotencyKey({})).toBeUndefined();
-    expect(readCommentIdempotencyKey(null)).toBeUndefined();
-    expect(readCommentIdempotencyKey(undefined)).toBeUndefined();
+    expect(readCommentIdempotencyKey({ clientRequestId: "" }, {})).toBeUndefined();
+    expect(readCommentIdempotencyKey({ clientRequestId: "   " }, {})).toBeUndefined();
+    expect(readCommentIdempotencyKey({ clientRequestId: 42 }, {})).toBeUndefined();
+    expect(readCommentIdempotencyKey({}, {})).toBeUndefined();
+    expect(readCommentIdempotencyKey(null, undefined)).toBeUndefined();
+    expect(readCommentIdempotencyKey(undefined, undefined)).toBeUndefined();
+    expect(readCommentIdempotencyKey({}, { "idempotency-key": 7 })).toBeUndefined();
   });
 });
 

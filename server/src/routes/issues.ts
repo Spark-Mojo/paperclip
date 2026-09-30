@@ -820,10 +820,24 @@ function authenticatedActorResponsibleUserId(req: Request) {
  * a bisect loop wrote 75 copies of one comment. The key is now opt-in for all
  * actors, and a blank or non-string value is treated as absent so a stray
  * whitespace key cannot bind an unintended unique constraint.
+ *
+ * Read from BOTH the standard `Idempotency-Key` request header and the
+ * `clientRequestId` body field, header first. The body field is what the existing
+ * board chat surface already sends; the header is the conventional transport and
+ * the one the agent guide documents. Documenting a header the server does not
+ * read would make this fix inert for its own documented consumer (SPA-9687 review
+ * finding D1).
  */
 export function readCommentIdempotencyKey(
   body: unknown,
+  headers?: unknown,
 ): string | undefined {
+  const headerValue = (headers as { [key: string]: unknown } | null | undefined)?.[
+    "idempotency-key"
+  ];
+  if (typeof headerValue === "string" && headerValue.trim().length > 0) {
+    return headerValue;
+  }
   const raw = (body as { clientRequestId?: unknown } | null | undefined)
     ?.clientRequestId;
   return typeof raw === "string" && raw.trim().length > 0 ? raw : undefined;
@@ -17355,7 +17369,10 @@ export function issueRoutes(
       // The idempotency key is opt-in for every actor, agents included. Agents
       // used to have it stripped unconditionally, so an agent retry after an
       // ambiguous failure wrote a duplicate comment every attempt.
-      const commentClientRequestId = readCommentIdempotencyKey(req.body);
+      const commentClientRequestId = readCommentIdempotencyKey(
+        req.body,
+        req.headers,
+      );
       const commentPresentation =
         req.body.presentation ??
         (await deriveRecoveryCommentPresentation(
