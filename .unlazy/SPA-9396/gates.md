@@ -1,5 +1,22 @@
 # SPA-9396 gates — incomplete WIP, 2026-09-30
 
+## Steve arbitration pass, 2026-09-30 (manager arbitration of the implementer-session cap)
+
+Two of the escalation's stated blockers were re-derived and corrected. One safety claim does NOT clear.
+
+**G5 is NOT blocked — the `cargo: not found` was a PATH artifact.** `cargo` exists at `~/.cargo/bin/cargo`; the run failed only because that directory was absent from `PATH`. With `export PATH="$HOME/.cargo/bin:$PATH"`, `timeout 900 pnpm --filter @paperclipai/shared --filter @paperclipai/server typecheck` **exits 0** (`Finished 'release' profile ... in 2m 47s`; `server typecheck: Done`). G5 is GREEN. Any later session MUST export that PATH before claiming the toolchain is unavailable.
+
+**G2's 2 failures are NOT introduced by this WIP.** Clean A/B, three arms, all exit 1 with the same two named tests:
+1. WIP product code + faithful mock → 2 failed | 39 passed.
+2. WIP product code reverted to `c8c7e847a1` + original mock → 2 failed | 17 passed (19).
+3. Base product code + faithful mock → 2 failed | 17 passed (19).
+
+So the red is pre-existing on the base commit, and reverting the repair does not clear it. Root cause of the masked assertion: `routes/issues.ts` calls `heartbeat.cancelLiveRunsForIssue` on every status transition, and the test's `mockHeartbeatService` never defined it, so the route threw mid-flight (`TypeError: heartbeat.cancelLiveRunsForIssue is not a function`) instead of reaching its assertions. `cancelLiveRunsForIssue` is real (`server/src/services/heartbeat.ts:29992`, returns an array of cancelled run rows); the mock now returns `[]`. That single faithful mock line is the only test change in the checkpoint commit `8f29726180`.
+
+**The "unsafe to ship" claim is NOT withdrawn.** Pre-existing-ness is exculpatory only when the red lives in a region this change cannot reach. Here the red IS the authorization guard exercised by `issue-execution-policy-routes.test.ts` — precisely the class this card must not weaken. Gate 0 (green-on-base with a faithful mock) did not go green, so there is currently no working oracle proving the guard still refuses. Root cause is NOT yet established: a proxy over `mockDb.transaction` logged no missing `tx` method, and `tx.insert`/`tx.update` appear only on decision-recording paths, so the 15s hang is still unexplained. Do not treat G2 as a known-red that can be waived; it is a MISSING ORACLE until the hang is explained and the guard is shown to refuse.
+
+Remaining scope is unchanged except G5 dropped out: comment-path locked-snapshot recheck, canonical PR-set validation under the update lock, stalled-review durable decision row with correct authenticated reviewer, changed-head fresh-review path, integration oracles, OpenAPI/shared/UI contract sync, negative controls, independent verification, engine PR, merge, rollout. Generic `approved` remains stage participation and must never be read as security-class attestation.
+
 Continuation receipt (2026-09-30): Sable measured on SPA-9690 that generic terminal stage participation writes `lastDecisionOutcome: approved` even outside the security class. This is not security attestation. Do not interpret it as such or migrate historical outcomes. Four bounded implementer sessions produced uncommitted partial changes; no PR, merge, deployment, or Sable approval. Foreground `timeout 180 pnpm exec vitest run server/src/__tests__/issue-stage-approvals.test.ts server/src/__tests__/issue-execution-policy.test.ts server/src/__tests__/issue-stalled-review-decision-routes.test.ts server/src/__tests__/issue-done-pr-merged-gate.test.ts --testTimeout=120000` exited 0: Test Files 4 passed; Tests 130 passed. This does not clear G2, G5, or integration requirements. `git diff --check` exited 0; tree remains dirty. G2 baseline was reproduced on pre-WIP base by implementer and passed with `--testTimeout=120000`; normal 15-second suite remains red. Untracked unit and negative-control tests are preserved in assigned worktree, not published. Do not PR this partial implementation.
 
 Typecheck receipt this run: `timeout 900 pnpm --filter @paperclipai/shared --filter @paperclipai/server typecheck` exit 1; shared typecheck Done, server prepare:runner-vendor failed at `cargo build`: `sh: 1: cargo: not found`. No server typecheck pass claim. Root/server manifests provide no lint script. G2 still red at default test timeout. Unit regression receipt above is 130 passed / 4 files, not end-to-end acceptance.
@@ -18,7 +35,7 @@ Scope: one atomic engine sequencing repair. Authorized premerge approval is dist
   CHECK: timeout 300 pnpm exec vitest run server/src/__tests__/issue-execution-policy-routes.test.ts server/src/__tests__/issue-done-pr-merged-gate.test.ts
   EXPECT: Test Files  2 passed
   RESULT: exit 1, EXPECT absent. Output: Test Files  1 failed | 1 passed (2); Tests  2 failed | 39 passed (41).
-  FAILURES: reauthorizes a terminal verdict against the review policy held under the update lock timed out in 15000ms (line 265); rejects an agent-authored in_review transition without a review path found update called once (line 337). Same failures reproduced twice; advisor consulted before any further fix. Do not assume mock-only defects.
+  FAILURES: reauthorizes a terminal verdict against the review policy held under the update lock timed out in 15000ms; rejects an agent-authored in_review transition without a review path found update called once. Same failures reproduced by Steve on the BASE commit with the WIP reverted (2 failed | 17 passed, both mock variants) — see arbitration section. Root cause: mockHeartbeatService lacks cancelLiveRunsForIssue; mock corrected in 8f29726180. The guard still does not go green, so this gate remains RED and is a missing oracle, not a waiver.
 
 ## G3 — Stalled review existing authorization regression
   CHECK: timeout 300 pnpm exec vitest run server/src/__tests__/issue-stalled-review-decision-routes.test.ts
@@ -35,7 +52,8 @@ Scope: one atomic engine sequencing repair. Authorized premerge approval is dist
 ## G5 — Shared/server contract typecheck
   CHECK: timeout 900 pnpm --filter @paperclipai/shared --filter @paperclipai/server typecheck
   EXPECT: server typecheck: Done
-  RESULT: exit 1, EXPECT absent. Output: packages/shared typecheck: Done; server typecheck: sh: 1: cargo: not found; ERR_PNPM_RECURSIVE_RUN_FIRST_FAIL; Exit status 1. No typecheck pass claim for server. No lint script defined in root/server package manifests.
+  RESULT: exit 1, EXPECT absent (SUPERSEDED 2026-09-30 by Steve's re-run — see arbitration section). Original output: packages/shared typecheck: Done; server typecheck: sh: 1: cargo: not found; ERR_PNPM_RECURSIVE_RUN_FIRST_FAIL; Exit status 1. No lint script defined in root/server package manifests.
+  RERUN (Steve, 2026-09-30, `export PATH="$HOME/.cargo/bin:$PATH"`): exit 0, EXPECT MATCHED. Output: `Finished 'release' profile [optimized] target(s) in 2m 47s`; server typecheck: Done. G5 IS GREEN. The original failure was a PATH artifact, not a missing toolchain.
 
 ## G6 — Diff integrity
   CHECK: timeout 20 git diff --check
