@@ -1529,6 +1529,30 @@ async function startServerWithDatabaseTeardown(
         }
 
         const promotion = await heartbeat.promoteDueScheduledRetries();
+        try {
+          const terminalLeaseResult = await heartbeat.reclaimTerminalEnvironmentLeases();
+          if (
+            terminalLeaseResult.reclaimed > 0 ||
+            terminalLeaseResult.driverFailures.length > 0
+          ) {
+            logger.warn(
+              {
+                reclaimed: terminalLeaseResult.reclaimed,
+                skippedUnknownOwner: terminalLeaseResult.skippedUnknownOwner,
+                skippedLiveOwners: terminalLeaseResult.skippedLiveOwners,
+                skippedCrossCompany: terminalLeaseResult.skippedCrossCompany,
+                skippedOwnershipChanged: terminalLeaseResult.skippedOwnershipChanged,
+                driverFailures: terminalLeaseResult.driverFailures.length,
+              },
+              "startup terminal-environment-lease reclamation changed active lease state",
+            );
+          }
+        } catch (err) {
+          logger.error(
+            { err },
+            "startup terminal-environment-lease reclamation failed - periodic sweep will serve as degraded backstop",
+          );
+        }
         await heartbeat.resumeQueuedRuns();
         const recoveredGoalActions = await heartbeat.recoverPendingSessionGoalActions();
         if (
@@ -1598,6 +1622,25 @@ async function startServerWithDatabaseTeardown(
     const setupCleanup = await environmentCustomImages.cleanupExpiredSetupSessions();
     if (setupCleanup.timedOut > 0 || setupCleanup.failed > 0) {
       logger.warn({ ...setupCleanup }, "startup environment customImage setup cleanup changed sessions");
+    }
+
+    // SPA-9351: a deferred wake whose blocking run ended before the process
+    // restarted never sees a run-end event, so the startup pass is the only
+    // chance to promote it. Ordered after the startup stale-lock sweep for the
+    // same reason as the periodic pass.
+    if (heartbeat && !heartbeatSchedulingSuppression.suppressed) {
+      const deferredWakes = await heartbeat
+        .reconcileStaleDeferredWakes()
+        .catch((err) => {
+          logger.error({ err }, "startup deferred-wake backstop failed");
+          return null;
+        });
+      if (deferredWakes && deferredWakes.promoted > 0) {
+        logger.warn(
+          { ...deferredWakes },
+          "startup deferred-wake backstop promoted stranded wakes",
+        );
+      }
     }
 
     const toolHealthSweep = await tools.sweepConnectionHealth();
@@ -1784,6 +1827,44 @@ async function startServerWithDatabaseTeardown(
           // persisted queued work is still being driven forward.
           trackHeartbeatSchedulerWork(heartbeat
             .reapOrphanedRuns({ staleThresholdMs: 5 * 60 * 1000 })
+            .then(() =>
+              heartbeat.reclaimTerminalEnvironmentLeases().then((result) => {
+                if (
+                  result.reclaimed > 0 ||
+                  result.driverFailures.length > 0
+                ) {
+                  logger.warn(
+                    {
+                      reclaimed: result.reclaimed,
+                      skippedUnknownOwner: result.skippedUnknownOwner,
+                      skippedLiveOwners: result.skippedLiveOwners,
+                      skippedCrossCompany: result.skippedCrossCompany,
+                      skippedOwnershipChanged: result.skippedOwnershipChanged,
+                      driverFailures: result.driverFailures.length,
+                    },
+                    "periodic terminal-environment-lease reclamation changed active lease state",
+                  );
+                }
+              }),
+            )
+            .then(() =>
+              heartbeat.reclaimTerminalEnvironmentLeasesForRestart().then((result) => {
+                if (
+                  result.releasedRestartOrphans.length > 0 ||
+                  result.replacedRunIds.length > 0 ||
+                  result.replacementDispatchFailures.length > 0
+                ) {
+                  logger.warn(
+                    {
+                      releasedRestartOrphans: result.releasedRestartOrphans.length,
+                      replacedRunIds: result.replacedRunIds.length,
+                      replacementDispatchFailures: result.replacementDispatchFailures.length,
+                    },
+                    "periodic restart-replacement dispatch observed terminal-environment-lease release",
+                  );
+                }
+              }),
+            )
             .then(() => heartbeat.promoteDueScheduledRetries())
             .then(async (promotion) => {
               await heartbeat.resumeQueuedRuns();
@@ -1824,6 +1905,15 @@ async function startServerWithDatabaseTeardown(
               const swept = await heartbeat.sweepStaleIssueLocks();
               if (swept.cleared > 0) {
                 logger.warn({ ...swept }, "periodic stale-lock sweeper cleared issue locks");
+              }
+            })
+            // SPA-9351: runs after the stale-lock sweeper so a lock column left
+            // behind by a finished run is cleared before the backstop decides
+            // whether a deferred wake's blocking run is still the live owner.
+            .then(async () => {
+              const promoted = await heartbeat.reconcileStaleDeferredWakes();
+              if (promoted.promoted > 0) {
+                logger.warn({ ...promoted }, "periodic deferred-wake backstop promoted stranded wakes");
               }
             })
             .catch((err) => {

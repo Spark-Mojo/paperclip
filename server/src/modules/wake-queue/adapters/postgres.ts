@@ -51,6 +51,7 @@ import {
 import { requireTransactionScopeTx, TransactionScope } from "../application/ports.js";
 import type {
   DeferredWakeCandidate,
+  DeferredWakeQueueDrainWriter,
   InvokableAgentSnapshot,
   IssueLockWriter,
   IssueSnapshot,
@@ -62,6 +63,7 @@ import type {
   WakeQueueHost,
   WakeQueueTransaction,
 } from "../application/ports.js";
+import { drainSingleDeferredWake } from "../application/use-cases.js";
 import type { RunSummary } from "../application/types.js";
 
 const DEFERRED_WAKE_STATUS = "deferred_issue_execution";
@@ -181,11 +183,22 @@ function buildHost(_tx: Db, deps: WakeQueuePostgresAdapterDeps): WakeQueueHost {
   };
 }
 
-function buildTransaction(tx: Db, deps: WakeQueuePostgresAdapterDeps, db: Db, run: HeartbeatRunRow): WakeQueueTransaction {
+function buildTransaction(
+  tx: Db,
+  deps: WakeQueuePostgresAdapterDeps,
+  db: Db,
+  run: HeartbeatRunRow | RunSnapshot,
+): WakeQueueTransaction {
   const treeControlSvc = issueTreeControlService(tx);
   const issuesSvc = issueService(tx);
+  // A drain with no finishing run supplies a stand-in snapshot, which carries
+  // no wake receipt and no resultJson. The two ports that read them are only
+  // reachable from the release-recovery tail, which a promotion-only drain
+  // never runs; normalize them to absent so a stand-in reads as "no receipt".
+  const runWakeupRequestId = "wakeupRequestId" in run ? run.wakeupRequestId : null;
+  const runResultJson = "resultJson" in run ? run.resultJson : undefined;
   const interruptQueueId = run.runtimeMode !== "native" && run.status === "cancelled"
-    ? readNonEmptyString(run.resultJson?.queuedCommentInterruptQueueId)
+    ? readNonEmptyString(runResultJson?.queuedCommentInterruptQueueId)
     : null;
 
   return {
@@ -548,13 +561,13 @@ function buildTransaction(tx: Db, deps: WakeQueuePostgresAdapterDeps, db: Db, ru
           "wake-queue: recovery source does not match the locked execution",
         );
       }
-      const failedChatRequestOwner = run.wakeupRequestId
+      const failedChatRequestOwner = runWakeupRequestId
         ? await tx
             .select({ id: chatActions.id })
             .from(chatActions)
             .where(
               and(
-                eq(chatActions.id, run.wakeupRequestId),
+                eq(chatActions.id, runWakeupRequestId),
                 eq(chatActions.companyId, run.companyId),
                 inArray(chatActions.kind, ["inbound_wakeup", "failed_run_retry"]),
               ),
@@ -565,7 +578,17 @@ function buildTransaction(tx: Db, deps: WakeQueuePostgresAdapterDeps, db: Db, ru
       return (
         Boolean(failedChatRequestOwner) ||
         run.errorCode === "chat_failed_run_retry_not_authorized" ||
-        classifyContinuationFailure(run).kind === "non_retryable"
+        classifyContinuationFailure({
+          id: run.id,
+          agentId: run.agentId,
+          status: run.status,
+          error: "error" in run ? run.error : null,
+          errorCode: run.errorCode,
+          contextSnapshot: run.contextSnapshot,
+          livenessState: "livenessState" in run ? run.livenessState : null,
+          startedAt: "startedAt" in run ? run.startedAt : null,
+          createdAt: "createdAt" in run ? run.createdAt : new Date(0),
+        }).kind === "non_retryable"
       );
     },
 
@@ -992,18 +1015,121 @@ export function createWakeAdmissionWriter(): WakeAdmissionWriter {
 
     async insertNewDeferredWake(scope, input) {
       const tx = requireAdmissionTx(scope, input.companyId);
-      await tx.insert(agentWakeupRequests).values({
-        ...input.durableReceipt,
-        companyId: input.companyId,
-        agentId: input.agentId,
-        source: input.source,
-        triggerDetail: input.triggerDetail,
-        reason: "issue_execution_deferred",
-        payload: input.payload,
-        status: DEFERRED_WAKE_STATUS,
-        requestedByActorType: input.requestedByActorType,
-        requestedByActorId: input.requestedByActorId,
-        idempotencyKey: input.idempotencyKey,
+      const row = await tx
+        .insert(agentWakeupRequests)
+        .values({
+          ...input.durableReceipt,
+          companyId: input.companyId,
+          agentId: input.agentId,
+          source: input.source,
+          triggerDetail: input.triggerDetail,
+          reason: "issue_execution_deferred",
+          payload: input.payload,
+          status: DEFERRED_WAKE_STATUS,
+          requestedByActorType: input.requestedByActorType,
+          requestedByActorId: input.requestedByActorId,
+          idempotencyKey: input.idempotencyKey,
+        })
+        .returning({ id: agentWakeupRequests.id })
+        .then((rows) => rows[0]);
+      if (!row) throw new Error("wake-queue: deferred wake insert returned no row");
+      return row.id;
+    },
+  };
+}
+
+/**
+ * The release drain reads a finishing run for several of its guards. A drain
+ * with no run to release supplies this zero-row stand-in so those reads stay
+ * inert instead of being re-derived: the SPA-8655 former-assignee rules key off
+ * `run.status`/`run.errorCode` (a cancelled reassignment run), the delegated
+ * mention check off a status plus a reason, and `promoteDeferredWake`'s
+ * responsible-user lookup off `run.responsibleUserId`. A `released` status with
+ * a null error code and no context makes every one of them read as "no
+ * finishing run", which is exactly the truth.
+ */
+function syntheticReleaseRun(issue: IssueRow): RunSnapshot {
+  return {
+    id: issue.id,
+    companyId: issue.companyId,
+    agentId: issue.assigneeAgentId ?? "",
+    status: "released",
+    runtimeMode: null,
+    errorCode: null,
+    responsibleUserId: null,
+    contextSnapshot: {},
+    configurationIncompletePayload: null,
+  };
+}
+
+export function createDeferredWakeQueueDrainAdapter(
+  db: Db,
+  deps: WakeQueuePostgresAdapterDeps,
+): DeferredWakeQueueDrainWriter {
+  return {
+    /**
+     * Promote one named deferred wake under the issue's own row lock, with no
+     * finishing run to release. The claim inside the drain is the same
+     * compare-and-set the release path uses, so two concurrent drains of the
+     * same wake cannot both produce a run, and `finalizePromotedWake` re-guards
+     * the null lock column and the current assignee at write time.
+     */
+    async drainDeferredWakeQueue(input) {
+      return db.transaction(async (rawTx) => {
+        const tx = rawTx as unknown as Db;
+        await tx
+          .select({ id: issues.id })
+          .from(issues)
+          .where(and(eq(issues.id, input.issueId), eq(issues.companyId, input.companyId)))
+          .for("update");
+
+        const [issueRow] = await tx
+          .select()
+          .from(issues)
+          .where(and(eq(issues.id, input.issueId), eq(issues.companyId, input.companyId)))
+          .limit(1);
+
+        // A missing issue, a reassigned card, a terminal card, a live
+        // execution owner, or a genuine recovery blocker all decline here. The
+        // claim below is taken under this same row lock, so nothing observed
+        // here can be overtaken before the promotion commits.
+        if (
+          !issueRow ||
+          issueRow.assigneeAgentId !== input.wakeAgentId ||
+          ["done", "cancelled"].includes(issueRow.status) ||
+          issueRow.executionRunId !== null
+        ) {
+          return { outcome: { kind: "not_promoted" as const }, postCommitEffects: [] };
+        }
+
+        if (await getExecutionBlocker(tx, input.companyId, input.issueId)) {
+          return { outcome: { kind: "not_promoted" as const }, postCommitEffects: [] };
+        }
+
+        const [wake] = await tx
+          .select({ id: agentWakeupRequests.id })
+          .from(agentWakeupRequests)
+          .where(
+            and(
+              eq(agentWakeupRequests.id, input.wakeId),
+              eq(agentWakeupRequests.companyId, input.companyId),
+              eq(agentWakeupRequests.agentId, input.wakeAgentId),
+              eq(agentWakeupRequests.status, DEFERRED_WAKE_STATUS),
+              sql`${agentWakeupRequests.payload} ->> 'issueId' = ${input.issueId}`,
+            ),
+          )
+          .limit(1);
+        if (!wake) {
+          return { outcome: { kind: "not_promoted" as const }, postCommitEffects: [] };
+        }
+
+        const result = await drainSingleDeferredWake(
+          { primaryIssue: toIssueSnapshot(issueRow), run: syntheticReleaseRun(issueRow) },
+          { host: buildHost(tx, deps), transaction: buildTransaction(tx, deps, db, syntheticReleaseRun(issueRow)) },
+          input.wakeId,
+          input.now,
+        );
+        return result;
       });
     },
   };

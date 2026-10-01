@@ -232,6 +232,12 @@ import {
   resolvePaperclipRunnerNativeProviderInput,
 } from "./native-runtime/provider-profile.js";
 import {
+  reclaimTerminalEnvironmentLeases as reclaimTerminalEnvironmentLeasesImpl,
+  reclaimTerminalEnvironmentLeasesForRestart as reclaimTerminalEnvironmentLeasesForRestartImpl,
+  installDriverTeardown,
+  installReplacementDispatcher,
+} from "./terminal-environment-leases.js";
+import {
   buildNativeHeartbeatPreparationSpans,
   buildNativeWakeIngressSpan,
   recordFailedSkillPreparation,
@@ -382,7 +388,12 @@ import {
   readManagedWorktreeInstanceOwnership,
   WORKTREE_INSTANCE_ROOT_METADATA_KEY,
 } from "./workspace-instance-cleanup.js";
-import { issueService } from "./issues.js";
+import { issueService, TERMINAL_HEARTBEAT_RUN_STATUSES } from "./issues.js";
+import {
+  DEFERRED_WAKE_BACKSTOP_CANDIDATE_LIMIT,
+  decideDeferredWakeBackstop,
+  readDeferredWakeBlockingReference,
+} from "./deferred-wake-backstop.js";
 import {
   blockRunnerGoalRecovery,
   failRunnerGoalAction,
@@ -9772,6 +9783,71 @@ export function heartbeatService(
     environmentRuntime,
   });
   const workspaceOperationsSvc = workspaceOperationService(db);
+
+  // SPA-9423: install the lease-subsystem teardown + bounded-replacement
+  // dispatcher so the helper module can drive the existing orchestrator and
+  // scheduler without inverting the dependency. The teardown delegates to
+  // `envOrchestrator.releaseForRun` (the same path every terminal transition
+  // uses) so the native-ownership safeguard in `releaseEnvironmentLeasesForRun`
+  // continues to be the canonical guard on the other side of the wire.
+  installDriverTeardown(async ({ heartbeatRunId, companyId, leaseId }) => {
+    const targetRunId = heartbeatRunId ?? "";
+    if (!targetRunId) {
+      throw new Error(
+        `terminal lease teardown: missing heartbeatRunId for lease ${leaseId}`,
+      );
+    }
+    const run = await getRun(targetRunId);
+    if (!run) {
+      throw new Error(
+        `terminal lease teardown: run ${targetRunId} not found for lease ${leaseId}`,
+      );
+    }
+    // SPA-9423 D3 fix: route through `envOrchestrator.releaseForRun` directly
+    // (not `releaseEnvironmentLeasesForRun`) so per-lease errors surface. The
+    // orchestrator's releaseForRun returns `{ released: [], errors: [] }`; an
+    // empty released set with non-empty errors means the runtime select found
+    // zero rows (lease no longer active) OR every driver's teardown threw. We
+    // throw in either case so the sweep's catch handler stamps cleanupStatus =
+    // failed and the lease stays active for the next sweep tick. The
+    // `isNativeRunnerOwnershipHeld` guard still fires on the live-release path
+    // (called from the four existing terminal-transition sites in heartbeat.ts);
+    // it does NOT need to fire here because the sweep's resolveReclamationOwnerState
+    // already excludes native-owned runs from the candidate set.
+    const release = await envOrchestrator.releaseForRun({
+      heartbeatRunId: targetRunId,
+      companyId,
+      agentId: run.agentId,
+      status: leaseReleaseStatusForRunStatus(run.status),
+      failureReason: run.error ?? undefined,
+    });
+    if (release.released.length === 0) {
+      throw new Error(
+        `terminal lease teardown: runtime released zero leases for run ${targetRunId} (lease ${leaseId})`,
+      );
+    }
+    if (release.errors.length > 0) {
+      const errorMessages = release.errors
+        .map((e) =>
+          e.error instanceof Error ? e.error.message : String(e.error),
+        )
+        .join("; ");
+      throw new Error(
+        `terminal lease teardown: ${release.errors.length} per-lease error(s) for run ${targetRunId}: ${errorMessages}`,
+      );
+    }
+  });
+
+  installReplacementDispatcher(async ({ fromRunId }) => {
+    const run = await getRun(fromRunId);
+    if (!run) return { replacementRunId: null };
+    const agent = await getAgent(run.agentId);
+    if (!agent) return { replacementRunId: null };
+    const replacement = await enqueueProcessLossRetry(run, agent, new Date());
+    return replacement
+      ? { replacementRunId: replacement.id }
+      : { replacementRunId: null };
+  });
   const liveRunExecutions = {
     has(id: string) {
       return runningProcesses.has(id) || activeRunExecutions.has(id);
@@ -19023,6 +19099,33 @@ export function heartbeatService(
     void cleanup.finally(() => activeRunExecutionPromises.delete(cleanup));
   }
 
+  // SPA-9423: terminal-environment-lease reclamation. The helper module owns
+  // the cross-company / ownership-changed / live-owner guards and the driver-
+  // failure isolation; this wrapper only calls it and exposes the outcome.
+  async function reclaimTerminalEnvironmentLeases(opts?: {
+    batchSize?: number;
+  }) {
+    return await reclaimTerminalEnvironmentLeasesImpl({
+      db,
+      batchSize: opts?.batchSize ?? 100,
+    });
+  }
+
+  async function reclaimTerminalEnvironmentLeasesForRestart(opts?: {
+    batchSize?: number;
+    onLeaseReleased?: (event: { runId: string; reason: "restart_reconciliation" }) => void;
+    onReplacementDispatched?: (event: { fromRunId: string; runId: string }) => void;
+  }) {
+    return await reclaimTerminalEnvironmentLeasesForRestartImpl({
+      db,
+      batchSize: opts?.batchSize ?? 100,
+      ...(opts?.onLeaseReleased ? { onLeaseReleased: opts.onLeaseReleased } : {}),
+      ...(opts?.onReplacementDispatched
+        ? { onReplacementDispatched: opts.onReplacementDispatched }
+        : {}),
+    });
+  }
+
   async function reapOrphanedRuns(opts?: { staleThresholdMs?: number }) {
     const staleThresholdMs = opts?.staleThresholdMs ?? 0;
     const now = new Date();
@@ -19658,6 +19761,212 @@ export function heartbeatService(
     for (const agentId of agentIds) {
       await startNextQueuedRunForAgent(agentId);
     }
+  }
+
+  /**
+   * SPA-9351: backstop for deferred wakes whose blocking run has already ended.
+   *
+   * Promotion is otherwise purely event-driven (the run-end release drains the
+   * queue), so a row that was already stale when that release shipped is never
+   * promoted. The pre-existing re-drives above are filtered to comment-queue
+   * wakes and resolve the blocker as the *wake agent's* latest run — which is
+   * exactly how SPA-9280 slipped through: its wake addresses the reassigned
+   * assignee, who has no run on the card, so the lookup finds nothing and the
+   * sweep skips it on every tick forever.
+   *
+   * This resolves the blocker from the wake's own recorded reference
+   * (`payload.interruptedRunId`), promotes through the same release admission
+   * so pause holds, leases and invokability still apply, and never displaces a
+   * newer live execution owner.
+   */
+  async function reconcileStaleDeferredWakes() {
+    const result = {
+      checked: 0,
+      promoted: 0,
+      suppressed: 0,
+      candidateLimitSkipped: 0,
+      wakeIds: [] as string[],
+    };
+
+    const candidates = await db
+      .select({ wake: agentWakeupRequests, companyStatus: companies.status })
+      .from(agentWakeupRequests)
+      .innerJoin(
+        issues,
+        and(
+          eq(issues.companyId, agentWakeupRequests.companyId),
+          sql`${issues.id}::text = ${agentWakeupRequests.payload}->>'issueId'`,
+        ),
+      )
+      .innerJoin(companies, eq(companies.id, issues.companyId))
+      .where(
+        and(
+          eq(agentWakeupRequests.status, "deferred_issue_execution"),
+          isNull(agentWakeupRequests.finishedAt),
+        ),
+      )
+      .orderBy(asc(agentWakeupRequests.requestedAt))
+      .limit(DEFERRED_WAKE_BACKSTOP_CANDIDATE_LIMIT);
+
+    for (const { wake, companyStatus } of candidates) {
+      result.checked += 1;
+      const issueId = readNonEmptyString(wake.payload?.issueId);
+      if (!issueId) {
+        result.suppressed += 1;
+        continue;
+      }
+      const reference = readDeferredWakeBlockingReference(wake.payload);
+
+      // Resolve the blocking run from the WAKE's reference, never from the
+      // wake agent's run history: after a reassignment the addressee may have
+      // no run on this card at all, which is the bug being fixed.
+      let blockingRunId: string | null = null;
+      let blockingRunStatus: string | null = null;
+      let blockingRunRow: typeof heartbeatRuns.$inferSelect | null = null;
+      let recoveryActionRunStatus: string | null = null;
+      let referenceUnresolvable = false;
+
+      if (reference.kind === "run") {
+        const [row] = await db
+          .select()
+          .from(heartbeatRuns)
+          .where(
+            and(
+              eq(heartbeatRuns.companyId, wake.companyId),
+              eq(heartbeatRuns.id, reference.runId),
+            ),
+          )
+          .limit(1);
+        if (row) {
+          blockingRunId = row.id;
+          blockingRunStatus = row.status;
+          blockingRunRow = row;
+        } else {
+          referenceUnresolvable = true;
+        }
+      } else if (reference.kind === "recovery_action") {
+        const [action] = await db
+          .select({ evidence: issueRecoveryActions.evidence })
+          .from(issueRecoveryActions)
+          .where(
+            and(
+              eq(issueRecoveryActions.companyId, wake.companyId),
+              eq(issueRecoveryActions.id, reference.recoveryActionId),
+            ),
+          )
+          .limit(1);
+        const evidenceRunId = readNonEmptyString(
+          (parseObject(action?.evidence).runId as string | undefined) ??
+            (parseObject(action?.evidence).sourceRunId as string | undefined),
+        );
+          if (action && evidenceRunId) {
+            const [row] = await db
+              .select()
+              .from(heartbeatRuns)
+              .where(
+                and(
+                  eq(heartbeatRuns.companyId, wake.companyId),
+                  eq(heartbeatRuns.id, evidenceRunId),
+                ),
+              )
+              .limit(1);
+          if (row) {
+            blockingRunId = row.id;
+            recoveryActionRunStatus = row.status;
+            blockingRunRow = row;
+          } else {
+            referenceUnresolvable = true;
+          }
+        } else {
+          referenceUnresolvable = true;
+        }
+      }
+
+      const [issue] = await db
+        .select({
+          status: issues.status,
+          assigneeAgentId: issues.assigneeAgentId,
+          executionRunId: issues.executionRunId,
+        })
+        .from(issues)
+        .where(eq(issues.id, issueId))
+        .limit(1);
+
+      // The actionless path has no run to join, so its one remaining proof is
+      // whether a genuine recovery action or retained execution lease holds the
+      // issue right now. The drain re-checks this under the issue lock too.
+      const currentRecoveryBlockerActive =
+        reference.kind === "actionless_recovery"
+          ? (await getExecutionBlocker(db, wake.companyId, issueId)) !== null
+          : false;
+
+      const decision = decideDeferredWakeBackstop({
+        wakeStatus: wake.status,
+        blockingReference: reference,
+        blockingRunStatus,
+        recoveryActionRunStatus,
+        issueExecutionRunId: issue?.executionRunId ?? null,
+        blockingRunStillHoldsLock:
+          issue?.executionRunId != null && issue.executionRunId === blockingRunId,
+        issueStatus: issue?.status ?? "",
+        wakeAgentIsAssignee: issue?.assigneeAgentId === wake.agentId,
+        wakeCompanyIsActive: companyStatus === "active",
+        referenceUnresolvable,
+        currentRecoveryBlockerActive,
+      });
+
+      if (decision.kind === "suppressed") {
+        result.suppressed += 1;
+        continue;
+      }
+
+      // An actionless wait has no finishing run to release, so it drains the
+      // queue directly under the issue lock instead. Both routes keep every
+      // guard and both read success back off the wake row, because a bare
+      // status flip would leave the wake in `queued` with nothing dispatching.
+      let released = false;
+      if (decision.blockingRunId === null) {
+        released = await reconcileDeferredWakeAfterDeferral(wake.id).catch((err) => {
+          logger.warn({ err, wakeId: wake.id }, "deferred-wake backstop failed to promote an actionless wait");
+          return false;
+        });
+      } else if (blockingRunRow) {
+        await releaseIssueExecutionAndPromote(blockingRunRow, {
+          suppressImmediateRecovery: true,
+        }).catch((err) => {
+          logger.warn(
+            { err, wakeId: wake.id, runId: decision.blockingRunId },
+            "deferred-wake backstop failed to promote",
+          );
+        });
+        const [after] = await db
+          .select({ status: agentWakeupRequests.status, runId: agentWakeupRequests.runId })
+          .from(agentWakeupRequests)
+          .where(
+            and(
+              eq(agentWakeupRequests.id, wake.id),
+              eq(agentWakeupRequests.companyId, wake.companyId),
+            ),
+          )
+          .limit(1);
+        released = (after?.status === "queued" || after?.status === "claimed") && Boolean(after.runId);
+      }
+
+      if (released) {
+        result.promoted += 1;
+        result.wakeIds.push(wake.id);
+      } else {
+        result.suppressed += 1;
+      }
+    }
+
+    if (result.promoted > 0) {
+      logger.warn(
+        { ...result, wakeIds: undefined },
+        "deferred-wake backstop promoted wakes whose blocking run had already ended (SPA-9351)",
+      );
+    }
+    return result;
   }
 
   async function recoverActiveSessionGoals() {
@@ -26609,6 +26918,57 @@ export function heartbeatService(
     }
   }
 
+  /**
+   * SPA-9351 shape 3: re-admit one deferred wake after its deferral committed.
+   *
+   * Admission reads the issue's live holder before it writes the deferred row,
+   * so a run that ends between that read and the commit leaves the row with no
+   * run-end event left to wait for. This re-drives that exact wake id through
+   * the wake-queue drain under the issue's own row lock, which re-applies the
+   * live-owner, assignee, terminal-card, recovery-blocker, pause-hold, and
+   * invokability guards, and claims the row with the same compare-and-set the
+   * release path uses — so a concurrent sweep and this call cannot both
+   * dispatch it. It never synthesizes a finishing run and never clears a lock
+   * a live run still holds.
+   */
+  async function reconcileDeferredWakeAfterDeferral(wakeId: string): Promise<boolean> {
+    const [wake] = await db
+      .select({
+        id: agentWakeupRequests.id,
+        companyId: agentWakeupRequests.companyId,
+        agentId: agentWakeupRequests.agentId,
+        status: agentWakeupRequests.status,
+        issueId: sql`${agentWakeupRequests.payload}->>'issueId'`,
+      })
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.id, wakeId))
+      .limit(1);
+    const issueId = readNonEmptyString(wake?.issueId);
+    if (!wake || wake.status !== "deferred_issue_execution" || !issueId) return false;
+
+    const { outcome, postCommitEffects } = await wakeQueue
+      .drainDeferredWakeQueue({
+        companyId: wake.companyId,
+        issueId,
+        wakeAgentId: wake.agentId,
+        wakeId: wake.id,
+        now: new Date(),
+      })
+      .catch((err) => {
+        logger.warn({ err, wakeId }, "deferred-wake post-deferral re-admission failed");
+        return { outcome: { kind: "not_promoted" as const }, postCommitEffects: [] };
+      });
+    await applyWakeQueuePostCommitEffects(postCommitEffects);
+    if (outcome.kind !== "promoted") return false;
+
+    const [after] = await db
+      .select({ status: agentWakeupRequests.status, runId: agentWakeupRequests.runId })
+      .from(agentWakeupRequests)
+      .where(and(eq(agentWakeupRequests.id, wakeId), eq(agentWakeupRequests.companyId, wake.companyId)))
+      .limit(1);
+    return (after?.status === "queued" || after?.status === "claimed") && Boolean(after.runId);
+  }
+
   async function releaseIssueExecutionAndPromote(
     run: Pick<typeof heartbeatRuns.$inferSelect, "id" | "companyId">,
     options: { suppressImmediateRecovery?: boolean } = {},
@@ -27174,6 +27534,11 @@ export function heartbeatService(
       const agentNameKey = normalizeAgentNameKey(agent.name);
 
       const cancelledRunsToEmit: (typeof heartbeatRuns.$inferSelect)[] = [];
+      // Deferred rows this admission established. The live holder that forced
+      // the deferral can end before this transaction commits, and then no
+      // run-end event exists to promote the row, so each one is re-driven once
+      // after the commit.
+      const deferredWakeIdsForFreshAdmission: string[] = [];
 
       const outcome = await db
         .transaction(async (tx) => {
@@ -28271,6 +28636,9 @@ export function heartbeatService(
               };
             }
             if (admission.kind === "deferred") {
+              if (admission.deferredWakeId) {
+                deferredWakeIdsForFreshAdmission.push(admission.deferredWakeId);
+              }
               return { kind: "deferred" as const };
             }
             // admission.kind === "proceed": no active run absorbed this wake,
@@ -28648,6 +29016,18 @@ export function heartbeatService(
           });
           await applyWakeQueuePostCommitEffects(postCommitEffects);
         }
+      }
+
+      // SPA-9351 shape 3. The deferral decision above read the live holder
+      // before this row committed; a holder that ended in between leaves the row
+      // with no run-end event left to wait for, which is the whole stranding.
+      // Re-drive it now, after the commit, through the guarded drain. It is
+      // error-isolated: a failure here must never change this wake's outcome,
+      // and the startup and periodic sweeps remain the durable backstop.
+      for (const deferredWakeId of new Set(deferredWakeIdsForFreshAdmission)) {
+        await reconcileDeferredWakeAfterDeferral(deferredWakeId).catch((err) => {
+          logger.warn({ err, wakeId: deferredWakeId }, "post-deferral re-admission failed");
+        });
       }
 
       if (outcome.kind === "durable") {
@@ -30083,6 +30463,8 @@ export function heartbeatService(
     recoverNativeRunsAfterRestart,
     reapOrphanedRuns,
     sweepPendingCleanupLeases,
+    reclaimTerminalEnvironmentLeases,
+    reclaimTerminalEnvironmentLeasesForRestart,
     // Override-aware scheduling-suppression check (honors the worktree
     // run-execution experimental setting). Callers outside the service that
     // gate on suppression should prefer this over the env-only resolver.
@@ -30099,6 +30481,8 @@ export function heartbeatService(
     retryScheduledRetryNow,
 
     resumeQueuedRuns,
+    reconcileStaleDeferredWakes,
+    reconcileDeferredWakeAfterDeferral,
 
     scheduleBoundedRetry: async (
       runId: string,
