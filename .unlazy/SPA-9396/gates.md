@@ -1,5 +1,26 @@
 # SPA-9396 gates — incomplete WIP, 2026-09-30
 
+## Import parent fence and delete negative — 2026-10-01 — HOLD
+
+The delete fixture now supplies the legacy outer `db.delete` and `db.select` paths. Temporarily replaying that pre-fix function against the same test exited 1 at the intended parent/child lock assertion (`expected [issue-lock, child-lock], received []`), not a missing mock. The production function was restored byte-for-byte. Import work products now locks all distinct parent issue rows in sorted-ID batches under the same transaction before any insert, checks company identity and refuses a missing parent. This does not prove route-level PostgreSQL concurrency or cover low-trust promotion.
+
+  CHECK: PATH="$HOME/.cargo/bin:$PATH" timeout 240 pnpm exec vitest run server/src/__tests__/work-products.test.ts --reporter=dot
+  EXPECT: Tests 8 passed (8)
+  RESULT: exit 0, Test Files 1 passed (1), Tests 8 passed (8), Duration 12.03s. Pre-import-fix same CHECK exit 1 (2 failed / 6 passed): expected issue-lock before insert but only insert observed; missing-parent refusal threw at insert instead. Delete pre-fix arm exit 1 at the lock assertion, 1 failed / 5 passed (before import tests were added).
+  NEGATIVE: pre-fix import function with test oracle present, same command, exit 1 at issue-lock assertion (received [insert]) and missing-parent refusal assertion; pre-fix delete function with both legacy DB methods modeled, same command exit 1 at expected lock-order assertion (received []). Production delete code restored after the isolated arm.
+
+  CHECK: PATH="$HOME/.cargo/bin:$PATH" timeout 900 pnpm --filter @paperclipai/shared --filter @paperclipai/server typecheck
+  EXPECT: server typecheck: Done
+  RESULT: exit 0; shared Done; server Done (pre-existing Rust unused warnings).
+  NEGATIVE: not run; typecheck is not a behavior assertion.
+
+  CHECK: git diff --check
+  EXPECT: exit 0
+  RESULT: exit 0, empty output before this ledger edit.
+  NEGATIVE: not run; no whitespace fixture.
+
+Still missing: actual two-connection approval-route concurrency, low-trust promotion writer fence, stalled durable decision, changed-head fresh review, contract sync, independent final-head verification, PR/merge/rollout and Sable decision. UNSAFE TO SHIP.
+
 ## Existing work-product update/remove fence — 2026-10-01 — HOLD
 
 The update and remove services now locate the child without locking it, lock its company-scoped parent issue, then lock and re-read the child under the same transaction; missing or changed identity refuses. An update patch cannot move the child to another issue/company. This is a modeled acquisition-order correction, not PostgreSQL route concurrency proof. Import and low-trust promotion remain open.
