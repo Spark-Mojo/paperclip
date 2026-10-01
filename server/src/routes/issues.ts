@@ -11075,6 +11075,11 @@ export function issueRoutes(
         promotedAt,
       });
       const product = await db.transaction(async (tx) => {
+        const [lockedIssue] = await tx.select({ id: issueRows.id }).from(issueRows).where(and(
+          eq(issueRows.id, issue.id),
+          eq(issueRows.companyId, issue.companyId),
+        )).for("update");
+        if (!lockedIssue) return null;
         const markPromoted = {
           sourceTrust: promotionTrust,
           updatedAt: promotedAt,
