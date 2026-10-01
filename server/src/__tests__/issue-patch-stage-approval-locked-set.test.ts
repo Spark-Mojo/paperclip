@@ -51,39 +51,45 @@ const mockAccessService = vi.hoisted(() => ({
 }));
 
 const mockDbSelectWhere = vi.hoisted(() =>
-  vi.fn(() => ({
-    for: () => ({
+  vi.fn((table?: unknown) => {
+    const chain = (rows: unknown[]) => ({
+      for: () => ({
+        then: (
+          onFulfilled: (rows: unknown[]) => unknown,
+          onRejected?: (reason: unknown) => unknown,
+        ) => Promise.resolve(rows).then(onFulfilled, onRejected),
+      }),
+      orderBy: () => ({
+        for: (strength: string) => {
+          lockedBindingTables.push(
+            `${(table as Record<symbol, string>)[Symbol.for("drizzle:Name")]}:${strength}`,
+          );
+          return { then: (on: (rows: unknown[]) => unknown) => on([]) };
+        },
+      }),
       then: (
         onFulfilled: (rows: unknown[]) => unknown,
         onRejected?: (reason: unknown) => unknown,
-      ) =>
-        Promise.resolve([
-          {
-            id: "55555555-5555-4555-8555-555555555555",
-            companyId: "company-1",
-            agentId: "33333333-3333-4333-8333-333333333333",
-            contextSnapshot: { issueId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa" },
-            permissions: null,
-          },
-        ]).then(onFulfilled, onRejected),
-    }),
-    then: (
-      onFulfilled: (rows: unknown[]) => unknown,
-      onRejected?: (reason: unknown) => unknown,
-    ) =>
-      Promise.resolve([
-        {
-          id: "55555555-5555-4555-8555-555555555555",
-          companyId: "company-1",
-          agentId: "33333333-3333-4333-8333-333333333333",
-          contextSnapshot: { issueId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa" },
-          permissions: null,
-        },
-      ]).then(onFulfilled, onRejected),
-  })),
+      ) => Promise.resolve(rows).then(onFulfilled, onRejected),
+    });
+    return chain([
+      {
+        id: "55555555-5555-4555-8555-555555555555",
+        companyId: "company-1",
+        agentId: "33333333-3333-4333-8333-333333333333",
+        contextSnapshot: { issueId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa" },
+        permissions: null,
+      },
+    ]);
+  }),
 );
-const mockDbSelectFrom = vi.hoisted(() => vi.fn(() => ({ where: mockDbSelectWhere })));
+const mockDbSelectFrom = vi.hoisted(() =>
+  vi.fn((table?: unknown) => ({ where: (predicate: unknown) => mockDbSelectWhere(table, predicate) })),
+);
 const mockDbSelect = vi.hoisted(() => vi.fn(() => ({ from: mockDbSelectFrom })));
+
+/** The binding tables the production lock helper actually locked, in order. */
+const lockedBindingTables = vi.hoisted(() => [] as string[]);
 
 /** The transaction handle, with the row/binding selects the guard must run on it. */
 const mockTx = vi.hoisted(() => {
@@ -358,9 +364,9 @@ describe("PATCH stage approval — canonical PR set rechecked under the lock", (
     });
     mockTx.select.mockImplementation(() => ({ from: mockDbSelectFrom }));
     mockDbSelect.mockImplementation(() => ({ from: mockDbSelectFrom }));
-    mockDbSelectFrom.mockImplementation(() => ({ where: mockDbSelectWhere }));
     mockAccessService.canUser.mockResolvedValue(true);
     mockAccessService.hasPermission.mockResolvedValue(false);
+    lockedBindingTables.length = 0;
     mockAccessService.decide.mockImplementation(async () => ({
       allowed: true,
       reason: "allow_explicit_grant",
@@ -521,6 +527,13 @@ describe("PATCH stage approval — canonical PR set rechecked under the lock", (
     expect(res.status, JSON.stringify(res.body)).toBe(200);
     // The recheck ran on the transaction handle, not the outer connection.
     expect(mockIssueDoneGateService.handles).toContain(mockTx);
+    // SPA-9396: the binding rows are locked on the SAME transaction, after the
+    // issue row. Locking only the issue row leaves work-product and comment
+    // UPDATEs free to rebind the set under the approval.
+    expect(lockedBindingTables).toEqual([
+      "issue_work_products:update",
+      "issue_comments:update",
+    ]);
     expect(mockIssueService.update).toHaveBeenCalledTimes(1);
     expect(insertedDecisionRows).toHaveLength(1);
     expect(insertedDecisionRows[0]!.row).toMatchObject({ stageId, outcome: "approved" });

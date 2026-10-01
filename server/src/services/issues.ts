@@ -12189,6 +12189,23 @@ export function issueService(db: Db) {
       };
 
       return db.transaction(async (tx) => {
+        // The issue row is the parent fence, taken BEFORE the comment row so the
+        // lock order stays parent-first everywhere a comment and its issue are
+        // both written. A premerge stage approval holds the issue row and then
+        // locks the binding rows; taking the comment first here would invert
+        // that pair into a 40P01 deadlock under concurrency.
+        const [target] = await tx
+          .select({ issueId: issueComments.issueId })
+          .from(issueComments)
+          .where(eq(issueComments.id, commentId))
+          .limit(1);
+        if (!target) return null;
+        await tx
+          .select({ id: issues.id })
+          .from(issues)
+          .where(eq(issues.id, target.issueId))
+          .for("update");
+
         const [comment] = await tx
           .delete(issueComments)
           .where(eq(issueComments.id, commentId))
@@ -12223,6 +12240,21 @@ export function issueService(db: Db) {
 
       return db.transaction(async (tx) => {
         const now = new Date();
+        // Same parent-first order as `removeComment`: resolve the parent issue
+        // and lock it before the comment row, so a concurrent premerge
+        // approval cannot hold the issue row while waiting on this comment.
+        const [target] = await tx
+          .select({ issueId: issueComments.issueId })
+          .from(issueComments)
+          .where(eq(issueComments.id, commentId))
+          .limit(1);
+        if (!target) return null;
+        await tx
+          .select({ id: issues.id })
+          .from(issues)
+          .where(eq(issues.id, target.issueId))
+          .for("update");
+
         const [comment] = await tx
           .update(issueComments)
           .set({

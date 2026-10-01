@@ -303,6 +303,7 @@ import {
 import {
   issueExecutionPolicyFingerprint,
   issueStageApprovalService,
+  lockStageApprovalBindingRows,
   reviewerChanged,
   STAGE_APPROVAL_INCOMPLETE_SET_CODE,
   STAGE_APPROVAL_POLICY_CHANGED_CODE,
@@ -13809,6 +13810,10 @@ export function issueRoutes(
             code: STAGE_APPROVAL_REVIEWER_CHANGED_CODE,
           });
         }
+        await lockStageApprovalBindingRows(tx as unknown as Db, {
+          id: lockedIssue.id,
+          companyId: lockedIssue.companyId,
+        });
         const lockedApprovalSvc = issueStageApprovalService(db, { tx: tx as unknown as Db });
         await lockedApprovalSvc.verifyReviewedPullRequests({
           issue: {
@@ -17992,6 +17997,10 @@ export function issueRoutes(
                   currentPolicyFingerprint: lockedPolicyFingerprint,
                 });
               }
+              await lockStageApprovalBindingRows(tx as unknown as typeof db, {
+                id: lockedIssue.id,
+                companyId: lockedIssue.companyId,
+              });
               const lockedBoundSet = (
                 await issueStageApprovalService(db, { tx: tx as unknown as typeof db }).readBound({
                   id: lockedIssue.id,
