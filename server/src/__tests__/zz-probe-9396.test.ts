@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { eq } from "drizzle-orm";
 import { describe, expect, it } from "vitest";
+import { lockStageApprovalBindingRows } from "../services/issue-stage-approvals.js";
 import {
   agents,
   companies,
@@ -112,10 +113,8 @@ describeEmbeddedPostgres("approval binding writer lock discipline", () => {
 
     const lockIssueRow = (tx: any) =>
       tx.select().from(issues).where(eq(issues.id, card.id)).for("update");
-    const lockBindingRows = async (tx: any) => {
-      await tx.select().from(issueWorkProducts).where(eq(issueWorkProducts.issueId, card.id)).for("update");
-      await tx.select().from(issueComments).where(eq(issueComments.issueId, card.id)).for("update");
-    };
+    const lockBindingRows = (tx: Parameters<typeof lockStageApprovalBindingRows>[0]) =>
+      lockStageApprovalBindingRows(tx, { id: card.id, companyId: company.id });
 
     const insertWorkProduct = () =>
       other
