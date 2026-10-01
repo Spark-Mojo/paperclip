@@ -1,5 +1,21 @@
 # SPA-9396 gates — incomplete WIP, 2026-09-30
 
+## Low-trust promotion parent fence — 2026-10-01 — HOLD
+
+The promotion transaction now locks the company-scoped issue row before updating its source artifact or inserting its work product. This is a narrow parent-first fence; the existing source-trust equality predicate remains the post-lock compare-and-swap. It does not prove a second connection waits on this route, or rule out every writer inversion. Advisor recommended retaining this order and requiring a route-level PostgreSQL oracle before safety claims.
+
+  CHECK: PATH="$HOME/.cargo/bin:$PATH" timeout 300 pnpm exec vitest run server/src/__tests__/low-trust-red-team-routes.test.ts -t 'keeps board positive controls for issue-linked approvals and sanitized promotion' --reporter=dot
+  EXPECT: Tests  1 passed
+  RESULT: exit 0, Test Files 1 passed (1), Tests 1 passed | 10 skipped (11), Duration 29.13s.
+  NEGATIVE: not run; this existing success test does not assert the issue lock. The fence is unproven by a behavior-specific negative.
+
+  CHECK: PATH="$HOME/.cargo/bin:$PATH" timeout 900 pnpm --filter @paperclipai/shared --filter @paperclipai/server typecheck
+  EXPECT: server typecheck: Done
+  RESULT: exit 0; shared typecheck Done, server typecheck Done, pre-existing Rust warnings.
+  NEGATIVE: not run; typecheck is not a behavior assertion.
+
+Still missing: production-route two-connection concurrency oracle and failing control; comprehensive lock-order review; stalled durable decision; changed-head review; contract sync; independent final-head verification, PR/merge/rollout and Sable decision. UNSAFE TO SHIP.
+
 ## Import parent fence and delete negative — 2026-10-01 — HOLD
 
 The delete fixture now supplies the legacy outer `db.delete` and `db.select` paths. Temporarily replaying that pre-fix function against the same test exited 1 at the intended parent/child lock assertion (`expected [issue-lock, child-lock], received []`), not a missing mock. The production function was restored byte-for-byte. Import work products now locks all distinct parent issue rows in sorted-ID batches under the same transaction before any insert, checks company identity and refuses a missing parent. This does not prove route-level PostgreSQL concurrency or cover low-trust promotion.
