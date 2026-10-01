@@ -1,5 +1,26 @@
 # SPA-9396 gates — incomplete WIP, 2026-09-30
 
+## Assigned-worktree rerun and fixture repair — 2026-10-01 — HOLD
+
+Latest board handoff `52bfa1e6` preserved HEAD `5642c40937`. This run re-read the assigned checkout (clean initially, matching HEAD). Live single-resource GET of SPA-9332 now returns `status=backlog`, `executionState=null`, `blockedBy=[SPA-9396]`, and Sable remains assignee; no live 409 probe was made, no security decision recorded. The historic deadlock remains a valid engine regression target, but its old victim execution state is no longer live evidence.
+
+  CHECK: PATH="$HOME/.cargo/bin:$PATH" timeout 300 pnpm exec vitest run server/src/__tests__/issue-queued-comments-routes.test.ts --reporter=dot --silent
+  EXPECT: Tests 47 passed (47)
+  RESULT: exit 1, 18 failed / 29 passed, `deferred_issue_execution` where `coalesced` or `queued` was expected, and `heartbeat.scheduling_suppressed` where `process_running` was expected. Explicit `env -u PAPERCLIP_IN_WORKTREE` repeat produced the same 18 failures; PAPERCLIP_IN_WORKTREE, PAPERCLIP_DATABASE_RESTORE_IN_PROGRESS and PAPERCLIP_RESTORE_IN_PROGRESS are unset in this shell. The handoff's worktree-dependent finding is confirmed here, not resolved. `resolveHeartbeatSchedulingSuppression` also considers module-scoped task drain; no isolated cause proof or base replay from this run. Do not waive.
+  NEGATIVE: not proven; test suite remains red in the assigned worktree.
+
+  CHECK: timeout 240 pnpm exec vitest run server/src/__tests__/issue-comment-reopen-routes.test.ts --testTimeout=60000 --reporter=dot --silent
+  EXPECT: Tests 106 passed (106)
+  RESULT: exit 0, Tests 106 passed (106), following a fixture-only correction. Initial unmodified run: 15 failed / 91 passed, including cold-import 15s timeout. With `--testTimeout=60000`, a single failing approval test still returned 500. Temporary test-local error middleware captured `TypeError: db.select(...).from(...).where(...).orderBy(...).limit is not a function` at `issue-done-gate.ts:260`, called by `issue-stage-approvals.ts:334`; the error middleware was removed. `mockIssueService` replaces services/issues.ts in this suite, so the handoff's proposed `mockTx.select` change was tested and reverted: it did not resolve this failure. The production approval-bound reader now uses `.limit`; this suite's existing `mockDbSelectOrderBy` omitted that method. Updated its factory/default to return `{ limit: vi.fn(async () => []) }`. The targeted assertion was red at expected 200 versus 500 before the correction and green after (1 passed / 105 skipped); full suite passed with expanded cold-import timeout. The fixture models an empty bound set, not route concurrency.
+  NEGATIVE: observed targeted pre-fix exit 1 at expected HTTP 200 versus actual 500; no independent isolated mutation control after the fix.
+
+  CHECK: PATH="$HOME/.cargo/bin:$PATH" timeout 900 pnpm --filter @paperclipai/shared --filter @paperclipai/server typecheck
+  EXPECT: server typecheck: Done
+  RESULT: exit 0, shared Done and server Done; Rust runner emitted pre-existing unused-code warnings.
+  NEGATIVE: typecheck is not a behavioral assertion; no safe negative run.
+
+Still missing: queued-comments suppression cause and pinned-base same-environment comparison; route-level concurrency proof and residual binding writers; stalled durable decision; changed-head fresh-review route; contract sync; independent verification, PR, merge, rollout and Sable's decision. This branch is UNSAFE TO SHIP.
+
 ## Binding-row lock continuation — 2026-10-01 — HOLD
 
 Two bounded implementer invocations on one deliverable added an issue-first binding-row lock helper, PATCH/comment route calls, and issue-first ordering in removeComment/tombstoneComment. The first invocation added a red test scaffold; the second reported 196/196 focused tests, 3/3 comment-lock-order tests, 2/2 binding-lock tests, and shared/server typecheck. These are implementer receipts, not independent final acceptance. Adjacent comment-route suites regressed because their transaction mocks lack select; baseline and WIP A/B is incomplete. The second invocation stashed the seven changed paths; Ty popped the stash and read back exactly seven dirty paths, with no loss. This deliverable is NOT safe to ship. Residual binding writers in work-products and low-trust promotion lack issue-row locking; check route concurrency and lock-order before green.
