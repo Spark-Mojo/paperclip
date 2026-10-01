@@ -1,5 +1,26 @@
 # SPA-9396 gates — incomplete WIP, 2026-09-30
 
+## Existing work-product update/remove fence — 2026-10-01 — HOLD
+
+The update and remove services now locate the child without locking it, lock its company-scoped parent issue, then lock and re-read the child under the same transaction; missing or changed identity refuses. An update patch cannot move the child to another issue/company. This is a modeled acquisition-order correction, not PostgreSQL route concurrency proof. Import and low-trust promotion remain open.
+
+  CHECK: PATH="$HOME/.cargo/bin:$PATH" timeout 180 pnpm exec vitest run server/src/__tests__/work-products.test.ts --reporter=dot
+  EXPECT: Tests 6 passed (6)
+  RESULT: exit 0, Test Files 1 passed (1), Tests 6 passed (6), Duration 12.45s. Before update code, the promotion test exited 1 at select called once versus expected three; before remove code, delete test exited 1 with db.delete not a function rather than the intended lock assertion. Remove negative is not yet an isolated authorization control.
+  NEGATIVE: promotion assertion on pre-fix function exited 1 (expected 3 locked sequence reads, observed 1), other 4 passed. Remove negative is unproven at the behavior assertion and needs an isolated control.
+
+  CHECK: PATH="$HOME/.cargo/bin:$PATH" timeout 900 pnpm --filter @paperclipai/shared --filter @paperclipai/server typecheck
+  EXPECT: server typecheck: Done
+  RESULT: exit 0, shared Done, server Done; pre-existing Rust warnings.
+  NEGATIVE: not run; typecheck is not a behavior assertion.
+
+  CHECK: git diff --check
+  EXPECT: exit 0
+  RESULT: exit 0, empty output before ledger update.
+  NEGATIVE: no whitespace fixture run.
+
+Still missing: import and low-trust promotion writer fence, actual two-connection approval-route proof, stalled durable decision, changed-head review, contract sync, independent final-head verification, PR/merge/rollout and Sable decision. UNSAFE TO SHIP.
+
 ## Work-product writer issue-row fence — 2026-10-01 — HOLD
 
 `workProductService.createForIssue` now locks the company-scoped parent issue before changing the primary work product or inserting another product; it refuses a missing/mismatched parent. This is one bounded writer correction, not the route-level concurrency oracle. Existing product update/remove and import, low-trust promotion, and other binding writers are not covered. The Vitest worktree flag was not further investigated here: the previous ledger records the isolated environment-sensitive 47/47 arm, which is not approval safety.
