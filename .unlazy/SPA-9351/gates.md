@@ -300,3 +300,81 @@ Live fork base `refs/heads/rebuild/v2026.916.0-survivors` remains `05f3a88e16477
 SPA-8692 and SPA-9280 were deliberately left untouched. They recover
 automatically once the fix is installed on the live engine; that is a
 post-merge observation, not claimed here.
+
+## 2026-10-01 — committed, pushed, gates run on the new live base
+
+Base moved twice since the 19:51Z candidate. Live base is now
+`916919bb7cbdbdfddaac59e31bf6b2e94bcf637c` (17 commits ahead of the previous
+`05f3a88e`), read by `git fetch sparkmojo refs/heads/rebuild/v2026.916.0-survivors`.
+The 24-file candidate was re-applied onto it with `git apply --3way --index`;
+every file applied cleanly, no conflict markers, no manual merge. The original
+PR #122 branch and head `68ee39e2` were not touched.
+
+Committed `6ee7973c99c4c09b625d5ae82bad536cfd811a19` on `ty/spa9351-migrate-fix`,
+pushed to `sparkmojo`, verified byte-identical on the remote by `git ls-remote`.
+
+**Gate M POSITIVE (now provable — the candidate has a commit).**
+    CHECK: timeout 300 node .github/scripts/check-pr-migration-order.mjs 916919bb7cbdbdfddaac59e31bf6b2e94bcf637c 6ee7973c99c4c09b625d5ae82bad536cfd811a19
+    EXPECT: exit 0
+    RESULT: exit 0. `All new migrations follow packages/db/src/migrations/9282_cascade_heartbeat_run_events_fk.sql.`
+    NEGATIVE: same command with base `916919bb7c` and the pre-fix head `68ee39e2d23f951da7c85fbaa32bd5f98d191a1f`
+    NEGATIVE RESULT: exit 1, `::error title=Migration numbers must follow the target branch`, names `0283_stranded_rewake_idempotency.sql` and requires 9283. Run this heartbeat, not copied from the manager's earlier run.
+
+**Gate R1 — deferred-wake readback counts a claimed wake with a linked run.** Now PROVEN both directions.
+    CHECK: timeout 300 pnpm -C server exec vitest run src/services/deferred-wake-backstop.test.ts -t 'claimed before the backstop reads it' --disable-console-intercept --reporter=dot
+    EXPECT: exit 0
+    NEGATIVE: the same focused test after reverting only the two production predicates in `heartbeat.ts` to `after?.status === "queued"`, then re-running the identical command.
+    RESULT (positive): exit 0, 1 passed / 57 skipped.
+    NEGATIVE RESULT: exit 1, `AssertionError: expected +0 to be 1 // Object.is equality`, 1 failed / 57 skipped. The negative fixture is the production predicate, not the test, so it validates the assertion under test. Restored file verified by sha256 `c2d9c18838bcee076be7dffc82271a12356c52b637f0b40726ad0f316dd65d32` before commit.
+
+**Gate R2 — server typecheck.** Replaced the previous non-validating negative.
+    CHECK: timeout 900 pnpm -C server exec tsc --noEmit
+    EXPECT: exit 0, no diagnostics
+    RESULT: exit 0 after canonical preparation — `pnpm --filter @paperclipai/plugin-sdk ensure-build-deps` (exit 0) and `pnpm --filter @paperclipai/paperclip-runner build:typescript` (exit 0; the full `prepare:runner-vendor` cannot run, `cargo: not found`, and this limitation stands). `build:typescript` emits `packages/paperclip-runner/dist/index.d.ts`, which is the declaration the earlier runs were missing. Tree still clean after preparation: `dist/` is gitignored.
+    NEGATIVE A (typecheck genuinely rejects a TS error in a file this gate claims): append `const __spa9351_r2_negative: number = "not-a-number";` to `server/src/services/deferred-wake-backstop.ts`, re-run the identical CHECK. RESULT: exit 1, `src/services/deferred-wake-backstop.ts(208,7): error TS2322: Type 'string' is not assignable to type 'number'.` File restored, sha256 `22d31a9108c3c35bc24e87d2c9f08a945ed0a90df60bee713d22d1539e2388fa`.
+    NEGATIVE B (the gate really does require the runner declaration): move `packages/paperclip-runner/dist/index.d.ts` aside, re-run the identical CHECK. RESULT: exit 1, `src/vendor/paperclip-runner/index.ts(10,35): error TS7016: Could not find a declaration file for module '@paperclipai/paperclip-runner'.` Declaration restored.
+    BASE COMPARISON: `tsc -p server/tsconfig.json --noEmit` in a detached worktree at the live base yields the identical 255-line error set when the `server/` prefix and line:column are normalized. Without preparation both sides report the same 255 errors, so the earlier `exit 2` readings were unbuilt-dependency noise, not a candidate defect. Normalized diff exit 0.
+
+**Gate S1 — generated snapshot delta.** Positive and negative both run this heartbeat.
+    CHECK: the `node --input-type=module` comparator over `9282_snapshot.json` → `9283_snapshot.json` (restamped from the 0282/0283 pair)
+    EXPECT: `SNAPSHOT-DELTA: verified against 9282`
+    RESULT: exit 0; `ASSERTED INDEX: agent_wakeup_requests_exhausted_retry_rewake_idempotency_uq`, `ASSERTED INDEX: agent_wakeup_requests_orphaned_retry_rewake_idempotency_uq`, `UNCHANGED SCHEMA OBJECTS: exactly equal`.
+    NEGATIVE: delete one asserted index from a scratch copy of `9283_snapshot.json` and zero `id`/`prevId`, re-run the same comparator.
+    NEGATIVE RESULT: exit 1, `AssertionError [ERR_ASSERTION]: Expected values to be strictly equal: + actual - expected  actual: '00000000-0000-0000-0000-000000000000'  expected: '70d41d4f-6714-441e-afe6-16a8410a9360'`. Snapshot restored, sha256 `96b45076dbbbee402dc02c6bc9e62ae918fa0a39feafe7ccec5d39177074abb6`.
+
+**Full gate re-run on the new base, this heartbeat, all foreground.**
+
+| Gate | Command | Exit | Evidence |
+|---|---|---|---|
+| 1.1-1.3, H1-H3, Shape 4 | `pnpm -C server exec vitest run src/services/recovery/exhausted-retry-rewake.test.ts` | 0 | 83 passed; `shape4-episode-scope-isolated` emitted |
+| 2.1-2.3, Shape 3, R1 | `pnpm -C server exec vitest run src/services/deferred-wake-backstop.test.ts` | 0 | 58 passed |
+| L1-L4 | `pnpm -C server exec vitest run src/services/terminal-environment-leases.test.ts` | 0 | 4 passed |
+| H4 | `pnpm -C packages/db exec vitest run src/stranded-rewake-idempotency-migration.test.ts` | 0 | 7 passed |
+| H5 | `pnpm -C packages/db exec tsx src/check-migration-numbering.ts && ... check-migration-safety.ts` | 0 | `Migration safety check passed: 20 historical finding(s) covered by baseline (1 stale baseline id(s) ignored).` |
+| H6 | `pnpm -C server exec vitest run src/services/recovery/ src/modules/wake-queue/ src/__tests__/heartbeat-deferred-promote-on-reassignment.test.ts src/__tests__/issue-recovery-actions.test.ts src/__tests__/recovery-classifiers.test.ts src/services/deferred-wake-backstop.test.ts src/services/terminal-environment-leases.test.ts` | 0 | 496 passed / 19 files |
+| R2 | `pnpm -C server exec tsc --noEmit` | 0 | no diagnostics |
+| M | `node .github/scripts/check-pr-migration-order.mjs <base> <head>` | 0 | see above |
+| S1 | snapshot comparator | 0 | see above |
+| patch integrity | `git diff --check` and `git diff --cached --check` | 0 | no whitespace errors |
+
+**Still unproven, stated not waived.**
+
+1. **The two CI fixture-teardown races.** The `deferred-wake-backstop` suite now logs
+   `heartbeat execution setup failed: Issue not found` and `Run identity does not
+   belong to this company` after the fixture rows are deleted — post-commit dispatch
+   still outlives the test. The suite is green (58/58) but the teardown is not clean,
+   and the manager's item 5 (close the two merge-fixture teardown deadlocks) is NOT
+   done. Two prior attempts at fixing it failed: drain-before-delete hit Vitest's 30s
+   hook timeout and then FK `agent_task_sessions_last_run_id_heartbeat_runs_id_fk`
+   (17 failed); session cleanup alone left `company_skills_company_id_companies_id_fk`.
+   This is the concrete next engineering step, not a flake note.
+2. **No new-head CI.** This fork delegates `.github/workflows/pr.yml` to
+   `paperclipai/paperclip/.github/workflows/pr-trusted.yml@master`, which yields no run
+   here, so GitHub has never gated this code. Every gate above is local.
+3. **`check-no-git-push` base red** — exits 1 on `server/src/services/workspace-runtime.ts:4884`,
+   a line byte-identical on the live base; not touched by this diff.
+4. **Independent sign-off, merge, install, migration, live acceptance** — none performed.
+
+**Mergeability.** `git merge-tree --write-tree 6ee7973c9 916919bb7c` exits 0: this head
+merges clean into the live base. PR #122 remains OPEN at its own head and is NOT this
+branch; a PR from `ty/spa9351-migrate-fix` does not exist yet.
