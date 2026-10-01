@@ -95,39 +95,45 @@ const mockTx = vi.hoisted(() => {
 const insertedDecisionRows = mockTx.__inserted as unknown[];
 
 const mockDbSelectWhere = vi.hoisted(() =>
-  vi.fn(() => ({
-    for: () => ({
+  vi.fn((table?: unknown) => {
+    const rows = [
+      {
+        id: "55555555-5555-4555-8555-555555555555",
+        companyId: "company-1",
+        agentId: "33333333-3333-4333-8333-333333333333",
+        contextSnapshot: { issueId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa" },
+        permissions: null,
+      },
+    ];
+    return {
+      for: () => ({
+        then: (
+          onFulfilled: (rows: unknown[]) => unknown,
+          onRejected?: (reason: unknown) => unknown,
+        ) => Promise.resolve(rows).then(onFulfilled, onRejected),
+      }),
+      orderBy: () => ({
+        for: (strength: string) => {
+          lockedBindingTables.push(
+            `${(table as Record<symbol, string>)[Symbol.for("drizzle:Name")]}:${strength}`,
+          );
+          return { then: (on: (rows: unknown[]) => unknown) => on([]) };
+        },
+      }),
       then: (
         onFulfilled: (rows: unknown[]) => unknown,
         onRejected?: (reason: unknown) => unknown,
-      ) =>
-        Promise.resolve([
-          {
-            id: "55555555-5555-4555-8555-555555555555",
-            companyId: "company-1",
-            agentId: "33333333-3333-4333-8333-333333333333",
-            contextSnapshot: { issueId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa" },
-            permissions: null,
-          },
-        ]).then(onFulfilled, onRejected),
-    }),
-    then: (
-      onFulfilled: (rows: unknown[]) => unknown,
-      onRejected?: (reason: unknown) => unknown,
-    ) =>
-      Promise.resolve([
-        {
-          id: "55555555-5555-4555-8555-555555555555",
-          companyId: "company-1",
-          agentId: "33333333-3333-4333-8333-333333333333",
-          contextSnapshot: { issueId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa" },
-          permissions: null,
-        },
-      ]).then(onFulfilled, onRejected),
-  })),
+      ) => Promise.resolve(rows).then(onFulfilled, onRejected),
+    };
+  }),
 );
-const mockDbSelectFrom = vi.hoisted(() => vi.fn(() => ({ where: mockDbSelectWhere })));
+const mockDbSelectFrom = vi.hoisted(() =>
+  vi.fn((table?: unknown) => ({ where: () => mockDbSelectWhere(table) })),
+);
 const mockDbSelect = vi.hoisted(() => vi.fn(() => ({ from: mockDbSelectFrom })));
+
+/** The binding tables the production lock helper actually locked, in order. */
+const lockedBindingTables = vi.hoisted(() => [] as string[]);
 const mockDb = vi.hoisted(() => ({
   select: mockDbSelect,
   transaction: vi.fn(async (callback: (tx: typeof mockTx) => Promise<unknown>) =>
@@ -366,8 +372,8 @@ describe("comment-path stage approval — locked snapshot and canonical PR set",
     mockIssueReferencesSvc.listIssueReferenceSummary.mockResolvedValue({ outbound: [], inbound: [] });
     mockTx.select.mockImplementation(() => ({ from: mockDbSelectFrom }));
     mockDbSelect.mockImplementation(() => ({ from: mockDbSelectFrom }));
-    mockDbSelectFrom.mockImplementation(() => ({ where: mockDbSelectWhere }));
     mockAccessService.canUser.mockResolvedValue(true);
+    lockedBindingTables.length = 0;
     mockAccessService.hasPermission.mockResolvedValue(false);
     mockAccessService.decide.mockImplementation(async () => ({
       allowed: true,
@@ -522,6 +528,13 @@ describe("comment-path stage approval — locked snapshot and canonical PR set",
 
     expect(res.status).toBe(201);
     expect(mockIssueDoneGateService.handles).toContain(mockTx);
+    // SPA-9396: the binding rows are locked on the SAME transaction, after the
+    // issue row, so a work-product URL update or a comment soft-delete cannot
+    // unbind a PR underneath the approval.
+    expect(lockedBindingTables).toEqual([
+      "issue_work_products:update",
+      "issue_comments:update",
+    ]);
     expect(mockIssueService.addComment).toHaveBeenCalledTimes(1);
     expect(insertedDecisionRows.length).toBe(1);
     // A premerge approval is stage participation, not terminal completion:

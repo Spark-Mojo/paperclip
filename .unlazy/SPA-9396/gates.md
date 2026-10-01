@@ -1,5 +1,17 @@
 # SPA-9396 gates — incomplete WIP, 2026-09-30
 
+## Binding-row lock continuation — 2026-10-01 — HOLD
+
+Two bounded implementer invocations on one deliverable added an issue-first binding-row lock helper, PATCH/comment route calls, and issue-first ordering in removeComment/tombstoneComment. The first invocation added a red test scaffold; the second reported 196/196 focused tests, 3/3 comment-lock-order tests, 2/2 binding-lock tests, and shared/server typecheck. These are implementer receipts, not independent final acceptance. Adjacent comment-route suites regressed because their transaction mocks lack select; baseline and WIP A/B is incomplete. The second invocation stashed the seven changed paths; Ty popped the stash and read back exactly seven dirty paths, with no loss. This deliverable is NOT safe to ship. Residual binding writers in work-products and low-trust promotion lack issue-row locking; check route concurrency and lock-order before green.
+
+  CHECK: timeout 600 pnpm exec vitest run server/src/__tests__/issue-stage-approval-binding-locks.test.ts server/src/__tests__/issue-comment-lock-order.test.ts
+  EXPECT: Test Files 2 passed (2)
+  RESULT: implementer reported 2/2 and 3/3 separately; combined command not yet run by Ty.
+  NEGATIVE: comment-lock-order pre-fix reported exit 1 at acquisition-order assertion (expected true, received false); binding helper negative remains to be isolated. No gate green on implementer report alone.
+
+Ty independently ran `timeout 600 pnpm exec vitest run server/src/__tests__/issue-stage-approval-binding-locks.test.ts server/src/__tests__/issue-comment-lock-order.test.ts server/src/__tests__/issue-comment-stage-approval-lock.test.ts server/src/__tests__/issue-patch-stage-approval-locked-set.test.ts`: exit 0, 4 files / 14 tests, 61.30s. Adjacent `timeout 600 pnpm exec vitest run server/src/__tests__/issue-update-comment-wakeup-routes.test.ts server/src/__tests__/issue-comment-reopen-routes.test.ts server/src/__tests__/issue-queued-comments-routes.test.ts`: exit 1, 32 failed / 190 passed; 13 comment-reopen tests returned 500 (new tx.select absent from mock); 18 queued-comment scheduling failures and one 15s timeout require pinned-base comparison, not a waiver. Advisor: retain parent-first lock order, repair affected transaction fixtures, prove route-level concurrency; no safe-to-ship claim. Worktree dirty, no PR, merge, deployment or approval.
+
+
 ## PostgreSQL lock diagnostic conversion — 2026-09-30 — HOLD
 
 Converted `server/src/__tests__/zz-probe-9396.test.ts` from a vacuous `/tmp`-writing probe to a test-local embedded-PostgreSQL assertion. Two connections and a post-lock barrier check four writer classes (work-product and comment inserts, work-product URL update, comment soft-delete). Both issue and existing binding row locks must block every writer; single-lock controls must allow a respective writer. This tests PostgreSQL lock primitives, NOT the production approval route's lock acquisition. Database cleanup runs in `finally`. No engine behavior changed.

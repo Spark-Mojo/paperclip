@@ -1,5 +1,7 @@
 import { createHash } from "node:crypto";
+import { and, asc, eq } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
+import { issueComments, issueWorkProducts } from "@paperclipai/db";
 import type {
   IssueExecutionPolicy,
   IssueExecutionStageApproval,
@@ -43,6 +45,54 @@ export const COMMENT_SCAN_LIMIT_APPROVAL = APPROVAL_COMMENT_SCAN_LIMIT;
 
 /** A full git object id: exactly 40 lowercase hex characters. */
 const CANONICAL_SHA_PATTERN = /^[0-9a-f]{40}$/;
+
+/**
+ * SPA-9396 — the binding fence for a premerge approval.
+ *
+ * The issue row alone is not enough. An INSERT of a new binding row is
+ * serialized behind the `issues` foreign key, but an UPDATE of an existing
+ * `issue_work_products` row (its URL, externalId, summary) or an
+ * `issue_comments` soft-delete that unbinds a PR takes no issue-row lock and
+ * commits freely underneath it, so the approval can land on a set the reviewer
+ * never saw. Locking every existing row of both binding tables closes that:
+ * the concurrent writer waits for the approval to finish, and the approval's
+ * canonical re-read cannot observe a half-applied rebind.
+ *
+ * Every row is locked, not only `pull_request` work products or live comments
+ * — a work product's `type` and a comment's `deletedAt` are themselves part of
+ * what makes a reference bind, so a subset would leave a rebind unlocked. Each
+ * table is locked in ascending id order: work products before comments, and
+ * never the reverse, so two approvals on the same card cannot invert. Callers
+ * MUST already hold the issue row (`svc.getByIdForUpdate`), which is the same
+ * parent-first order `addComment` and the comment-queue writer use.
+ */
+export async function lockStageApprovalBindingRows(
+  db: Db,
+  issue: { id: string; companyId: string },
+): Promise<void> {
+  await db
+    .select({ id: issueWorkProducts.id })
+    .from(issueWorkProducts)
+    .where(
+      and(
+        eq(issueWorkProducts.companyId, issue.companyId),
+        eq(issueWorkProducts.issueId, issue.id),
+      ),
+    )
+    .orderBy(asc(issueWorkProducts.id))
+    .for("update");
+  await db
+    .select({ id: issueComments.id })
+    .from(issueComments)
+    .where(
+      and(
+        eq(issueComments.companyId, issue.companyId),
+        eq(issueComments.issueId, issue.id),
+      ),
+    )
+    .orderBy(asc(issueComments.id))
+    .for("update");
+}
 
 function referenceKey(reference: { owner: string; repo: string; number: number }): string {
   return `${reference.owner.toLowerCase()}/${reference.repo.toLowerCase()}#${reference.number}`;
