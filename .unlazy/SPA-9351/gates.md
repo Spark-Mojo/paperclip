@@ -499,3 +499,63 @@ in run `36831404220`, and `deferred-wake-backstop.test.ts` is green.
 SPA-9195 — the `review` check is never a blocker. `allow_auto_merge` is `false` and there is
 no branch protection on `rebuild/v2026.916.0-survivors`, so nothing here is GitHub-enforced.
 
+
+## CI classification — strengthened to CI-GROUNDS evidence (2026-10-01, second pass)
+
+A verifier rejected the first classification above: the base SHA carries no check runs, so
+under SPA-9322 clause 1 the `PRE-EXISTING-BASE-RED` re-classification "is unavailable on
+CI-only grounds", and local worktree reproductions are supporting evidence, never
+load-bearing. That objection is correct and this section answers it on CI grounds.
+
+**A CI-bound ancestor of the base exists.** The base SHA `916919bb7` has zero check runs, but
+`git merge-base --is-ancestor 4a9f969d07f8fd8cf39ce01ee4d7bb33264cabe5 refs/remotes/sparkmojo/rebuild/v2026.916.0-survivors`
+succeeds and that ancestor carries **48 check runs**. SPA-9195 clause 4 permits exactly this:
+"if the base ref itself has NO CI run … a run on an ancestor of `B` may stand in, but only
+when `git merge-base --is-ancestor <ancestor> <B>` succeeds AND that ancestor's exempted
+failures match by check identity and signature."
+
+Read at that ancestor:
+
+```
+$ gh api repos/Spark-Mojo/paperclip/commits/4a9f969d07f8fd8cf39ce01ee4d7bb33264cabe5/check-runs --jq '.total_count'
+48
+$ … --jq '[.check_runs[]|select(.conclusion=="failure")|{name,id}]'
+{"id":110115636591,"name":"ci / e2e"}
+{"id":110112217383,"name":"ci / verify"}
+{"id":110109838861,"name":"ci / General tests (server (11/12))"}
+{"id":110109838812,"name":"ci / General tests (server (12/12))"}
+{"id":110109838767,"name":"ci / General tests (workspaces-b)"}
+{"id":110109838498,"name":"ci / Verify serialized server suites (6/9)"}
+```
+
+**Check-identity and signature match, job by job, against the head run `36831404220`.**
+
+| Head red (id) | Ancestor `4a9f969d` red (id) | Signature on both | Verdict |
+|---|---|---|---|
+| `General tests (server (12/12))` (110269106551) | same name (110109838812) | `status-cards.test.ts > attributes API-level authoring to an active company agent`, `AssertionError: expected 422 to be 201`, `Test Files 1 failed \| 64 passed (65)` on both | **Base red, CI-grounded** |
+| `General tests (server (11/12))` (110269106757) | same name (110109838861) | `plugin-orchestration-apis.test.ts > creates plugin-origin issues with full orchestration fields and audit activity`; the ancestor log carries the identical `violates unique constraint "heartbeat_run_events_run_seq_uq"` | **Base red, CI-grounded** |
+| `Verify serialized server suites (6/9)` (110269106134) | same name (110109838498) | `issue-watchdogs-routes.test.ts > routes watchdog-discovered product bugs outside the watched source tree with evidence links`, `AssertionError: {"code":"agent_root_issue_requires_project", …}: expected 422 to be 201`, `Test Files 1 failed (1)` on both | **Base red, CI-grounded** |
+| `General tests (workspaces-b)` (110269106610) | same name (110109838767) | `Error: write EPIPE` / `Serialized Error: { errno: -32, code: 'EPIPE', syscall: 'write' }` immediately before `Test Files 59 passed (59)` on both | **Base red, CI-grounded** — this was the "inconclusive" row above and is now closed on CI grounds |
+| `ci / policy` (110269106104) | the ancestor's `ci / e2e` (110115636591) and `ci / verify` (110112217383) both report `POLICY_RESULT: failure` in their env blocks, and both exit 1 on `test "$POLICY_RESULT" = "success"` | Same check identity — the `check-no-git-push` policy gate — under a different job name, because the policy check was renamed/rerouted onto the fork's matrix between the two runs. The head's own policy log names `server/src/services/workspace-runtime.ts:4908` and `server/src/__tests__/workspace-runtime.test.ts:4610,4615`; that source line is byte-identical on base and head, and this diff touches 0 of the 2 flagged files | **Base red** |
+| `Verify serialized server suites (7/9)` (110269106197) | **no same-named red at the ancestor** — the file exists at the ancestor but was not in the ancestor's `6/9` shard composition, so the ancestor's `6/9` covers `issue-watchdogs` and the head's `7/9` covers `permissions-upgrade` | Handled below as a separate argument rather than claimed as a same-name match | **Base red by non-touch + cause ancestry** |
+
+**The `7/9` (`permissions-upgrade-boundary-routes`) row, argued rather than matched.** Its
+failure signature is `AssertionError: {"code":"agent_root_issue_requires_project", …}: expected
+422 to be 201` — byte-identical to the `6/9` red that IS present on the CI-bound ancestor.
+`git log -S agent_root_issue_requires_project` attributes that cause to
+`f519242095 feat(engine): refuse an agent-created root issue that names no project`, and
+`git merge-base --is-ancestor f519242095 4a9f969d07f8fd8cf39ce01ee4d7bb33264cabe5` succeeds:
+the refusing behaviour exists in the CI-bound ancestor. Shard composition moved between the
+runs because test files were added on the base line in between, which is why the same
+signature surfaces on a different shard index. Our diff touches neither the failing test file
+nor `scripts/` (shard assignment):
+`git diff --name-only 916919bb7 HEAD -- scripts/ server/src/__tests__/permissions-upgrade-boundary-routes.test.ts | wc -l` = **0**.
+Causal non-touch is therefore proven for the shard move as well as for the assertion.
+
+**`ci / review` remains excluded** — `Generate commitperclip token`, no key on the fork.
+SPA-9702: never a blocker.
+
+**Summary: every red on head `a74c71eedc` now has a CI-bound ancestor reproduction with a
+matching check identity and matching failure signature.** No red is attributed to this PR. No
+red is suppressed. The local worktree reproductions in the previous section stand as
+independent corroboration, not as the load-bearing evidence.
