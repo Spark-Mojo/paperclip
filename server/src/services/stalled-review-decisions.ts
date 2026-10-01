@@ -12,7 +12,13 @@ import {
   applyIssueExecutionPolicyTransition,
   normalizeIssueExecutionPolicy,
 } from "./issue-execution-policy.js";
-import { issueStageApprovalService } from "./issue-stage-approvals.js";
+import {
+  issueExecutionPolicyFingerprint,
+  issueStageApprovalService,
+  lockStageApprovalBindingRows,
+  reviewerChanged,
+  STAGE_APPROVAL_REVIEWER_CHANGED_CODE,
+} from "./issue-stage-approvals.js";
 import {
   executeIssuePostCommitActions,
   issueService,
@@ -38,9 +44,10 @@ export function stalledReviewDecisionService(db: Db) {
   return {
     decide: async (input: DecideStalledReviewInput) => {
       let verifiedApprovalPullRequests: IssueStageApprovalPullRequest[] | null = null;
+      let issueForApproval: Awaited<ReturnType<typeof svc.getById>> = null;
       if (input.action === "approve") {
         const stageApprovalSvc = issueStageApprovalService(db);
-        const issueForApproval = await svc.getById(input.issueId);
+        issueForApproval = await svc.getById(input.issueId);
         if (issueForApproval && issueForApproval.companyId === input.companyId) {
           const hasBoundPrs = await stageApprovalSvc.hasBoundPullRequests({
             id: issueForApproval.id,
@@ -91,6 +98,41 @@ export function stalledReviewDecisionService(db: Db) {
             issueId: lockedIssue.id,
             reviewAttentionState: reviewAttention?.state ?? "none",
           });
+        }
+        if (input.action === "approve") {
+          const priorPolicy = normalizeIssueExecutionPolicy(issueForApproval?.executionPolicy ?? null);
+          const lockedPolicy = normalizeIssueExecutionPolicy(lockedIssue.executionPolicy ?? null);
+          if (
+            !issueForApproval ||
+            issueForApproval.status !== lockedIssue.status ||
+            issueForApproval.assigneeAgentId !== lockedIssue.assigneeAgentId ||
+            issueForApproval.assigneeUserId !== lockedIssue.assigneeUserId ||
+            issueExecutionPolicyFingerprint(priorPolicy) !== issueExecutionPolicyFingerprint(lockedPolicy) ||
+            JSON.stringify(issueForApproval.executionState ?? null) !== JSON.stringify(lockedIssue.executionState ?? null)
+          ) {
+            throw reviewerChanged({ issueId: lockedIssue.id, code: STAGE_APPROVAL_REVIEWER_CHANGED_CODE });
+          }
+          await lockStageApprovalBindingRows(txDb, {
+            id: lockedIssue.id,
+            companyId: lockedIssue.companyId,
+          });
+          const lockedApprovalSvc = issueStageApprovalService(db, { tx: txDb });
+          const lockedSubject = {
+            id: lockedIssue.id,
+            companyId: lockedIssue.companyId,
+            description: lockedIssue.description,
+          };
+          if (verifiedApprovalPullRequests) {
+            await lockedApprovalSvc.verifyReviewedPullRequests({
+              issue: lockedSubject,
+              claim: verifiedApprovalPullRequests,
+            });
+          } else if (await lockedApprovalSvc.hasBoundPullRequests(lockedSubject)) {
+            await lockedApprovalSvc.verifyReviewedPullRequests({
+              issue: lockedSubject,
+              claim: input.reviewedPullRequests,
+            });
+          }
         }
 
         const comment = input.note
