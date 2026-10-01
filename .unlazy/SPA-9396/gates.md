@@ -1,5 +1,21 @@
 # SPA-9396 gates — incomplete WIP, 2026-09-30
 
+## Stalled-review route concurrent rebind — 2026-10-01 — HOLD
+
+Embedded PostgreSQL route test starts a separate issue-row lock transaction, waits until the stalled route preflight resolves the original PR head, changes the existing work-product URL from pull/1 to pull/2 before releasing the row, then demands a 409 incomplete-set refusal and unchanged in_review status. The production route's tx-scoped recheck catches the rebind. An isolated temporary removal of only that recheck in stalled-review-decisions.ts returned the unrelated terminal unmerged-PR 409 instead: the intended refusal assertion failed, proving this oracle distinguishes the fence from a generic 409. Production source restored; no live board probe. This is one interleaving on the stalled route, not approval success or PATCH/comment/promotion route coverage.
+
+  CHECK: PATH="$HOME/.cargo/bin:$PATH" timeout 300 pnpm exec vitest run server/src/__tests__/issue-stalled-review-decision-routes.test.ts --reporter=dot
+  EXPECT: Tests 11 passed (11)
+  RESULT: exit 0, Test Files 1 passed (1), Tests 11 passed (11), duration 32.13s.
+  NEGATIVE: temporarily remove only lockedApprovalSvc.verifyReviewedPullRequests when verifiedApprovalPullRequests is present, run `PATH="$HOME/.cargo/bin:$PATH" timeout 180 pnpm exec vitest run server/src/__tests__/issue-stalled-review-decision-routes.test.ts -t 'refuses a stalled approval when the bound PR changes' --reporter=dot`; exit 1 at assertion expected issue_stage_approval_incomplete_pull_request_set, received issue_done_with_unmerged_pull_request. Restore source; positive rerun above exit 0.
+
+  CHECK: PATH="$HOME/.cargo/bin:$PATH" timeout 900 pnpm --filter @paperclipai/shared --filter @paperclipai/server typecheck
+  EXPECT: server typecheck: Done
+  RESULT: exit 0, shared Done and server Done; existing runner warnings.
+  NEGATIVE: not run; typecheck is not the behavioral assertion.
+
+Still missing: route positive premerge approval, PATCH/comment/promotion concurrent-writer arms and both interleavings, correct durable reviewer decision, changed-head fresh-review path, shared/OpenAPI/UI contract sync, independent final-head verification, engine PR/merge/rollout and Sable decision. UNSAFE TO SHIP.
+
 ## Stalled-review transaction fence — 2026-10-01 — HOLD
 
 `stalledReviewDecisionService.decide` now locks the company-scoped issue first, checks the preflight review snapshot, locks all binding rows, then re-verifies the PR set and head using the transaction handle before any comment or transition. If preflight observed no bound PR but the locked snapshot does, it refuses the missing claim. Board-only route authorization remains unchanged. This is only a bounded WIP increment: no stalled-route PR-backed integration fixture, two-connection interleaving or isolated failing negative was run; no durable reviewer decision or terminal sequencing repair is claimed. Do not ship.
