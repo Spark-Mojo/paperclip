@@ -1,5 +1,26 @@
 # SPA-9396 gates — incomplete WIP, 2026-09-30
 
+## Stalled-review transaction fence — 2026-10-01 — HOLD
+
+`stalledReviewDecisionService.decide` now locks the company-scoped issue first, checks the preflight review snapshot, locks all binding rows, then re-verifies the PR set and head using the transaction handle before any comment or transition. If preflight observed no bound PR but the locked snapshot does, it refuses the missing claim. Board-only route authorization remains unchanged. This is only a bounded WIP increment: no stalled-route PR-backed integration fixture, two-connection interleaving or isolated failing negative was run; no durable reviewer decision or terminal sequencing repair is claimed. Do not ship.
+
+  CHECK: PATH="$HOME/.cargo/bin:$PATH" timeout 300 pnpm exec vitest run server/src/__tests__/issue-stalled-review-decision-routes.test.ts --reporter=dot
+  EXPECT: Tests 10 passed (10)
+  RESULT: exit 0, Test Files 1 passed (1), Tests 10 passed (10), duration 31.69s; legacy paths only, no new approval-safety oracle.
+  NEGATIVE: not run; same-assertion failing input not yet constructed, gate unproven.
+
+  CHECK: PATH="$HOME/.cargo/bin:$PATH" timeout 900 pnpm --filter @paperclipai/shared --filter @paperclipai/server typecheck
+  EXPECT: server typecheck: Done
+  RESULT: exit 0, shared Done and server Done; pre-existing Rust warnings.
+  NEGATIVE: not run; typecheck is not the behavioral oracle.
+
+  CHECK: git diff --check
+  EXPECT: exit 0
+  RESULT: exit 0, empty output before ledger edit.
+  NEGATIVE: not run; no isolated whitespace fixture.
+
+Still missing: route-driven two-connection approval and promotion concurrency, failing fence controls, correct board reviewer durable decision, changed-head fresh review, contract sync, independent final-head verification, engine PR/merge/rollout and Sable decision. UNSAFE TO SHIP.
+
 ## Production binding-lock helper, real PostgreSQL — 2026-10-01 — HOLD
 
 The isolated two-connection PostgreSQL test now invokes `lockStageApprovalBindingRows` from production after locking the issue row, rather than duplicating its binding-row SQL in a test closure. Four concurrent writers (work-product/comment INSERT, work-product URL UPDATE, comment soft-delete) wait until the lock transaction releases. Single-lock controls still show why both lock classes are necessary. This proves the production helper's locks, NOT that PATCH/comment approval routes reach it or that the decision and binding are coherent under concurrent HTTP requests.
