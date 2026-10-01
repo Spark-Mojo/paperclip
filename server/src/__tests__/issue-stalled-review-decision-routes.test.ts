@@ -27,13 +27,13 @@ import {
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
 
-const pullRequestRead = vi.hoisted(() => ({ onRead: null as (() => void) | null }));
+const pullRequestRead = vi.hoisted(() => ({ onRead: null as (() => void) | null, headSha: "a".repeat(40) }));
 
 vi.mock("../services/github-pull-request-merge.js", async (importOriginal) => ({
   ...await importOriginal<typeof import("../services/github-pull-request-merge.js")>(),
   createPullRequestMergeDetailsResolver: () => async () => {
     pullRequestRead.onRead?.();
-    return { state: "open" as const, headRef: "review", headSha: "a".repeat(40) };
+    return { state: "open" as const, headRef: "review", headSha: pullRequestRead.headSha };
   },
 }));
 
@@ -59,6 +59,7 @@ describeEmbeddedPostgres("stalled review decision routes", () => {
   afterEach(async () => {
     enqueueWakeup.mockClear();
     pullRequestRead.onRead = null;
+    pullRequestRead.headSha = "a".repeat(40);
     await db.delete(issueThreadInteractions);
     await db.delete(issueApprovals);
     await db.delete(approvals);
@@ -640,6 +641,55 @@ describeEmbeddedPostgres("stalled review decision routes", () => {
       const result = await response;
       expect(result.status, JSON.stringify(result.body)).toBe(409);
       expect(result.body.details?.code).toBe("issue_stage_approval_incomplete_pull_request_set");
+      const [persisted] = await db.select({ status: issues.status }).from(issues).where(eq(issues.id, issueId));
+      expect(persisted?.status).toBe("in_review");
+    } finally {
+      release.resolve();
+      await holder;
+    }
+  }, 90_000);
+
+  it("refuses a stalled approval when the PR head moves after preflight", async () => {
+    const seeded = await seedCompany("HED");
+    const issueId = await seedReview({
+      companyId: seeded.companyId,
+      assigneeAgentId: seeded.assigneeAgentId,
+      identifier: "HED-1",
+    });
+    await db.insert(issueWorkProducts).values({
+      companyId: seeded.companyId,
+      issueId,
+      type: "pull_request",
+      provider: "github",
+      title: "PR 1",
+      url: "https://github.com/Spark-Mojo/paperclip/pull/1",
+      status: "open",
+    });
+    const locked = Promise.withResolvers<void>();
+    const preflight = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<void>();
+    let reads = 0;
+    pullRequestRead.onRead = () => {
+      if (++reads === 3) preflight.resolve();
+    };
+    const holder = db.transaction(async (tx) => {
+      await tx.select().from(issues).where(eq(issues.id, issueId)).for("update");
+      locked.resolve();
+      await release.promise;
+    });
+    await locked.promise;
+    const responsePromise = request(app(boardActor(seeded.companyId, seeded.memberUserId)))
+      .post(`/api/issues/${issueId}/stalled-review-decision`)
+      .send({ action: "approve", reviewedPullRequests: [{ owner: "Spark-Mojo", repo: "paperclip", number: 1, headSha: "a".repeat(40) }] });
+    try {
+      const response = responsePromise.then((result) => result);
+      await preflight.promise;
+      pullRequestRead.headSha = "b".repeat(40);
+      release.resolve();
+      await holder;
+      const result = await response;
+      expect(result.status, JSON.stringify(result.body)).toBe(409);
+      expect(result.body.details?.code).toBe("issue_stage_approval_stale_pull_request_head");
       const [persisted] = await db.select({ status: issues.status }).from(issues).where(eq(issues.id, issueId));
       expect(persisted?.status).toBe("in_review");
     } finally {
