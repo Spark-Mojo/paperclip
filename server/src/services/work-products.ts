@@ -1,6 +1,6 @@
 import { and, desc, eq, inArray } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
-import { heartbeatRunEvents, issueWorkProducts, workspaceRuntimeServices } from "@paperclipai/db";
+import { heartbeatRunEvents, issueWorkProducts, issues, workspaceRuntimeServices } from "@paperclipai/db";
 import type { IssueWorkProduct } from "@paperclipai/shared";
 import { insertRowsInChunks } from "./batch-insert.js";
 import {
@@ -245,6 +245,11 @@ export function workProductService(
 
     createForIssue: async (issueId: string, companyId: string, data: Omit<typeof issueWorkProducts.$inferInsert, "issueId" | "companyId">) => {
       const row = await db.transaction(async (tx) => {
+        const [parent] = await tx.select({ id: issues.id }).from(issues).where(and(
+          eq(issues.id, issueId),
+          eq(issues.companyId, companyId),
+        )).for("update");
+        if (!parent) return null;
         if (data.isPrimary) {
           await tx
             .update(issueWorkProducts)

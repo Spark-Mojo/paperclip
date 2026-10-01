@@ -1,5 +1,24 @@
 # SPA-9396 gates — incomplete WIP, 2026-09-30
 
+## Work-product writer issue-row fence — 2026-10-01 — HOLD
+
+`workProductService.createForIssue` now locks the company-scoped parent issue before changing the primary work product or inserting another product; it refuses a missing/mismatched parent. This is one bounded writer correction, not the route-level concurrency oracle. Existing product update/remove and import, low-trust promotion, and other binding writers are not covered. The Vitest worktree flag was not further investigated here: the previous ledger records the isolated environment-sensitive 47/47 arm, which is not approval safety.
+
+  CHECK: PATH="$HOME/.cargo/bin:$PATH" timeout 180 pnpm exec vitest run server/src/__tests__/work-products.test.ts --reporter=dot
+  EXPECT: Tests 5 passed (5)
+  RESULT: exit 0, Test Files 1 passed (1), Tests 5 passed (5), Duration 12.50s. Before the issue-lock edit the same CHECK exited 1 at the acquisition-order assertion (`[update, insert]` rather than `[issue-lock, update, insert]`), four other tests passed.
+  NEGATIVE: the same suite on the pre-fix production function exited 1 at the issue-lock ordering assertion; the test uses a transaction mock, not a real PostgreSQL lock. Route-level concurrent writer negative still unproven.
+
+  CHECK: PATH="$HOME/.cargo/bin:$PATH" timeout 900 pnpm --filter @paperclipai/shared --filter @paperclipai/server typecheck
+  EXPECT: server typecheck: Done
+  RESULT: exit 0; shared Done, server Done. No behavior-negative control for typecheck.
+
+  CHECK: git diff --check
+  EXPECT: exit 0
+  RESULT: exit 0, no output. No whitespace-negative fixture run.
+
+Still missing: all other binding writers' parent-first lock order; real approval-route two-connection PostgreSQL concurrency and negative; durable stalled decision; changed-head review; contract sync; independent verification, engine PR/merge/rollout and Sable decision. UNSAFE TO SHIP.
+
 ## Assigned-worktree suppression isolated — 2026-10-01 — HOLD
 
 The 18 queued-comment failures are caused by the worktree runtime flag in the Vitest worker, not by task-drain state or this branch's binding-lock changes. A focused test in a fresh Vitest process failed on `deferred_issue_execution`; a temporary assertion inside the test's `beforeAll` read `process.env.PAPERCLIP_IN_WORKTREE === "true"` and `resolveHeartbeatSchedulingSuppression(process.env) === { suppressed: true, reason: "worktree_instance" }`. The same diagnostic after the failing route found `getTaskDrainStatus().draining === false`. The parent shell's flag was unset while the Vitest worker observed it as `true`; the setter was not traced, so the precise startup source is unproven. All temporary diagnostic assertions/imports were removed and `git status --short` returned empty before the ledger edit. No production suppression logic changed.

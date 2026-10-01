@@ -137,7 +137,14 @@ describe("workProductService", () => {
     const insertValues = vi.fn(() => ({ returning: insertReturning }));
     const txInsert = vi.fn(() => ({ values: insertValues }));
 
+    const calls: string[] = [];
+    const txSelect = vi.fn(() => ({
+      from: () => ({ where: () => ({ for: vi.fn(async () => { calls.push("issue-lock"); return [{}]; }) }) }),
+    }));
+    txUpdate.mockImplementation(() => { calls.push("update"); return { set: updateSet }; });
+    txInsert.mockImplementation(() => { calls.push("insert"); return { values: insertValues }; });
     const tx = {
+      select: txSelect,
       update: txUpdate,
       insert: txInsert,
     };
@@ -156,6 +163,7 @@ describe("workProductService", () => {
     expect(transaction).toHaveBeenCalledTimes(1);
     expect(txUpdate).toHaveBeenCalledTimes(1);
     expect(txInsert).toHaveBeenCalledTimes(1);
+    expect(calls).toEqual(["issue-lock", "update", "insert"]);
     expect(result?.id).toBe("work-product-1");
   });
 
