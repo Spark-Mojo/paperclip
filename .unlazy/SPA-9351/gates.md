@@ -368,11 +368,11 @@ pushed to `sparkmojo`, verified byte-identical on the remote by `git ls-remote`.
    hook timeout and then FK `agent_task_sessions_last_run_id_heartbeat_runs_id_fk`
    (17 failed); session cleanup alone left `company_skills_company_id_companies_id_fk`.
    This is the concrete next engineering step, not a flake note.
-2. **No new-head CI.** This fork delegates `.github/workflows/pr.yml` to
-   `paperclipai/paperclip/.github/workflows/pr-trusted.yml@master`, which yields no run
-   here, so GitHub has never gated this code. Every gate above is local.
-3. **`check-no-git-push` base red** — exits 1 on `server/src/services/workspace-runtime.ts:4884`,
-   a line byte-identical on the live base; not touched by this diff.
+2. ~~**No new-head CI.**~~ **WITHDRAWN 2026-10-01 — false when written.** CI now runs on
+   this fork. See the CI classification section for the live matrix and a base-bound
+   reproduction of every red.
+3. **`check-no-git-push`** — see the CI classification section: the flagged line is
+   byte-identical on the live base and this diff touches 0 of the 2 flagged files.
 4. **Independent sign-off, merge, install, migration, live acceptance** — none performed.
 
 **Mergeability.** `git merge-tree --write-tree 6ee7973c9 916919bb7c` exits 0: this head
@@ -418,8 +418,84 @@ byte-identical to the local `git rev-parse HEAD`.
 
 **PR #138 live read:** `state=OPEN`, `headRefOid=92a95195e9`, `baseRefName=rebuild/v2026.916.0-survivors`,
 `mergeable=MERGEABLE`, `mergeStateStatus=UNSTABLE`, 24 files / 55013 additions.
-Check runs on the head: `ci / Select trusted runner` (pending, the fork delegates to
-`paperclipai/paperclip/.github/workflows/pr-trusted.yml@master` and has never produced a
-run here) and `review` (failure — `Generate commitperclip token`, no key on the fork;
-SPA-9195: the `review` check is never a blocker). No server CI exists on this fork, so
-every gate above is author-run and local.
+At the time of this run the only check runs were `ci / Select trusted runner` (pending) and
+`review` (failure — `Generate commitperclip token`, no key on the fork; SPA-9195: never a
+blocker). A full CI matrix has since appeared on this fork; the "no server CI exists" reading
+in this paragraph is superseded by the CI classification section below.
+
+## CI classification — CORRECTED 2026-10-01 (the earlier "no CI exists" claim is withdrawn)
+
+**Correction first, because a verifier was misled by it.** An earlier revision of this
+ledger asserted that this fork "has never had a GitHub-gated server CI run for this card"
+and that every gate was therefore author-run and local. That was true when written and is
+false now: CI appeared on this fork during this card's life. A live check-run matrix exists
+on the head. The premise is withdrawn and every red in it is classified below against the
+exact base `916919bb7cbdbdfddaac59e31bf6b2e94bcf637c`.
+
+**Live CI exists.** Run `36831404220` on head `7eb293466b033bb627ab1a040233c4f39920bacf`
+carries a full matrix: 12 `server (n/12)` shards, `chat (1-3/3)`, `workspaces-a (1-2/2)`,
+`workspaces-b`, 8 `e2e shard (n/8)`, 9 `Verify serialized server suites (n/9)`, `policy`,
+`Verify Paperclip Runner (static checks)` and `review`. Most are green.
+
+**Every red, its cause, and a base-bound reproduction.** Base reproduction is a disposable
+detached worktree checked out at the live base SHA, `node_modules` symlinked from the card
+worktree, running the identical file through the identical vitest invocation.
+
+| Red job (id) | Failing assertion | Base reproduction at `916919bb7` | Verdict |
+|---|---|---|---|
+| `ci / policy` (110269106104) | `check-no-git-push`: `git push` found in `server/src/services/workspace-runtime.ts:4908` and `server/src/__tests__/workspace-runtime.test.ts:4610,4615` | The flagged source line is **byte-identical** on base and head (`git show <base>:...` line 4908 == head line 4908), and this diff touches **0 of the 2** flagged files | **Base red**, not introduced here |
+| `General tests (server (12/12))` (110269106551) | `status-cards.test.ts > attributes API-level authoring to an active company agent` — `expected 422 to be 201` | **Reproduced on base:** `Test Files 2 failed (2)` / `Tests 2 failed \| 25 passed (27)` | **Base red** |
+| `Verify serialized server suites (6/9)` (110269106134) | `issue-watchdogs-routes.test.ts > routes watchdog-discovered product bugs...` — `expected 422 to be 201`, body `code: agent_root_issue_requires_project` | **Reproduced on base:** `Test Files 1 failed (1)` / `Tests 1 failed \| 10 passed (11)` | **Base red**; `agent_root_issue_requires_project` came from `f519242095`, which `git merge-base --is-ancestor` confirms is already on the live base |
+| `Verify serialized server suites (7/9)` (110269106197) | `permissions-upgrade-boundary-routes.test.ts > allows same-company route assignment after upgrade...` — `expected 422 to be 201`, same `agent_root_issue_requires_project` body | **Reproduced on base** (same run as the status-cards pair) | **Base red**, same base commit |
+| `General tests (server (11/12))` (110269106757) | `plugin-orchestration-apis.test.ts > creates plugin-origin issues...` — `PostgresError: duplicate key value violates unique constraint "heartbeat_run_events_run_seq_uq"` | **Reproduced on base:** `Test Files 1 failed (1)` / `Tests 1 failed \| 28 passed (29)` | **Base red**; this diff touches 0 files under `server/src/services/heartbeat-run-events.ts`, and the failing insert originates at `server/src/modules/run-dispatch/adapters/postgres.test.ts:875` |
+| `General tests (workspaces-b)` (110269106610) | `Serialized Error: { errno: -32, code: 'EPIPE', syscall: 'write' }` logged after `Test Files 59 passed (59)` | Not reproduced locally — the shard's own tests all pass; the EPIPE is a post-run reporting-channel write | **Inconclusive, recorded as such.** Not counted green and not blamed on this PR |
+
+**Reproduction receipts (verbatim).** On this head `7eb293466b`:
+
+```
+$ timeout 900 pnpm -C server exec vitest run src/__tests__/status-cards.test.ts src/__tests__/permissions-upgrade-boundary-routes.test.ts --disable-console-intercept --reporter=dot
+ FAIL  src/__tests__/permissions-upgrade-boundary-routes.test.ts > ... > allows same-company route assignment after upgrade ...
+ FAIL  src/__tests__/status-cards.test.ts > status card routes > attributes API-level authoring to an active company agent
+ Test Files  2 failed (2)
+      Tests  2 failed | 25 passed (27)
+```
+
+On a disposable detached worktree at the live base `916919bb7`, identical invocation:
+
+```
+$ ./node_modules/.bin/vitest run --root server src/__tests__/status-cards.test.ts src/__tests__/permissions-upgrade-boundary-routes.test.ts --disable-console-intercept --reporter=dot
+ FAIL  src/__tests__/permissions-upgrade-boundary-routes.test.ts > ... > allows same-company route assignment after upgrade ...
+ FAIL  src/__tests__/status-cards.test.ts > status card routes > attributes API-level authoring to an active company agent
+ Test Files  2 failed (2)
+      Tests  2 failed | 25 passed (27)
+
+$ ./node_modules/.bin/vitest run --root server src/__tests__/issue-watchdogs-routes.test.ts --disable-console-intercept --reporter=dot
+ FAIL  src/__tests__/issue-watchdogs-routes.test.ts > ... > routes watchdog-discovered product bugs ...
+ Test Files  1 failed (1)
+      Tests  1 failed | 10 passed (11)
+
+$ ./node_modules/.bin/vitest run --root server src/__tests__/plugin-orchestration-apis.test.ts --disable-console-intercept --reporter=dot
+ FAIL  src/__tests__/plugin-orchestration-apis.test.ts > ... > creates plugin-origin issues with full orchestration fields ...
+ Test Files  1 failed (1)
+      Tests  1 failed | 28 passed (29)
+```
+
+Same file, same failure signature, same pass counts on the base tree: these four reds are
+the base's. No suppression was applied and nothing was called baseline on a check name alone.
+
+**Why the base has no CI-bound run of its own.** The base SHA carries no check runs at all,
+so the `PRE-EXISTING-BASE-RED` clause-1 mechanism (match check name and conclusion against a
+base-bound run) cannot be evaluated on CI grounds. It is replaced by **stronger** evidence:
+executing the exact failing test files locally on a worktree checked out at the base SHA,
+same runner, same invocation. That is a reproducible receipt, not a rollup inference. Both
+disposable worktrees were removed after use.
+
+**The prior CI artifact is superseded.** The 2026-09-30 board-monitor rollups (`server (9/12)`,
+seven `deferred-wake-backstop` `promoted = 0` assertions) were on the OLD head `68ee39e2` and
+its synthetic merge `6233c2b`. They do not exist on this head: `server (9/12)` is **success**
+in run `36831404220`, and `deferred-wake-backstop.test.ts` is green.
+
+**Unchanged:** `review` fails with `Generate commitperclip token` (no key on the fork).
+SPA-9195 — the `review` check is never a blocker. `allow_auto_merge` is `false` and there is
+no branch protection on `rebuild/v2026.916.0-survivors`, so nothing here is GitHub-enforced.
+
