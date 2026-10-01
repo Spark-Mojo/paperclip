@@ -1,5 +1,21 @@
 # SPA-9396 gates — incomplete WIP, 2026-09-30
 
+## Stalled-review route changed-head interleaving — 2026-10-01 — HOLD
+
+Embedded PostgreSQL test holds the issue row before stalled-route preflight, observes the third PR resolver read (the verified preflight head), then moves the mocked live GitHub head from full SHA `a` to `b` before releasing the issue lock. The route refuses with 409 stale-head and retains in_review. This is a real route request with two PostgreSQL connections and a controlled external-head change; the head change is a mocked resolver, not a real GitHub update. No live board probe.
+
+  CHECK: PATH="$HOME/.cargo/bin:$PATH" timeout 300 pnpm exec vitest run server/src/__tests__/issue-stalled-review-decision-routes.test.ts --reporter=dot
+  EXPECT: Tests 12 passed (12)
+  RESULT: exit 0, Test Files 1 passed (1), Tests 12 passed (12), duration 29.92s; git diff --check exit 0.
+  NEGATIVE: temporarily change both tx-recheck conditions in `server/src/services/stalled-review-decisions.ts` to `false && …`; run `PATH="$HOME/.cargo/bin:$PATH" timeout 180 pnpm exec vitest run server/src/__tests__/issue-stalled-review-decision-routes.test.ts -t 'PR head moves after preflight' --reporter=dot`; exit 1 at intended assertion: expected `issue_stage_approval_stale_pull_request_head`, received `issue_done_with_unmerged_pull_request`. With only the verified-claim branch disabled the test still passed via the no-claim branch, so both branches were disabled for the failing control. Both production conditions restored with edit tool, positive full suite rerun above.
+
+  CHECK: PATH="$HOME/.cargo/bin:$PATH" timeout 900 pnpm --filter @paperclipai/shared --filter @paperclipai/server typecheck
+  EXPECT: server typecheck: Done
+  RESULT: exit 0, shared Done and server Done; existing Rust warnings.
+  NEGATIVE: not run; typecheck is not the behavioral assertion.
+
+Still missing: premerge approval success, PATCH/comment/promotion concurrency, durable authenticated reviewer decision, fresh review of changed head, shared/OpenAPI/UI contract, independent final-head verification, PR/merge/rollout and Sable decision. This refusal test alone is UNSAFE TO SHIP.
+
 ## Stalled-review route concurrent rebind — 2026-10-01 — HOLD
 
 Embedded PostgreSQL route test starts a separate issue-row lock transaction, waits until the stalled route preflight resolves the original PR head, changes the existing work-product URL from pull/1 to pull/2 before releasing the row, then demands a 409 incomplete-set refusal and unchanged in_review status. The production route's tx-scoped recheck catches the rebind. An isolated temporary removal of only that recheck in stalled-review-decisions.ts returned the unrelated terminal unmerged-PR 409 instead: the intended refusal assertion failed, proving this oracle distinguishes the fence from a generic 409. Production source restored; no live board probe. This is one interleaving on the stalled route, not approval success or PATCH/comment/promotion route coverage.
