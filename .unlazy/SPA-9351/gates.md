@@ -378,3 +378,48 @@ pushed to `sparkmojo`, verified byte-identical on the remote by `git ls-remote`.
 **Mergeability.** `git merge-tree --write-tree 6ee7973c9 916919bb7c` exits 0: this head
 merges clean into the live base. PR #122 remains OPEN at its own head and is NOT this
 branch; a PR from `ty/spa9351-migrate-fix` does not exist yet.
+
+## 2026-10-01 — manager item 5 CLOSED: the two fixture-teardown races
+
+Head `92a95195e98a26dcce16bbfd5388d899af60dc83` (commit
+`test(engine): drain dispatched runs before fixture teardown (SPA-9351)`).
+
+**Root cause.** The backstop promotes a wake and the heartbeat service dispatches it
+after commit, so background run executions were still writing rows when `afterEach`
+deleted the fixture out from under them. `delete from heartbeat_runs` raced an async
+`UPDATE issues SET execution_run_id = NULL`, and a promoted run was still referenced
+from `agent_task_sessions.last_run_id`. The suite was green while logging the race.
+
+**Fix.** Every service instance built by the test file is tracked, and both `afterEach`
+hooks call `drainActiveRunExecutions()` (the existing production helper, which loops
+until no wakeup or run execution is in flight) BEFORE the first delete. The fixture is
+then removed in reverse dependency order: `company_skills` and `agent_task_sessions`
+before their parents. No `TRUNCATE CASCADE`.
+
+This is the third attempt and the first that worked. Recorded for the next reader:
+attempt 1 (drain before delete, no child-row deletes) hit
+`agent_task_sessions_last_run_id_heartbeat_runs_id_fk`; attempt 2 (child-row delete,
+no drain) hit `company_skills_company_id_companies_id_fk` at 17 failed / 41 passed.
+Both halves are required — drain alone leaves a session referencing a promoted run,
+child-row deletes alone are beaten by a run that re-seeds mid-teardown.
+
+**Gate T — teardown quiescence.**
+    CHECK: timeout 600 pnpm -C server exec vitest run src/services/deferred-wake-backstop.test.ts --disable-console-intercept --reporter=dot ; the run must emit zero `Issue not found` and zero `Run identity does not belong to this company` lines.
+    EXPECT: exit 0, `Tests  58 passed (58)`, teardown-race log line count 0.
+    NEGATIVE: remove ONLY the `await drainHeartbeatServiceInstances();` line from the two `afterEach` hooks, leaving the child-row deletes in place, and re-run the identical CHECK.
+    RESULT (positive): exit 0, 58/58, `grep -cE 'Issue not found|does not belong to this company'` = **0**. Re-verified after restoring the file; restored sha256 `d7f0882d0a0b58abf2901d8080a16bdfa958e881ac2c8a2982c425d746afdd56`.
+    NEGATIVE RESULT: `grep -cE` = **14** of those lines, on a run whose 58 tests still pass. That is the point: the assertions were never what was failing, and a green suite alone did not prove quiescence. The control removes the drain only, so the same assertion set runs both ways.
+
+`timeout 900 pnpm -C server exec tsc --noEmit` exit 0 on this head. `git diff --check` exit 0.
+
+**Push receipt.** `git push sparkmojo ty/spa9351-migrate-fix` exit 0;
+`git ls-remote sparkmojo refs/heads/ty/spa9351-migrate-fix` = `92a95195e98a26dcce16bbfd5388d899af60dc83`,
+byte-identical to the local `git rev-parse HEAD`.
+
+**PR #138 live read:** `state=OPEN`, `headRefOid=92a95195e9`, `baseRefName=rebuild/v2026.916.0-survivors`,
+`mergeable=MERGEABLE`, `mergeStateStatus=UNSTABLE`, 24 files / 55013 additions.
+Check runs on the head: `ci / Select trusted runner` (pending, the fork delegates to
+`paperclipai/paperclip/.github/workflows/pr-trusted.yml@master` and has never produced a
+run here) and `review` (failure — `Generate commitperclip token`, no key on the fork;
+SPA-9195: the `review` check is never a blocker). No server CI exists on this fork, so
+every gate above is author-run and local.
