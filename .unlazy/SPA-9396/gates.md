@@ -1,5 +1,21 @@
 # SPA-9396 gates — incomplete WIP, 2026-09-30
 
+## Production binding-lock helper, real PostgreSQL — 2026-10-01 — HOLD
+
+The isolated two-connection PostgreSQL test now invokes `lockStageApprovalBindingRows` from production after locking the issue row, rather than duplicating its binding-row SQL in a test closure. Four concurrent writers (work-product/comment INSERT, work-product URL UPDATE, comment soft-delete) wait until the lock transaction releases. Single-lock controls still show why both lock classes are necessary. This proves the production helper's locks, NOT that PATCH/comment approval routes reach it or that the decision and binding are coherent under concurrent HTTP requests.
+
+  CHECK: PATH="$HOME/.cargo/bin:$PATH" timeout 300 pnpm exec vitest run server/src/__tests__/zz-probe-9396.test.ts --reporter=dot
+  EXPECT: Tests  1 passed (1)
+  RESULT: exit 0; Test Files 1 passed (1), Tests 1 passed (1), Duration 26.09s after negative restoration.
+  NEGATIVE: temporarily replace only the test's `lockBindingRows` closure with an empty async closure, run the identical CHECK; exit 1, one failed at `zz-probe-9396.test.ts:151` (expected blocked true, received false). Restore production-helper call and rerun positive. This control removes the helper invocation, not its implementation; approval-route wiring remains unproven.
+
+  CHECK: PATH="$HOME/.cargo/bin:$PATH" timeout 900 pnpm --filter @paperclipai/shared --filter @paperclipai/server typecheck
+  EXPECT: server typecheck: Done
+  RESULT: exit 0; shared Done, server Done; Rust warnings pre-existing.
+  NEGATIVE: no isolated type-error fixture; typecheck is not the behavioral gate.
+
+Still missing: route-driven two-connection approval and promotion concurrency (both interleavings, failing route-fence control), stalled durable decision, changed-head fresh review, contract sync, independent final-head verification, engine PR/merge/rollout, Sable decision. UNSAFE TO SHIP.
+
 ## Low-trust promotion parent fence — 2026-10-01 — HOLD
 
 The promotion transaction now locks the company-scoped issue row before updating its source artifact or inserting its work product. This is a narrow parent-first fence; the existing source-trust equality predicate remains the post-lock compare-and-swap. It does not prove a second connection waits on this route, or rule out every writer inversion. Advisor recommended retaining this order and requiring a route-level PostgreSQL oracle before safety claims.
