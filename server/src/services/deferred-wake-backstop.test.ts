@@ -23,6 +23,8 @@ import {
   issueComments,
   issueRecoveryActions,
   issues,
+  agentTaskSessions,
+  companySkills,
 } from "@paperclipai/db";
 import {
   decideDeferredWakeBackstop,
@@ -34,6 +36,30 @@ import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "../__tests__/helpers/embedded-postgres.js";
+
+// SPA-9351: every service instance built below shares one fixture database, and
+// each one's post-commit dispatch keeps writing rows after the test body
+// returns. Track them so teardown can drain the in-flight executions BEFORE
+// deleting fixture rows; without this, `delete from heartbeat_runs` races an
+// async `UPDATE issues SET execution_run_id = NULL` and a promoted run is still
+// referenced from `agent_task_sessions.last_run_id`.
+const trackedHeartbeatServices: Array<{ drainActiveRunExecutions: () => Promise<void> }> = [];
+
+function trackHeartbeatService<T extends { drainActiveRunExecutions: () => Promise<void> }>(
+  service: T,
+): T {
+  trackedHeartbeatServices.push(service);
+  return service;
+}
+
+async function drainHeartbeatServiceInstances(): Promise<void> {
+  // Drain repeatedly: a settling run can dispatch a follow-up for the same
+  // agent, registering further work on the same instance before it goes idle.
+  for (let pass = 0; pass < 5; pass += 1) {
+    await Promise.all(trackedHeartbeatServices.map((service) => service.drainActiveRunExecutions()));
+  }
+  trackedHeartbeatServices.length = 0;
+}
 
 const BLOCKING_RUN_ID = "33333333-3333-4333-8333-333333333333";
 
@@ -411,8 +437,17 @@ describeEmbeddedPostgres("SPA-9351 shape 2: deferred-wake backstop", () => {
   }, 60_000);
 
   afterEach(async () => {
+    // SPA-9351: the backstop promotes a wake and the service dispatches it
+    // post-commit, so background run executions are still writing rows when
+    // this hook starts. Deleting the fixture out from under them produces
+    // "Issue not found" / "Run identity does not belong to this company" and
+    // leaves a held FK on a promoted run. Drain every service instance this
+    // file built, then delete in reverse dependency order.
+    await drainHeartbeatServiceInstances();
+    await db.delete(companySkills);
     await db.delete(activityLog);
     await db.delete(issueComments);
+    await db.delete(agentTaskSessions);
     await db.delete(heartbeatRuns);
     await db.delete(agentWakeupRequests);
     await db.delete(issueRecoveryActions);
@@ -534,7 +569,7 @@ describeEmbeddedPostgres("SPA-9351 shape 2: deferred-wake backstop", () => {
       execute function spa9351_claim_promoted_wake()
     `);
     const { heartbeatService } = await import("./heartbeat.js");
-    const heartbeat = heartbeatService(db as never);
+    const heartbeat = trackHeartbeatService(heartbeatService(db as never));
 
     try {
       const result = await heartbeat.reconcileStaleDeferredWakes();
@@ -554,7 +589,7 @@ describeEmbeddedPostgres("SPA-9351 shape 2: deferred-wake backstop", () => {
   it("promotes a stale deferral the old re-drive could never see", async () => {
     const seeded = await seedStaleDeferredWake({ blockingStatus: "cancelled" });
     const { heartbeatService } = await import("./heartbeat.js");
-    const heartbeat = heartbeatService(db as never);
+    const heartbeat = trackHeartbeatService(heartbeatService(db as never));
 
     const result = await heartbeat.reconcileStaleDeferredWakes();
 
@@ -582,7 +617,7 @@ describeEmbeddedPostgres("SPA-9351 shape 2: deferred-wake backstop", () => {
   it("leaves a deferral whose blocking run is still live", async () => {
     const seeded = await seedStaleDeferredWake({ blockingStatus: "running" });
     const { heartbeatService } = await import("./heartbeat.js");
-    const heartbeat = heartbeatService(db as never);
+    const heartbeat = trackHeartbeatService(heartbeatService(db as never));
 
     const result = await heartbeat.reconcileStaleDeferredWakes();
 
@@ -605,7 +640,7 @@ describeEmbeddedPostgres("SPA-9351 shape 2: deferred-wake backstop", () => {
       .where(eq(agentWakeupRequests.id, seeded.wakeId));
 
     const { heartbeatService } = await import("./heartbeat.js");
-    const heartbeat = heartbeatService(db as never);
+    const heartbeat = trackHeartbeatService(heartbeatService(db as never));
     const result = await heartbeat.reconcileStaleDeferredWakes();
 
     expect(result.promoted).toBe(0);
@@ -634,7 +669,7 @@ describeEmbeddedPostgres("SPA-9351 shape 2: deferred-wake backstop", () => {
       .where(eq(issues.id, seeded.issueId));
 
     const { heartbeatService } = await import("./heartbeat.js");
-    const heartbeat = heartbeatService(db as never);
+    const heartbeat = trackHeartbeatService(heartbeatService(db as never));
     const result = await heartbeat.reconcileStaleDeferredWakes();
 
     expect(result.promoted).toBe(0);
@@ -645,7 +680,7 @@ describeEmbeddedPostgres("SPA-9351 shape 2: deferred-wake backstop", () => {
   it("is idempotent: a second pass finds nothing left to promote", async () => {
     await seedStaleDeferredWake({ blockingStatus: "cancelled" });
     const { heartbeatService } = await import("./heartbeat.js");
-    const heartbeat = heartbeatService(db as never);
+    const heartbeat = trackHeartbeatService(heartbeatService(db as never));
 
     const first = await heartbeat.reconcileStaleDeferredWakes();
     expect(first.promoted).toBe(1);
@@ -673,8 +708,17 @@ describeEmbeddedPostgres("SPA-9351 shape 3: actionless recovery waits", () => {
   }, 60_000);
 
   afterEach(async () => {
+    // SPA-9351: the backstop promotes a wake and the service dispatches it
+    // post-commit, so background run executions are still writing rows when
+    // this hook starts. Deleting the fixture out from under them produces
+    // "Issue not found" / "Run identity does not belong to this company" and
+    // leaves a held FK on a promoted run. Drain every service instance this
+    // file built, then delete in reverse dependency order.
+    await drainHeartbeatServiceInstances();
+    await db.delete(companySkills);
     await db.delete(activityLog);
     await db.delete(issueComments);
+    await db.delete(agentTaskSessions);
     await db.delete(heartbeatRuns);
     await db.delete(agentWakeupRequests);
     await db.delete(issueRecoveryActions);
@@ -784,7 +828,7 @@ describeEmbeddedPostgres("SPA-9351 shape 3: actionless recovery waits", () => {
       execute function spa9351_claim_promoted_wake()
     `);
     const { heartbeatService } = await import("./heartbeat.js");
-    const heartbeat = heartbeatService(db as never);
+    const heartbeat = trackHeartbeatService(heartbeatService(db as never));
 
     try {
       const requeued = await heartbeat.reconcileDeferredWakeAfterDeferral(seeded.wakeId);
@@ -804,7 +848,7 @@ describeEmbeddedPostgres("SPA-9351 shape 3: actionless recovery waits", () => {
   it("promotes an actionless recovery wait and gives it a real run", async () => {
     const seeded = await seedActionlessDeferredWake();
     const { heartbeatService } = await import("./heartbeat.js");
-    const heartbeat = heartbeatService(db as never);
+    const heartbeat = trackHeartbeatService(heartbeatService(db as never));
 
     const result = await heartbeat.reconcileStaleDeferredWakes();
 
@@ -830,7 +874,7 @@ describeEmbeddedPostgres("SPA-9351 shape 3: actionless recovery waits", () => {
   it("is idempotent under a second pass", async () => {
     await seedActionlessDeferredWake();
     const { heartbeatService } = await import("./heartbeat.js");
-    const heartbeat = heartbeatService(db as never);
+    const heartbeat = trackHeartbeatService(heartbeatService(db as never));
 
     expect((await heartbeat.reconcileStaleDeferredWakes()).promoted).toBe(1);
     expect((await heartbeat.reconcileStaleDeferredWakes()).promoted).toBe(0);
@@ -858,7 +902,7 @@ describeEmbeddedPostgres("SPA-9351 shape 3: actionless recovery waits", () => {
       .where(eq(agentWakeupRequests.id, seeded.wakeId));
 
     const { heartbeatService } = await import("./heartbeat.js");
-    const heartbeat = heartbeatService(db as never);
+    const heartbeat = trackHeartbeatService(heartbeatService(db as never));
     const result = await heartbeat.reconcileStaleDeferredWakes();
 
     expect(result.promoted).toBe(0);
@@ -888,7 +932,7 @@ describeEmbeddedPostgres("SPA-9351 shape 3: actionless recovery waits", () => {
       .where(eq(issues.id, seeded.issueId));
 
     const { heartbeatService } = await import("./heartbeat.js");
-    const heartbeat = heartbeatService(db as never);
+    const heartbeat = trackHeartbeatService(heartbeatService(db as never));
     const result = await heartbeat.reconcileStaleDeferredWakes();
 
     expect(result.promoted).toBe(0);
@@ -919,7 +963,7 @@ describeEmbeddedPostgres("SPA-9351 shape 3: actionless recovery waits", () => {
     expect(await getExecutionBlocker(db as never, seeded.companyId, seeded.issueId)).not.toBeNull();
 
     const { heartbeatService } = await import("./heartbeat.js");
-    const heartbeat = heartbeatService(db as never);
+    const heartbeat = trackHeartbeatService(heartbeatService(db as never));
     const result = await heartbeat.reconcileStaleDeferredWakes();
 
     expect(result.promoted).toBe(0);
@@ -946,7 +990,7 @@ describeEmbeddedPostgres("SPA-9351 shape 3: actionless recovery waits", () => {
     });
 
     const { heartbeatService } = await import("./heartbeat.js");
-    const heartbeat = heartbeatService(db as never);
+    const heartbeat = trackHeartbeatService(heartbeatService(db as never));
     const requeued = await heartbeat.reconcileDeferredWakeAfterDeferral(seeded.wakeId);
 
     expect(requeued).toBe(false);
@@ -964,7 +1008,7 @@ describeEmbeddedPostgres("SPA-9351 shape 3: actionless recovery waits", () => {
     // this row. The fresh admission after deferral must turn it into a run.
     const seeded = await seedActionlessDeferredWake();
     const { heartbeatService } = await import("./heartbeat.js");
-    const heartbeat = heartbeatService(db as never);
+    const heartbeat = trackHeartbeatService(heartbeatService(db as never));
 
     const requeued = await heartbeat.reconcileDeferredWakeAfterDeferral(seeded.wakeId);
 
@@ -1000,7 +1044,7 @@ describeEmbeddedPostgres("SPA-9351 shape 3: actionless recovery waits", () => {
       .where(eq(issues.id, seeded.issueId));
 
     const { heartbeatService } = await import("./heartbeat.js");
-    const heartbeat = heartbeatService(db as never);
+    const heartbeat = trackHeartbeatService(heartbeatService(db as never));
     const requeued = await heartbeat.reconcileDeferredWakeAfterDeferral(seeded.wakeId);
 
     expect(requeued).toBe(false);
@@ -1020,7 +1064,7 @@ describeEmbeddedPostgres("SPA-9351 shape 3: actionless recovery waits", () => {
       .where(eq(agentWakeupRequests.id, seeded.wakeId));
 
     const { heartbeatService } = await import("./heartbeat.js");
-    const heartbeat = heartbeatService(db as never);
+    const heartbeat = trackHeartbeatService(heartbeatService(db as never));
     const requeued = await heartbeat.reconcileDeferredWakeAfterDeferral(seeded.wakeId);
 
     expect(requeued).toBe(false);
@@ -1029,7 +1073,7 @@ describeEmbeddedPostgres("SPA-9351 shape 3: actionless recovery waits", () => {
   it("promotes exactly one run when two concurrent post-deferral reconciliations race", async () => {
     const seeded = await seedActionlessDeferredWake();
     const { heartbeatService } = await import("./heartbeat.js");
-    const heartbeat = heartbeatService(db as never);
+    const heartbeat = trackHeartbeatService(heartbeatService(db as never));
 
     const [a, b] = await Promise.all([
       heartbeat.reconcileDeferredWakeAfterDeferral(seeded.wakeId),
@@ -1047,7 +1091,7 @@ describeEmbeddedPostgres("SPA-9351 shape 3: actionless recovery waits", () => {
   it("keeps concurrent startup/periodic sweeps from double-dispatching the same wake", async () => {
     await seedActionlessDeferredWake();
     const { heartbeatService } = await import("./heartbeat.js");
-    const heartbeat = heartbeatService(db as never);
+    const heartbeat = trackHeartbeatService(heartbeatService(db as never));
 
     const [first, second] = await Promise.all([
       heartbeat.reconcileStaleDeferredWakes(),
