@@ -1,5 +1,16 @@
 # SPA-9396 gates — incomplete WIP, 2026-09-30
 
+## Assigned-worktree suppression isolated — 2026-10-01 — HOLD
+
+The 18 queued-comment failures are caused by the worktree runtime flag in the Vitest worker, not by task-drain state or this branch's binding-lock changes. A focused test in a fresh Vitest process failed on `deferred_issue_execution`; a temporary assertion inside the test's `beforeAll` read `process.env.PAPERCLIP_IN_WORKTREE === "true"` and `resolveHeartbeatSchedulingSuppression(process.env) === { suppressed: true, reason: "worktree_instance" }`. The same diagnostic after the failing route found `getTaskDrainStatus().draining === false`. The parent shell's flag was unset while the Vitest worker observed it as `true`; the setter was not traced, so the precise startup source is unproven. All temporary diagnostic assertions/imports were removed and `git status --short` returned empty before the ledger edit. No production suppression logic changed.
+
+  CHECK: PATH="$HOME/.cargo/bin:$PATH" PAPERCLIP_IN_WORKTREE=false timeout 300 pnpm exec vitest run server/src/__tests__/issue-queued-comments-routes.test.ts --reporter=dot --silent
+  EXPECT: Tests 47 passed (47)
+  RESULT: exit 0, Test Files 1 passed (1), Tests 47 passed (47), Duration 57.52s. The identical suite without the explicit false flag exited 1, 18 failed / 29 passed at the expected scheduling assertions. The false flag is scoped to this isolated test process, not the running engine. This establishes an environment-sensitive adjacent suite, not production approval safety.
+  NEGATIVE: same suite without the explicit flag exited 1 with `heartbeat.scheduling_suppressed` and deferred wakes; not a mutation of an approval assertion, so the stage-approval safety gate remains unproven.
+
+Still missing: route-level PostgreSQL concurrent-writer oracle, locking on residual binding writers, stalled durable decision, changed-head fresh-review route, contract sync, independent verification, PR/merge/rollout and Sable decision. UNSAFE TO SHIP.
+
 ## Assigned-worktree rerun and fixture repair — 2026-10-01 — HOLD
 
 Latest board handoff `52bfa1e6` preserved HEAD `5642c40937`. This run re-read the assigned checkout (clean initially, matching HEAD). Live single-resource GET of SPA-9332 now returns `status=backlog`, `executionState=null`, `blockedBy=[SPA-9396]`, and Sable remains assignee; no live 409 probe was made, no security decision recorded. The historic deadlock remains a valid engine regression target, but its old victim execution state is no longer live evidence.
