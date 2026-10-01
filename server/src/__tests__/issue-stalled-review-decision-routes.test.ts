@@ -17,6 +17,7 @@ import {
   issueInboxArchives,
   issueRecoveryActions,
   issueThreadInteractions,
+  issueWorkProducts,
   issues,
 } from "@paperclipai/db";
 import { errorHandler } from "../middleware/index.js";
@@ -25,6 +26,16 @@ import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
+
+const pullRequestRead = vi.hoisted(() => ({ onRead: null as (() => void) | null }));
+
+vi.mock("../services/github-pull-request-merge.js", async (importOriginal) => ({
+  ...await importOriginal<typeof import("../services/github-pull-request-merge.js")>(),
+  createPullRequestMergeDetailsResolver: () => async () => {
+    pullRequestRead.onRead?.();
+    return { state: "open" as const, headRef: "review", headSha: "a".repeat(40) };
+  },
+}));
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -47,6 +58,7 @@ describeEmbeddedPostgres("stalled review decision routes", () => {
 
   afterEach(async () => {
     enqueueWakeup.mockClear();
+    pullRequestRead.onRead = null;
     await db.delete(issueThreadInteractions);
     await db.delete(issueApprovals);
     await db.delete(approvals);
@@ -56,6 +68,7 @@ describeEmbeddedPostgres("stalled review decision routes", () => {
     await db.delete(heartbeatRuns);
     await db.delete(agentWakeupRequests);
     await db.delete(issueInboxArchives);
+    await db.delete(issueWorkProducts);
     await db.delete(issues);
     await db.delete(companyMemberships);
     await db.delete(agents);
@@ -586,6 +599,54 @@ describeEmbeddedPostgres("stalled review decision routes", () => {
       },
     });
   });
+
+  it("refuses a stalled approval when the bound PR changes while its issue row is locked", async () => {
+    const seeded = await seedCompany("RBD");
+    const issueId = await seedReview({
+      companyId: seeded.companyId,
+      assigneeAgentId: seeded.assigneeAgentId,
+      identifier: "RBD-1",
+    });
+    const [product] = await db.insert(issueWorkProducts).values({
+      companyId: seeded.companyId,
+      issueId,
+      type: "pull_request",
+      provider: "github",
+      title: "PR 1",
+      url: "https://github.com/Spark-Mojo/paperclip/pull/1",
+      status: "open",
+    }).returning();
+    const locked = Promise.withResolvers<void>();
+    const preflight = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<void>();
+    pullRequestRead.onRead = () => preflight.resolve();
+    const holder = db.transaction(async (tx) => {
+      await tx.select().from(issues).where(eq(issues.id, issueId)).for("update");
+      locked.resolve();
+      await release.promise;
+      await tx.update(issueWorkProducts).set({
+        url: "https://github.com/Spark-Mojo/paperclip/pull/2",
+      }).where(eq(issueWorkProducts.id, product!.id));
+    });
+    await locked.promise;
+    const responsePromise = request(app(boardActor(seeded.companyId, seeded.memberUserId)))
+      .post(`/api/issues/${issueId}/stalled-review-decision`)
+      .send({ action: "approve", reviewedPullRequests: [{ owner: "Spark-Mojo", repo: "paperclip", number: 1, headSha: "a".repeat(40) }] });
+    try {
+      const response = responsePromise.then((result) => result);
+      await preflight.promise;
+      release.resolve();
+      await holder;
+      const result = await response;
+      expect(result.status, JSON.stringify(result.body)).toBe(409);
+      expect(result.body.details?.code).toBe("issue_stage_approval_incomplete_pull_request_set");
+      const [persisted] = await db.select({ status: issues.status }).from(issues).where(eq(issues.id, issueId));
+      expect(persisted?.status).toBe("in_review");
+    } finally {
+      release.resolve();
+      await holder;
+    }
+  }, 90_000);
 
   it("rejects stale or covered reviews and serializes concurrent decisions", async () => {
     const seeded = await seedCompany("RCE");
