@@ -3,7 +3,7 @@ import type { Db } from "@paperclipai/db";
 import type { AttentionSortMode } from "@paperclipai/shared";
 import { attentionService } from "../services/attention.js";
 import { badRequest } from "../errors.js";
-import { assertBoard, assertCompanyAccess } from "./authz.js";
+import { assertBoardOrAgentRole, assertCompanyAccess } from "./authz.js";
 
 function optionalQueryString(value: unknown, field: string) {
   if (value === undefined) return undefined;
@@ -18,8 +18,11 @@ export function attentionRoutes(db: Db) {
   router.get("/companies/:companyId/attention", async (req, res) => {
     const companyId = req.params.companyId as string;
     assertCompanyAccess(req, companyId);
-    assertBoard(req);
-    if (!req.actor.userId) {
+    await assertBoardOrAgentRole(req, db, companyId, ["ceo"]);
+    // Agent actors (CoS-role curation readers) carry no board userId; they
+    // intentionally receive the unfiltered company feed. Board actors still
+    // require their user context for per-user dismissal scoping.
+    if (req.actor.type === "board" && !req.actor.userId) {
       res.status(403).json({ error: "Board user context required" });
       return;
     }
