@@ -358,6 +358,21 @@ export function workProductService(
       // prefix behind (which a retry would then duplicate). Mirrors the
       // per-writer transaction the batched issue/document writers use.
       await db.transaction(async (tx) => {
+        const expectedParents = new Map<string, string>();
+        for (const row of rows) {
+          const previous = expectedParents.get(row.issueId);
+          if (previous && previous !== row.companyId) throw new Error("import_work_product_parent_missing");
+          expectedParents.set(row.issueId, row.companyId);
+        }
+        const parentIds = [...expectedParents.keys()].sort();
+        for (let start = 0; start < parentIds.length; start += 500) {
+          const chunk = parentIds.slice(start, start + 500);
+          const locked = await tx.select({ id: issues.id, companyId: issues.companyId })
+            .from(issues).where(inArray(issues.id, chunk)).orderBy(issues.id).for("update");
+          if (locked.length !== chunk.length || locked.some((parent) => expectedParents.get(parent.id) !== parent.companyId)) {
+            throw new Error("import_work_product_parent_missing");
+          }
+        }
         await insertRowsInChunks(tx, issueWorkProducts, values);
       });
     },

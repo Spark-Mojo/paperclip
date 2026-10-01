@@ -206,6 +206,36 @@ describe("workProductService", () => {
     expect(result?.reviewState).toBe("ready_for_review");
   });
 
+  it("locks each imported parent before inserting any work product", async () => {
+    const calls: string[] = [];
+    const lockedParents = vi.fn(async () => [{ id: "issue-1", companyId: "company-1" }]);
+    const tx = {
+      select: vi.fn(() => ({ from: () => ({ where: () => ({ orderBy: () => ({ for: lockedParents }) }) }) })),
+      insert: vi.fn(() => ({ values: vi.fn(async () => { calls.push("insert"); }) })),
+    };
+    lockedParents.mockImplementation(async () => { calls.push("issue-lock"); return [{ id: "issue-1", companyId: "company-1" }]; });
+    const transaction = vi.fn(async (callback: (input: typeof tx) => Promise<unknown>) => callback(tx));
+    await workProductService({ transaction } as any).createManyForImport([{
+      ...createWorkProductRow(),
+      sourceTrust: null,
+    }] as any);
+    expect(calls).toEqual(["issue-lock", "insert"]);
+  });
+
+  it("refuses import if a parent does not belong to the claimed company", async () => {
+    const insert = vi.fn();
+    const tx = {
+      select: vi.fn(() => ({ from: () => ({ where: () => ({ orderBy: () => ({ for: vi.fn(async () => []) }) }) }) })),
+      insert,
+    };
+    const transaction = vi.fn(async (callback: (input: typeof tx) => Promise<unknown>) => callback(tx));
+    await expect(workProductService({ transaction } as any).createManyForImport([{
+      ...createWorkProductRow(),
+      sourceTrust: null,
+    }] as any)).rejects.toThrow("import_work_product_parent_missing");
+    expect(insert).not.toHaveBeenCalled();
+  });
+
   it("locks the parent before deleting an existing work product", async () => {
     const existingRow = createWorkProductRow();
     const calls: string[] = [];
@@ -222,7 +252,7 @@ describe("workProductService", () => {
     const tx = { select, delete: del };
     const transaction = vi.fn(async (callback: (input: typeof tx) => Promise<unknown>) => callback(tx));
 
-    const result = await workProductService({ transaction } as any).remove("work-product-1");
+    const result = await workProductService({ transaction, delete: del, select: () => ({ from: () => ({ where: async () => [existingRow] }) }) } as any).remove("work-product-1");
 
     expect(result?.id).toBe("work-product-1");
     expect(calls).toEqual(["issue-lock", "child-lock"]);
