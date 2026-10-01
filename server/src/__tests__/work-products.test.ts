@@ -170,9 +170,15 @@ describe("workProductService", () => {
   it("uses a transaction when promoting an existing work product to primary", async () => {
     const existingRow = createWorkProductRow({ isPrimary: false });
 
+    const calls: string[] = [];
     const selectWhere = vi.fn(async () => [existingRow]);
     const selectFrom = vi.fn(() => ({ where: selectWhere }));
     const txSelect = vi.fn(() => ({ from: selectFrom }));
+    const lockedWhere = vi.fn(() => ({ for: vi.fn(async () => { calls.push("issue-lock"); return [{ id: "issue-1" }]; }) }));
+    const lockedSelect = vi.fn(() => ({ from: () => ({ where: lockedWhere }) }));
+    const childWhere = vi.fn(() => ({ for: vi.fn(async () => { calls.push("child-lock"); return [existingRow]; }) }));
+    const childSelect = vi.fn(() => ({ from: () => ({ where: childWhere }) }));
+    const select = vi.fn().mockImplementationOnce(txSelect).mockImplementationOnce(lockedSelect).mockImplementationOnce(childSelect);
 
     const updateReturning = vi
       .fn()
@@ -182,7 +188,7 @@ describe("workProductService", () => {
     const txUpdate = vi.fn(() => ({ set: updateSet }));
 
     const tx = {
-      select: txSelect,
+      select,
       update: txUpdate,
     };
     const transaction = vi.fn(async (callback: (input: typeof tx) => Promise<unknown>) => await callback(tx));
@@ -194,8 +200,32 @@ describe("workProductService", () => {
     });
 
     expect(transaction).toHaveBeenCalledTimes(1);
-    expect(txSelect).toHaveBeenCalledTimes(1);
+    expect(select).toHaveBeenCalledTimes(3);
     expect(txUpdate).toHaveBeenCalledTimes(2);
+    expect(calls).toEqual(["issue-lock", "child-lock"]);
     expect(result?.reviewState).toBe("ready_for_review");
+  });
+
+  it("locks the parent before deleting an existing work product", async () => {
+    const existingRow = createWorkProductRow();
+    const calls: string[] = [];
+    const lookup = vi.fn(async () => [existingRow]);
+    const parentLock = vi.fn(async () => { calls.push("issue-lock"); return [{ id: "issue-1" }]; });
+    const childLock = vi.fn(async () => { calls.push("child-lock"); return [existingRow]; });
+    const select = vi.fn()
+      .mockImplementationOnce(() => ({ from: () => ({ where: lookup }) }))
+      .mockImplementationOnce(() => ({ from: () => ({ where: () => ({ for: parentLock }) }) }))
+      .mockImplementationOnce(() => ({ from: () => ({ where: () => ({ for: childLock }) }) }));
+    const returning = vi.fn(async () => [existingRow]);
+    const removeWhere = vi.fn(() => ({ returning }));
+    const del = vi.fn(() => ({ where: removeWhere }));
+    const tx = { select, delete: del };
+    const transaction = vi.fn(async (callback: (input: typeof tx) => Promise<unknown>) => callback(tx));
+
+    const result = await workProductService({ transaction } as any).remove("work-product-1");
+
+    expect(result?.id).toBe("work-product-1");
+    expect(calls).toEqual(["issue-lock", "child-lock"]);
+    expect(del).toHaveBeenCalledTimes(1);
   });
 });

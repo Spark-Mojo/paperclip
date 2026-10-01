@@ -277,12 +277,21 @@ export function workProductService(
 
     update: async (id: string, patch: Partial<typeof issueWorkProducts.$inferInsert>) => {
       const row = await db.transaction(async (tx) => {
-        const existing = await tx
+        const candidate = await tx
           .select()
           .from(issueWorkProducts)
           .where(eq(issueWorkProducts.id, id))
           .then((rows) => rows[0] ?? null);
-        if (!existing) return null;
+        if (!candidate) return null;
+        const [parent] = await tx.select({ id: issues.id }).from(issues).where(and(
+          eq(issues.id, candidate.issueId),
+          eq(issues.companyId, candidate.companyId),
+        )).for("update");
+        if (!parent) return null;
+        const existing = await tx.select().from(issueWorkProducts).where(eq(issueWorkProducts.id, id)).for("update").then((rows) => rows[0] ?? null);
+        if (!existing || existing.issueId !== candidate.issueId || existing.companyId !== candidate.companyId) return null;
+        if (patch.issueId !== undefined && patch.issueId !== existing.issueId) return null;
+        if (patch.companyId !== undefined && patch.companyId !== existing.companyId) return null;
 
         if (patch.isPrimary === true) {
           await tx
@@ -354,11 +363,18 @@ export function workProductService(
     },
 
     remove: async (id: string) => {
-      const row = await db
-        .delete(issueWorkProducts)
-        .where(eq(issueWorkProducts.id, id))
-        .returning()
-        .then((rows) => rows[0] ?? null);
+      const row = await db.transaction(async (tx) => {
+        const candidate = await tx.select().from(issueWorkProducts).where(eq(issueWorkProducts.id, id)).then((rows) => rows[0] ?? null);
+        if (!candidate) return null;
+        const [parent] = await tx.select({ id: issues.id }).from(issues).where(and(
+          eq(issues.id, candidate.issueId),
+          eq(issues.companyId, candidate.companyId),
+        )).for("update");
+        if (!parent) return null;
+        const existing = await tx.select().from(issueWorkProducts).where(eq(issueWorkProducts.id, id)).for("update").then((rows) => rows[0] ?? null);
+        if (!existing || existing.issueId !== candidate.issueId || existing.companyId !== candidate.companyId) return null;
+        return await tx.delete(issueWorkProducts).where(eq(issueWorkProducts.id, id)).returning().then((rows) => rows[0] ?? null);
+      });
       return row ? toIssueWorkProduct(row) : null;
     },
   };
