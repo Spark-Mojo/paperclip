@@ -1,0 +1,9 @@
+[Unit]
+Description=Timer for cadence-heartbeat
+
+[Timer]
+Unit=cadence-heartbeat.service
+OnUnitActiveSec=10800s
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,17 @@
+[Unit]
+Description=question-pinger (bigbox)
+After=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/jamesilsley
+EnvironmentFile=/home/jamesilsley/.config/paperclip/box.env
+Environment=QUESTION_PINGER_DAILY_CAP=5
+Environment=QUESTION_PINGER_OLDER_HOURS=4
+Environment=QUESTION_PINGER_RENOTIFY_HOURS=24
+ExecStart=/bin/bash /home/jamesilsley/GitHub/sparkmojo-internal/platform/strategy-pipeline/monitor/bin/question-pinger.sh
+StandardOutput=append:/home/jamesilsley/GitHub/sparkmojo-internal/platform/strategy-pipeline/monitor/state/question-pinger.out.log
+StandardError=append:/home/jamesilsley/GitHub/sparkmojo-internal/platform/strategy-pipeline/monitor/state/question-pinger.err.log
+
+[Install]
+WantedBy=default.target

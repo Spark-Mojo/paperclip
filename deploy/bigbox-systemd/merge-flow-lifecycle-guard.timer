@@ -1,0 +1,9 @@
+[Unit]
+Description=Timer for merge-flow-lifecycle-guard
+
+[Timer]
+Unit=merge-flow-lifecycle-guard.service
+OnUnitActiveSec=300s
+
+[Install]
+WantedBy=timers.target

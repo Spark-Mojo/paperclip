@@ -1,0 +1,9 @@
+[Unit]
+Description=Timer for managed-skill-sync
+
+[Timer]
+Unit=managed-skill-sync.service
+OnUnitActiveSec=900s
+
+[Install]
+WantedBy=timers.target

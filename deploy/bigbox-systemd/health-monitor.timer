@@ -1,0 +1,9 @@
+[Unit]
+Description=Timer for health-monitor
+
+[Timer]
+Unit=health-monitor.service
+OnCalendar=*-*-* 09:00:00
+
+[Install]
+WantedBy=timers.target

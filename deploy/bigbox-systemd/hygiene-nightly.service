@@ -1,0 +1,13 @@
+[Unit]
+Description=hygiene-nightly (bigbox)
+After=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/jamesilsley
+ExecStart=/bin/bash /home/jamesilsley/GitHub/spark-mojo-platform/scripts/hygiene/nightly-hygiene.sh
+StandardOutput=append:/home/jamesilsley/.gbrain/hygiene-nightly.log
+StandardError=append:/home/jamesilsley/.gbrain/hygiene-nightly.log
+
+[Install]
+WantedBy=default.target

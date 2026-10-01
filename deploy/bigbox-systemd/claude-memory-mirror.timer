@@ -1,0 +1,9 @@
+[Unit]
+Description=Timer for claude-memory-mirror
+
+[Timer]
+Unit=claude-memory-mirror.service
+OnCalendar=*-*-* 02:45:00
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,13 @@
+[Unit]
+Description=cadence-nightly (bigbox)
+After=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/jamesilsley
+ExecStart=/bin/bash /home/jamesilsley/GitHub/sparkmojo-internal/platform/strategy-pipeline/scheduler/bin/gate.sh
+StandardOutput=append:/home/jamesilsley/GitHub/sparkmojo-internal/platform/strategy-pipeline/scheduler/state/launchd-nightly.out.log
+StandardError=append:/home/jamesilsley/GitHub/sparkmojo-internal/platform/strategy-pipeline/scheduler/state/launchd-nightly.err.log
+
+[Install]
+WantedBy=default.target

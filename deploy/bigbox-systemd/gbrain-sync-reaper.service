@@ -1,0 +1,13 @@
+[Unit]
+Description=gbrain-sync-reaper (bigbox)
+After=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/jamesilsley
+ExecStart=/bin/bash /home/jamesilsley/GitHub/sparkmojo-internal/platform/strategy-pipeline/monitor/bin/gbrain-sync-reaper.sh
+StandardOutput=append:/home/jamesilsley//dev/null
+StandardError=append:/home/jamesilsley/GitHub/sparkmojo-internal/platform/strategy-pipeline/monitor/state/gbrain-sync-reaper.err.log
+
+[Install]
+WantedBy=default.target

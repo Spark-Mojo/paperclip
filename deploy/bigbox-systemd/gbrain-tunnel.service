@@ -1,0 +1,15 @@
+[Unit]
+Description=gbrain-tunnel (bigbox)
+After=network-online.target
+
+[Service]
+Type=simple
+Restart=always
+RestartSec=30
+WorkingDirectory=/home/jamesilsley
+ExecStart=/usr/bin/ssh -NT -o ServerAliveInterval=30 -o ServerAliveCountMax=3 -o ExitOnForwardFailure=yes -o BatchMode=yes -o IdentitiesOnly=yes -o IdentityAgent=none -o ControlMaster=no -o ControlPath=none -i /home/jamesilsley/.ssh/gbrain_tunnel -L 5433:127.0.0.1:5433 sparkmojo
+StandardOutput=append:/home/jamesilsley/.gbrain/tunnel.log
+StandardError=append:/home/jamesilsley/.gbrain/tunnel.log
+
+[Install]
+WantedBy=default.target

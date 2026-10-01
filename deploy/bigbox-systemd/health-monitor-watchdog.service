@@ -1,0 +1,13 @@
+[Unit]
+Description=health-monitor-watchdog (bigbox)
+After=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/jamesilsley
+ExecStart=/bin/sh /home/jamesilsley/.sparkmojo/monitor-sync-and-run.sh /bin/bash /home/jamesilsley/.sparkmojo/monitor-main/platform/strategy-pipeline/monitor/bin/watchdog.sh
+StandardOutput=append:/home/jamesilsley/.sparkmojo/monitor-main/platform/strategy-pipeline/monitor/state/watchdog.out.log
+StandardError=append:/home/jamesilsley/.sparkmojo/monitor-main/platform/strategy-pipeline/monitor/state/watchdog.err.log
+
+[Install]
+WantedBy=default.target

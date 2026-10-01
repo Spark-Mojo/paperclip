@@ -1,0 +1,13 @@
+[Unit]
+Description=deploy-failure-alarm (bigbox)
+After=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/jamesilsley
+ExecStart=/bin/sh /home/jamesilsley/.sparkmojo/monitor-sync-and-run.sh /bin/bash /home/jamesilsley/.sparkmojo/monitor-main/platform/strategy-pipeline/monitor/bin/deploy-failure-alarm.sh
+StandardOutput=append:/home/jamesilsley/.sparkmojo/monitor-main/platform/strategy-pipeline/monitor/state/deploy-failure-alarm.out.log
+StandardError=append:/home/jamesilsley/.sparkmojo/monitor-main/platform/strategy-pipeline/monitor/state/deploy-failure-alarm.err.log
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,9 @@
+[Unit]
+Description=Timer for health-monitor-watchdog
+
+[Timer]
+Unit=health-monitor-watchdog.service
+OnCalendar=*-*-* 09:45:00
+
+[Install]
+WantedBy=timers.target

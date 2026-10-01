@@ -1,0 +1,15 @@
+[Unit]
+Description=litellm (bigbox)
+After=network-online.target
+
+[Service]
+Type=simple
+Restart=always
+RestartSec=30
+WorkingDirectory=/home/jamesilsley
+ExecStart=/home/jamesilsley/.machine-litellm/start.sh
+StandardOutput=append:/home/jamesilsley/.machine-litellm/proxy.log
+StandardError=append:/home/jamesilsley/.machine-litellm/proxy.log
+
+[Install]
+WantedBy=default.target

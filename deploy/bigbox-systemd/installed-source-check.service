@@ -1,0 +1,13 @@
+[Unit]
+Description=installed-source-check (bigbox)
+After=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/jamesilsley
+ExecStart=/bin/bash /home/jamesilsley/GitHub/sparkmojo-internal/infra/launchd/scripts/check-installed.sh
+StandardOutput=append:/home/jamesilsley/.gbrain/installed-source-check.log
+StandardError=append:/home/jamesilsley/.gbrain/installed-source-check.log
+
+[Install]
+WantedBy=default.target

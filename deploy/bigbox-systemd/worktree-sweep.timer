@@ -1,0 +1,9 @@
+[Unit]
+Description=Timer for worktree-sweep
+
+[Timer]
+Unit=worktree-sweep.service
+OnCalendar=*-*-* 04:47:00
+
+[Install]
+WantedBy=timers.target

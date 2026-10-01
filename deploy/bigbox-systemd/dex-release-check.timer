@@ -1,0 +1,9 @@
+[Unit]
+Description=Timer for dex-release-check
+
+[Timer]
+Unit=dex-release-check.service
+OnUnitActiveSec=900s
+
+[Install]
+WantedBy=timers.target

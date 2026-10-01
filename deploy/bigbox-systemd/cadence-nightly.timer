@@ -1,0 +1,9 @@
+[Unit]
+Description=Timer for cadence-nightly
+
+[Timer]
+Unit=cadence-nightly.service
+OnCalendar=*-*-* 03:30:00
+
+[Install]
+WantedBy=timers.target

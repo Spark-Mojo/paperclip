@@ -1,0 +1,9 @@
+[Unit]
+Description=Timer for merge-flow-deploy-gate-closer
+
+[Timer]
+Unit=merge-flow-deploy-gate-closer.service
+OnUnitActiveSec=300s
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,13 @@
+[Unit]
+Description=claude-memory-mirror (bigbox)
+After=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/jamesilsley
+ExecStart=/bin/bash /home/jamesilsley/.gbrain/claude-memory-mirror.sh
+StandardOutput=append:/home/jamesilsley/.gbrain/claude-memory-mirror.log
+StandardError=append:/home/jamesilsley/.gbrain/claude-memory-mirror.log
+
+[Install]
+WantedBy=default.target

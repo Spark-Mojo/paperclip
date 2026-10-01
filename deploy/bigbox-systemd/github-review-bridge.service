@@ -1,0 +1,15 @@
+[Unit]
+Description=github-review-bridge (bigbox)
+After=network-online.target
+
+[Service]
+Type=simple
+Restart=always
+RestartSec=30
+WorkingDirectory=/home/jamesilsley
+ExecStart=/usr/bin/python3 /home/jamesilsley/bin/github-review-bridge.py
+StandardOutput=append:/home/jamesilsley/.machine-github-bridge/stderr.log
+StandardError=append:/home/jamesilsley/.machine-github-bridge/stderr.log
+
+[Install]
+WantedBy=default.target

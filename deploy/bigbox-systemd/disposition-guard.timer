@@ -1,0 +1,9 @@
+[Unit]
+Description=Timer for disposition-guard
+
+[Timer]
+Unit=disposition-guard.service
+OnUnitActiveSec=900s
+
+[Install]
+WantedBy=timers.target
