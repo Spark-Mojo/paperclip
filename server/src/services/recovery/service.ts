@@ -134,6 +134,28 @@ import {
   DISPOSITION_REPAIR_MAX_ATTEMPTS,
 } from "./disposition-repair.js";
 import {
+  BOUNDED_TRANSIENT_RETRY_REASON,
+  EXHAUSTED_RETRY_REWAKE_ISSUE_STATUSES,
+  EXHAUSTED_RETRY_REWAKE_KEY_PREFIX,
+  EXHAUSTED_RETRY_REWAKE_SOURCE,
+  EXHAUSTED_RETRY_REWAKE_WAKE_REASON,
+  ORPHANED_RETRY_REWAKE_KEY_PREFIX,
+  ORPHANED_RETRY_REWAKE_SOURCE,
+  ORPHANED_RETRY_REWAKE_WAKE_REASON,
+  buildExhaustedRetryRewakeEpisodeKey,
+  buildExhaustedRetryRewakeIdempotencyKey,
+  buildOrphanedRetryRewakeEpisodeKey,
+  buildOrphanedRetryRewakeIdempotencyKey,
+  decideExhaustedRetryRewake,
+  decideOrphanedRetryRewake,
+  exhaustedRetryRewakeEpisodeContext,
+  isEpisodeIdempotencyConflict,
+  isOrphanedRetryRun,
+  orphanedRetryRewakeReplacementContext,
+  readExhaustedRetryRewakeEpisode,
+  readOrphanedRetryRewakeEpisode,
+} from "./exhausted-retry-rewake.js";
+import {
   createActiveRunWatchdog,
   WatchdogDecisionApplicationError,
   type RunOutputSilenceSummary,
@@ -488,6 +510,24 @@ function didAutomaticRecoveryFail(
 function isTerminalIssueRun(latestRun: LatestIssueRun) {
   if (!latestRun) return false;
   return TERMINAL_HEARTBEAT_RUN_STATUSES.has(latestRun.status);
+}
+
+/**
+ * An active recovery action that has consumed its own budget keeps one
+ * inspectable board-owned record but no automatic wake path. The exhausted-retry
+ * re-wake must respect that: it is another automatic wake, and must not
+ * resurrect a card the board escalation already took over.
+ */
+function isRecoveryActionBudgetExhausted(action: {
+  evidence: Record<string, unknown> | null;
+}) {
+  const budget = parseObject(action.evidence).recoveryBudget;
+  return Boolean(
+    budget &&
+      typeof budget === "object" &&
+      !Array.isArray(budget) &&
+      (budget as Record<string, unknown>).state === "exhausted",
+  );
 }
 
 const TRANSIENT_INFRA_CONTINUATION_ERROR_CODES = new Set<string>([
@@ -2049,6 +2089,444 @@ export function recoveryService(
         .then((rows) => rows[0] ?? null),
     ]);
     return Boolean(comment || attachment);
+  }
+
+  /**
+   * SPA-9351: the single bounded re-wake an exhausted-retry episode is allowed.
+   *
+   * Deliberately NOT routed through `enqueueStrandedIssueRecovery`: passing the
+   * exhausted predecessor as `retryOfRunId` lands in that function's
+   * terminal-predecessor branch, which calls `deps.scheduleRecoveryRetry` and
+   * gets refused by a budget the heartbeat lane has already spent. This calls
+   * `deps.enqueueWakeup` directly with no `retryOfRunId`, so the card gets a
+   * fresh execution path instead of a request to redo a dead one.
+   *
+   * The idempotency key is the budget: the insert races concurrent sweeps and
+   * restarts on the partial unique index behind
+   * `agent_wakeup_requests.idempotency_key`, and exactly one wins.
+   */
+  async function enqueueExhaustedRetryRewake(input: {
+    issue: typeof issues.$inferSelect;
+    agentId: string;
+    latestRun: LatestIssueRun;
+    classification: ContinuationRetryClassification;
+  }): Promise<"rewoken" | "suppressed"> {
+    const exhaustedRun = input.latestRun;
+    if (!exhaustedRun) return "suppressed";
+    const episodeKey = buildExhaustedRetryRewakeEpisodeKey({
+      companyId: input.issue.companyId,
+      issueId: input.issue.id,
+      exhaustedRunId: exhaustedRun.id,
+    });
+    const idempotencyKey = buildExhaustedRetryRewakeIdempotencyKey({
+      companyId: input.issue.companyId,
+      issueId: input.issue.id,
+      episodeKey,
+    });
+
+    const [
+      hasLivePath,
+      hasQueuedWake,
+      hasPendingInteraction,
+      unresolvedBlockerIds,
+      invocationBudgetBlocked,
+      pauseHeld,
+      episodeRuns,
+      activeAction,
+      episodeRewakeDispatched,
+    ] = await Promise.all([
+      hasActiveExecutionPath(input.issue.companyId, input.issue.id, input.agentId),
+      hasQueuedIssueWake(input.issue.companyId, input.issue.id, input.agentId),
+      hasPendingWakeInteraction(input.issue.companyId, input.issue.id),
+      existingUnresolvedBlockerIssueIds(input.issue.companyId, input.issue.id),
+      isInvocationBudgetBlocked(input.issue, input.agentId),
+      isAutomaticRecoverySuppressedByPauseHold(
+        db,
+        input.issue.companyId,
+        input.issue.id,
+      ),
+      // The delay is anchored on the episode's newest finished run, so the
+      // query deliberately ALSO matches the exhausted run that defines the
+      // episode.
+      db
+        .select({ id: heartbeatRuns.id, finishedAt: heartbeatRuns.finishedAt })
+        .from(heartbeatRuns)
+        .where(
+          and(
+            eq(heartbeatRuns.companyId, input.issue.companyId),
+            or(
+              sql`${heartbeatRuns.contextSnapshot} -> 'exhaustedRetryRewakeEpisode' ->> 'episodeKey' = ${episodeKey}`,
+              eq(heartbeatRuns.id, exhaustedRun.id),
+            ),
+          ),
+        )
+        .orderBy(desc(heartbeatRuns.finishedAt), desc(heartbeatRuns.createdAt))
+        .limit(1),
+      recoveryActionsSvc.getActiveForIssue(input.issue.companyId, input.issue.id),
+      db
+        .select({ id: agentWakeupRequests.id })
+        .from(agentWakeupRequests)
+        .where(
+          and(
+            eq(agentWakeupRequests.companyId, input.issue.companyId),
+            eq(agentWakeupRequests.agentId, input.agentId),
+            eq(agentWakeupRequests.idempotencyKey, idempotencyKey),
+          ),
+        )
+        .limit(1)
+        .then((rows) => rows.length > 0),
+    ]);
+
+    const recoveryBudgetExhausted = Boolean(
+      activeAction && isRecoveryActionBudgetExhausted(activeAction),
+    );
+
+    const decision = decideExhaustedRetryRewake({
+      retryReason: BOUNDED_TRANSIENT_RETRY_REASON,
+      errorCode: exhaustedRun.errorCode ?? null,
+      classificationKind: input.classification.kind,
+      retryBudgetExhausted: true,
+      latestFinishedAt:
+        episodeRuns[0]?.finishedAt instanceof Date ? episodeRuns[0].finishedAt : null,
+      episodeRewakeDispatched,
+      recoveryBudgetExhausted,
+      hasLiveExecutionPath: hasLivePath,
+      hasQueuedWake,
+      hasOpenBlocker: unresolvedBlockerIds.length > 0,
+      hasPendingInteraction,
+      isInvocationBudgetBlocked: invocationBudgetBlocked,
+      isSuppressedByPauseHold: pauseHeld,
+      issueStatus: input.issue.status,
+      hasAgentAssignee: Boolean(input.issue.assigneeAgentId),
+    });
+
+    if (decision.kind === "suppressed") {
+      logger.info(
+        {
+          issueId: input.issue.id,
+          agentId: input.agentId,
+          exhaustedRunId: exhaustedRun.id,
+          errorCode: exhaustedRun.errorCode,
+          episodeKey,
+          reason: decision.reason,
+        },
+        "exhausted-retry re-wake suppressed",
+      );
+      return "suppressed";
+    }
+
+    const episodeContext = exhaustedRetryRewakeEpisodeContext({
+      episodeKey,
+      exhaustedRunId: exhaustedRun.id,
+      errorCode: exhaustedRun.errorCode ?? null,
+    });
+
+    const queued = await deps
+      .enqueueWakeup(input.agentId, {
+        source: "automation",
+        triggerDetail: "system",
+        reason: EXHAUSTED_RETRY_REWAKE_WAKE_REASON,
+        idempotencyKey,
+        payload: withRecoveryContext(
+          {
+            issueId: input.issue.id,
+            ...episodeContext,
+          },
+          "normal_model",
+        ),
+        requestedByActorType: "system",
+        requestedByActorId: null,
+        contextSnapshot: withRecoveryContext(
+          {
+            issueId: input.issue.id,
+            taskId: input.issue.id,
+            wakeReason: EXHAUSTED_RETRY_REWAKE_WAKE_REASON,
+            retryReason: EXHAUSTED_RETRY_REWAKE_WAKE_REASON,
+            source: EXHAUSTED_RETRY_REWAKE_SOURCE,
+            ...episodeContext,
+          },
+          "normal_model",
+        ),
+      })
+      .catch((error: unknown) => {
+        // The budget is the insert. A losing racer means this episode's
+        // re-wake already exists, which is a successful no-op, not a sweep
+        // failure.
+        if (isEpisodeIdempotencyConflict(error, EXHAUSTED_RETRY_REWAKE_KEY_PREFIX)) {
+          return null;
+        }
+        throw error;
+      });
+
+    if (!queued) return "suppressed";
+
+    logger.warn(
+      {
+        issueId: input.issue.id,
+        agentId: input.agentId,
+        exhaustedRunId: exhaustedRun.id,
+        errorCode: exhaustedRun.errorCode,
+        episodeKey,
+        wakeId: queued.id,
+      },
+      "re-woke card stranded by an exhausted retry budget",
+    );
+    return "rewoken";
+  }
+
+  async function resolveRetryLineageRootRunId(
+    companyId: string,
+    runId: string,
+  ): Promise<{ rootRunId: string; lineageRunIds: string[] }> {
+    let currentId = runId;
+    const lineageRunIds = [runId];
+    const seen = new Set<string>([runId]);
+    for (let depth = 0; depth < 32; depth += 1) {
+      const [row] = await db
+        .select({ retryOfRunId: heartbeatRuns.retryOfRunId })
+        .from(heartbeatRuns)
+        .where(
+          and(
+            eq(heartbeatRuns.companyId, companyId),
+            eq(heartbeatRuns.id, currentId),
+          ),
+        )
+        .limit(1);
+      const parentId = row?.retryOfRunId ?? null;
+      if (!parentId || seen.has(parentId)) break;
+      seen.add(parentId);
+      currentId = parentId;
+      lineageRunIds.push(parentId);
+    }
+    return { rootRunId: currentId, lineageRunIds };
+  }
+
+  async function enqueueOrphanedRetryRedispatch(input: {
+    issue: typeof issues.$inferSelect;
+    agentId: string;
+    latestRun: LatestIssueRun;
+  }): Promise<"redispatched" | "suppressed"> {
+    const orphanRun = input.latestRun;
+    if (!orphanRun) return "suppressed";
+
+    const { rootRunId, lineageRunIds } = await resolveRetryLineageRootRunId(
+      input.issue.companyId,
+      orphanRun.id,
+    );
+    const episodeKey = buildOrphanedRetryRewakeEpisodeKey({
+      companyId: input.issue.companyId,
+      issueId: input.issue.id,
+      rootRunId,
+    });
+    const idempotencyKey = buildOrphanedRetryRewakeIdempotencyKey({
+      companyId: input.issue.companyId,
+      issueId: input.issue.id,
+      episodeKey,
+    });
+
+    const [
+      hasLivePath,
+      hasQueuedWake,
+      hasPendingInteraction,
+      unresolvedBlockerIds,
+      invocationBudgetBlocked,
+      pauseHeld,
+      hasNewerRun,
+      episodeRuns,
+      activeAction,
+      exhaustedEpisode,
+      episodeRedispatchDispatched,
+    ] = await Promise.all([
+      hasActiveExecutionPath(input.issue.companyId, input.issue.id, input.agentId),
+      hasQueuedIssueWake(input.issue.companyId, input.issue.id, input.agentId),
+      hasPendingWakeInteraction(input.issue.companyId, input.issue.id),
+      existingUnresolvedBlockerIssueIds(input.issue.companyId, input.issue.id),
+      isInvocationBudgetBlocked(input.issue, input.agentId),
+      isAutomaticRecoverySuppressedByPauseHold(
+        db,
+        input.issue.companyId,
+        input.issue.id,
+      ),
+      db
+        .select({ id: heartbeatRuns.id })
+        .from(heartbeatRuns)
+        .where(
+          and(
+            eq(heartbeatRuns.companyId, input.issue.companyId),
+            sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${input.issue.id}`,
+            or(
+              gt(heartbeatRuns.createdAt, orphanRun.createdAt),
+              and(
+                eq(heartbeatRuns.createdAt, orphanRun.createdAt),
+                gt(heartbeatRuns.id, orphanRun.id),
+              ),
+            ),
+            notInArray(heartbeatRuns.id, lineageRunIds),
+          ),
+        )
+        .limit(1)
+        .then((rows) => rows.length > 0),
+      db
+        .select({
+          id: heartbeatRuns.id,
+          finishedAt: heartbeatRuns.finishedAt,
+          createdAt: heartbeatRuns.createdAt,
+        })
+        .from(heartbeatRuns)
+        .where(
+          and(
+            eq(heartbeatRuns.companyId, input.issue.companyId),
+            or(
+              sql`${heartbeatRuns.contextSnapshot} -> 'orphanedRetryRedispatchEpisode' ->> 'episodeKey' = ${episodeKey}`,
+              eq(heartbeatRuns.id, orphanRun.id),
+            ),
+          ),
+        )
+        .orderBy(desc(heartbeatRuns.createdAt)),
+      recoveryActionsSvc.getActiveForIssue(input.issue.companyId, input.issue.id),
+      // SPA-9351: scope to this issue and the orphan's own retry lineage. A
+      // company-wide marker match suppressed unrelated cards.
+      db
+        .select({ id: heartbeatRuns.id })
+        .from(heartbeatRuns)
+        .where(
+          and(
+            eq(heartbeatRuns.companyId, input.issue.companyId),
+            sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${input.issue.id}`,
+            inArray(heartbeatRuns.id, lineageRunIds),
+            sql`(${heartbeatRuns.contextSnapshot} -> 'exhaustedRetryRewakeEpisode' ->> 'exhaustedRunId') is not null`,
+          ),
+        )
+        .limit(1)
+        .then((rows) => rows.length > 0),
+      // The budget is the durable receipt for this exact episode.
+      db
+        .select({ id: agentWakeupRequests.id })
+        .from(agentWakeupRequests)
+        .where(
+          and(
+            eq(agentWakeupRequests.companyId, input.issue.companyId),
+            eq(agentWakeupRequests.agentId, input.agentId),
+            eq(agentWakeupRequests.idempotencyKey, idempotencyKey),
+          ),
+        )
+        .limit(1)
+        .then((rows) => rows.length > 0),
+    ]);
+
+    const latestFinishedAt =
+      episodeRuns
+        .map((row) => row.finishedAt)
+        .filter((value): value is Date => value instanceof Date)
+        .sort((a, b) => b.getTime() - a.getTime())[0] ?? null;
+
+    const decision = decideOrphanedRetryRewake({
+      runStatus: orphanRun.status,
+      runErrorCode: orphanRun.errorCode ?? null,
+      latestFinishedAt,
+      episodeRedispatchDispatched,
+      recoveryBudgetExhausted:
+        Boolean(activeAction) && isRecoveryActionBudgetExhausted(activeAction!),
+      hasNewerRun,
+      exhaustedRetryBudgetSpent: exhaustedEpisode,
+      hasLiveExecutionPath: hasLivePath,
+      hasQueuedWake,
+      hasOpenBlocker: unresolvedBlockerIds.length > 0,
+      hasPendingInteraction,
+      isInvocationBudgetBlocked: invocationBudgetBlocked,
+      isSuppressedByPauseHold: pauseHeld,
+      issueStatus: input.issue.status,
+      hasAgentAssignee: Boolean(input.issue.assigneeAgentId),
+    });
+
+    if (decision.kind === "suppressed") {
+      logger.info(
+        {
+          issueId: input.issue.id,
+          agentId: input.agentId,
+          orphanRunId: orphanRun.id,
+          errorCode: orphanRun.errorCode,
+          rootRunId,
+          episodeKey,
+          reason: decision.reason,
+        },
+        "orphaned-retry replacement dispatch suppressed",
+      );
+      return "suppressed";
+    }
+
+    const inheritedExhaustedEpisode = readExhaustedRetryRewakeEpisode(
+      orphanRun.contextSnapshot,
+    );
+    const inheritedOrphanEpisode = readOrphanedRetryRewakeEpisode(
+      orphanRun.contextSnapshot,
+    );
+
+    const episodeContext = {
+      ...(inheritedExhaustedEpisode
+        ? exhaustedRetryRewakeEpisodeContext({
+            episodeKey: inheritedExhaustedEpisode.episodeKey,
+            exhaustedRunId: inheritedExhaustedEpisode.exhaustedRunId,
+            errorCode: inheritedExhaustedEpisode.errorCode,
+          })
+        : {}),
+      ...orphanedRetryRewakeReplacementContext({
+        episodeKey,
+        orphanRunId: orphanRun.id,
+        rootRunId,
+        previousOrphanRunId: inheritedOrphanEpisode?.orphanRunId ?? null,
+      }),
+    };
+
+    const queued = await deps
+      .enqueueWakeup(input.agentId, {
+        source: "automation",
+        triggerDetail: "system",
+        reason: ORPHANED_RETRY_REWAKE_WAKE_REASON,
+        idempotencyKey,
+        payload: withRecoveryContext(
+          { issueId: input.issue.id, ...episodeContext },
+          "normal_model",
+        ),
+        requestedByActorType: "system",
+        requestedByActorId: null,
+        contextSnapshot: withRecoveryContext(
+          {
+            issueId: input.issue.id,
+            taskId: input.issue.id,
+            wakeReason: ORPHANED_RETRY_REWAKE_WAKE_REASON,
+            source: ORPHANED_RETRY_REWAKE_SOURCE,
+            ...episodeContext,
+          },
+          "normal_model",
+        ),
+        issueStateGuard: {
+          statuses: [...EXHAUSTED_RETRY_REWAKE_ISSUE_STATUSES],
+          assigneeAgentId: input.agentId,
+        },
+      })
+      .catch((error: unknown) => {
+        if (isEpisodeIdempotencyConflict(error, ORPHANED_RETRY_REWAKE_KEY_PREFIX)) {
+          return null;
+        }
+        throw error;
+      });
+
+    if (!queued) return "suppressed";
+
+    logger.warn(
+      {
+        issueId: input.issue.id,
+        agentId: input.agentId,
+        orphanRunId: orphanRun.id,
+        errorCode: orphanRun.errorCode,
+        rootRunId,
+        episodeKey,
+        wakeId: queued.id,
+      },
+      "re-dispatched a card whose retry was orphaned by a restart",
+    );
+    return "redispatched";
   }
 
   async function enqueueStrandedIssueRecovery(input: {
@@ -4425,6 +4903,8 @@ export function recoveryService(
       escalated: 0,
       waitingOnReviewResolved: 0,
       providerQuotaMonitored: 0,
+      exhaustedRetryRewoken: 0,
+      orphanedRetryRedispatched: 0,
       recentProgressExempted: 0,
       operatorCancelExempted: 0,
       onboardingFirstTaskExempted: 0,
@@ -4700,10 +5180,42 @@ export function recoveryService(
         // (SPA-8965/8966/8969/8970/8971 sat 3.5h after the 09-27 08:42
         // restart). The shutdown-time speculative-replay guard in
         // enqueueProcessLossRetry keeps its own stricter view.
+        // SPA-9351: a run stranded by the BOUNDED TRANSIENT lane is not a
+        // legacy execution whose provider action outcomes are unknown. It
+        // failed before the adapter could do work the board must reconcile —
+        // the `spawn E2BIG` case, where the process never started — and
+        // `legacyExecutionNeedsReconciliation` returns true for it only
+        // because `executionFailureRetryCount >= 2` (the exhausted-budget
+        // shortcut at legacy-execution-recovery.ts:45).
+        //
+        // Terminalizing here is what stranded SPA-8692: the run was parked
+        // behind a board-owned `active_run_watchdog` recovery action, and every
+        // later sweep then stood down at the `activeRecoveryAction.ownerType
+        // === "board"` guard above, because a board-owned action IS the
+        // human-owned continuation path. The card sat with no run, no pending
+        // wake and no open blocker for hours, and no recovery action was ever
+        // created for the failure itself.
+        //
+        // A genuine unknown-outcome legacy execution still terminalizes: the
+        // guard is scoped to the bounded-transient lane's own retry reason,
+        // which by definition carries `executionRecovery` evidence absence.
+        const exhaustedBoundedTransientRun =
+          readNonEmptyString(
+            parseObject(source?.contextSnapshot).retryReason,
+          ) === BOUNDED_TRANSIENT_RETRY_REASON;
+        // SPA-9351 shape 4: `legacyExecutionNeedsReconciliation` returns true for
+        // any run with a retry ancestry, which terminalizes a restart-orphaned
+        // retry behind a board-owned recovery action. The later sweeps then all
+        // stand down at the `ownerType === "board"` guard above, stranding the
+        // card with no run, no wake and no blocker. Scoped to the exact
+        // `interrupted` + `orphaned_running_run` class and nothing wider.
+        const restartOrphanedRetryRun = isOrphanedRetryRun(source);
         if (
           source &&
           legacyExecutionNeedsReconciliation(source) &&
-          !isServerShutdownInterruptedRun(source)
+          !isServerShutdownInterruptedRun(source) &&
+          !exhaustedBoundedTransientRun &&
+          !restartOrphanedRetryRun
         ) {
           await terminalizeLegacyExecution({
             db,
@@ -5432,6 +5944,33 @@ export function recoveryService(
       }
       if (isUnsuccessfulTerminalIssueRun(latestRun)) {
         const classification = classifyContinuationFailure(latestRun);
+        // `isUnsuccessfulTerminalIssueRun` proves non-nullness at runtime but
+        // is typed as a plain `boolean`, so bind it once for the branches below.
+        const unsuccessfulRun = latestRun;
+        if (!unsuccessfulRun) {
+          result.skipped += 1;
+          continue;
+        }
+
+        // SPA-9351 shape 4. Every branch below reads a terminal latest run as a
+        // verdict on the card and either escalates it to `blocked` or
+        // resubmits the dead predecessor to the bounded retry scheduler, which
+        // is refused because the restart spent the same budget. Ordered first:
+        // this is the only branch that reads the status as infrastructure.
+        if (isOrphanedRetryRun(unsuccessfulRun)) {
+          const redispatched = await enqueueOrphanedRetryRedispatch({
+            issue,
+            agentId,
+            latestRun: unsuccessfulRun,
+          });
+          if (redispatched === "redispatched") {
+            result.orphanedRetryRedispatched += 1;
+            result.issueIds.push(issue.id);
+          } else {
+            result.skipped += 1;
+          }
+          continue;
+        }
 
         if (
           classification.errorCode === CONTINUATION_WAITING_ON_REVIEW_ERROR_CODE
@@ -5473,6 +6012,34 @@ export function recoveryService(
           });
           if (updated) {
             result.escalated += 1;
+            result.issueIds.push(issue.id);
+          } else {
+            result.skipped += 1;
+          }
+          continue;
+        }
+
+        // SPA-9351: a card stranded by the *bounded transient* lane. The
+        // continuation branch below cannot see it — both
+        // `didAutomaticRecoveryFail` and `summarizeRecentContinuationRetries`
+        // are hard-gated on `retryReason === "issue_continuation_needed"`,
+        // and this lane records `transient_failure`. Without this branch the
+        // card falls through to `enqueueStrandedIssueRecovery`, which hands
+        // the already-exhausted predecessor back to `scheduleRecoveryRetry`,
+        // the heartbeat scheduler refuses, and the card never runs again.
+        if (
+          readNonEmptyString(
+            parseObject(unsuccessfulRun.contextSnapshot).retryReason,
+          ) === BOUNDED_TRANSIENT_RETRY_REASON
+        ) {
+          const rewoken = await enqueueExhaustedRetryRewake({
+            issue,
+            agentId,
+            latestRun: unsuccessfulRun,
+            classification,
+          });
+          if (rewoken === "rewoken") {
+            result.exhaustedRetryRewoken += 1;
             result.issueIds.push(issue.id);
           } else {
             result.skipped += 1;

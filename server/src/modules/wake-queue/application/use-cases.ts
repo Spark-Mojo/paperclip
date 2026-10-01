@@ -124,6 +124,126 @@ export type ReleaseIssueExecutionInput = {
 type PauseHoldFacts = Awaited<ReturnType<WakeQueueTransaction["getPauseHoldFacts"]>>;
 
 /**
+ * Promotes exactly the named deferred wake, or declines. The per-wake guards
+ * (invokability, pause hold, queued-comment liveness, terminal-card reopen)
+ * are the same ones `runReleaseDrain` applies, minus the rules that read a
+ * finishing run. When it declines it leaves the wake in its current status: a
+ * claim it does not win, or a guard that cancels, is the caller's next
+ * decision, and a wake left untouched stays visible to the periodic sweep.
+ */
+export async function drainSingleDeferredWake(
+  locked: LockedIssueExecution,
+  ports: { host: WakeQueueHost; transaction: WakeQueueTransaction },
+  wakeId: string,
+  now: Date,
+): Promise<{ outcome: { kind: "promoted"; runId: string } | { kind: "not_promoted" }; postCommitEffects: PostCommitEffect[] }> {
+  const postCommitEffects: PostCommitEffect[] = [];
+  const { run } = locked;
+  const issue = locked.primaryIssue;
+  const candidate = await ports.transaction.findNextDeferredWake({
+    companyId: run.companyId,
+    issueId: issue.id,
+  });
+  if (!candidate || candidate.id !== wakeId) {
+    return { outcome: { kind: "not_promoted" }, postCommitEffects };
+  }
+
+  let liveness = { liveNonSelfCommentIds: candidate.queuedCommentIds, containedSelfAuthoredComment: false };
+  if (!candidate.authorizedFailedChatRetry && candidate.queuedCommentIds.length > 0) {
+    liveness = await ports.transaction.getQueuedCommentLiveness({
+      companyId: run.companyId,
+      issueId: issue.id,
+      wakeAgentId: candidate.agentId,
+      finishingRunId: run.id,
+      finishingRunAgentId: run.agentId,
+      queuedCommentIds: candidate.queuedCommentIds,
+    });
+  }
+  const liveCommentIdsDiffer = liveness.liveNonSelfCommentIds.length !== candidate.queuedCommentIds.length;
+
+  const deferredAgent = await ports.transaction.findInvokableAgent({ companyId: run.companyId, agentId: candidate.agentId });
+  const pauseHold = await ports.transaction.getPauseHoldFacts({
+    companyId: run.companyId,
+    issueId: issue.id,
+    wakeAgentId: candidate.agentId,
+    deferredContextSeed: candidate.deferredContextSeed,
+    requestedByActorType: candidate.requestedByActorType,
+    requestedByActorId: candidate.requestedByActorId,
+  });
+
+  const commentAction = decideQueuedCommentAction({
+    hasQueuedCommentIds: candidate.queuedCommentIds.length > 0,
+    liveNonSelfCommentIdsLength: liveness.liveNonSelfCommentIds.length,
+    liveCommentIdsDiffer,
+    containedSelfAuthoredComment: liveness.containedSelfAuthoredComment,
+    preservesIndependentContinuation: candidate.preservesIndependentContinuation,
+  });
+
+  if (commentAction.kind === "cancel_empty") {
+    await ports.transaction.cancelDeferredWake({
+      companyId: run.companyId,
+      wakeId: candidate.id,
+      reason: commentAction.selfAuthored
+        ? "Deferred wake contained only comments authored by the finishing run"
+        : "Queued messages were discarded before promotion",
+      now,
+    });
+    return { outcome: { kind: "not_promoted" }, postCommitEffects };
+  }
+
+  let workingCandidate = candidate;
+  if (commentAction.kind === "normalize") {
+    const normalized = await ports.transaction.normalizeDeferredWakeCommentIds({
+      companyId: run.companyId,
+      wakeId: candidate.id,
+      payload: candidate.payload,
+      liveCommentIds: liveness.liveNonSelfCommentIds,
+      now,
+    });
+    if (!normalized) return { outcome: { kind: "not_promoted" }, postCommitEffects };
+    workingCandidate = normalized;
+  }
+
+  const wakeOutcome = decideWakeOutcome({
+    agent: { agentFound: deferredAgent !== null, invokable: deferredAgent?.invokable ?? false },
+    pauseHold: { activePauseHold: pauseHold.activePauseHold, treeHoldInteractionWake: pauseHold.treeHoldInteractionWake },
+  });
+
+  if (wakeOutcome.kind === "fail_not_invokable") {
+    await ports.transaction.failDeferredWake({ companyId: run.companyId, wakeId: workingCandidate.id, now });
+    return { outcome: { kind: "not_promoted" }, postCommitEffects };
+  }
+  if (wakeOutcome.kind === "cancel_pause_hold") {
+    await ports.transaction.cancelDeferredWake({
+      companyId: run.companyId,
+      wakeId: workingCandidate.id,
+      reason: "Deferred wake suppressed by active subtree pause hold",
+      now,
+    });
+    return { outcome: { kind: "not_promoted" }, postCommitEffects };
+  }
+
+  if (!deferredAgent) {
+    throw new Error("wake-queue: promoted a deferred wake with no invokable agent");
+  }
+
+  const promoted = await promoteDeferredWake(
+    ports,
+    run,
+    issue,
+    workingCandidate,
+    deferredAgent,
+    pauseHold,
+    postCommitEffects,
+    { companyId: run.companyId, runId: run.id, now },
+  );
+  if (!promoted || promoted.outcome.kind !== "promoted") {
+    return { outcome: { kind: "not_promoted" }, postCommitEffects };
+  }
+  return { outcome: { kind: "promoted", runId: promoted.outcome.run.id }, postCommitEffects };
+}
+
+/**
  * Drains the deferred-wake queue for the issue a run just released, in
  * `requestedAt` order, promoting at most one wake. When the queue empties
  * without a promotion, decides the release-recovery outcome. Every read and
@@ -958,7 +1078,7 @@ export function createAdmitWakeBehindIssueExecution(deps: {
             }
           : {}),
       });
-      return { kind: "deferred" };
+      return { kind: "deferred", deferredWakeId: existingDeferred.id };
     }
 
     const deferredPayload = {
@@ -966,7 +1086,7 @@ export function createAdmitWakeBehindIssueExecution(deps: {
       issueId: input.issueId,
       [DEFERRED_WAKE_CONTEXT_KEY]: input.contextSnapshot,
     };
-    await deps.writer.insertNewDeferredWake(scope, {
+    const deferredWakeId = await deps.writer.insertNewDeferredWake(scope, {
       companyId: input.companyId,
       agentId: input.agentId,
       source: input.source,
@@ -977,7 +1097,7 @@ export function createAdmitWakeBehindIssueExecution(deps: {
       requestedByActorId: input.requestedByActorId,
       idempotencyKey: input.idempotencyKey,
     });
-    return { kind: "deferred" };
+    return { kind: "deferred", deferredWakeId };
   };
 }
 
