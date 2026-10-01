@@ -42,6 +42,7 @@ const mockIssuesApi = vi.hoisted(() => ({
   upsertWatchdog: vi.fn(),
   deleteWatchdog: vi.fn(),
   unarchiveFromInbox: vi.fn(),
+  update: vi.fn(),
 }));
 
 const mockAuthApi = vi.hoisted(() => ({
@@ -2689,6 +2690,85 @@ describe("IssueProperties", () => {
     expect(
       Array.from(container.querySelectorAll("button")).some((button) => button.textContent?.includes("Unarchive")),
     ).toBe(false);
+
+    act(() => root.unmount());
+  });
+
+  it("renders Approve stage-decision controls that disable until a comment is provided when commentRequired", async () => {
+    const onUpdate = vi.fn();
+    const targetIssue = createIssue({
+      id: "issue-approve",
+      identifier: "PAP-approve",
+      status: "in_review",
+      executionPolicy: createExecutionPolicy({
+        stages: [
+          {
+            id: "approval-stage",
+            type: "approval",
+            approvalsNeeded: 1,
+            participants: [{ id: "participant-approve", type: "user", agentId: null, userId: "user-1" }],
+          },
+        ],
+      }),
+      executionState: createExecutionState({
+        status: "pending",
+        currentStageId: "approval-stage",
+        currentStageIndex: 0,
+        currentStageType: "approval",
+        currentParticipant: { type: "user", agentId: null, userId: "user-1" },
+        returnAssignee: { type: "agent", agentId: "agent-2", userId: null },
+        lastDecisionOutcome: null,
+      }),
+    });
+
+    mockIssuesApi.update.mockResolvedValue({} as Issue);
+
+    const root = renderProperties(container, {
+      issue: targetIssue,
+      childIssues: [],
+      onUpdate,
+      inline: true,
+    });
+    await waitForAssertion(() => {
+      expect(container.querySelector('[data-testid="stage-decision-actions"]')).not.toBeNull();
+      expect(container.textContent).toContain("Stage decision");
+    });
+
+    const approveButton = container.querySelector<HTMLButtonElement>(
+      '[data-testid="stage-decision-approve"]',
+    );
+    expect(approveButton).not.toBeNull();
+    expect(approveButton!.disabled).toBe(true);
+    expect(approveButton!.title).toContain("Add a comment to approve");
+
+    const textarea = container.querySelector<HTMLTextAreaElement>(
+      '[data-testid="stage-decision-comment"]',
+    );
+    expect(textarea).not.toBeNull();
+    expect(textarea!.placeholder).toContain("A decision comment is required");
+
+    await act(async () => {
+      const nativeSetter = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, "value")!.set!;
+      nativeSetter.call(textarea!, "UAT verified — approved.");
+      textarea!.dispatchEvent(new Event("input", { bubbles: true }));
+      textarea!.dispatchEvent(new Event("change", { bubbles: true }));
+    });
+    await flush();
+
+    const enabledButton = container.querySelector<HTMLButtonElement>(
+      '[data-testid="stage-decision-approve"]',
+    );
+    expect(enabledButton!.disabled).toBe(false);
+
+    await act(async () => {
+      enabledButton!.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    });
+    await flush();
+
+    expect(mockIssuesApi.update).toHaveBeenCalledWith(
+      "issue-approve",
+      expect.objectContaining({ status: "done", comment: "UAT verified — approved." }),
+    );
 
     act(() => root.unmount());
   });
