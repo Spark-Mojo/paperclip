@@ -505,6 +505,7 @@ export const issueExecutionStateSchema = z.object({
   currentStageId: z.string().guid().nullable(),
   currentStageIndex: z.number().int().nonnegative().nullable(),
   currentStageType: z.enum(ISSUE_EXECUTION_STAGE_TYPES).nullable(),
+  stageEnteredAt: z.string().datetime().nullable().optional(),
   currentParticipant: issueExecutionStagePrincipalSchema.nullable(),
   returnAssignee: issueExecutionStagePrincipalSchema.nullable(),
   reviewRequest: issueReviewRequestSchema.nullable().optional().default(null),

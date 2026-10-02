@@ -165,6 +165,26 @@ describe("issue execution policy transitions", () => {
   describe("happy path: executor → review → approval → done", () => {
     const policy = twoStagePolicy();
 
+    it("SPA-10069 records stage entry once and renews it on a new review round", () => {
+      const start = applyIssueExecutionPolicyTransition({
+        issue: { status: "in_progress", assigneeAgentId: coderAgentId, assigneeUserId: null, executionPolicy: policy, executionState: null },
+        policy, requestedStatus: "done", requestedAssigneePatch: {}, actor: { agentId: coderAgentId }, commentBody: "Ready",
+      });
+      const pending = start.patch.executionState as IssueExecutionState;
+      expect(pending.stageEnteredAt).toMatch(/^\d{4}-\d{2}-\d{2}T/);
+      expect(parseIssueExecutionState(pending)?.stageEnteredAt).toBe(pending.stageEnteredAt);
+      const repair = applyIssueExecutionPolicyTransition({
+        issue: { status: "in_review", assigneeAgentId: coderAgentId, assigneeUserId: null, executionPolicy: policy, executionState: pending },
+        policy, requestedStatus: "in_review", requestedAssigneePatch: {}, actor: { agentId: coderAgentId }, commentBody: "Repair assignment",
+      });
+      expect((repair.patch.executionState as IssueExecutionState).stageEnteredAt).toBe(pending.stageEnteredAt);
+      const resubmit = applyIssueExecutionPolicyTransition({
+        issue: { status: "in_progress", assigneeAgentId: coderAgentId, assigneeUserId: null, executionPolicy: policy, executionState: { ...pending, status: "changes_requested", lastDecisionOutcome: "changes_requested" } },
+        policy, requestedStatus: "done", requestedAssigneePatch: {}, actor: { agentId: coderAgentId }, commentBody: "Revised",
+      });
+      expect((resubmit.patch.executionState as IssueExecutionState).stageEnteredAt).not.toBe(pending.stageEnteredAt);
+    });
+
     it("routes executor completion into review", () => {
       const result = applyIssueExecutionPolicyTransition({
         issue: {
