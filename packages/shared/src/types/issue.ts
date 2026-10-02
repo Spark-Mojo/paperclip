@@ -705,6 +705,7 @@ export interface IssueExecutionState {
   currentStageId: string | null;
   currentStageIndex: number | null;
   currentStageType: IssueExecutionStageType | null;
+  stageEnteredAt?: string | null;
   currentParticipant: IssueExecutionStagePrincipal | null;
   returnAssignee: IssueExecutionStagePrincipal | null;
   reviewRequest: IssueReviewRequest | null;

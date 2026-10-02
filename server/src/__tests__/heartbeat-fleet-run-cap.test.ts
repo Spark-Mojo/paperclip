@@ -650,6 +650,44 @@ describeEmbeddedPostgres("fleet-wide agent run ceiling", () => {
     expect(startedRunIds.filter((id) => runs.some((run) => run.id === id))).toHaveLength(2);
   }, 120_000);
 
+  it("SPA-10069 starts a cap-deferred review-stage wake without a comment or monitor after capacity clears", async () => {
+    const companyId = await seedCompany();
+    const holder = await seedAgentWithQueuedRun({ companyId, index: 0, createdAt: new Date(Date.now() - 60_000) });
+    const reviewerId = await seedAgent(companyId, 1);
+    const issueId = randomUUID();
+    const stageId = randomUUID();
+    await db.insert(issues).values({
+      id: issueId, companyId, title: "Cap-deferred review", status: "in_review", priority: "medium",
+      assigneeAgentId: reviewerId, responsibleUserId: "responsible-user",
+      executionState: {
+        status: "pending", currentStageId: stageId, currentStageIndex: 0, currentStageType: "review",
+        stageEnteredAt: new Date(Date.now() - 20 * 60_000).toISOString(),
+        currentParticipant: { type: "agent", agentId: reviewerId, userId: null },
+        returnAssignee: { type: "agent", agentId: holder.agentId, userId: null },
+        reviewRequest: null, completedStageIds: [], lastDecisionId: null, lastDecisionOutcome: null,
+      },
+    });
+    await heartbeatAtCeilingOne.resumeQueuedRuns();
+    expect(await waitForExecutionsOf([holder.runId], 1)).toBe(true);
+    const reviewRun = await heartbeatAtCeilingOne.wakeup(reviewerId, {
+      source: "assignment", reason: "execution_review_requested", payload: { issueId },
+      contextSnapshot: { issueId, wakeReason: "execution_review_requested" },
+      requestedByActorType: "system", requestedByActorId: "test",
+    });
+    expect(reviewRun?.status).toBe("queued");
+    expect((await heartbeatAtCeilingOne.reconcileStrandedAssignedIssues()).reviewParticipantRequeued).toBe(0);
+    expect(executionsOf([reviewRun!.id])).toHaveLength(0);
+    await db.update(issues).set({ status: "done", completedAt: new Date() }).where(eq(issues.id, holder.issueId));
+    await releaseExecution(holder.runId);
+    expect(await waitForCondition(async () => (await heartbeat.getRun(holder.runId))?.status === "succeeded", 30_000)).toBe(true);
+    await heartbeatAtCeilingOne.reconcileStrandedAssignedIssues();
+    await heartbeatAtCeilingOne.resumeQueuedRuns();
+    expect(await waitForExecutionsOf([reviewRun!.id], 1)).toBe(true);
+    expect((await heartbeat.getRun(reviewRun!.id))?.status).toBe("running");
+    expect(await db.select().from(issueComments).where(eq(issueComments.issueId, issueId))).toHaveLength(0);
+    expect((await db.select().from(issues).where(eq(issues.id, issueId)))[0]?.monitorNextCheckAt).toBeNull();
+  }, 120_000);
+
   it("re-admits an over-cap queued run once a slot frees", async () => {
     const { seeded } = await seedCompanyWithQueuedRuns();
     const seededRunIds = seeded.map((s) => s.runId);
