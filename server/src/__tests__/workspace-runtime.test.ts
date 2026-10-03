@@ -11212,6 +11212,7 @@ async function createOldRepoWorktree(branchName: string) {
   const oldWorktreePath = path.join(oldRepo, ".paperclip", "worktrees", branchName);
   await fs.mkdir(path.dirname(oldWorktreePath), { recursive: true });
   await runGit(oldRepo, ["worktree", "add", "-b", branchName, oldWorktreePath, "HEAD"]);
+  await runGit(oldRepo, ["update-ref", "refs/remotes/origin/main", "HEAD"]);
   return { oldRepo, oldWorktreePath };
 }
 
@@ -11289,6 +11290,29 @@ describe("ensurePersistedExecutionWorkspaceAvailable SPA-9437 project workspace 
     expect(listedWorktrees).not.toContain(oldWorktreePath);
   }, 20_000);
 
+  it("preserves a clean old-repo worktree with an unpushed runtime-owned commit", async () => {
+    const branchName = "PAP-9437-ahead-rebind";
+    const { oldRepo, oldWorktreePath } = await createOldRepoWorktree(branchName);
+    const newRepo = await createNewRepo();
+    await fs.writeFile(path.join(oldWorktreePath, "committed.txt"), "unpublished\n", "utf8");
+    await runGit(oldWorktreePath, ["add", "committed.txt"]);
+    await runGit(oldWorktreePath, ["-c", "user.name=Fixture", "-c", "user.email=fixture@example.test", "commit", "-m", "unpublished"]);
+    let error: unknown;
+    try {
+      await ensurePersistedExecutionWorkspaceAvailable({
+        base: { baseCwd: newRepo, source: "project_primary", projectId: "project-1", workspaceId: "workspace-new", repoUrl: null, repoRef: "HEAD" },
+        workspace: { id: "ahead-workspace", mode: "isolated_workspace", strategyType: "git_worktree", cwd: oldWorktreePath, providerRef: oldWorktreePath, projectId: "project-1", projectWorkspaceId: "workspace-old", repoUrl: null, baseRef: "HEAD", branchName, metadata: RUNTIME_OWNED_GIT_BRANCH_METADATA },
+        issue: { id: "ahead-issue", identifier: "PAP-9437", title: "Ahead rebind" },
+        agent: { id: "agent-1", name: "Coder", companyId: "company-1" },
+      });
+    } catch (caught) {
+      error = caught;
+    }
+    expect(error).toMatchObject({ resultJson: { workspaceValidation: { reason: "git_worktree_belongs_to_other_repo", reasonCode: "branch_unreachable_in_other_repo" } } });
+    expect(await fs.readFile(path.join(oldWorktreePath, "committed.txt"), "utf8")).toBe("unpublished\n");
+    expect(await readGit(oldRepo, ["worktree", "list", "--porcelain"])).toContain(oldWorktreePath);
+  }, 20_000);
+
   it("refuses and preserves a dirty persisted git worktree whose repo no longer matches the project workspace (SPA-9437)", async () => {
     const branchName = "PAP-9437-dirty-rebind";
     const { oldRepo, oldWorktreePath } = await createOldRepoWorktree(branchName);
@@ -11361,6 +11385,9 @@ describe("ensurePersistedExecutionWorkspaceAvailable SPA-9437 project workspace 
     const branchName = "PAP-9437-clean-no-upstream";
     const { oldRepo, oldWorktreePath } = await createOldRepoWorktree(branchName);
     const newRepo = await createNewRepo();
+    await fs.writeFile(path.join(oldWorktreePath, "unpublished.txt"), "unpublished\n", "utf8");
+    await runGit(oldWorktreePath, ["add", "unpublished.txt"]);
+    await runGit(oldWorktreePath, ["-c", "user.name=Fixture", "-c", "user.email=fixture@example.test", "commit", "-m", "unpublished"]);
     // Detach HEAD on the OLD worktree, then drop the local ref so neither
     // local nor origin has the branch. Use `git update-ref -d` so we can
     // delete the branch ref even while the worktree is checked out on it.
@@ -11621,6 +11648,36 @@ describeEmbeddedPostgres(
           .from(issues)
           .where(eq(issues.id, sourceIssueId));
         expect(updatedIssue.executionWorkspaceId).toBeNull();
+      } finally {
+        await support.cleanup();
+      }
+    }, 30_000);
+
+    it("refuses to retire an old worktree with an unpushed runtime-owned commit", async () => {
+      const support = await startEmbeddedPostgresTestDatabase("paperclip-spa9437-ahead-rebind-");
+      try {
+        const db = createDb(support.connectionString);
+        const companyId = randomUUID();
+        const projectId = randomUUID();
+        const projectWorkspaceId = randomUUID();
+        const sourceIssueId = randomUUID();
+        const executionWorkspaceId = randomUUID();
+        const branchName = "PAP-9437-issue-update-ahead";
+        const { oldRepo, oldWorktreePath } = await createOldRepoWorktree(branchName);
+        await fs.writeFile(path.join(oldWorktreePath, "committed.txt"), "unpublished\n", "utf8");
+        await runGit(oldWorktreePath, ["add", "committed.txt"]);
+        await runGit(oldWorktreePath, ["-c", "user.name=Fixture", "-c", "user.email=fixture@example.test", "commit", "-m", "unpublished"]);
+        await db.insert(companies).values({ id: companyId, name: "ahead-co" });
+        await db.insert(projects).values({ id: projectId, companyId, name: "ahead-project" });
+        await db.insert(projectWorkspaces).values({ id: projectWorkspaceId, companyId, projectId, name: "old", cwd: oldRepo, repoUrl: null, repoRef: "refs/heads/main" });
+        await db.insert(executionWorkspaces).values({ id: executionWorkspaceId, companyId, projectId, projectWorkspaceId, mode: "isolated_workspace", strategyType: "git_worktree", name: "ahead-workspace", status: "active", cwd: oldWorktreePath, branchName, providerType: "git_worktree", providerRef: oldWorktreePath, metadata: RUNTIME_OWNED_GIT_BRANCH_METADATA });
+        await db.insert(issues).values({ id: sourceIssueId, companyId, projectId, projectWorkspaceId, executionWorkspaceId, title: "ahead rebind", status: "todo" } as Partial<typeof issues.$inferInsert>);
+        await db.update(executionWorkspaces).set({ sourceIssueId }).where(eq(executionWorkspaces.id, executionWorkspaceId));
+        const outcome = await executionWorkspaceService(db).retireExecutionWorkspaceAfterProjectWorkspaceRebind({ companyId, executionWorkspaceId, sourceIssueId, reason: "rebind" });
+        expect(outcome.outcome).toBe("refused_unpushed");
+        expect((await db.select().from(executionWorkspaces).where(eq(executionWorkspaces.id, executionWorkspaceId)))[0].status).toBe("active");
+        expect((await db.select().from(issues).where(eq(issues.id, sourceIssueId)))[0].executionWorkspaceId).toBe(executionWorkspaceId);
+        expect(await fs.readFile(path.join(oldWorktreePath, "committed.txt"), "utf8")).toBe("unpublished\n");
       } finally {
         await support.cleanup();
       }
