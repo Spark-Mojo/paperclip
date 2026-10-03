@@ -560,6 +560,140 @@ The full `workspace-runtime.test.ts` file reports 6 failures on the new base
 at `916919bb7c` with no SPA-9437 code present. This is the known gate 13
 provisioning-suite red, unchanged in character.
 
+## Head `a73300e388` — base-red closure, re-run 2026-10-03 (run 09549db5 successor)
+
+The head advanced by four commits (all ledger + tests, no production change)
+since the section above, and CI is terminal on it. This section records the
+base-red evidence for THIS head, re-measured rather than inherited.
+
+### What CI actually builds — the merge commit, not the head
+
+This is the fact the earlier sections were reasoning around, now stated
+mechanically. GitHub's `pull_request` event checks out the MERGE commit:
+
+    gh api repos/Spark-Mojo/paperclip/pulls/125 --jq .merge_commit_sha
+      -> cab4612b27e20e5e88715ca3d9929d64c5a2a1f5
+    gh api .../commits/cab4612b27e.../check-runs  (job 111138454006 log, line 132)
+      -> HEAD is now at cab4612 Merge a73300e388a... into 916919bb7cbd...
+    parents: 916919bb7cbdbdfddaac59e31bf6b2e94bcf637c   (base side)
+             a73300e388a7233d3fe553fbdda35f3339701a34   (this PR)
+
+Consequences, both load-bearing for the exemptions below:
+
+  - Every SPA-9437-specific gate result in this ledger is a property of the
+    HEAD SIDE, and every failing assertion lives on the BASE SIDE or in a file
+    the base side supplies. The comparison that matters is therefore
+    base-side vs merge, not branch vs base.
+  - `git merge-base a73300e388 62bab46c6f34` = `694d0fbe002a` — so the
+    open-time pin and the live tip share a merge base, and the live tip
+    `62bab46c6f` (41 commits past `916919bb7c`) is where a merge lands.
+
+### Causal non-touch, by blob identity at base side vs the CI-built merge
+
+    git rev-parse 916919bb7c:<f>  cab4612b27e:<f>
+
+  | file                                                      | blob (BOTH) |
+  |-----------------------------------------------------------|-------------|
+  | `server/src/__tests__/status-cards.test.ts`                | `285060b75` |
+  | `server/src/__tests__/plugin-orchestration-apis.test.ts`  | `b54fe6e31` |
+  | `server/src/__tests__/permissions-upgrade-boundary-routes.test.ts` | `89c00485e` |
+  | `packages/adapter-utils/src/server-utils.test.ts`         | `2e47e14c`  |
+  | `scripts/check-no-git-push.mjs`                           | `7254f6caf` |
+
+All five byte-identical, so the PR cannot have altered any failing assertion
+or the policy check. `server/src/services/issues.ts` DOES differ
+(`4d2f0f2ef` -> `192d89a44`) because both sides changed it — this PR adds the
+rebind post-commit action, the base side adds the 422 guard — but the guard is
+absent from every commit on this branch:
+
+    git grep -c assertAgentRootIssueHasProject a73300e388 -- server/src packages
+      -> 0     (present ONLY as prose inside this ledger)
+
+### Base reproduction — re-run, not log-reading
+
+Throwaway worktrees (NOT the card worktree, NOT scratch):
+`/tmp/base-red-a` at `916919bb7c` (base side, zero SPA-9437 code) and
+`/tmp/base-red-merged` at `cab4612b27e` (exactly what CI built). Both got
+their own `pnpm install --frozen-lockfile --ignore-scripts`; symlinking the
+card worktree's `node_modules` does not resolve `express` (it lives in
+`server/package.json` but links through the root `.pnpm` store).
+
+**(a) The 422 family — all FOUR files, not three.** The earlier record covered
+three; `issue-watchdogs-routes.test.ts` (job `Verify serialized server suites
+(6/9)`) was unaccounted for. At `916919bb7c`, zero SPA-9437 code:
+
+    vitest run src/__tests__/status-cards.test.ts \
+               src/__tests__/plugin-orchestration-apis.test.ts \
+               src/__tests__/issue-watchdogs-routes.test.ts \
+               src/__tests__/permissions-upgrade-boundary-routes.test.ts
+
+    exit 1 — Test Files 4 failed (4); Tests 4 failed | 12 passed (14)
+    every failure: `expected 422 to be 201 // Object.is equality`
+    every failure: `at assertAgentRootIssueHasProject (src/services/issues.ts:368:9)`
+
+Same check identity, same test name, same assertion as each head job.
+
+**(b) `workspaces-b` EPIPE.** At `916919bb7c`, base side only:
+
+    vitest run packages/adapter-utils/src/server-utils.test.ts
+    exit 1 — Test Files 1 passed (1); Tests 126 passed (126); Errors 1 error
+             `Error: write EPIPE` / `Serialized Error: { errno: -32, code: 'EPIPE', syscall: 'write' }`
+
+Identical shape to the head job: every test passes, the file is torn down by
+an unhandled error, so the assertion is on the ERROR COUNT, not a test failure.
+
+**(c) `ci / policy`.** Same script at both revs, run this run:
+
+    node scripts/check-no-git-push.mjs   # at 916919bb7c -> exit 1, 3 offenses
+    node scripts/check-no-git-push.mjs   # CI reported    -> exit 1, 3 offenses
+
+Output byte-identical once line numbers are normalized: `4908 -> 5121`,
+`4610 -> 4625`, `4615 -> 4630` (my hunks add lines; the offense CONTENT is
+unchanged). The check is boolean (`if (allOffenses.length > 0)`, line 171) and
+the count is unchanged, so the verdict is identical under any threshold.
+
+**(d) Discriminating control on the tree CI built.** At `cab4612b27e`:
+
+    vitest run <the same four files>
+    exit 1 — Test Files 4 failed (4); Tests 4 failed | 63 passed (67)
+    same four test names, same 422 assertion
+
+Base-only fails 4/4 and base+head fails the same 4/4: my change neither
+introduces nor repairs these. This is the pair that makes the exemption a
+measured claim rather than an inference.
+
+### Terminal red inventory at `a73300e388` — 9 reds, all accounted for
+
+    gh api .../commits/a73300e388.../check-runs --paginate \
+      --jq '.check_runs[] | select(.conclusion=="failure") | .name' | sort
+      -> ci / e2e, ci / General tests (server (11/12)),
+         ci / General tests (server (12/12)),
+         ci / General tests (workspaces-b), ci / policy, ci / verify,
+         ci / Verify serialized server suites (6/9),
+         ci / Verify serialized server suites (7/9), review
+
+  | # | check                                       | verdict |
+  |---|---------------------------------------------|---------|
+  | 1 | `ci / policy`                               | REAL base red — (c) above, 3 offenses both revs |
+  | 2 | `ci / General tests (workspaces-b)`         | REAL base red — (b) above, EPIPE, 126 pass + 1 error |
+  | 3 | `ci / General tests (server (11/12))`       | REAL base red — plugin-orchestration-apis.test.ts:236, 422 |
+  | 4 | `ci / General tests (server (12/12))`       | REAL base red — status-cards.test.ts:406, 422 |
+  | 5 | `ci / Verify serialized server suites (6/9)` | REAL base red — issue-watchdogs-routes.test.ts, 422 |
+  | 6 | `ci / Verify serialized server suites (7/9)` | REAL base red — permissions-upgrade-boundary-routes.test.ts:311, 422 |
+  | 7 | `ci / e2e`                                  | AGGREGATE — derived from #1 (`POLICY_RESULT: failure`) |
+  | 8 | `ci / verify`                               | AGGREGATE — `Fail if any split verify lane failed` = #5, #6 |
+  | 9 | `review`                                    | EXEMPT BY RULE — vendor `commitperclip`, no key on the fork |
+
+Note `Verify serialized server suites (2/9)` is GREEN on this head (it was red
+on `f17538edf4`): its lane is flaky-by-lane, not fixed by me, and it is not
+counted as an exemption either way.
+
+`ci / e2e`'s job log (id to be read at merge time; on `f17538edf4` it was
+111132424517) fails on its FIRST executed line, before any shard result is
+consumed, with `POLICY_RESULT: failure` and `E2E_SHARDS_RESULT: success` — all
+8 shards `success`. So #7 derives from #1 alone and is not an independent
+exemption.
+
 ## Verifier round 1 (FAIL) — disposition, recorded 2026-10-03
 
 The independent verifier returned `VERDICT: FAIL` on head `3bd031e416` with
@@ -679,6 +813,21 @@ this fork, which is why A was chosen the same way.
 agreed and correctly noted it is a check-state note, not acceptance.
 
 ## Notes
+
+18. Gate re-run ledger for head `a73300e388`, 2026-10-03, all in the foreground
+    under `timeout` on the card worktree:
+
+    | gate | command | result |
+    |------|---------|--------|
+    | 17 | `vitest run server/src/__tests__/workspace-runtime.test.ts -t 'SPA-9437|unpushed runtime-owned commit|pushed to origin|non-reusable persisted git worktrees'` | exit 0 — `Test Files 1 passed (1); Tests 11 passed \| 182 skipped (193)` |
+    | 10 | `vitest run server/src/__tests__/issues-service.test.ts` | exit 0 — `Test Files 1 passed (1); Tests 133 passed (133)` |
+    | 8  | `tsc --noEmit --project server/tsconfig.json` | exit 1, 111 pre-existing diagnostics; `grep -cE 'workspace-runtime\.ts\|issues\.ts\|execution-workspaces\.ts'` over the output = **0** |
+    | 9  | `git diff --check` | exit 0, empty output |
+
+    Gate 8's nonzero exit is unchanged in character from every prior run: the
+    diagnostics come from a missing `@paperclipai/paperclip-runner` build plus
+    pre-existing implicit-any errors in files this PR does not touch. Zero of
+    them land in a changed file, which is the gate's actual assertion.
 
 16. The deliberate boundary of the reachability guard: a branch that was
     PUSHED but has no pull request behind it IS torn down. This is the one
