@@ -2951,22 +2951,17 @@ async function tearDownPersistedWorktreeBoundToOtherRepo(input: {
   // deleting the worktree: runtime-owned branches can be recreated on
   // demand; operator-owned branches must exist on origin or in a local
   // ref so a future pull can re-attach the tip.
-  if (input.branchName) {
-    const localSha = await runGit(
-      ["rev-parse", "--verify", "--quiet", `refs/heads/${input.branchName}`],
-      input.persistedRepoRoot,
+  {
+    const commitsAhead = await runGit(
+      ["rev-list", "--count", "HEAD", "--not", "--remotes=origin"],
+      input.reuseWorktreePath,
     ).catch(() => null);
-    const originSha = await runGit(
-      ["rev-parse", "--verify", "--quiet", `refs/remotes/origin/${input.branchName}`],
-      input.persistedRepoRoot,
-    ).catch(() => null);
-    if (!localSha && !originSha) {
+    if (commitsAhead !== "0") {
       throw new WorkspaceRuntimeValidationFailure(
         `Persisted git worktree "${input.reuseWorktreePath}" belongs to repo "${input.persistedRepoRoot}", ` +
           `but the current project workspace is for repo "${input.currentRepoRoot}". The worktree's ` +
-          `branch "${input.branchName}" was deleted locally and has no \`origin/${input.branchName}\` ref. ` +
-          `Push the branch or restore it on origin before retrying the run, or attach a different branch ` +
-          `to the card explicitly.`,
+          `HEAD is not confirmed reachable from an origin ref. ` +
+          `Push the old worktree's commits before retrying the run.`,
         {
           workspaceValidation: {
             reason: "git_worktree_belongs_to_other_repo",

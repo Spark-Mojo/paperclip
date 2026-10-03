@@ -4074,10 +4074,10 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
       // on origin (a future pull can re-attach it without data loss). A clean
       // worktree whose branch ref has NO live upstream — local refs deleted
       // AND no `origin/<branch>` — would lose work; refuse.
-      if (row.providerType === "git_worktree" && leafPath && !leafMissing && row.branchName) {
+      if (row.providerType === "git_worktree" && leafPath && !leafMissing) {
         const reachable = await assertBranchRefReachableForRetire({
           repoRoot: git?.repoRoot ?? null,
-          branchName: row.branchName,
+          branchName: row.branchName ?? "<detached>",
           worktreePath: leafPath,
           branchCreatedByRuntime: git?.createdByRuntime ?? false,
         });
@@ -4131,17 +4131,15 @@ async function assertBranchRefReachableForRetire(input: {
   worktreePath: string;
   branchCreatedByRuntime: boolean;
 }): Promise<{ reachable: true } | { reachable: false; reason: string }> {
-  if (input.branchCreatedByRuntime) return { reachable: true };
-  if (!input.repoRoot) return { reachable: true };
-  const localSha = await readGitStdout(["rev-parse", "--verify", "--quiet", `refs/heads/${input.branchName}`], input.repoRoot).catch(() => null);
-  const originSha = await readGitStdout(["rev-parse", "--verify", "--quiet", `refs/remotes/origin/${input.branchName}`], input.repoRoot).catch(() => null);
-  if (localSha) return { reachable: true };
-  if (originSha) return { reachable: true };
+  try {
+    const commits = await readGitStdout(["rev-list", "--count", "HEAD", "--not", "--remotes=origin"], input.worktreePath);
+    if (commits === "0") return { reachable: true };
+  } catch {
+    return { reachable: false, reason: `Could not verify that the worktree at "${input.worktreePath}" is reachable from origin.` };
+  }
   return {
     reachable: false,
-    reason:
-      `Branch "${input.branchName}" was deleted locally and has no \`origin/${input.branchName}\` ref. ` +
-      `Refusing to retire — push the branch or restore it on origin before rebinding the card.`,
+    reason: `Branch "${input.branchName}" has commits not reachable from origin. Push the branch before rebinding the card.`,
   };
 }
 
