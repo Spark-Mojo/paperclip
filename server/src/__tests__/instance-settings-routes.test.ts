@@ -17,6 +17,9 @@ const mockHeartbeatService = vi.hoisted(() => ({
   applyTaskDrain: vi.fn(),
   stopTaskDrain: vi.fn(),
   getTaskDrainStatus: vi.fn(),
+  getFleetMaxConcurrentRunsStatus: vi.fn(),
+  invalidateFleetMaxConcurrentRunsCache: vi.fn(),
+  resumeQueuedRuns: vi.fn(),
 }));
 const mockEnvironmentService = vi.hoisted(() => ({
   getById: vi.fn(),
@@ -40,7 +43,11 @@ function registerModuleMocks() {
 
 // Identity object the mocked db.transaction hands to writers; tests assert
 // both the marker clear and the settings update receive THIS same tx.
-const TX_SENTINEL = { __tx: true };
+// `execute` is a no-op mock so the fleet-max-concurrent-runs PATCH route's
+// `tx.execute(sql\`select pg_advisory_xact_lock(...)\`)` lock acquisition has
+// something to call; its SQL argument is asserted directly in the tests that
+// care about it.
+const TX_SENTINEL = { __tx: true, execute: vi.fn().mockResolvedValue(undefined) };
 // Runs the callback with a sentinel tx and propagates throws, so a failing
 // write inside rejects the whole request exactly like a real transaction
 // rollback. This is the default mockDb.transaction implementation; a test
@@ -97,6 +104,11 @@ describe("instance settings routes", () => {
     mockHeartbeatService.applyTaskDrain.mockReset();
     mockHeartbeatService.stopTaskDrain.mockReset();
     mockHeartbeatService.getTaskDrainStatus.mockReset();
+    mockHeartbeatService.getFleetMaxConcurrentRunsStatus.mockReset();
+    mockHeartbeatService.getFleetMaxConcurrentRunsStatus.mockResolvedValue({ value: null, source: "none" });
+    mockHeartbeatService.invalidateFleetMaxConcurrentRunsCache.mockReset();
+    mockHeartbeatService.resumeQueuedRuns.mockReset();
+    mockHeartbeatService.resumeQueuedRuns.mockResolvedValue(undefined);
     mockEnvironmentService.getById.mockReset();
     mockEnvironmentService.findManagedSandboxEnvironment.mockReset();
     mockEnvironmentService.findManagedSandboxEnvironment.mockResolvedValue(null);
@@ -671,6 +683,288 @@ describe("instance settings routes", () => {
 
     expect(res.status).toBe(403);
     expect(mockInstanceSettingsService.updateGeneral).not.toHaveBeenCalled();
+  });
+
+  describe("fleet-max-concurrent-runs setting (SPA-10137)", () => {
+    const adminActor = {
+      type: "board",
+      userId: "admin-1",
+      source: "session",
+      isInstanceAdmin: true,
+      companyIds: ["company-1"],
+    };
+    const nonAdminActor = {
+      type: "board",
+      userId: "user-1",
+      source: "session",
+      isInstanceAdmin: false,
+      companyIds: ["company-1"],
+    };
+
+    it("lets any board org member read the effective cap and its source", async () => {
+      mockHeartbeatService.getFleetMaxConcurrentRunsStatus.mockResolvedValue({ value: 8, source: "env" });
+      const app = await createApp(nonAdminActor);
+
+      const res = await request(app).get("/api/instance/settings/fleet-max-concurrent-runs");
+
+      expect(res.status).toBe(200);
+      expect(res.body).toEqual({ value: 8, source: "env" });
+    });
+
+    it("rejects a board caller without company access from reading the cap", async () => {
+      const app = await createApp({
+        type: "board",
+        userId: "user-2",
+        source: "session",
+        isInstanceAdmin: false,
+        companyIds: [],
+        memberships: [],
+      });
+
+      const res = await request(app).get("/api/instance/settings/fleet-max-concurrent-runs");
+
+      expect(res.status).toBe(403);
+      expect(mockHeartbeatService.getFleetMaxConcurrentRunsStatus).not.toHaveBeenCalled();
+    });
+
+    it("rejects agent callers from reading or writing the cap", async () => {
+      const app = await createApp({
+        type: "agent",
+        agentId: "agent-1",
+        companyId: "company-1",
+        source: "agent_key",
+      });
+
+      const getRes = await request(app).get("/api/instance/settings/fleet-max-concurrent-runs");
+      expect(getRes.status).toBe(403);
+
+      const patchRes = await request(app)
+        .patch("/api/instance/settings/fleet-max-concurrent-runs")
+        .send({ value: 5 });
+      expect(patchRes.status).toBe(403);
+      expect(mockInstanceSettingsService.updateGeneral).not.toHaveBeenCalled();
+    });
+
+    it("rejects non-admin board users from writing the cap", async () => {
+      const app = await createApp(nonAdminActor);
+
+      const res = await request(app)
+        .patch("/api/instance/settings/fleet-max-concurrent-runs")
+        .send({ value: 5 });
+
+      expect(res.status).toBe(403);
+      expect(mockInstanceSettingsService.updateGeneral).not.toHaveBeenCalled();
+    });
+
+    it("rejects a malformed value (out of range, non-integer, or missing)", async () => {
+      const app = await createApp(adminActor);
+
+      // Schema validation failures go through the generic validate() middleware
+      // (plain Zod 400), not the semantic unprocessable() 422 used elsewhere.
+      await request(app).patch("/api/instance/settings/fleet-max-concurrent-runs").send({ value: 0 }).expect(400);
+      await request(app).patch("/api/instance/settings/fleet-max-concurrent-runs").send({ value: 51 }).expect(400);
+      await request(app).patch("/api/instance/settings/fleet-max-concurrent-runs").send({ value: 1.5 }).expect(400);
+      await request(app).patch("/api/instance/settings/fleet-max-concurrent-runs").send({}).expect(400);
+      expect(mockInstanceSettingsService.updateGeneral).not.toHaveBeenCalled();
+    });
+
+    it("sets an explicit ceiling, invalidates the cache, and logs old/new/actor", async () => {
+      // Read (previous) and write (next) both happen inside the locked DB
+      // transaction now (Mira review round 2), driven by the real
+      // resolveFleetMaxConcurrentRuns -- not by a mocked effective-status
+      // sequence -- so the fixtures below carry the raw stored field.
+      mockInstanceSettingsService.getGeneral.mockResolvedValueOnce({
+        censorUsernameInLogs: false,
+        keyboardShortcuts: false,
+        feedbackDataSharingPreference: "prompt",
+        fleetMaxConcurrentRuns: 2,
+      });
+      mockInstanceSettingsService.updateGeneral.mockResolvedValueOnce({
+        id: "instance-settings-1",
+        general: {
+          censorUsernameInLogs: false,
+          keyboardShortcuts: false,
+          feedbackDataSharingPreference: "prompt",
+          fleetMaxConcurrentRuns: 10,
+        },
+      });
+      const app = await createApp(adminActor);
+
+      const res = await request(app)
+        .patch("/api/instance/settings/fleet-max-concurrent-runs")
+        .send({ value: 10 });
+
+      expect(res.status).toBe(200);
+      expect(res.body).toEqual({ value: 10, source: "db" });
+      expect(mockInstanceSettingsService.getGeneral).toHaveBeenCalledWith({ db: TX_SENTINEL });
+      expect(mockInstanceSettingsService.updateGeneral).toHaveBeenCalledWith(
+        { fleetMaxConcurrentRuns: 10 },
+        { db: TX_SENTINEL },
+      );
+      // The advisory lock is acquired as the first statement inside the
+      // transaction, before either read or write. drizzle's `sql` template
+      // keeps literal text as {value: [string]} chunks and an interpolated
+      // value as a bare element in queryChunks -- stringifying the object
+      // directly just yields "[object Object]".
+      expect(TX_SENTINEL.execute).toHaveBeenCalledTimes(1);
+      const lockQueryChunks = (TX_SENTINEL.execute.mock.calls[0]?.[0] as {
+        queryChunks: Array<{ value?: string[] } | string>;
+      }).queryChunks;
+      const lockQueryText = lockQueryChunks
+        .map((chunk) => (typeof chunk === "string" ? chunk : chunk.value?.[0] ?? ""))
+        .join("");
+      expect(lockQueryText).toContain("pg_advisory_xact_lock");
+      // Invalidated once, right after the transaction commits.
+      expect(mockHeartbeatService.invalidateFleetMaxConcurrentRunsCache).toHaveBeenCalledTimes(1);
+      expect(mockLogActivity).toHaveBeenCalledTimes(2);
+      expect(mockLogActivity).toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({
+          action: "instance.settings.fleet_max_concurrent_runs_updated",
+          actorId: "admin-1",
+          details: expect.objectContaining({
+            previous: 2,
+            next: 10,
+            previousEffective: { value: 2, source: "db" },
+            nextEffective: { value: 10, source: "db" },
+          }),
+        }),
+      );
+    });
+
+    it("maps the \"none\" sentinel to an explicit null (no ceiling) write", async () => {
+      mockInstanceSettingsService.getGeneral.mockResolvedValueOnce({
+        censorUsernameInLogs: false,
+        keyboardShortcuts: false,
+        feedbackDataSharingPreference: "prompt",
+        fleetMaxConcurrentRuns: 5,
+      });
+      mockInstanceSettingsService.updateGeneral.mockResolvedValueOnce({
+        id: "instance-settings-1",
+        general: { fleetMaxConcurrentRuns: null },
+      });
+      const app = await createApp(adminActor);
+
+      const res = await request(app)
+        .patch("/api/instance/settings/fleet-max-concurrent-runs")
+        .send({ value: null });
+
+      expect(res.status).toBe(200);
+      // An explicit DB null is a deliberate "no ceiling" override, so the
+      // source is "db" (not "none" -- "none" means nothing is configured at
+      // all, see resolveFleetMaxConcurrentRuns).
+      expect(res.body).toEqual({ value: null, source: "db" });
+      expect(mockInstanceSettingsService.updateGeneral).toHaveBeenCalledWith(
+        { fleetMaxConcurrentRuns: null },
+        { db: TX_SENTINEL },
+      );
+    });
+
+    it("triggers an admission pass when the write raises the cap", async () => {
+      mockInstanceSettingsService.getGeneral.mockResolvedValueOnce({
+        censorUsernameInLogs: false,
+        keyboardShortcuts: false,
+        feedbackDataSharingPreference: "prompt",
+        fleetMaxConcurrentRuns: 2,
+      });
+      mockInstanceSettingsService.updateGeneral.mockResolvedValueOnce({
+        id: "instance-settings-1",
+        general: { fleetMaxConcurrentRuns: 10 },
+      });
+      const app = await createApp(adminActor);
+
+      await request(app).patch("/api/instance/settings/fleet-max-concurrent-runs").send({ value: 10 });
+      await new Promise((resolve) => setImmediate(resolve));
+
+      expect(mockHeartbeatService.resumeQueuedRuns).toHaveBeenCalledTimes(1);
+    });
+
+    it("triggers an admission pass when the write removes the ceiling entirely", async () => {
+      mockInstanceSettingsService.getGeneral.mockResolvedValueOnce({
+        censorUsernameInLogs: false,
+        keyboardShortcuts: false,
+        feedbackDataSharingPreference: "prompt",
+        fleetMaxConcurrentRuns: 2,
+      });
+      mockInstanceSettingsService.updateGeneral.mockResolvedValueOnce({
+        id: "instance-settings-1",
+        general: { fleetMaxConcurrentRuns: null },
+      });
+      const app = await createApp(adminActor);
+
+      await request(app).patch("/api/instance/settings/fleet-max-concurrent-runs").send({ value: null });
+      await new Promise((resolve) => setImmediate(resolve));
+
+      expect(mockHeartbeatService.resumeQueuedRuns).toHaveBeenCalledTimes(1);
+    });
+
+    it("does not trigger an admission pass when the write lowers the cap", async () => {
+      mockInstanceSettingsService.getGeneral.mockResolvedValueOnce({
+        censorUsernameInLogs: false,
+        keyboardShortcuts: false,
+        feedbackDataSharingPreference: "prompt",
+        fleetMaxConcurrentRuns: 10,
+      });
+      mockInstanceSettingsService.updateGeneral.mockResolvedValueOnce({
+        id: "instance-settings-1",
+        general: { fleetMaxConcurrentRuns: 2 },
+      });
+      const app = await createApp(adminActor);
+
+      await request(app).patch("/api/instance/settings/fleet-max-concurrent-runs").send({ value: 2 });
+      await new Promise((resolve) => setImmediate(resolve));
+
+      expect(mockHeartbeatService.resumeQueuedRuns).not.toHaveBeenCalled();
+    });
+
+    it("acquires the cross-replica advisory lock, scoped by a fixed key, as the first statement in the transaction", async () => {
+      // SPA-10137 Mira review round 2: a process-local queue cannot
+      // serialize two PATCHes landing on different server replicas that
+      // share only the database. The fix moved the critical section into a
+      // single DB transaction holding a Postgres advisory lock
+      // (pg_advisory_xact_lock) for its whole duration -- a mechanism this
+      // codebase already relies on elsewhere for the identical cross-
+      // replica problem (server/src/services/device-login-service.ts,
+      // server/src/routes/projects.ts, server/src/services/email-channels.ts)
+      // and already has a real-Postgres proof for
+      // (server/src/__tests__/folders-service.test.ts "rechecks nested
+      // folders after waiting for the company mutation lock"). A mocked
+      // db.transaction cannot re-prove Postgres's own mutual-exclusion
+      // guarantee, so this test asserts the one thing that IS this route's
+      // responsibility: it asks for the lock, with a fixed key (there is
+      // exactly one fleet-cap row, nothing to scope the key to), before
+      // reading or writing anything.
+      mockInstanceSettingsService.getGeneral.mockResolvedValueOnce({
+        censorUsernameInLogs: false,
+        keyboardShortcuts: false,
+        feedbackDataSharingPreference: "prompt",
+        fleetMaxConcurrentRuns: 2,
+      });
+      mockInstanceSettingsService.updateGeneral.mockResolvedValueOnce({
+        id: "instance-settings-1",
+        general: { fleetMaxConcurrentRuns: 10 },
+      });
+      const app = await createApp(adminActor);
+
+      await request(app).patch("/api/instance/settings/fleet-max-concurrent-runs").send({ value: 10 });
+
+      expect(mockDb.transaction).toHaveBeenCalledTimes(1);
+      expect(TX_SENTINEL.execute).toHaveBeenCalledTimes(1);
+      // drizzle's `sql` template keeps literal text as {value: [string]}
+      // chunks and an interpolated value (the lock key) as a bare element
+      // in `queryChunks` -- assert on that shape directly rather than on a
+      // stringified form, which just yields "[object Object]".
+      const lockQuery = TX_SENTINEL.execute.mock.calls[0]?.[0] as {
+        queryChunks: Array<{ value?: string[] } | string>;
+      };
+      const chunkText = lockQuery.queryChunks
+        .map((chunk) => (typeof chunk === "string" ? chunk : chunk.value?.[0] ?? ""))
+        .join("");
+      expect(chunkText).toContain("pg_advisory_xact_lock");
+      expect(chunkText).toContain("hashtextextended");
+      expect(chunkText).toContain("paperclip:instance-settings:fleet-max-concurrent-runs");
+    });
+
   });
 
   describe("executionMode floor on cloud-managed instances", () => {

@@ -32,12 +32,30 @@ export const instanceGeneralSettingsSchema = z.object({
   // Execution policy. Absent/"any" = unrestricted; "kubernetes" forces the
   // Kubernetes sandbox provider and denies local/ssh execution (cloud_tenant).
   executionMode: z.enum(["kubernetes", "any"]).optional(),
+  // Live DB override for the fleet-wide run ceiling (SPA-10137). Integer 1..50
+  // sets an explicit ceiling; null explicitly forces "no ceiling", overriding
+  // PAPERCLIP_MAX_CONCURRENT_AGENT_RUNS; absent leaves the env var in control.
+  fleetMaxConcurrentRuns: z.number().int().min(1).max(50).nullable().optional(),
 }).strict();
 
 export const patchInstanceGeneralSettingsSchema = z
   .object(shapeWithoutDefaults(instanceGeneralSettingsSchema.shape))
   .partial()
   .strict();
+
+// Dedicated PATCH body for the fleet-max-concurrent-runs endpoint: a single
+// required field (not a partial of the general-settings shape) so a caller
+// cannot omit `value` and silently no-op.
+export const patchFleetMaxConcurrentRunsSchema = z.object({
+  value: z.number().int().min(1).max(50).nullable(),
+}).strict();
+export type PatchFleetMaxConcurrentRuns = z.infer<typeof patchFleetMaxConcurrentRunsSchema>;
+
+export const fleetMaxConcurrentRunsSourceSchema = z.enum(["db", "env", "none"]);
+export const fleetMaxConcurrentRunsStatusSchema = z.object({
+  value: z.number().int().min(1).max(50).nullable(),
+  source: fleetMaxConcurrentRunsSourceSchema,
+}).strict();
 
 export const instanceExperimentalSettingsSchema = z.object({
   enableEnvironments: z.boolean().default(false),
