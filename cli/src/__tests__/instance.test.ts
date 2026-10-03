@@ -1,12 +1,15 @@
 import { Command } from "commander";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { parseFleetMaxConcurrentRunsValue, registerInstanceCommands } from "../commands/client/instance.js";
+import { addFleetMaxConcurrentRunsCommands, parseFleetMaxConcurrentRunsValue } from "../commands/client/instance.js";
 
 function createProgram(): Command {
   const program = new Command();
   program.exitOverride();
   program.configureOutput({ writeOut: () => {}, writeErr: () => {} });
-  registerInstanceCommands(program);
+  // Mirrors access.ts: the `instance` top-level command is built by the
+  // caller, and this module only adds its get/set subcommands onto it.
+  const instance = program.command("instance");
+  addFleetMaxConcurrentRunsCommands(instance);
   return program;
 }
 

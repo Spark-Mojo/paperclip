@@ -9,18 +9,24 @@ import {
 } from "./common.js";
 
 // SPA-10137: the fleet-wide run ceiling is the only instance-wide setting
-// exposed through this command group today. `instance get/set <key>` is
-// deliberately key/value shaped (rather than a one-off `fleet-cap` command)
-// so a later live instance setting can be added as another supported key
-// without a new command group.
+// exposed through `get`/`set` today. Deliberately key/value shaped (rather
+// than a one-off `fleet-cap` command) so a later live instance setting can be
+// added as another supported key without a new command shape.
+//
+// The `instance` top-level command already exists in access.ts
+// (registerAccessCommands) -- commander throws "cannot add command 'instance'
+// as already have command 'instance'" if a second file tries to create it,
+// which took down the whole CLI (and every e2e test that boots it) the first
+// time this landed. So this module does NOT create `program.command("instance")`
+// itself; the caller (access.ts) passes in the existing `instance` Command and
+// this just adds the `get`/`set` subcommands onto it.
 const FLEET_MAX_CONCURRENT_RUNS_KEY = "fleet-max-concurrent-runs";
 const SUPPORTED_KEYS = [FLEET_MAX_CONCURRENT_RUNS_KEY] as const;
 
 type InstanceCommandOptions = BaseClientOptions;
 
-export function registerInstanceCommands(program: Command): void {
-  const instance = program.command("instance").description("Live instance-wide settings (board/instance-admin only)");
-
+/** Mounts `instance get <key>` / `instance set <key> <value>` onto an existing `instance` Command. */
+export function addFleetMaxConcurrentRunsCommands(instance: Command): void {
   addCommonClientOptions(
     instance
       .command("get")
