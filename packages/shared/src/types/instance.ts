@@ -38,6 +38,29 @@ export interface InstanceGeneralSettings {
    * Kubernetes sandbox provider and denies local/ssh execution.
    */
   executionMode?: InstanceExecutionMode;
+  /**
+   * Live DB override for the fleet-wide ceiling on concurrently RUNNING agent
+   * runs (server/src/services/heartbeat.ts `fleetMaxConcurrentRuns()`).
+   * Integer 1..50 sets an explicit ceiling; `null` explicitly forces "no
+   * ceiling", overriding the `PAPERCLIP_MAX_CONCURRENT_AGENT_RUNS` boot
+   * default; absent leaves the env var (if any) in control. See
+   * `FleetMaxConcurrentRunsStatus` for the resolved effective value and its
+   * source — this field is the stored override only, not the effective one.
+   */
+  fleetMaxConcurrentRuns?: number | null;
+}
+
+/** Where the effective fleet-wide run ceiling came from. */
+export type FleetMaxConcurrentRunsSource = "db" | "env" | "none";
+
+/**
+ * The resolved, effective fleet-wide run ceiling plus where it came from.
+ * Precedence: an explicit DB value (`InstanceGeneralSettings.fleetMaxConcurrentRuns`)
+ * wins over `PAPERCLIP_MAX_CONCURRENT_AGENT_RUNS`, which wins over "no ceiling".
+ */
+export interface FleetMaxConcurrentRunsStatus {
+  value: number | null;
+  source: FleetMaxConcurrentRunsSource;
 }
 
 export interface InstanceExperimentalSettings {
