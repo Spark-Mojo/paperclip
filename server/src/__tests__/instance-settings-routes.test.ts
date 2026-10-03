@@ -876,6 +876,106 @@ describe("instance settings routes", () => {
       expect(mockHeartbeatService.resumeQueuedRuns).not.toHaveBeenCalled();
     });
 
+    it("serializes concurrent PATCHes so a queued request's \"previous\" reflects the prior request's committed write (Mira review)", async () => {
+      // Without serialization, a second PATCH's pre-write snapshot could be
+      // taken while the first PATCH is still in flight, so it would read the
+      // value from BEFORE the first PATCH committed -- misreporting its own
+      // transition (and potentially misclassifying a lowering request as a
+      // raise, per the review finding). This proves the two PATCHes run as
+      // one queued transition each, start to finish, in arrival order.
+      const app = await createApp(adminActor);
+      const callOrder: string[] = [];
+
+      let notifyPatch1Blocked: (() => void) | undefined;
+      const patch1Blocked = new Promise<void>((resolve) => {
+        notifyPatch1Blocked = resolve;
+      });
+      let releasePatch1Update: ((value: unknown) => void) | undefined;
+
+      mockInstanceSettingsService.getGeneral.mockImplementation(async () => {
+        callOrder.push("getGeneral");
+        // First call is PATCH 1's pre-write snapshot (cap=2). Any later call
+        // is only reachable once PATCH 1 has committed (cap=10) -- if the
+        // route let the two PATCHes race, PATCH 2's snapshot could instead
+        // observe this same pre-PATCH-1 general object.
+        return callOrder.filter((c) => c === "getGeneral").length === 1
+          ? { censorUsernameInLogs: false, keyboardShortcuts: false, feedbackDataSharingPreference: "prompt", fleetMaxConcurrentRuns: 2 }
+          : { censorUsernameInLogs: false, keyboardShortcuts: false, feedbackDataSharingPreference: "prompt", fleetMaxConcurrentRuns: 10 };
+      });
+      mockInstanceSettingsService.updateGeneral.mockImplementation(
+        (patch: { fleetMaxConcurrentRuns: number | null }) => {
+          if (patch.fleetMaxConcurrentRuns === 10) {
+            callOrder.push("updateGeneral:start:raise-to-10");
+            return new Promise((resolve) => {
+              notifyPatch1Blocked?.();
+              releasePatch1Update = () => {
+                callOrder.push("updateGeneral:commit:raise-to-10");
+                resolve({ id: "instance-settings-1", general: { fleetMaxConcurrentRuns: 10 } });
+              };
+            });
+          }
+          callOrder.push("updateGeneral:lower-to-1");
+          return Promise.resolve({ id: "instance-settings-1", general: { fleetMaxConcurrentRuns: 1 } });
+        },
+      );
+      let fleetStatusCall = 0;
+      mockHeartbeatService.getFleetMaxConcurrentRunsStatus.mockImplementation(async () => {
+        fleetStatusCall += 1;
+        callOrder.push(`fleetStatus:${fleetStatusCall}`);
+        switch (fleetStatusCall) {
+          case 1: return { value: 2, source: "db" }; // PATCH 1 previous
+          case 2: return { value: 10, source: "db" }; // PATCH 1 next
+          // PATCH 2 previous: MUST be 10 (PATCH 1's committed write), never
+          // the stale pre-PATCH-1 value of 2.
+          case 3: return { value: 10, source: "db" };
+          case 4: return { value: 1, source: "db" }; // PATCH 2 next
+          default: throw new Error(`unexpected getFleetMaxConcurrentRunsStatus call ${fleetStatusCall}`);
+        }
+      });
+
+      // supertest only sends a request once something calls .then() on it
+      // (see the task-drain test above for the same gotcha), so force both
+      // requests to send now instead of waiting for the final Promise.all.
+      const patch1 = request(app)
+        .patch("/api/instance/settings/fleet-max-concurrent-runs")
+        .send({ value: 10 });
+      patch1.then(() => {}, () => {});
+      await patch1Blocked;
+
+      const patch2 = request(app)
+        .patch("/api/instance/settings/fleet-max-concurrent-runs")
+        .send({ value: 1 });
+      patch2.then(() => {}, () => {});
+      // Give PATCH 2 every chance to (wrongly) race ahead while PATCH 1 is
+      // still blocked on its update. It must not reach a second getGeneral
+      // call yet -- that would mean it skipped the queue.
+      await new Promise((resolve) => setImmediate(resolve));
+      await new Promise((resolve) => setImmediate(resolve));
+      expect(callOrder.filter((c) => c === "getGeneral")).toHaveLength(1);
+
+      releasePatch1Update?.(undefined);
+      const [res1, res2] = await Promise.all([patch1, patch2]);
+
+      expect(res1.status).toBe(200);
+      expect(res1.body).toEqual({ value: 10, source: "db" });
+      expect(res2.status).toBe(200);
+      expect(res2.body).toEqual({ value: 1, source: "db" });
+      // PATCH 1 (2 -> 10) raised the cap: one admission pass. PATCH 2
+      // (10 -> 1) lowered it: no admission pass for that one.
+      expect(mockHeartbeatService.resumeQueuedRuns).toHaveBeenCalledTimes(1);
+      expect(callOrder).toEqual([
+        "getGeneral",
+        "fleetStatus:1",
+        "updateGeneral:start:raise-to-10",
+        "updateGeneral:commit:raise-to-10",
+        "fleetStatus:2",
+        "getGeneral",
+        "fleetStatus:3",
+        "updateGeneral:lower-to-1",
+        "fleetStatus:4",
+      ]);
+    });
+
   });
 
   describe("executionMode floor on cloud-managed instances", () => {

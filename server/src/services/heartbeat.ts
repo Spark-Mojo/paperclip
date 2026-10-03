@@ -784,6 +784,15 @@ interface FleetMaxConcurrentRunsCacheEntry {
   expiresAt: number;
 }
 let fleetMaxConcurrentRunsCache: FleetMaxConcurrentRunsCacheEntry | null = null;
+// Bumped by invalidateFleetMaxConcurrentRunsCache(). A cache-miss read spans
+// an `await`, so an invalidation can land while a read is already in flight:
+// without this guard, a pre-write read that started before a PATCH's
+// invalidate+write could still complete AFTER the PATCH's own post-write read
+// populates the cache, overwriting the fresh value with the stale one for
+// another full TTL window. Capturing the generation before the read and only
+// publishing if it is unchanged makes a read that was invalidated out from
+// under it a no-op instead of a stale write (Mira review, PR #140).
+let fleetMaxConcurrentRunsCacheGeneration = 0;
 
 /**
  * Invalidate the fleet-cap cache immediately. Call this right after any
@@ -793,6 +802,7 @@ let fleetMaxConcurrentRunsCache: FleetMaxConcurrentRunsCacheEntry | null = null;
  */
 export function invalidateFleetMaxConcurrentRunsCache(): void {
   fleetMaxConcurrentRunsCache = null;
+  fleetMaxConcurrentRunsCacheGeneration += 1;
 }
 
 export function normalizeFleetRunLivenessWindowMs(value: unknown): number {
@@ -17376,16 +17386,24 @@ export function heartbeatService(
     ) {
       return fleetMaxConcurrentRunsCache.resolved;
     }
+    // Capture the generation before the read, which spans an await: if an
+    // invalidation lands while this read is in flight (a concurrent PATCH),
+    // publishing below would overwrite that PATCH's fresh post-write cache
+    // entry with this now-stale value. Skip the write when the generation
+    // moved instead (Mira review, PR #140).
+    const generation = fleetMaxConcurrentRunsCacheGeneration;
     const general = await instanceSettings.getGeneral();
     const resolved = resolveFleetMaxConcurrentRuns({
       dbValue: general.fleetMaxConcurrentRuns,
       envValue: envRawValue,
     });
-    fleetMaxConcurrentRunsCache = {
-      envRawValue,
-      resolved,
-      expiresAt: now + FLEET_MAX_CONCURRENT_RUNS_CACHE_TTL_MS,
-    };
+    if (generation === fleetMaxConcurrentRunsCacheGeneration) {
+      fleetMaxConcurrentRunsCache = {
+        envRawValue,
+        resolved,
+        expiresAt: Date.now() + FLEET_MAX_CONCURRENT_RUNS_CACHE_TTL_MS,
+      };
+    }
     return resolved;
   }
 
