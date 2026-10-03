@@ -3992,6 +3992,15 @@ export function applyProjectWorkspaceDefaultRefToWorktreeStrategy(
   return { ...config, workspaceStrategy: { ...strategy, baseRef: defaultRef } };
 }
 
+export function requireSelectedProjectWorkspace<T extends ProjectWorkspaceCandidate>(
+  rows: T[], selectedWorkspaceId: string | null | undefined,
+): T[] {
+  if (!selectedWorkspaceId) return rows;
+  const selected = rows.find((row) => row.id === selectedWorkspaceId);
+  if (!selected) throw new Error(`Selected project workspace "${selectedWorkspaceId}" is not available on this project.`);
+  return [selected];
+}
+
 export function prioritizeProjectWorkspaceCandidatesForRun<
   T extends ProjectWorkspaceCandidate,
 >(rows: T[], preferredWorkspaceId: string | null | undefined): T[] {
@@ -6128,6 +6137,25 @@ export type AllocatorExecutionWorkspaceReuseDecision = {
  * `resolveExecutionWorkspaceReuseRequestForIssue` so callers cannot forget to
  * apply it before handing off to `provisionExecutionWorkspaceForFreshnessDecision`.
  */
+export function assertPinnedExecutionWorkspaceMatchesProjectWorkspace(input: {
+  selectedProjectWorkspaceId?: string | null;
+  requestedExecutionWorkspaceId?: string | null;
+  executionWorkspacePreference?: string | null;
+  existingExecutionWorkspace?: { id: string; projectWorkspaceId: string | null } | null;
+}): void {
+  if (
+    input.selectedProjectWorkspaceId &&
+    input.existingExecutionWorkspace &&
+    input.requestedExecutionWorkspaceId === input.existingExecutionWorkspace.id &&
+    input.existingExecutionWorkspace.projectWorkspaceId !== input.selectedProjectWorkspaceId &&
+    input.executionWorkspacePreference === "reuse_existing"
+  ) {
+    throw new Error(
+      `Selected project workspace ${input.selectedProjectWorkspaceId} differs from pinned execution workspace ${input.existingExecutionWorkspace.id}. Clear the issue's executionWorkspaceId and executionWorkspacePreference through PATCH before retrying; the existing worktree is not changed.`,
+    );
+  }
+}
+
 export function resolveAllocatorExecutionWorkspaceReuseDecision(input: {
   issueExecutionWorkspaceId?: string | null;
   issueExecutionWorkspacePreference?: string | null;
@@ -12676,6 +12704,10 @@ export function heartbeatService(
       repoRef: readNonEmptyString(workspace.repoRef),
     }));
 
+    if (preferredProjectWorkspaceId) {
+      requireSelectedProjectWorkspace(projectWorkspaceRows, preferredProjectWorkspaceId);
+    }
+
     if (projectWorkspaceRows.length > 0) {
       const preferredWorkspace = preferredProjectWorkspaceId
         ? (projectWorkspaceRows.find(
@@ -12689,7 +12721,7 @@ export function heartbeatService(
       if (preferredProjectWorkspaceId && !preferredWorkspace) {
         preferredWorkspaceWarning = `Selected project workspace "${preferredProjectWorkspaceId}" is not available on this project.`;
       }
-      for (const workspace of projectWorkspaceRows) {
+      for (const workspace of requireSelectedProjectWorkspace(projectWorkspaceRows, preferredProjectWorkspaceId)) {
         let projectCwd: string;
         let managedWorkspaceWarning: string | null = null;
         try {
@@ -12749,6 +12781,11 @@ export function heartbeatService(
         missingProjectCwds.push(projectCwd);
       }
 
+      if (preferredProjectWorkspaceId) {
+        throw new Error(
+          preferredWorkspaceWarning ?? `Selected project workspace "${preferredProjectWorkspaceId}" is unavailable.`,
+        );
+      }
       const fallbackCwd = resolveDefaultAgentWorkspaceDir(agent.id);
       await fs.mkdir(fallbackCwd, { recursive: true });
       const warnings = buildAnchorFallbackWorkspaceNotes({
@@ -21257,6 +21294,14 @@ export function heartbeatService(
       // locally before any downstream policy/provisioning decision sees it, so the
       // provisioning path always falls through to realizeWorkspace() rather than
       // hitting the `inherited_workspace_reuse_unavailable` throw.
+      assertPinnedExecutionWorkspaceMatchesProjectWorkspace({
+        selectedProjectWorkspaceId: issueRef?.projectWorkspaceId,
+        requestedExecutionWorkspaceId,
+        executionWorkspacePreference: nativeRecoveryExecutionWorkspaceId
+          ? "reuse_existing"
+          : issueRef?.executionWorkspacePreference,
+        existingExecutionWorkspace,
+      });
       const allocatorDecision = resolveAllocatorExecutionWorkspaceReuseDecision({
         issueExecutionWorkspaceId: requestedExecutionWorkspaceId,
         issueExecutionWorkspacePreference: nativeRecoveryExecutionWorkspaceId
