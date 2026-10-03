@@ -3,7 +3,7 @@ name: Refresh Lockfile
 on:
   push:
     branches:
-      - master
+      - rebuild/v2026.916.0-survivors
   workflow_dispatch:
 
 concurrency:

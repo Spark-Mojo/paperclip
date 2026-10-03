@@ -3,7 +3,7 @@ name: Docker
 on:
   push:
     branches:
-      - "master"
+      - "rebuild/v2026.916.0-survivors"
     tags:
       - "v*"
       - "nightly/v*"
@@ -366,7 +366,7 @@ jobs:
   # and manual Docker dispatches call the same implementation, preserving the
   # release tags and the canary promotion dependency below.
   build-and-push-cloud:
-    if: github.event_name != 'push' || github.ref != 'refs/heads/master'
+    if: github.event_name != 'push' || github.ref != 'refs/heads/rebuild/v2026.916.0-survivors'
     uses: ./.github/workflows/docker-cloud.yml
     permissions:
       contents: read
