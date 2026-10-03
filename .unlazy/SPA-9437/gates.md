@@ -739,6 +739,48 @@ back. Re-run at the base side CI actually used this time:
 The policy check script is blob `7254f6caf` at both revs and boolean at line 171,
 so the verdict is threshold-independent.
 
+### Lane -> failing file, read from THIS head's job logs (not carried over)
+
+Lane indices shift between runs, so the lane -> file mapping was re-read from
+this head's own job logs rather than inherited from `a73300e388`. It happens to
+land identically, which is now a measured fact rather than an assumption:
+
+| check | job id | failing file (from the FAIL line) | signature |
+|-------|--------|-----------------------------------|-----------|
+| `server (11/12)` | 111143235347 | `plugin-orchestration-apis.test.ts` | `expected 422 to be 201` |
+| `server (12/12)` | 111143235479 | `status-cards.test.ts` | `expected 422 to be 201` |
+| `verify 6/9` | 111143235252 | `issue-watchdogs-routes.test.ts` | `expected 422 to be 201` |
+| `verify 7/9` | 111143235324 | `permissions-upgrade-boundary-routes.test.ts` | `expected 422 to be 201` |
+| `verify 5/9` | 111143235425 | `openapi-routes.test.ts` | `missingInSpec` fleet-cap routes |
+| `workspaces-b` | 111143235456 | `packages/adapter-utils/src/server-utils.test.ts` | `write EPIPE` |
+| `policy` | 111143235059 | n/a (script) | 3 offenses |
+
+`ci / verify` (job 111144469070) is confirmed an AGGREGATE by its own log, not by
+inference — it fails on its FIRST executed line:
+
+    33: Run test "$POLICY_RESULT" = "success"
+    58:   POLICY_RESULT: failure
+    65:   ##[error]Process completed with exit code 1.
+
+It never evaluates the split lanes; it fails because the policy red propagates.
+Not an independent exemption.
+
+### Ledger freeze — why this section is the last write before verify
+
+Adding evidence to this ledger pushes a new head, which restarts CI, which
+invalidates the very pins this ledger records. Two heads have now been consumed
+that way. The freeze rule adopted here:
+
+  - The ONLY commits allowed between this section and the verify dispatch are
+    ones that change production code or tests in response to a verifier FINDING.
+    No more ledger-only commits to "keep the record current".
+  - When the next base advance happens, the response is to RE-DERIVE IN THE
+    VERIFIER'S CONTEXT (its `pr-read.sh checks` runs), not to push another head.
+  - The stale pin risk is bounded and stated plainly: CI's base side is
+    whatever `merge_commit_sha`'s parent 1 is at the moment the verifier reads
+    it. The evidence in this ledger holds as long as that base side is at or
+    after `62bab46c6f` and the five implicated files keep their recorded blobs.
+
 ### Red inventory on `9079d79a83` — enumerated from THIS head, mid-flight
 
 As of this write, 41 of 46 checks are complete, 5 in progress
