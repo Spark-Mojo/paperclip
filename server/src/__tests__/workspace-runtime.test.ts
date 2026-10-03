@@ -11313,6 +11313,48 @@ describe("ensurePersistedExecutionWorkspaceAvailable SPA-9437 project workspace 
     expect(await readGit(oldRepo, ["worktree", "list", "--porcelain"])).toContain(oldWorktreePath);
   }, 20_000);
 
+  it("tears down a clean old-repo worktree whose commits are already pushed to origin (SPA-9437)", async () => {
+    // Pins the deliberate boundary of the guard: reachability from an origin
+    // ref is the recoverability test, NOT the existence of a PR. A branch that
+    // was pushed but has no PR behind it is torn down, because the commits
+    // survive on origin and `git fetch` re-attaches them; only commits that
+    // exist nowhere but the worktree are preserved. This is the one behavior a
+    // reviewer can reasonably read as harm, so it is asserted rather than left
+    // to prose: the contract is "nothing unpushed", not "nothing orphaned".
+    const branchName = "PAP-9437-pushed-rebind";
+    const { oldRepo, oldWorktreePath } = await createOldRepoWorktree(branchName);
+    const newRepo = await createNewRepo();
+    await fs.writeFile(path.join(oldWorktreePath, "pushed.txt"), "on origin\n", "utf8");
+    await runGit(oldWorktreePath, ["add", "pushed.txt"]);
+    await runGit(oldWorktreePath, ["-c", "user.name=Fixture", "-c", "user.email=fixture@example.test", "commit", "-m", "pushed"]);
+    // The commits live on the worktree's own branch, not on `main`; record the
+    // tip before the teardown so the recovery assertion below can name it.
+    const pushedTip = await readGit(oldWorktreePath, ["rev-parse", "HEAD"]);
+    // Simulate the push by moving the remote-tracking ref onto the new tip —
+    // the reachability test reads `--remotes=origin`, not a real remote.
+    await runGit(oldWorktreePath, ["update-ref", `refs/remotes/origin/${branchName}`, "HEAD"]);
+
+    let error: unknown;
+    try {
+      await ensurePersistedExecutionWorkspaceAvailable({
+        base: { baseCwd: newRepo, source: "project_primary", projectId: "project-1", workspaceId: "workspace-new", repoUrl: null, repoRef: "HEAD" },
+        workspace: { id: "pushed-workspace", mode: "isolated_workspace", strategyType: "git_worktree", cwd: oldWorktreePath, providerRef: oldWorktreePath, projectId: "project-1", projectWorkspaceId: "workspace-old", repoUrl: null, baseRef: "HEAD", branchName, metadata: RUNTIME_OWNED_GIT_BRANCH_METADATA },
+        issue: { id: "pushed-issue", identifier: "PAP-9437", title: "Pushed rebind" },
+        agent: { id: "agent-1", name: "Coder", companyId: "company-1" },
+      });
+    } catch (caught) {
+      error = caught;
+    }
+
+    // Treated as recoverable: the guard tears the worktree down and signals
+    // unprovisionable so the allocator re-realizes against the NEW repo.
+    expect(error).toBeInstanceOf(ExecutionWorkspaceNotProvisionableError);
+    await expect(fs.stat(oldWorktreePath)).rejects.toThrow();
+    // The commits are NOT lost: the origin ref still names the exact tip.
+    const originSha = await readGit(oldRepo, ["rev-parse", `refs/remotes/origin/${branchName}`]);
+    expect(originSha).toBe(pushedTip);
+  }, 20_000);
+
   it("refuses and preserves a dirty persisted git worktree whose repo no longer matches the project workspace (SPA-9437)", async () => {
     const branchName = "PAP-9437-dirty-rebind";
     const { oldRepo, oldWorktreePath } = await createOldRepoWorktree(branchName);
