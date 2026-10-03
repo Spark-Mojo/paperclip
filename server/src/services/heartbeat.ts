@@ -3905,6 +3905,10 @@ interface WakeupOptions {
   issueStateGuard?: {
     statuses: string[];
     assigneeAgentId: string;
+    stageId?: string;
+    participantAgentId?: string;
+    lastDecisionId?: string | null;
+    stageEnteredAt?: string;
   };
   /** Keep causally distinct external chat continuations out of an existing run. */
   allowRunCoalescing?: boolean;
@@ -18188,8 +18192,25 @@ export function heartbeatService(
     }
     const claimed = queuedCommentClaim
       ? queuedCommentClaim.run
-      : await withChatControlRecoveryGate(run, "claim", async (tx) =>
-          tx
+      : await withChatControlRecoveryGate(run, "claim", async (tx) => {
+          if (context.source === "issue.execution_review_recovery") {
+            const [stageIssue] = await tx.select({ status: issues.status, executionState: issues.executionState })
+              .from(issues).where(and(eq(issues.companyId, run.companyId), eq(issues.id, issueId!))).limit(1);
+            const stage = parseIssueExecutionState(stageIssue?.executionState);
+            if (!context.stageEnteredAt || stageIssue?.status !== "in_review" || stage?.status !== "pending" ||
+              stage.currentStageId !== context.currentStageId || stage.stageEnteredAt !== context.stageEnteredAt ||
+              stage.currentParticipant?.type !== "agent" || stage.currentParticipant.agentId !== run.agentId) {
+              const now = new Date();
+              await tx.update(heartbeatRuns).set({ status: "cancelled", errorCode: "review_stage_changed", error: "Review stage changed before recovery wake claim", finishedAt: now, updatedAt: now })
+                .where(and(eq(heartbeatRuns.id, run.id), eq(heartbeatRuns.status, "queued")));
+              if (run.wakeupRequestId) {
+                await tx.update(agentWakeupRequests).set({ status: "cancelled", finishedAt: now, updatedAt: now })
+                  .where(and(eq(agentWakeupRequests.id, run.wakeupRequestId), eq(agentWakeupRequests.status, "queued")));
+              }
+              return null;
+            }
+          }
+          return tx
             .update(heartbeatRuns)
             .set({
               status: "running",
@@ -18206,8 +18227,8 @@ export function heartbeatService(
               ),
             )
             .returning()
-            .then((rows) => rows[0] ?? null),
-        );
+            .then((rows) => rows[0] ?? null);
+        });
     if (!claimed) return null;
 
     publishLiveEvent({
@@ -27542,6 +27563,7 @@ export function heartbeatService(
               conversationUserId: issues.conversationUserId,
               conversationState: issues.conversationState,
               status: issues.status,
+              executionState: issues.executionState,
               projectId: issues.projectId,
               projectWorkspaceId: issues.projectWorkspaceId,
               executionWorkspaceId: issues.executionWorkspaceId,
@@ -27765,7 +27787,16 @@ export function heartbeatService(
           if (
             issueStateGuard &&
             (!issueStateGuard.statuses.includes(issue.status) ||
-              issue.assigneeAgentId !== issueStateGuard.assigneeAgentId)
+              issue.assigneeAgentId !== issueStateGuard.assigneeAgentId ||
+              (issueStateGuard.stageId !== undefined && (() => {
+                const stage = parseIssueExecutionState(issue.executionState);
+                return stage?.status !== "pending" ||
+                  stage.currentStageId !== issueStateGuard.stageId ||
+                  stage.currentParticipant?.type !== "agent" ||
+                  stage.currentParticipant.agentId !== issueStateGuard.participantAgentId ||
+                  stage.lastDecisionId !== issueStateGuard.lastDecisionId ||
+                  stage.stageEnteredAt !== issueStateGuard.stageEnteredAt;
+              })()))
           ) {
             await tx.insert(agentWakeupRequests).values({
               ...durableReceiptFields,
