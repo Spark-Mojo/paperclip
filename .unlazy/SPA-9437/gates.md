@@ -168,11 +168,22 @@ Clause 1 — head and base pinned atomically from one read:
     B = 694d0fbe002a7214f027a2f5d09a5b69d0686a4c
     baseRefName = rebuild/v2026.916.0-survivors
     RESULT: exit 0; H and B read from the same response.
-    (H advanced three times during this evidence pass: db63174fd5 -> e634c931f0
-    after the safety fix, -> 918272705e after the boundary test in gate 16,
-    -> 16d2961aeb after force-adding this ledger to the PR. Every clause below
-    was re-derived against the final H; earlier reads are superseded, not
-    relied on.)
+
+    HOW TO READ THIS PIN. Every clause below was gathered against H =
+    16d2961aeb, which is the head that carries the final CODE state: the
+    reachability fix (e634c931f0), the boundary test (918272705e) and this
+    ledger (16d2961aeb). Commits after it touch this markdown file only, so
+    the code under test is identical at any later head. Rather than chase
+    the SHA with further ledger edits — which is self-referential and never
+    terminates — the verifier should read the live head itself
+    (`pr-read.sh head 125 --repo Spark-Mojo/paperclip`) and confirm the
+    code-identical claim directly:
+
+        git diff 16d2961aebc6cdeb8e042fedb79ef8f764560154..<live head> \
+          -- server/src packages
+
+    An empty result is the whole check. The B pin needs no such caveat: B is
+    the branch tip and is stable.
 
 Clause 2 — conflict state:
 
