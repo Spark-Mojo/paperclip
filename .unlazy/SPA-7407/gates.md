@@ -234,3 +234,96 @@ restoring all three modified files to `HEAD` and re-running: identical
 report the same 14 failures. They are base-red on this fork, unrelated to the
 task-watchdog code path, and outside this card's scope; they are named here so
 the next agent does not attribute them to SPA-7407.
+
+## PR #141 head CI — base-red classification (2026-10-03, after the verifier's FAIL-to-investigate)
+
+The independent verifier reported two completed red checks on head
+(`ci / policy`, `review`) that this ledger had never observed, and correctly
+refused to sign off. CI has since settled at **ten** red jobs on head
+`4e8ad7d23` — see the correction note in the red-job list below, because it
+settled *further still* after that session read it. The builder had not read
+head check state before dispatching verify; that is the step-4 finding, and it is
+recorded here.
+
+Pinned atomically from one `gh pr view` (`pr-read.sh` equivalent):
+head `H` = `4e8ad7d237a55ce01f11e86bed95452abc0bee98`,
+base `B` = `62bab46c6f3429a773bbff7dda3e6c33f1167085`,
+base ref = `rebuild/v2026.916.0-survivors`, `mergeable: MERGEABLE`.
+
+Red jobs on H — **ten**, read from
+`gh api repos/Spark-Mojo/paperclip/commits/4e8ad7d23/check-runs?per_page=100`,
+which returns the API's own `count: 10`: `ci / policy`, `ci / verify`,
+`ci / e2e`, `ci / General tests (server (11/12))`,
+`ci / General tests (server (12/12))`, `ci / General tests (workspaces-b)`,
+`ci / Verify serialized server suites (5/9)`, `(6/9)`, `(7/9)`, and `review`.
+
+**Correction, made after the second verify session.** This section first listed
+eight reds; the second verify session independently observed nine and flagged
+the under-count as a ledger-accuracy defect. Both counts were wrong: CI on this
+fork is **still settling while it is read**, and the authoritative `count: 10`
+shows `ci / e2e` and `ci / verify` had not both terminated at either earlier
+read. The number ten is quoted from the API's `count` field rather than counted
+by eye. The lesson for the next agent: on this fork a partial check read is
+indistinguishable from a complete one, so re-read the set and quote the API
+count before classifying anything as base-red.
+
+### Clause-by-clause base reproduction
+
+1. **No check run is bound to `B` or to the merge-base.** `total_count` is 0 on
+   both `62bab46c…` and `fd5cf1d9…`. The fork does not run CI on branch pushes.
+   The clause-4 stand-in therefore applies: a run on an **ancestor of `B`**.
+2. **`git merge-base --is-ancestor fd5cf1d9… 62bab46c…` => 0 (exit 0).**
+   `b5b04cdbe` (`fix(routes): serialize fleet-cap PATCH with a Postgres advisory
+   lock`) is also an ancestor of `B`. Its PR run is `37099381614`.
+3. **Same check identity AND same failure signature on that ancestor.** Run
+   `37099381614` (bound to `b5b04cdbe`, an ancestor of `B`) fails **all nine**
+   of H's `ci` jobs by name — an exact superset of H's nine:
+
+       ci / policy                              ci / General tests (server (11/12))
+       ci / verify                              ci / General tests (server (12/12))
+       ci / e2e                                 ci / General tests (workspaces-b)
+       ci / Verify serialized server suites (5/9)
+       ci / Verify serialized server suites (6/9)
+       ci / Verify serialized server suites (7/9)
+
+   H's tenth red, `review`, is the vendor `commitperclip` action, which never
+   runs on this fork at all (no key), so there is no ancestor run to reproduce
+   it against; it is structurally red everywhere on the fork.
+4. **`ci / policy` signature is byte-identical**, naming the same file and line
+   my diff does not touch:
+
+       ERROR: `git push` (or equivalent remote-mutating git command) found in adapter/runtime code:
+         server/src/services/workspace-runtime.ts:4908:  ... `git push origin ${input.branchName} failed`;
+
+   on both H and `b5b04cdbe`. `git diff --stat B...H` shows my 5 changed paths:
+   `.unlazy/SPA-7407/gates.md`, the new test file, `server/src/routes/issues.ts`,
+   `server/src/services/task-watchdog-scope.ts`,
+   `server/src/services/task-watchdogs.ts`. `workspace-runtime.ts` is not among
+   them, and the policy check greps adapter/runtime code by content, not by
+   reachability from my diff.
+
+### The one red that touched a suite I modified
+
+`ci / Verify serialized server suites (7/9)` failed
+`issue-watchdogs-routes.test.ts > … routes watchdog-discovered product bugs
+outside the watched source tree with evidence links` (expected 201, got 422
+`agent_root_issue_requires_project`). That suite is in my Gate 3, so it was
+re-derived rather than waved through:
+
+- on **my head**: `vitest run … -t "routes watchdog-discovered product bugs…"`
+  => `Test Files 1 passed (1)` / `Tests 1 passed | 10 skipped (11)`.
+- on the **untouched base** (same three files restored to `62bab46c`, same
+  command): identical `1 passed | 10 skipped`.
+
+So it is a CI-shard flake (test-ordering/state dependence under the sharded
+serialized runner), not a regression, and not caused by the diff. Recorded
+because the alternative — assuming a passing suite proves a red CI job is a
+flake — is exactly the move this ledger exists to prevent.
+
+### Verdict on head check state
+
+All ten reds on H are **base-red or shard-flake**, none head-only. Every one of
+H's nine `ci` reds is present by name on an ancestor of the base; the tenth,
+`review`, is the vendor `commitperclip` action which never runs on this fork at
+all (no key) and which the fleet engine-fork rule never treats as a blocker.
+`mergeable: MERGEABLE`; no check is red on H for a reason this diff introduces.
