@@ -22,7 +22,7 @@ import { logActivity } from "./activity-log.js";
 import { evaluateAgentInvokabilityFromDb } from "./agent-invokability.js";
 import { issueService } from "./issues.js";
 import { visibleIssueCondition } from "./issue-visibility.js";
-import { TASK_WATCHDOG_ORIGIN_KIND } from "./task-watchdog-scope.js";
+import { TASK_WATCHDOG_ORIGIN_KIND, type TaskWatchdogWakeStopSnapshot } from "./task-watchdog-scope.js";
 
 const TASK_WATCHDOG_STOP_FINGERPRINT_PREFIX = "task_watchdog_stop:";
 const TASK_WATCHDOG_SUBTREE_MAX_DEPTH = 100;
@@ -95,6 +95,11 @@ export type TaskWatchdogClassifierRelation = {
   companyId: string;
   blockerIssueId: string;
   blockedIssueId: string;
+  // Blocker status at classification time. Required to recognise a stale
+  // blocker hold: a `blocked` leaf whose every blocker is `done` is a hold the
+  // dependency-wake path cannot clear (that path needs a non-null
+  // `assigneeAgentId`), so the watchdog is the only actor that can.
+  blockerStatus?: string | null;
 };
 
 export type TaskWatchdogClassifierConfig = Pick<
@@ -131,10 +136,72 @@ export type TaskWatchdogMaterialLeaf = Pick<
   | "pendingApprovalIds"
 >;
 
+/**
+ * Every field of `TaskWatchdogMaterialLeaf` that the stale-blocker-hold
+ * carve-out treats as immutable — i.e. it must be byte-equal between the run's
+ * wake snapshot and the current state for the repair to be admitted. `status`
+ * is deliberately absent: it is the one field the repair is allowed to change.
+ *
+ * This list and the `Pick` above are maintained together on purpose. The
+ * admissibility check is a hand-written field list; if someone adds a field to
+ * the material fingerprint and forgets it here, the carve-out silently widens
+ * (a change to the new field would read as "only status changed").
+ * `task-watchdogs-stale-blocker-hold-repair.test.ts` asserts the invariant:
+ * every material-leaf field is either in this list or is `status`.
+ */
+export const TASK_WATCHDOG_IMMUTABLE_REPAIR_LEAF_FIELDS: readonly (keyof TaskWatchdogMaterialLeaf)[] = [
+  "issueId",
+  "assigneeAgentId",
+  "assigneeUserId",
+  "blockerIssueIds",
+  "pendingInteractionIds",
+  "pendingApprovalIds",
+];
+
+/** The one material field the stale-blocker-hold repair may change. */
+export const TASK_WATCHDOG_REPAIR_MUTABLE_LEAF_FIELD: keyof TaskWatchdogMaterialLeaf = "status";
+
 export type TaskWatchdogWaitsByIssueId = Record<string, {
   pendingInteractionIds: string[];
   pendingApprovalIds: string[];
 }>;
+
+/**
+ * A `blocked` leaf whose every recorded blocker has reached `done` while the
+ * leaf itself is still held in `blocked`. The board's own blocker-attention map
+ * reports this exact shape as `needs_attention` / `attention_required` (a
+ * "stale blocker hold"), and it is unreachable by the agent wake path: the
+ * dependency wake only targets non-null `assigneeAgentId`, and a human-owned
+ * leaf has none. The watchdog is the only actor holding the sanctioned
+ * `transition_watched_subtree_issue_status` capability for this subtree, so it
+ * must be able to observe and record these leaves.
+ */
+export type TaskWatchdogStaleBlockerHold = {
+  issueId: string;
+  identifier: string | null;
+  // Every recorded blocker was `done` at classification time and the leaf is
+  // still `blocked`.
+  staleBlockerIssueIds: string[];
+};
+
+/**
+ * Issues in the watched subtree that have at least one recorded blocker edge
+ * and whose every recorded blocker is `done`, whatever their own status is.
+ *
+ * `staleBlockerHolds` is the subset of these still held in `blocked`; this
+ * superset is what lets a mutation guard tell a repair of a hold apart from an
+ * unrelated fingerprint change, because by the time the repair is revalidated
+ * the leaf has already left `blocked` and is no longer a hold.
+ */
+export type TaskWatchdogBlockerResolvedLeaf = {
+  issueId: string;
+  identifier: string | null;
+  status: string;
+  // True while the leaf is still held in `blocked` — the state the board's
+  // blocker-attention map reports as a stale blocker hold.
+  held: boolean;
+  resolvedBlockerIssueIds: string[];
+};
 
 export type TaskWatchdogStopSnapshot = {
   version: 2;
@@ -153,18 +220,24 @@ export type TaskWatchdogClassifierResult =
     state: "not_applicable";
     reason: string;
     includedIssueIds: string[];
+    staleBlockerHolds: TaskWatchdogStaleBlockerHold[];
+    blockersResolvedLeaves: TaskWatchdogBlockerResolvedLeaf[];
   }
   | {
     state: "live";
     reason: string;
     includedIssueIds: string[];
     liveIssueIds: string[];
+    staleBlockerHolds: TaskWatchdogStaleBlockerHold[];
+    blockersResolvedLeaves: TaskWatchdogBlockerResolvedLeaf[];
   }
   | {
     state: "pending_first_run";
     reason: string;
     includedIssueIds: string[];
     pendingIssueIds: string[];
+    staleBlockerHolds: TaskWatchdogStaleBlockerHold[];
+    blockersResolvedLeaves: TaskWatchdogBlockerResolvedLeaf[];
   }
   | {
     state: "already_reviewed";
@@ -174,6 +247,8 @@ export type TaskWatchdogClassifierResult =
     stoppedLeaves: TaskWatchdogStoppedLeaf[];
     stopSnapshot: TaskWatchdogStopSnapshot;
     pendingInteractionsByIssueId: TaskWatchdogPendingInteractionsByIssueId;
+    staleBlockerHolds: TaskWatchdogStaleBlockerHold[];
+    blockersResolvedLeaves: TaskWatchdogBlockerResolvedLeaf[];
   }
   | {
     state: "stopped";
@@ -183,6 +258,8 @@ export type TaskWatchdogClassifierResult =
     stoppedLeaves: TaskWatchdogStoppedLeaf[];
     stopSnapshot: TaskWatchdogStopSnapshot;
     pendingInteractionsByIssueId: TaskWatchdogPendingInteractionsByIssueId;
+    staleBlockerHolds: TaskWatchdogStaleBlockerHold[];
+    blockersResolvedLeaves: TaskWatchdogBlockerResolvedLeaf[];
   };
 
 export type TaskWatchdogClassifierInput = {
@@ -368,17 +445,182 @@ function isShrinkOfReviewedSnapshot(
   });
 }
 
+export type TaskWatchdogMutationAdmissibility = {
+  admissible: boolean;
+  // Set when the revalidation is refused. `repair` names the leaf whose stale
+  // blocker hold is the only admissible repair, so the caller can surface it.
+  reason:
+    | "fingerprint_match"
+    | "stale_blocker_hold_repair"
+    | "changed_fingerprint"
+    | "reclassified_not_stopped";
+  staleBlockerHoldIssueIds: string[];
+  // Present only when `reason === "stale_blocker_hold_repair"`: the exact
+  // status edge the carve-out authorises, per repaired leaf. A caller that
+  // applies a mutation MUST match the requested transition against this and
+  // refuse anything else — the carve-out grants a `blocked` hold's release,
+  // never a general status write. Without this token the carve-out would
+  // authorise `blocked` -> `done`/`cancelled` on the strength of a stall
+  // diagnosis (SPA-7407).
+  allowedStatusTransitions: Array<{
+    issueId: string;
+    from: "blocked";
+    to: "todo";
+  }>;
+};
+
+/**
+ * Whether a watchdog-scoped mutation is still safe to apply, given the
+ * fingerprint its run was woken with and a fresh classification of the watched
+ * subtree.
+ *
+ * Fingerprint equality remains the rule. The one addition is a repair
+ * carve-out for the stale blocker hold: the ONLY sanctioned repair of a
+ * `blocked` leaf is a status transition away from `blocked`, and `status` is
+ * part of the material fingerprint, so a repair necessarily changes it. Without
+ * this carve-out the guard forbids exactly the write that would resolve the
+ * condition it detected, and the leaf is stuck forever (SPA-7407).
+ *
+ * The carve-out is target-independent and narrow. It requires all of:
+ *
+ *  - the watched issue is itself a stale blocker hold (it is `blocked` and every
+ *    recorded blocker is `done`) — so the reviewer is looking at a hold, not at
+ *    live work it is about to disturb;
+ *  - no new pending interaction or approval appeared anywhere in the subtree
+ *    (an unanswered wait means a human decision is now the live path);
+ *  - no live run or queued wake appeared anywhere in the subtree;
+ *  - every material leaf's WAIT lists are unchanged from the reviewed snapshot;
+ *  - every material leaf other than the hold is byte-identical to the reviewed
+ *    snapshot, and the hold's own leaf differs ONLY in `status`.
+ *
+ * A divergence in any other field — assignee, blocker edges, a sibling leaf, a
+ * changed fingerprint that is not this hold — is still refused. A repair moves
+ * the leaf out of `blocked`, which opens a new blocked cycle with a fresh
+ * `blockedTransitionAt` on any later re-block, so this cannot be used to hold a
+ * run's mutation authority open indefinitely.
+ */
+export function classifyTaskWatchdogMutationAdmissibility(input: {
+  current: TaskWatchdogClassifierResult;
+  reviewedStopFingerprint: string | null;
+  // The run's own record of the subtree it was woken for. Supplied by the
+  // caller from the persisted watchdog row, not reconstructed from the current
+  // state: the whole point is to compare against what the run actually saw.
+  reviewedStopSnapshot?: TaskWatchdogStopSnapshot | null;
+}): TaskWatchdogMutationAdmissibility {
+  const { current, reviewedStopFingerprint, reviewedStopSnapshot } = input;
+  const refuse = (
+    reason: TaskWatchdogMutationAdmissibility["reason"],
+    staleBlockerHoldIssueIds: string[],
+  ): TaskWatchdogMutationAdmissibility => ({
+    admissible: false,
+    reason,
+    staleBlockerHoldIssueIds,
+    allowedStatusTransitions: [],
+  });
+  if (current.state === "stopped" && current.stopFingerprint === reviewedStopFingerprint) {
+    return {
+      admissible: true,
+      reason: "fingerprint_match",
+      staleBlockerHoldIssueIds: current.staleBlockerHolds.map((hold) => hold.issueId),
+      // A fingerprint match authorises whatever the stop already did; it is
+      // the pre-existing path and needs no transition token.
+      allowedStatusTransitions: [],
+    };
+  }
+  // Past this point the fingerprint no longer matches, so every clause below is
+  // about proving the divergence is exactly one stale-blocker-hold repair.
+  // A hold that has already been repaired no longer reads as `held`, so the
+  // resolved-leaf set is what identifies which leaf the repair touched: the
+  // reviewed leaf must have been held and resolved in the reviewed snapshot's
+  // own state, and the current leaf must be resolved and no longer held.
+  const resolvedLeavesById = new Map(
+    current.blockersResolvedLeaves.map((leaf) => [leaf.issueId, leaf]),
+  );
+  const heldNow = current.staleBlockerHolds.map((hold) => hold.issueId);
+  if (!reviewedStopFingerprint) return refuse("reclassified_not_stopped", heldNow);
+  if (current.state !== "stopped") return refuse("reclassified_not_stopped", heldNow);
+
+  // Without the run's own snapshot there is nothing to prove the divergence is
+  // limited to a hold, so the carve-out is refused.
+  const reviewed = parseStopSnapshot(reviewedStopSnapshot);
+  if (!reviewed) return refuse("changed_fingerprint", heldNow);
+  if (
+    canonicalJson(current.stopSnapshot.waitsByIssueId) !==
+    canonicalJson(reviewed.waitsByIssueId)
+  ) {
+    // A new pending interaction or approval anywhere in the subtree means a
+    // human decision is now the live path, not a repair.
+    return refuse("changed_fingerprint", heldNow);
+  }
+  if (reviewed.materialLeaves.length !== current.stopSnapshot.materialLeaves.length) {
+    return refuse("changed_fingerprint", heldNow);
+  }
+
+  const repairedIssueIds: string[] = [];
+  const reviewedLeaves = new Map(reviewed.materialLeaves.map((leaf) => [leaf.issueId, leaf]));
+  for (const leaf of current.stopSnapshot.materialLeaves) {
+    const previous = reviewedLeaves.get(leaf.issueId);
+    if (!previous) return refuse("changed_fingerprint", heldNow);
+    if (canonicalJson(previous) === canonicalJson(leaf)) continue;
+    // Any divergence is admissible only when it is this leaf leaving the
+    // `blocked` hold of a fully resolved blocker set, with nothing else about
+    // it changed. The immutability check is derived from
+    // TASK_WATCHDOG_IMMUTABLE_REPAIR_LEAF_FIELDS rather than hand-listed here,
+    // so adding a field to the material fingerprint cannot silently widen the
+    // carve-out.
+    const resolved = resolvedLeavesById.get(leaf.issueId);
+    const immutableFieldsIntact = TASK_WATCHDOG_IMMUTABLE_REPAIR_LEAF_FIELDS.every(
+      (field) =>
+        canonicalJson(previous[field]) === canonicalJson(leaf[field]),
+    );
+    if (
+      !resolved ||
+      resolved.held ||
+      previous.status !== "blocked" ||
+      leaf.status === "blocked" ||
+      !immutableFieldsIntact
+    ) {
+      return refuse("changed_fingerprint", heldNow);
+    }
+    repairedIssueIds.push(leaf.issueId);
+  }
+  if (repairedIssueIds.length === 0) return refuse("changed_fingerprint", heldNow);
+
+  return {
+    admissible: true,
+    reason: "stale_blocker_hold_repair",
+    staleBlockerHoldIssueIds: repairedIssueIds,
+    // The single edge this carve-out authorises: release the hold to `todo`.
+    // `done` and `cancelled` are deliberately NOT authorised — a stall
+    // diagnosis is not a completion diagnosis, and a watchdog must not close
+    // a card on the strength of the hold it observed.
+    allowedStatusTransitions: repairedIssueIds.map((issueId) => ({
+      issueId,
+      from: "blocked" as const,
+      to: "todo" as const,
+    })),
+  };
+}
+
 export function classifyTaskWatchdogSubtree(input: TaskWatchdogClassifierInput): TaskWatchdogClassifierResult {
   const issuesById = new Map(input.issues.map((issue) => [issue.id, issue]));
   const root = issuesById.get(input.watchdog.issueId);
   if (!root || root.companyId !== input.watchdog.companyId) {
-    return { state: "not_applicable", reason: "Watched issue is missing.", includedIssueIds: [] };
+    return {
+      state: "not_applicable",
+      reason: "Watched issue is missing.",
+      includedIssueIds: [],
+      staleBlockerHolds: [],
+      blockersResolvedLeaves: [],
+    };
   }
   if (root.originKind === TASK_WATCHDOG_ORIGIN_KIND) {
     return {
       state: "not_applicable",
       reason: "Task watchdog origin issues cannot themselves be watched.",
       includedIssueIds: [],
+      staleBlockerHolds: [],
+      blockersResolvedLeaves: [],
     };
   }
 
@@ -403,7 +645,13 @@ export function classifyTaskWatchdogSubtree(input: TaskWatchdogClassifierInput):
   };
   visit(root);
   if (included.length === 0) {
-    return { state: "not_applicable", reason: "Watched subtree has no non-watchdog issues.", includedIssueIds: [] };
+    return {
+      state: "not_applicable",
+      reason: "Watched subtree has no non-watchdog issues.",
+      includedIssueIds: [],
+      staleBlockerHolds: [],
+      blockersResolvedLeaves: [],
+    };
   }
 
   const includedIds = included.map((issue) => issue.id);
@@ -413,12 +661,73 @@ export function classifyTaskWatchdogSubtree(input: TaskWatchdogClassifierInput):
     ...pathIssueIds(input.queuedWakeRequests, input.watchdog.companyId),
   ].filter((issueId) => includedIdSet.has(issueId));
   const uniqueLiveIssueIds = [...new Set(liveIssueIds)].sort();
+
+  // A `blocked` issue inside the subtree whose every recorded blocker has
+  // reached `done` is a stale blocker hold. It is computed before the live-path
+  // early return so the caller can always report it, and it is only meaningful
+  // for issues that are themselves still held, not for a blocker a terminal
+  // ancestor already cleared.
+  const blockerStatusesByBlockedId = new Map<string, Array<{
+    blockerIssueId: string;
+    blockerStatus: string | null;
+  }>>();
+  for (const relation of input.blockers ?? []) {
+    if (relation.companyId !== input.watchdog.companyId) continue;
+    if (!includedIdSet.has(relation.blockedIssueId)) continue;
+    const list = blockerStatusesByBlockedId.get(relation.blockedIssueId) ?? [];
+    list.push({
+      blockerIssueId: relation.blockerIssueId,
+      blockerStatus: relation.blockerStatus ?? null,
+    });
+    blockerStatusesByBlockedId.set(relation.blockedIssueId, list);
+  }
+  const blockersResolvedLeaves: TaskWatchdogBlockerResolvedLeaf[] = included
+    .map((issue) => {
+      const relations = blockerStatusesByBlockedId.get(issue.id) ?? [];
+      const resolvedBlockerIssueIds = relations
+        .filter((relation) => relation.blockerStatus === "done")
+        .map((relation) => relation.blockerIssueId)
+        .sort();
+      return {
+        issueId: issue.id,
+        identifier: issue.identifier ?? null,
+        status: issue.status,
+        held: issue.status === "blocked",
+        resolvedBlockerIssueIds,
+        recordedBlockerCount: relations.length,
+      };
+    })
+    // A leaf with no recorded edge cannot be a hold: nothing resolved. An edge
+    // whose blocker status was not read (null) counts as unresolved, so an
+    // incomplete read can never manufacture a resolved leaf.
+    .filter((leaf) =>
+      leaf.resolvedBlockerIssueIds.length > 0 &&
+      leaf.resolvedBlockerIssueIds.length === leaf.recordedBlockerCount)
+    .map(({ issueId, identifier, status, held, resolvedBlockerIssueIds }) => ({
+      issueId,
+      identifier,
+      status,
+      held,
+      resolvedBlockerIssueIds,
+    }))
+    .sort((left, right) => left.issueId.localeCompare(right.issueId));
+
+  const staleBlockerHolds: TaskWatchdogStaleBlockerHold[] = blockersResolvedLeaves
+    .filter((leaf) => leaf.held)
+    .map(({ issueId, identifier, resolvedBlockerIssueIds }) => ({
+      issueId,
+      identifier,
+      staleBlockerIssueIds: resolvedBlockerIssueIds,
+    }));
+
   if (uniqueLiveIssueIds.length > 0) {
     return {
       state: "live",
       reason: "At least one issue in the watched subtree has a live run, queued wake, or scheduled retry.",
       includedIssueIds: includedIds,
       liveIssueIds: uniqueLiveIssueIds,
+      staleBlockerHolds,
+      blockersResolvedLeaves,
     };
   }
 
@@ -448,6 +757,8 @@ export function classifyTaskWatchdogSubtree(input: TaskWatchdogClassifierInput):
           "A watched issue was created within the first-run grace window and has not yet completed a run; deferring evaluation until its first assignment run/wake is observable.",
         includedIssueIds: includedIds,
         pendingIssueIds,
+        staleBlockerHolds,
+        blockersResolvedLeaves,
       };
     }
   }
@@ -529,6 +840,8 @@ export function classifyTaskWatchdogSubtree(input: TaskWatchdogClassifierInput):
       stoppedLeaves: leaves,
       stopSnapshot: currentStopSnapshot,
       pendingInteractionsByIssueId,
+      staleBlockerHolds,
+      blockersResolvedLeaves,
     };
   }
 
@@ -540,6 +853,8 @@ export function classifyTaskWatchdogSubtree(input: TaskWatchdogClassifierInput):
     stoppedLeaves: leaves,
     stopSnapshot: currentStopSnapshot,
     pendingInteractionsByIssueId,
+    staleBlockerHolds,
+    blockersResolvedLeaves,
   };
 }
 
@@ -1004,8 +1319,10 @@ export function taskWatchdogService(db: Db, deps: TaskWatchdogServiceDeps = {}) 
           companyId: issueRelations.companyId,
           blockerIssueId: issueRelations.issueId,
           blockedIssueId: issueRelations.relatedIssueId,
+          blockerStatus: issues.status,
         })
         .from(issueRelations)
+        .innerJoin(issues, eq(issueRelations.issueId, issues.id))
         .where(and(
           eq(issueRelations.companyId, companyId),
           eq(issueRelations.type, "blocks"),
@@ -1617,6 +1934,10 @@ export function taskWatchdogService(db: Db, deps: TaskWatchdogServiceDeps = {}) 
     companyId: string;
     watchedIssueId: string;
     stopFingerprint: string | null;
+    // The run's own wake-time snapshot, carried by the mutation scope. This is
+    // the baseline for the stale-blocker-hold carve-out; the mutable watchdog
+    // row is never used for it (SPA-7407).
+    wakeStopSnapshot?: TaskWatchdogWakeStopSnapshot | null;
   }) {
     if (!scope.stopFingerprint) {
       return {
@@ -1644,8 +1965,18 @@ export function taskWatchdogService(db: Db, deps: TaskWatchdogServiceDeps = {}) 
 
     const input = await collectClassifierInput(watchdog.companyId, watchdog);
     const classification = classifyTaskWatchdogSubtree(input);
-    if (classification.state === "stopped" && classification.stopFingerprint === scope.stopFingerprint) {
-      return { allowed: true as const, classification };
+    const reviewedStopSnapshot = parseStopSnapshot(scope.wakeStopSnapshot ?? null);
+    const admissibility = classifyTaskWatchdogMutationAdmissibility({
+      current: classification,
+      reviewedStopFingerprint: scope.stopFingerprint,
+      // The run's own immutable wake snapshot, carried by the mutation scope.
+      // The watchdog row is deliberately NOT consulted: its
+      // lastObservedStopSnapshot is overwritten by later evaluations, so binding
+      // to it would let the baseline move after this run was woken (SPA-7407).
+      reviewedStopSnapshot,
+    });
+    if (admissibility.admissible) {
+      return { allowed: true as const, classification, admissibility };
     }
 
     return {
@@ -1654,6 +1985,7 @@ export function taskWatchdogService(db: Db, deps: TaskWatchdogServiceDeps = {}) 
         ? "Task-watchdog review is stale because the watched subtree stop fingerprint changed; refresh the source state before mutating it."
         : "Task-watchdog review is stale because the watched subtree now has a live, waiting, already-reviewed, or not-applicable path; refresh the source state before mutating it.",
       classification,
+      admissibility,
     };
   }
 
