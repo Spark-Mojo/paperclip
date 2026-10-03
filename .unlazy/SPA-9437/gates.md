@@ -662,6 +662,105 @@ Base-only fails 4/4 and base+head fails the same 4/4: my change neither
 introduces nor repairs these. This is the pair that makes the exemption a
 measured claim rather than an inference.
 
+## Head `9079d79a83` — base side ADVANCED, exemption set re-derived 2026-10-03
+
+**The base moved again and the merge ref was recomputed, so every pin in the
+section above is stale for this head.** This supersedes it.
+
+    gh api .../pulls/125 --jq .merge_commit_sha  -> f41eae677d9697f97828186a57ec8169e7c631ab
+    parents of that merge:
+      62bab46c6f3429a773bbff7dda3e6c33f1167085   (base side — the LIVE TIP now)
+      9079d79a83619071c9c669290a55ee52d6c95177   (this PR head)
+
+The base side is no longer `916919bb7c`; it is the live tip `62bab46c6f`, whose
+tip commit is `62bab46c6f Merge pull request #140 from
+Spark-Mojo/feat/spa-10137-live-fleet-cap`. A NEW red appeared with it.
+
+**The exemption set is not stable across heads**, exactly as warned. The new
+check `ci / Verify serialized server suites (5/9)` was green on `a73300e388` and
+red on `9079d79a83`. It needed its own reproduction; it does not inherit the
+earlier evidence.
+
+### The new red — `openapi-routes.test.ts`, an OpenAPI route-coverage test
+
+This one was NOT assumed to be a base red. It is change-sensitive by
+construction (it diffs mounted routes against the spec), so it got the full
+treatment:
+
+    # head job 111143235425, lane 5/9
+    FAIL @paperclipai/server src/__tests__/openapi-routes.test.ts >
+         openapi routes > covers the mounted server routes exactly
+    -   "missingInSpec": [],
+    +   "missingInSpec": [
+    +     "GET /api/instance/settings/fleet-max-concurrent-runs",
+    +     "PATCH /api/instance/settings/fleet-max-concurrent-runs",
+      ❯ src/__tests__/openapi-routes.test.ts:723:8
+    Test Files 1 failed (1); Tests 1 failed | 8 passed (9)
+
+Attribution by blob identity — identical at base side, at the CI-built merge,
+and at my head, so the assertion itself is untouched by this PR:
+
+    | rev                                        | blob (all three) |
+    |--------------------------------------------|-----------------|
+    | `62bab46c6f` (base side)                   | `9e2975386`     |
+    | `f41eae677d` (what CI built)               | `9e2975386`     |
+    | `9079d79a83` (my head)                     | `9e2975386`     |
+
+    git diff 694d0fbe..9079d79a83 -- server/src/routes   -> EMPTY
+
+The two named routes are mounted by base-side PR #140 (fleet-cap), which is why
+the base side reports them missing from the spec and my branch never does.
+
+Reproduction, both throwaway worktrees with their own `pnpm install`:
+
+    # base side ALONE, 62bab46c6f, zero SPA-9437 code
+    vitest run src/__tests__/openapi-routes.test.ts
+      exit 1 — Test Files 1 failed (1); Tests 1 failed | 8 passed (9)
+      same test name, same assertion, same two missingInSpec routes
+
+    # the tree CI BUILT, f41eae677d
+    vitest run src/__tests__/openapi-routes.test.ts
+      exit 1 — Test Files 1 failed (1); Tests 1 failed | 8 passed (9)
+
+Base fails 1/1, base+head fails the same 1/1: inherited, not introduced.
+
+### Every OTHER red re-proven against the NEW base side `62bab46c6f`
+
+The earlier reproductions were pinned to `916919bb7c`, which is now two merges
+back. Re-run at the base side CI actually used this time:
+
+| red | command at `62bab46c6f` | result |
+|-----|--------------------------|--------|
+| 422 family (4 files) | `vitest run status-cards / plugin-orchestration-apis / issue-watchdogs-routes / permissions-upgrade-boundary-routes` | exit 1 — `4 failed \| 63 passed (67)`, same 4 names |
+| `workspaces-b` EPIPE | `vitest run packages/adapter-utils/src/server-utils.test.ts` | exit 1 — `1 passed (1); 126 passed (126); Errors 1 error`, `write EPIPE` |
+| `ci / policy` | `node scripts/check-no-git-push.mjs` | exit 1, 3 offenses |
+| `ci / policy` at `f41eae677d` | same script | exit 1, 3 offenses — output IDENTICAL modulo line numbers (`diff` of both outputs with `:N:` normalization is empty) |
+
+The policy check script is blob `7254f6caf` at both revs and boolean at line 171,
+so the verdict is threshold-independent.
+
+### Red inventory on `9079d79a83` — enumerated from THIS head, mid-flight
+
+As of this write, 41 of 46 checks are complete, 5 in progress
+(`e2e shard (7/8)`, `Canary Dry Run`, `Paperclip Runner (rust)`,
+`Typecheck + Release Registry`, `Build`). Recorded so far:
+
+    ci / General tests (server (11/12))                              422, reproduced above
+    ci / General tests (server (12/12))                              422, reproduced above
+    ci / General tests (workspaces-b)                                EPIPE, reproduced above
+    ci / policy                                                      3 offenses, reproduced above
+    ci / Verify serialized server suites (5/9)                       openapi-routes, NEW, reproduced above
+    ci / Verify serialized server suites (6/9)                       422, reproduced above
+    ci / Verify serialized server suites (7/9)                       422, reproduced above
+    review                                                            vendor commitperclip, exempt by rule
+    ci / e2e                                                          aggregate, pending shard 7/8
+    ci / verify                                                       aggregate of the split lanes
+
+**This inventory is NOT final and MUST be re-read from a terminal head before
+verify is dispatched.** The aggregates cannot be classified until their inputs
+are terminal, and a further base advance can add or clear a check — that is
+exactly what happened twice already.
+
 ### Terminal red inventory at `a73300e388` — 9 reds, all accounted for
 
     gh api .../commits/a73300e388.../check-runs --paginate \
