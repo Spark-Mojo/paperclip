@@ -368,6 +368,148 @@ Clause 4 — base ref has no CI run, ancestor stand-in used:
     `success` while H has it `failure`, so it was discarded as a stand-in and
     `9a4034850626c6cf8ccc335ba1e1b5b9010caba7` chosen instead.
 
+## Base-advance supersession (recorded 2026-10-03, run 2b248190's successor)
+
+**The B pin above is SUPERSEDED. Re-read this section before the older one.**
+
+Between the previous run and this one, `rebuild/v2026.916.0-survivors`
+advanced 41 commits:
+
+    git ls-remote origin refs/heads/rebuild/v2026.916.0-survivors
+      -> 916919bb7cbdbdfddaac59e31bf6b2e94bcf637c
+    git merge-base f17538edf4 refs/remotes/origin/rebuild/v2026.916.0-survivors
+      -> 694d0fbe002a7214f027a2f5d09a5b69d0686a4c   (UNCHANGED)
+    git rev-list --count f17538edf4..refs/remotes/origin/rebuild/v2026.916.0-survivors
+      -> 41
+
+`gh api .../pulls/125 --jq .base.sha` still reports `694d0fbe002a` because
+GitHub's REST `base.sha` is the merge base pinned when the PR was opened, not
+the live branch tip. Reading `.base.sha` alone would have pinned a 41-commit-
+stale base. **The live tip `916919bb7c` is the correct B for a merge, and it
+is what CI actually built.**
+
+The material consequence: `f519242095` ("feat(engine): refuse an
+agent-created root issue that names no project", SPA-9498, merged as PR #130
+in `a4bc04c428`) landed on base inside that window. It adds
+`assertAgentRootIssueHasProject` to `server/src/services/issues.ts`, which
+throws 422 on an agent-created root issue that names no project. Three
+existing test files predate that guard and do not name a project, so they now
+fail. This is **another card's change**, and the evidence below shows the
+failing state is the base's alone.
+
+Reproduction, run 2026-10-03 in a throwaway worktree at `/srv/bulk/probe/base-tip-9437`
+(NOT the card worktree, NOT scratch — it survives teardown):
+
+    # 1. Base tip ALONE, zero SPA-9437 code present
+    git checkout --detach 916919bb7cbdbdfddaac59e31bf6b2e94bcf637c
+    cd server && pnpm exec vitest run \
+      src/__tests__/status-cards.test.ts \
+      src/__tests__/plugin-orchestration-apis.test.ts \
+      src/__tests__/permissions-upgrade-boundary-routes.test.ts
+
+    RESULT: exit 1 — Test Files 3 failed (3); Tests 3 failed | 53 passed (56)
+    Failure signature, identical in all three, and identical to the head's:
+      Error: An agent-created task must belong to a project, but this create
+      resolved no project: it is a root task (no parent) and names neither
+      projectId nor a project/execution workspace to infer one from.
+      at assertAgentRootIssueHasProject (src/services/issues.ts:368:9)
+      at persist (src/services/issues.ts:9929:9)
+    server-12 CI log shows the same for status-cards.test.ts:406
+    (`expected 422 to be 201`); verify-7 for
+    permissions-upgrade-boundary-routes.test.ts:311.
+
+    # 2. POSITIVE CONTROL — the commit before the guard, same tree otherwise
+    git checkout --detach 24597d524fe5cf8962c932f164a9b4dc4c354678  # f519242095~1
+    cd server && pnpm exec vitest run <same three files>
+
+    RESULT: exit 0 — Test Files 3 passed (3); Tests 56 passed (56)
+
+    This pair is the causation proof: the reds appear at `f519242095` and are
+    absent at its parent, on the same base, with no SPA-9437 code in either run.
+
+    # 3. NEGATIVE CONTROL — my head merged onto the new base
+    git checkout --detach 916919bb7c
+    git merge --no-ff f17538edf4ed1699d2054bd52b341e05232df4a8
+      -> "Automatic merge went well" (exit 0; no conflict)
+    cd server && pnpm exec vitest run <same three files>
+
+    RESULT: exit 0 — Test Files 3 passed (3); Tests 56 passed (56)
+
+    My change does not cause the reds and does not fix them. The exemption
+    holds on the live base, and CI's failure is inherited, not introduced.
+
+Head-red inventory at `f17538edf4` (run 37097395276, `pull_request` event,
+now fully terminal — zero checks `queued`/`in_progress`). Authoritative count
+via `check-runs` (NOT `gh pr checks`, which reported 1 and 8 on two
+consecutive reads of the same head and is unreliable here):
+
+    gh api repos/Spark-Mojo/paperclip/commits/f17538edf4.../check-runs \
+      --paginate --jq '.check_runs[] | select((.conclusion // "") == "failure") | .name' | sort
+
+  **9 reds, and every one is accounted for** (7 REAL base reds + 2 aggregates
+  + 1 rule-exempt — the arithmetic is 9 checks total, of which 6 real):
+
+  | # | check                                       | verdict |
+  |---|---------------------------------------------|---------|
+  | 1 | `ci / policy`                               | REAL base red (re-verified this run, both revs) |
+  | 2 | `ci / General tests (workspaces-b)`         | REAL base red — EPIPE unhandled teardown; 1232 tests PASS, only `Errors 1` |
+  | 3 | `ci / General tests (server (11/12))`        | REAL base red (new) — plugin-orchestration-apis.test.ts:236, 422 |
+  | 4 | `ci / General tests (server (12/12))`        | REAL base red (new) — status-cards.test.ts:406, 422 |
+  | 5 | `ci / Verify serialized server suites (6/9)` | REAL base red (new) — permissions-upgrade-boundary-routes.test.ts:311, 422 |
+  | 6 | `ci / Verify serialized server suites (7/9)` | REAL base red (new) — same 422 signature |
+  | 7 | `ci / e2e`                                  | AGGREGATE — see proof below |
+  | 8 | `ci / verify`                               | AGGREGATE — `Fail if any split verify lane failed`, lanes 6/9 and 7/9 |
+  | 9 | `review`                                    | EXEMPT BY RULE — vendor `commitperclip`, no key on the fork |
+
+`ci / e2e` — aggregate claim proven, not assumed. All 8 e2e SHARDS are
+`success` (`e2e shard (1/8)`..`(8/8)`). Its job log (id 111132424517) is 50
+lines and fails on the very FIRST executed line, before any shard result is
+consumed:
+
+    Run test "$POLICY_RESULT" = "success"
+    env:
+      FULL_CI: true
+      POLICY_RESULT: failure      <- the inherited ci / policy red
+      E2E_SHARDS_RESULT: success
+    ##[error]Process completed with exit code 1.
+
+So its failure is derived from #1 alone. It is not an independent exemption
+and must not be counted as one.
+
+`ci / policy` re-verified THIS run at both revs, since it names files I edit:
+
+    node scripts/check-no-git-push.mjs   # at 916919bb7c (no SPA-9437 code)
+      -> exit 1, 3 offenses, byte-identical output
+    node scripts/check-no-git-push.mjs   # at f17538edf4
+      -> exit 1, 3 offenses, byte-identical output
+
+Offense count is unchanged at 3, and the check is boolean
+(`if (allOffenses.length > 0)`, line 171), so the verdict is identical under
+any threshold reading. Critically, the flagged line
+`workspace-runtime.ts:4908` is NOT in my diff
+(`git diff <base>..f17538edf4 -- server/src/services/workspace-runtime.ts |
+grep -E '^[+-].*git push'` -> no match), and the two files the policy names
+GREW under my change (workspace-runtime.ts 10148 -> 10337 lines;
+workspace-runtime.test.ts 11233 -> 11833 lines) while the reported line
+numbers stayed put, which is only consistent with the offenses sitting
+outside my hunks. My new `execution-workspaces.ts` helper adds zero
+`git push`-matching lines.
+
+My own SPA-9437 acceptance tests, re-run on the NEW base (gates 10-16 green):
+
+    # at merge 74a54c0f69 (916919bb7c + f17538edf4)
+    pnpm exec vitest run src/__tests__/workspace-runtime.test.ts \
+      -t 'SPA-9437|pushed to origin|unpushed runtime-owned commit'
+      -> exit 0 — Test Files 1 passed; Tests 9 passed | 183 skipped (192)
+    pnpm exec vitest run src/__tests__/issues-service.test.ts
+      -> exit 0 — Test Files 1 passed; Tests 133 passed (133)
+
+The full `workspace-runtime.test.ts` file reports 6 failures on the new base
+(all pnpm worktree-provisioning / install-sandbox tests, none SPA-9437). Those
+6 are base reds too — same 6 identical test names, `6 failed | 179 passed`,
+at `916919bb7c` with no SPA-9437 code present. This is the known gate 13
+provisioning-suite red, unchanged in character.
+
 ## Notes
 
 16. The deliberate boundary of the reachability guard: a branch that was
