@@ -559,6 +559,12 @@ function noopTaskWatchdogService(): TaskWatchdogService {
     }),
     revalidateMutationScope: async () => ({
       allowed: true,
+      admissibility: {
+        admissible: true,
+        reason: "fingerprint_match",
+        staleBlockerHoldIssueIds: [],
+        allowedStatusTransitions: [],
+      },
       classification: {
         state: "stopped",
         reason: "Task watchdog service unavailable in this route context.",
@@ -572,6 +578,8 @@ function noopTaskWatchdogService(): TaskWatchdogService {
           waitsByIssueId: {},
         },
         pendingInteractionsByIssueId: {},
+        staleBlockerHolds: [],
+        blockersResolvedLeaves: [],
       },
     }),
   };
@@ -5239,7 +5247,18 @@ export function issueRoutes(
       /** Used only to name the task in denial copy (plan §6). */
       identifier?: string | null;
     },
-    options: { allowVisibleIssueWrite?: boolean } = {},
+    options: {
+      allowVisibleIssueWrite?: boolean;
+      /**
+       * The status transition this request is asking for, when the request is a
+       * status write. Passed through to the task-watchdog staleness revalidation
+       * so the stale-blocker-hold carve-out can authorise only the exact edge it
+       * admits (SPA-7407). Absent for non-status mutations and for callers that
+       * cannot know the target status; a status write with no declared
+       * transition can never match the carve-out token, so it fails closed.
+       */
+      requestedStatusTransition?: { to: string } | null;
+    } = {},
   ) {
     if (req.actor.type !== "agent") return true;
     const actorAgentId = req.actor.agentId;
@@ -5276,7 +5295,12 @@ export function issueRoutes(
         });
         return false;
       }
-      return assertFreshTaskWatchdogSourceMutation(res, watchdogScope, issue);
+      return assertFreshTaskWatchdogSourceMutation(
+        res,
+        watchdogScope,
+        issue,
+        options.requestedStatusTransition ?? null,
+      );
     }
     const boundaryDecision = await decideIssueAccess(
       req,
@@ -5376,13 +5400,45 @@ export function issueRoutes(
     res: Response,
     scope: Awaited<ReturnType<typeof resolveTaskWatchdogMutationScope>>,
     issue: { id: string },
+    requestedStatusTransition: { to: string } | null = null,
   ) {
     if (scope.kind !== "watchdog") return true;
     if (scope.watchdogIssueId && issue.id === scope.watchdogIssueId)
       return true;
 
     const revalidated = await taskWatchdogsSvc.revalidateMutationScope(scope);
-    if (revalidated.allowed) return true;
+    if (revalidated.allowed) {
+      // The stale-blocker-hold carve-out is admitted ONLY for the exact status
+      // edge it authorised. Without this check the stall diagnosis behind the
+      // carve-out would also license closing the card (`blocked` -> `done` or
+      // `cancelled`), which no stall observation can justify (SPA-7407).
+      const allowedTransitions =
+        "admissibility" in revalidated && revalidated.admissibility
+          ? revalidated.admissibility.allowedStatusTransitions
+          : [];
+      if (allowedTransitions.length === 0) return true;
+      const permitted =
+        requestedStatusTransition != null &&
+        allowedTransitions.some(
+          (transition) =>
+            transition.issueId === issue.id &&
+            transition.to === requestedStatusTransition.to,
+        );
+      if (permitted) return true;
+      res.status(409).json({
+        error:
+          "Task-watchdog stale-review repair is limited to releasing a resolved stale blocker hold to todo; refresh the source state before mutating it.",
+        details: {
+          issueId: issue.id,
+          watchedIssueId: scope.watchedIssueId,
+          watchdogId: scope.watchdogId,
+          runStopFingerprint: scope.stopFingerprint,
+          requestedStatus: requestedStatusTransition?.to ?? null,
+          allowedStatusTransitions: allowedTransitions,
+        },
+      });
+      return false;
+    }
     res.status(409).json({
       error: revalidated.reason,
       details: {
@@ -12759,7 +12815,16 @@ export function issueRoutes(
         req,
         res,
         existing,
-        { allowVisibleIssueWrite: true },
+        {
+          allowVisibleIssueWrite: true,
+          // Declared so a task-watchdog stale-blocker-hold repair can be
+          // matched against the exact edge it authorised (SPA-7407). Only set
+          // when the request actually names a target status.
+          requestedStatusTransition:
+            typeof req.body.status === "string"
+              ? { to: req.body.status }
+              : null,
+        },
       );
       if (!issueMutationAccess) return;
       if (req.body.comment && !(await assertBoardCommentNotPaused(req, res, existing))) return;
