@@ -113,6 +113,29 @@ function withTaskDrainTransition<T>(run: () => Promise<T>): Promise<T> {
   return turn;
 }
 
+// SPA-10137 / Mira review (PR #140): the fleet-max-concurrent-runs PATCH does
+// a read (previous value) - write - read (next value) - audit - raise-check
+// sequence. Without serialization, two concurrent PATCHes can each snapshot
+// the OTHER's pre-write value as their own "previous", so the audit record
+// and the raise/lower decision can describe a transition that never actually
+// happened (e.g. a lowering request reading a stale low "previous" and
+// misclassifying itself as a raise). Same shape as the task-drain race above
+// — reuse the identical queue-of-turns pattern so every PATCH's whole
+// snapshot-write-read-audit sequence runs as one atomic turn, in arrival
+// order.
+let fleetMaxConcurrentRunsTransitionQueue: Promise<void> = Promise.resolve();
+
+function withFleetMaxConcurrentRunsTransition<T>(run: () => Promise<T>): Promise<T> {
+  const turn = fleetMaxConcurrentRunsTransitionQueue.then(run);
+  // Normalize to a settled void promise for the next caller in line, so a
+  // rejected transition cannot wedge every later transition behind it.
+  fleetMaxConcurrentRunsTransitionQueue = turn.then(
+    () => undefined,
+    () => undefined,
+  );
+  return turn;
+}
+
 export function instanceSettingsRoutes(db: Db) {
   const router = Router();
   const svc = instanceSettingsService(db);
@@ -318,60 +341,69 @@ export function instanceSettingsRoutes(db: Db) {
       // board/ops control with no UI surface, same as the task-drain routes
       // below, which also skip it.
 
-      // Invalidate first so this read is never served a cache entry a
-      // concurrent write populated moments ago, then snapshot the
-      // pre-write value for the activity log and the raise/lower decision.
-      heartbeat.invalidateFleetMaxConcurrentRunsCache();
-      const previousGeneral = await svc.getGeneral();
-      const previousStatus = await heartbeat.getFleetMaxConcurrentRunsStatus();
+      // The whole snapshot-write-read-audit-raise sequence runs as one queued
+      // transition (see withFleetMaxConcurrentRunsTransition above), so an
+      // overlapping PATCH cannot read this request's pre-write value as ITS
+      // "previous", or vice versa: every PATCH's "previous"/"next" pair
+      // describes a transition that actually happened, in request order.
+      const nextStatus = await withFleetMaxConcurrentRunsTransition(async () => {
+        // Invalidate first so this read is never served a cache entry a
+        // concurrent write populated moments ago, then snapshot the
+        // pre-write value for the activity log and the raise/lower decision.
+        heartbeat.invalidateFleetMaxConcurrentRunsCache();
+        const previousGeneral = await svc.getGeneral();
+        const previousStatus = await heartbeat.getFleetMaxConcurrentRunsStatus();
 
-      const updated = await svc.updateGeneral({ fleetMaxConcurrentRuns: req.body.value });
+        const updated = await svc.updateGeneral({ fleetMaxConcurrentRuns: req.body.value });
 
-      // Invalidate again: the read above cached the PRE-write value, which is
-      // now stale. The next read (here, and the next admission check) must
-      // see the value this request just wrote, not wait out the TTL.
-      heartbeat.invalidateFleetMaxConcurrentRunsCache();
-      const nextStatus = await heartbeat.getFleetMaxConcurrentRunsStatus();
+        // Invalidate again: the read above cached the PRE-write value, which
+        // is now stale. The next read (here, and the next admission check)
+        // must see the value this request just wrote, not wait out the TTL.
+        heartbeat.invalidateFleetMaxConcurrentRunsCache();
+        const nextStatus = await heartbeat.getFleetMaxConcurrentRunsStatus();
 
-      const actor = getActorInfo(req);
-      const companyIds = await svc.listCompanyIds();
-      await Promise.all(
-        companyIds.map((companyId) =>
-          logActivity(db, {
-            companyId,
-            actorType: actor.actorType,
-            actorId: actor.actorId,
-            agentId: actor.agentId,
-            runId: actor.runId,
-            agentApiKeyId: actor.agentApiKeyId,
-            action: "instance.settings.fleet_max_concurrent_runs_updated",
-            entityType: "instance_settings",
-            entityId: updated.id,
-            details: {
-              previous: previousGeneral.fleetMaxConcurrentRuns ?? null,
-              next: updated.general.fleetMaxConcurrentRuns ?? null,
-              previousEffective: previousStatus,
-              nextEffective: nextStatus,
-            },
-          }),
-        ),
-      );
+        const actor = getActorInfo(req);
+        const companyIds = await svc.listCompanyIds();
+        await Promise.all(
+          companyIds.map((companyId) =>
+            logActivity(db, {
+              companyId,
+              actorType: actor.actorType,
+              actorId: actor.actorId,
+              agentId: actor.agentId,
+              runId: actor.runId,
+              agentApiKeyId: actor.agentApiKeyId,
+              action: "instance.settings.fleet_max_concurrent_runs_updated",
+              entityType: "instance_settings",
+              entityId: updated.id,
+              details: {
+                previous: previousGeneral.fleetMaxConcurrentRuns ?? null,
+                next: updated.general.fleetMaxConcurrentRuns ?? null,
+                previousEffective: previousStatus,
+                nextEffective: nextStatus,
+              },
+            }),
+          ),
+        );
 
-      // Raising the cap (or removing it) must start an admission pass right
-      // away instead of waiting for the next scheduled sweep (SPA-10137 item
-      // 4). Lowering it never kills a running run — the per-admission budget
-      // check (countRunningRunsGlobal) is what withholds new admissions until
-      // the running count falls back under the new ceiling, with no action
-      // needed here.
-      const isRaise =
-        nextStatus.value === null
-          ? previousStatus.value !== null
-          : previousStatus.value === null || nextStatus.value > previousStatus.value;
-      if (isRaise) {
-        void heartbeat.resumeQueuedRuns().catch((err) => {
-          logger.error({ err }, "fleet cap admission pass after a raise failed");
-        });
-      }
+        // Raising the cap (or removing it) must start an admission pass
+        // right away instead of waiting for the next scheduled sweep
+        // (SPA-10137 item 4). Lowering it never kills a running run — the
+        // per-admission budget check (countRunningRunsGlobal) is what
+        // withholds new admissions until the running count falls back under
+        // the new ceiling, with no action needed here.
+        const isRaise =
+          nextStatus.value === null
+            ? previousStatus.value !== null
+            : previousStatus.value === null || nextStatus.value > previousStatus.value;
+        if (isRaise) {
+          void heartbeat.resumeQueuedRuns().catch((err) => {
+            logger.error({ err }, "fleet cap admission pass after a raise failed");
+          });
+        }
+
+        return nextStatus;
+      });
 
       res.json(nextStatus);
     },
