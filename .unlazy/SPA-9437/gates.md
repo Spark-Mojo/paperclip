@@ -510,6 +510,124 @@ The full `workspace-runtime.test.ts` file reports 6 failures on the new base
 at `916919bb7c` with no SPA-9437 code present. This is the known gate 13
 provisioning-suite red, unchanged in character.
 
+## Verifier round 1 (FAIL) — disposition, recorded 2026-10-03
+
+The independent verifier returned `VERDICT: FAIL` on head `3bd031e416` with
+three substantive findings. Disposition of each, with evidence:
+
+**Finding 6 (out-of-scope behaviour change on the clone path) — UPHELD, then
+answered with a control, and the code left unchanged.** The verifier read the
+rewritten `routes non-reusable persisted git worktrees` expectation as the
+guard replacing a correct cleanup path with a refusal. I built the
+`not_a_registered_worktree` fall-through for exactly that reading, ran it,
+and it did not fire — which disproved the premise. Measured:
+
+    # fixture: clone nested INSIDE the OLD repo
+    git -C origin worktree list --porcelain   -> reports the nested clone path
+    git -C c1   worktree list --porcelain    -> reports itself
+
+`inspectManagedGitWorktreeBranch` reads `repoRoot` as the clone's OWN
+`--show-toplevel`, not the OLD repo, so `git worktree remove` runs against the
+clone and the path IS registered. Two consequences:
+
+  1. The `not_registered` expectation the verifier calls "pre-existing" was
+     NEVER produced by this fixture — `listLinkedGitWorktreePaths(repoRoot)`
+     returns the clone, so the old code took `wrong_repository_root`, not
+     `not_registered`. I did not run base for this; this is the fixture's own
+     construction, so treat it as reasoned, not measured, until someone
+     reproduces it at `916919bb7c`.
+  2. The teardown therefore genuinely cannot apply to this shape, and the
+     guard's refusal is CORRECT — the alternative is leaving a directory that
+     can never be removed by `git worktree remove`.
+
+So the fall-through was reverted (`git checkout -- workspace-runtime.ts`); the
+production code is byte-identical to what the verifier reviewed. What changed
+is the misleading comment above the fixture, which claimed the clone is "not
+in the OLD repo's linked-worktree list" — untrue for this fixture — and a new
+negative-control test.
+
+**New gate 17 (negative control for the guard's boundary).**
+
+    CHECK: timeout 600 pnpm exec vitest run server/src/__tests__/workspace-runtime.test.ts \
+      -t 'SPA-9437|unpushed runtime-owned commit|pushed to origin|non-reusable persisted git worktrees'
+    EXPECT: exit 0; all 11 selected tests pass
+    RESULT: exit 0 — Test Files 1 passed (1); Tests 11 passed | 182 skipped (193)
+
+`still tears down a REGISTERED other-repo worktree (SPA-9437 negative control
+for the clone fall-through)` asserts the path IS in the OLD repo's
+`git worktree list` BEFORE the call (precondition stated, not assumed) and
+that it is afterwards absent from disk AND pruned from the OLD repo. Without
+that precondition the test could pass via the fall-through and prove nothing.
+
+Re-run of gate 10 after this change: `vitest run src/__tests__/issues-service.test.ts`
+-> exit 0, 133/133 passed. Gate 8 re-run explicitly (not inferred): `tsc
+--noEmit --project server/tsconfig.json` exits 1 with 115 pre-existing
+diagnostics, and `grep -cE 'workspace-runtime\.ts|issues\.ts|execution-workspaces\.ts'`
+over that output is **0** — no diagnostic in any changed file. Gate 9
+`git diff --check` -> exit 0.
+
+**Finding 7 (gates 13/14 UNPROVEN) — accepted as stated, left honest.** Not
+converted to green. Gate 13's 6 failures are proven base reds; gate 14's
+typecheck nonzero is from a missing runner build and 115 pre-existing
+diagnostics, none in changed files.
+
+**Finding 8 (reds unprovable as base reds on the wrapper surface) — the
+verifier's evidence is incomplete; the required stand-in exists.** The
+verifier reported that `pr-read.sh checks` shows no `ci / …` run on
+`694d0fbe` or `916919bb7`. That is correct — and it is exactly the clause-4
+case ("if the base ref itself has NO CI run … a run on an ANCESTOR of B may
+stand in"). The stand-in was not gathered for this round. It is now:
+
+    A = f519242095fac059955387af6f68cc28e1408895   (PR #130 head = the 422 guard)
+
+    git merge-base --is-ancestor f519242095... 916919bb7c   -> exit 0
+    gh api .../commits/f519242095.../check-runs --jq .total_count -> 48
+
+A's reds, which is a SUPERSET of every head red:
+
+    ci / e2e, ci / e2e shard (8/8), ci / General tests (server (11/12)),
+    ci / General tests (server (12/12)), ci / General tests (workspaces-b),
+    ci / policy, ci / verify, ci / Verify serialized server suites (2/9),
+    ci / Verify serialized server suites (6/9),
+    ci / Verify serialized server suites (7/9), review
+
+Per-check signature match, A job vs head job (same failing test name and same
+assertion in each):
+
+  | head check                                  | A job     | head job   | shared failure signature |
+  |---------------------------------------------|-----------|------------|-------------------------|
+  | `Verify serialized server suites (6/9)`      | 109733735602 | 109865347710 | `issue-watchdogs-routes.test.ts > routes watchdog-discovered product bugs…`, AssertionError |
+  | `Verify serialized server suites (7/9)`      | 109733735656 | 109865347673 | `permissions-upgrade-boundary-routes.test.ts > allows same-company route assignment…`, AssertionError |
+  | `General tests (server (11/12))`             | 109733735763 | 109865348116 | `plugin-orchestration-apis.test.ts > creates plugin-origin issues…`, `agent_root_issue_requires_project` |
+  | `General tests (server (12/12))`             | 109733735686 | 109865348094 | `status-cards.test.ts > attributes API-level authoring…`, AssertionError |
+
+  `General tests (workspaces-b)` A 109733735732 vs head 109865348124: both
+  report `Test Files 59 passed (59)` then an uncaught
+  `Error: { errno: -32, code: 'EPIPE', syscall: 'write' }`.
+
+  `ci / policy` A 109733735536 vs head 109865347255: both run
+  `node ./scripts/check-no-git-push.mjs` and emit the same 3 offenses. Line
+  numbers shift (A 4884/4572/4577, head 4908/4610/4615) because the PR adds
+  lines, so identity is proven by CONTENT: `scripts/check-no-git-push.mjs` is
+  blob `7254f6caf` at BOTH the base tip and the head.
+
+Causal non-touch, by blob identity at base tip vs head:
+
+  | file                                                 | blob (both) |
+  |------------------------------------------------------|-------------|
+  | `server/src/__tests__/status-cards.test.ts`            | `285060b75` |
+  | `server/src/__tests__/plugin-orchestration-apis.test.ts`| `b54fe6e31` |
+  | `server/src/__tests__/permissions-upgrade-boundary-routes.test.ts` | `89c00485e` |
+  | `scripts/check-no-git-push.mjs`                       | `7254f6caf` |
+
+All four are byte-identical at `916919bb7c` and at the head, so the PR cannot
+have altered the failing assertions or the policy check. This is the same
+proof pattern SPA-9405 (`4a9f969d07`) and SPA-9283 (`a6e4473b1a`) recorded on
+this fork, which is why A was chosen the same way.
+
+**Acceptance (SPA-9359) remains RUNTIME-ONLY and unproven.** The verifier
+agreed and correctly noted it is a check-state note, not acceptance.
+
 ## Notes
 
 16. The deliberate boundary of the reachability guard: a branch that was
