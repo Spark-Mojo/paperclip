@@ -242,6 +242,18 @@ export type IssuePostCommitAction = {
   runId: string;
   issueId: string;
   issueStatus: string;
+} | {
+  type: "retire_execution_workspace_after_project_workspace_rebind";
+  companyId: string;
+  issueId: string;
+  executionWorkspaceId: string;
+  /**
+   * Diagnostic surfaced on the card so the board / agent can see exactly
+   * which old repo the OLD worktree belonged to and which new project
+   * workspace is in effect now.
+   */
+  previousProjectWorkspaceId: string | null;
+  nextProjectWorkspaceId: string | null;
 };
 
 /** Execute side effects that must never run before the issue transaction commits. */
@@ -254,27 +266,99 @@ export async function executeIssuePostCommitActions(
   const heartbeat = heartbeatService(db);
   const cancelledRunIds = new Set<string>();
   for (const action of actions) {
-    if (cancelledRunIds.has(action.runId)) continue;
-    cancelledRunIds.add(action.runId);
-    try {
-      await heartbeat.cancelRun(
-        action.runId,
-        "Task closed while waiting for operator input",
-        {
-          resultJson: {
-            cancelledByIssueStatus: action.issueStatus,
-            cancelledIssueId: action.issueId,
+    if (action.type === "cancel_native_question_run") {
+      if (cancelledRunIds.has(action.runId)) continue;
+      cancelledRunIds.add(action.runId);
+      try {
+        await heartbeat.cancelRun(
+          action.runId,
+          "Task closed while waiting for operator input",
+          {
+            resultJson: {
+              cancelledByIssueStatus: action.issueStatus,
+              cancelledIssueId: action.issueId,
+            },
           },
-        },
-      );
-    } catch (err) {
-      // The durable marker written by the issue transaction remains available
-      // to startup and periodic recovery. Do not report a post-commit failure
-      // as though the already-committed issue transition had rolled back.
-      logger.warn(
-        { err, runId: action.runId, issueId: action.issueId },
-        "native question cancellation deferred to recovery sweep",
-      );
+        );
+      } catch (err) {
+        // The durable marker written by the issue transaction remains available
+        // to startup and periodic recovery. Do not report a post-commit failure
+        // as though the already-committed issue transition had rolled back.
+        logger.warn(
+          { err, runId: action.runId, issueId: action.issueId },
+          "native question cancellation deferred to recovery sweep",
+        );
+      }
+      continue;
+    }
+    if (action.type === "retire_execution_workspace_after_project_workspace_rebind") {
+      try {
+        const { executionWorkspaceService } = await import(
+          "./execution-workspaces.js"
+        );
+        const outcome = await executionWorkspaceService(
+          db,
+        ).retireExecutionWorkspaceAfterProjectWorkspaceRebind({
+          companyId: action.companyId,
+          executionWorkspaceId: action.executionWorkspaceId,
+          sourceIssueId: action.issueId,
+          reason:
+            `project workspace rebind ` +
+            `${action.previousProjectWorkspaceId ?? "<none>"} -> ` +
+            `${action.nextProjectWorkspaceId ?? "<none>"}`,
+        });
+        if (outcome.outcome === "refused_dirty") {
+          logger.warn(
+            {
+              companyId: action.companyId,
+              issueId: action.issueId,
+              executionWorkspaceId: outcome.executionWorkspaceId,
+              worktreePath: outcome.worktreePath,
+              dirtyReason: outcome.dirtyReason,
+            },
+            "execution workspace not retired after project workspace rebind: worktree is dirty",
+          );
+        } else if (outcome.outcome === "refused_unpushed") {
+          logger.warn(
+            {
+              companyId: action.companyId,
+              issueId: action.issueId,
+              executionWorkspaceId: outcome.executionWorkspaceId,
+              worktreePath: outcome.worktreePath,
+              unpushedReason: outcome.unpushedReason,
+            },
+            "execution workspace not retired after project workspace rebind: branch tip has no live upstream",
+          );
+        } else if (outcome.outcome === "not_found") {
+          logger.info(
+            {
+              companyId: action.companyId,
+              issueId: action.issueId,
+              executionWorkspaceId: action.executionWorkspaceId,
+            },
+            "execution workspace not retired after project workspace rebind: row not found",
+          );
+        } else if (outcome.outcome === "skipped_already_closed") {
+          logger.info(
+            {
+              companyId: action.companyId,
+              issueId: action.issueId,
+              executionWorkspaceId: outcome.executionWorkspaceId,
+            },
+            "execution workspace not retired after project workspace rebind: row already closed",
+          );
+        }
+      } catch (err) {
+        // The bound row remains untouched on failure; the next run will see
+        // status=active and either succeed when the OLD worktree's repo
+        // matches or fail validation again, surfacing the dirty/unpushed
+        // reason through the existing recovery sweep.
+        logger.error(
+          { err, action },
+          "execution workspace retire after project workspace rebind failed; leaving bound row intact",
+        );
+      }
+      continue;
     }
   }
 }
@@ -11165,6 +11249,33 @@ export function issueService(db: Db) {
               })
               .where(eq(executionWorkspaces.id, workspace.id));
           }
+        }
+        // SPA-9437: when the issue's project workspace changes, the OLD
+        // execution workspace (if any) belongs to the OLD repo and would
+        // deterministically fail workspace_validation on the next run.
+        // Queue a post-commit action so the engine retires that workspace
+        // (set status=archived, clear issue.executionWorkspaceId) so the
+        // next run provisions a fresh workspace against the new project
+        // workspace. The action runs after the issue transaction commits
+        // and refuses when the OLD worktree has dirty / unpushed state.
+        if (
+          existing.executionWorkspaceId
+          && issueData.projectWorkspaceId !== undefined
+          && existing.projectWorkspaceId !== nextProjectWorkspaceId
+        ) {
+          if (dbOrTx !== db && !postCommitActions) {
+            throw new Error(
+              "Project workspace rebind in an external transaction requires a post-commit action queue",
+            );
+          }
+          queuedPostCommitActions.push({
+            type: "retire_execution_workspace_after_project_workspace_rebind",
+            companyId: existing.companyId,
+            issueId: existing.id,
+            executionWorkspaceId: existing.executionWorkspaceId,
+            previousProjectWorkspaceId: existing.projectWorkspaceId,
+            nextProjectWorkspaceId: nextProjectWorkspaceId ?? null,
+          });
         }
         const [enriched] = await withIssueLabels(tx, [updated]);
         const nextBlockedByIssueIds =
