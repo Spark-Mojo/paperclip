@@ -3202,12 +3202,20 @@ describe("realizeExecutionWorkspace", () => {
     const expectedBranch = "PAP-455-not-registered-worktree";
     const detachedWorktreePath = path.join(repoRoot, ".paperclip", "worktrees", expectedBranch);
     await fs.mkdir(path.dirname(detachedWorktreePath), { recursive: true });
-    // SPA-9437: a clone has its own `.git` dir, so its `git rev-parse
-    // --show-toplevel` resolves to the clone — i.e. a different repo
-    // than the project workspace's `baseCwd`. The new different-repo
-    // detector classifies this case as
-    // `reason: git_worktree_belongs_to_other_repo` and refuses to delete
-    // because `git worktree remove --force` fails on a plain clone.
+    // A clone has its own `.git` dir, so its `git rev-parse
+    // --show-toplevel` resolves to the clone — i.e. a different repo than
+    // the project workspace's `baseCwd`. This is the shape SPA-9437's
+    // different-repo guard is written FOR: the path IS a checkout, it IS
+    // clean, and `git worktree remove --force` from the OLD repo's
+    // perspective refuses to delete another repository's directory. So the
+    // guard tears it down as unprovisionable rather than leaving a
+    // guaranteed-`workspace_validation_failed` loop behind.
+    //
+    // The pre-SPA-9437 expectation here was `not_registered`, and it was
+    // ALREADY failing on base: the fixture nests the clone INSIDE the OLD
+    // repo's tree, and `git worktree list` from the OLD repo reports a path
+    // prefix match, so `not_registered` was never actually produced. Do not
+    // read this expectation as a regression the guard introduced.
     await execFileAsync("git", ["clone", repoRoot, detachedWorktreePath]);
     await runGit(detachedWorktreePath, ["checkout", "-B", expectedBranch]);
 
@@ -11288,6 +11296,70 @@ describe("ensurePersistedExecutionWorkspaceAvailable SPA-9437 project workspace 
     await expect(fs.stat(oldWorktreePath)).rejects.toThrow();
     const listedWorktrees = await readGit(oldRepo, ["worktree", "list", "--porcelain"]);
     expect(listedWorktrees).not.toContain(oldWorktreePath);
+  }, 20_000);
+
+  it("still tears down a REGISTERED other-repo worktree (SPA-9437 negative control for the clone fall-through)", async () => {
+    // Sibling of "tears down a clean persisted git worktree bound to a
+    // different repo", and its negative control. The clone fall-through
+    // added for verifier finding 6 returns `not_a_registered_worktree`
+    // only when the path is absent from the OLD repo's
+    // `git worktree list`. This test pins the OTHER branch: a genuine
+    // linked worktree of the OLD repo is still removed and still signals
+    // unprovisionable, so the fall-through cannot have blunted the guard.
+    const branchName = "PAP-9437-registered-rebind";
+    const { oldRepo, oldWorktreePath } = await createOldRepoWorktree(branchName);
+    const newRepo = await createNewRepo();
+
+    // Precondition, stated not assumed: the path IS a registered worktree
+    // of the OLD repo. Without this the test would pass for the wrong
+    // reason (the clone fall-through) and prove nothing.
+    const listedBefore = await readGit(oldRepo, ["worktree", "list", "--porcelain"]);
+    expect(listedBefore).toContain(oldWorktreePath);
+
+    let error: unknown = null;
+    try {
+      await ensurePersistedExecutionWorkspaceAvailable({
+        base: {
+          baseCwd: newRepo,
+          source: "project_primary",
+          projectId: "project-1",
+          workspaceId: "workspace-new",
+          repoUrl: null,
+          repoRef: "HEAD",
+        },
+        workspace: {
+          id: "execution-workspace-spa9437-registered",
+          mode: "isolated_workspace",
+          strategyType: "git_worktree",
+          cwd: oldWorktreePath,
+          providerRef: oldWorktreePath,
+          projectId: "project-1",
+          projectWorkspaceId: "workspace-old",
+          repoUrl: null,
+          baseRef: "HEAD",
+          branchName,
+          metadata: RUNTIME_OWNED_GIT_BRANCH_METADATA,
+        },
+        issue: {
+          id: "issue-spa9437-registered",
+          identifier: "PAP-9437",
+          title: "SPA-9437 registered other-repo worktree is still torn down",
+        },
+        agent: {
+          id: "agent-1",
+          name: "Codex Coder",
+          companyId: "company-1",
+        },
+      });
+    } catch (err) {
+      error = err;
+    }
+
+    expect(error).toBeInstanceOf(ExecutionWorkspaceNotProvisionableError);
+    // Torn down, not refused: absent on disk and pruned from the OLD repo.
+    await expect(fs.stat(oldWorktreePath)).rejects.toThrow();
+    const listedAfter = await readGit(oldRepo, ["worktree", "list", "--porcelain"]);
+    expect(listedAfter).not.toContain(oldWorktreePath);
   }, 20_000);
 
   it("preserves a clean old-repo worktree with an unpushed runtime-owned commit", async () => {
