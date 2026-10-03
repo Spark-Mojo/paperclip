@@ -17,6 +17,9 @@ const mockHeartbeatService = vi.hoisted(() => ({
   applyTaskDrain: vi.fn(),
   stopTaskDrain: vi.fn(),
   getTaskDrainStatus: vi.fn(),
+  getFleetMaxConcurrentRunsStatus: vi.fn(),
+  invalidateFleetMaxConcurrentRunsCache: vi.fn(),
+  resumeQueuedRuns: vi.fn(),
 }));
 const mockEnvironmentService = vi.hoisted(() => ({
   getById: vi.fn(),
@@ -97,6 +100,11 @@ describe("instance settings routes", () => {
     mockHeartbeatService.applyTaskDrain.mockReset();
     mockHeartbeatService.stopTaskDrain.mockReset();
     mockHeartbeatService.getTaskDrainStatus.mockReset();
+    mockHeartbeatService.getFleetMaxConcurrentRunsStatus.mockReset();
+    mockHeartbeatService.getFleetMaxConcurrentRunsStatus.mockResolvedValue({ value: null, source: "none" });
+    mockHeartbeatService.invalidateFleetMaxConcurrentRunsCache.mockReset();
+    mockHeartbeatService.resumeQueuedRuns.mockReset();
+    mockHeartbeatService.resumeQueuedRuns.mockResolvedValue(undefined);
     mockEnvironmentService.getById.mockReset();
     mockEnvironmentService.findManagedSandboxEnvironment.mockReset();
     mockEnvironmentService.findManagedSandboxEnvironment.mockResolvedValue(null);
@@ -671,6 +679,203 @@ describe("instance settings routes", () => {
 
     expect(res.status).toBe(403);
     expect(mockInstanceSettingsService.updateGeneral).not.toHaveBeenCalled();
+  });
+
+  describe("fleet-max-concurrent-runs setting (SPA-10137)", () => {
+    const adminActor = {
+      type: "board",
+      userId: "admin-1",
+      source: "session",
+      isInstanceAdmin: true,
+      companyIds: ["company-1"],
+    };
+    const nonAdminActor = {
+      type: "board",
+      userId: "user-1",
+      source: "session",
+      isInstanceAdmin: false,
+      companyIds: ["company-1"],
+    };
+
+    it("lets any board org member read the effective cap and its source", async () => {
+      mockHeartbeatService.getFleetMaxConcurrentRunsStatus.mockResolvedValue({ value: 8, source: "env" });
+      const app = await createApp(nonAdminActor);
+
+      const res = await request(app).get("/api/instance/settings/fleet-max-concurrent-runs");
+
+      expect(res.status).toBe(200);
+      expect(res.body).toEqual({ value: 8, source: "env" });
+    });
+
+    it("rejects a board caller without company access from reading the cap", async () => {
+      const app = await createApp({
+        type: "board",
+        userId: "user-2",
+        source: "session",
+        isInstanceAdmin: false,
+        companyIds: [],
+        memberships: [],
+      });
+
+      const res = await request(app).get("/api/instance/settings/fleet-max-concurrent-runs");
+
+      expect(res.status).toBe(403);
+      expect(mockHeartbeatService.getFleetMaxConcurrentRunsStatus).not.toHaveBeenCalled();
+    });
+
+    it("rejects agent callers from reading or writing the cap", async () => {
+      const app = await createApp({
+        type: "agent",
+        agentId: "agent-1",
+        companyId: "company-1",
+        source: "agent_key",
+      });
+
+      const getRes = await request(app).get("/api/instance/settings/fleet-max-concurrent-runs");
+      expect(getRes.status).toBe(403);
+
+      const patchRes = await request(app)
+        .patch("/api/instance/settings/fleet-max-concurrent-runs")
+        .send({ value: 5 });
+      expect(patchRes.status).toBe(403);
+      expect(mockInstanceSettingsService.updateGeneral).not.toHaveBeenCalled();
+    });
+
+    it("rejects non-admin board users from writing the cap", async () => {
+      const app = await createApp(nonAdminActor);
+
+      const res = await request(app)
+        .patch("/api/instance/settings/fleet-max-concurrent-runs")
+        .send({ value: 5 });
+
+      expect(res.status).toBe(403);
+      expect(mockInstanceSettingsService.updateGeneral).not.toHaveBeenCalled();
+    });
+
+    it("rejects a malformed value (out of range, non-integer, or missing)", async () => {
+      const app = await createApp(adminActor);
+
+      // Schema validation failures go through the generic validate() middleware
+      // (plain Zod 400), not the semantic unprocessable() 422 used elsewhere.
+      await request(app).patch("/api/instance/settings/fleet-max-concurrent-runs").send({ value: 0 }).expect(400);
+      await request(app).patch("/api/instance/settings/fleet-max-concurrent-runs").send({ value: 51 }).expect(400);
+      await request(app).patch("/api/instance/settings/fleet-max-concurrent-runs").send({ value: 1.5 }).expect(400);
+      await request(app).patch("/api/instance/settings/fleet-max-concurrent-runs").send({}).expect(400);
+      expect(mockInstanceSettingsService.updateGeneral).not.toHaveBeenCalled();
+    });
+
+    it("sets an explicit ceiling, invalidates the cache, and logs old/new/actor", async () => {
+      mockInstanceSettingsService.getGeneral.mockResolvedValueOnce({
+        censorUsernameInLogs: false,
+        keyboardShortcuts: false,
+        feedbackDataSharingPreference: "prompt",
+        fleetMaxConcurrentRuns: 2,
+      });
+      mockHeartbeatService.getFleetMaxConcurrentRunsStatus
+        .mockResolvedValueOnce({ value: 2, source: "db" }) // read before the write
+        .mockResolvedValueOnce({ value: 10, source: "db" }); // read after the write
+      mockInstanceSettingsService.updateGeneral.mockResolvedValueOnce({
+        id: "instance-settings-1",
+        general: {
+          censorUsernameInLogs: false,
+          keyboardShortcuts: false,
+          feedbackDataSharingPreference: "prompt",
+          fleetMaxConcurrentRuns: 10,
+        },
+      });
+      const app = await createApp(adminActor);
+
+      const res = await request(app)
+        .patch("/api/instance/settings/fleet-max-concurrent-runs")
+        .send({ value: 10 });
+
+      expect(res.status).toBe(200);
+      expect(res.body).toEqual({ value: 10, source: "db" });
+      expect(mockInstanceSettingsService.updateGeneral).toHaveBeenCalledWith({ fleetMaxConcurrentRuns: 10 });
+      // Invalidated before the pre-write read and again after the write.
+      expect(mockHeartbeatService.invalidateFleetMaxConcurrentRunsCache).toHaveBeenCalledTimes(2);
+      expect(mockLogActivity).toHaveBeenCalledTimes(2);
+      expect(mockLogActivity).toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({
+          action: "instance.settings.fleet_max_concurrent_runs_updated",
+          actorId: "admin-1",
+          details: expect.objectContaining({
+            previous: 2,
+            next: 10,
+            previousEffective: { value: 2, source: "db" },
+            nextEffective: { value: 10, source: "db" },
+          }),
+        }),
+      );
+    });
+
+    it("maps the \"none\" sentinel to an explicit null (no ceiling) write", async () => {
+      mockHeartbeatService.getFleetMaxConcurrentRunsStatus
+        .mockResolvedValueOnce({ value: 5, source: "db" })
+        .mockResolvedValueOnce({ value: null, source: "db" });
+      mockInstanceSettingsService.updateGeneral.mockResolvedValueOnce({
+        id: "instance-settings-1",
+        general: { fleetMaxConcurrentRuns: null },
+      });
+      const app = await createApp(adminActor);
+
+      const res = await request(app)
+        .patch("/api/instance/settings/fleet-max-concurrent-runs")
+        .send({ value: null });
+
+      expect(res.status).toBe(200);
+      expect(mockInstanceSettingsService.updateGeneral).toHaveBeenCalledWith({ fleetMaxConcurrentRuns: null });
+    });
+
+    it("triggers an admission pass when the write raises the cap", async () => {
+      mockHeartbeatService.getFleetMaxConcurrentRunsStatus
+        .mockResolvedValueOnce({ value: 2, source: "db" })
+        .mockResolvedValueOnce({ value: 10, source: "db" });
+      mockInstanceSettingsService.updateGeneral.mockResolvedValueOnce({
+        id: "instance-settings-1",
+        general: { fleetMaxConcurrentRuns: 10 },
+      });
+      const app = await createApp(adminActor);
+
+      await request(app).patch("/api/instance/settings/fleet-max-concurrent-runs").send({ value: 10 });
+      await new Promise((resolve) => setImmediate(resolve));
+
+      expect(mockHeartbeatService.resumeQueuedRuns).toHaveBeenCalledTimes(1);
+    });
+
+    it("triggers an admission pass when the write removes the ceiling entirely", async () => {
+      mockHeartbeatService.getFleetMaxConcurrentRunsStatus
+        .mockResolvedValueOnce({ value: 2, source: "db" })
+        .mockResolvedValueOnce({ value: null, source: "db" });
+      mockInstanceSettingsService.updateGeneral.mockResolvedValueOnce({
+        id: "instance-settings-1",
+        general: { fleetMaxConcurrentRuns: null },
+      });
+      const app = await createApp(adminActor);
+
+      await request(app).patch("/api/instance/settings/fleet-max-concurrent-runs").send({ value: null });
+      await new Promise((resolve) => setImmediate(resolve));
+
+      expect(mockHeartbeatService.resumeQueuedRuns).toHaveBeenCalledTimes(1);
+    });
+
+    it("does not trigger an admission pass when the write lowers the cap", async () => {
+      mockHeartbeatService.getFleetMaxConcurrentRunsStatus
+        .mockResolvedValueOnce({ value: 10, source: "db" })
+        .mockResolvedValueOnce({ value: 2, source: "db" });
+      mockInstanceSettingsService.updateGeneral.mockResolvedValueOnce({
+        id: "instance-settings-1",
+        general: { fleetMaxConcurrentRuns: 2 },
+      });
+      const app = await createApp(adminActor);
+
+      await request(app).patch("/api/instance/settings/fleet-max-concurrent-runs").send({ value: 2 });
+      await new Promise((resolve) => setImmediate(resolve));
+
+      expect(mockHeartbeatService.resumeQueuedRuns).not.toHaveBeenCalled();
+    });
+
   });
 
   describe("executionMode floor on cloud-managed instances", () => {

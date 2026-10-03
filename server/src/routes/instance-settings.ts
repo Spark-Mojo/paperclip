@@ -4,6 +4,7 @@ import {
   patchInstanceSettingsSchema,
   patchInstanceExperimentalSettingsSchema,
   patchInstanceGeneralSettingsSchema,
+  patchFleetMaxConcurrentRunsSchema,
   startTaskDrainRequestSchema,
 } from "@paperclipai/shared";
 import { forbidden } from "../errors.js";
@@ -287,6 +288,92 @@ export function instanceSettingsRoutes(db: Db) {
         ),
       );
       res.json(updated.experimental);
+    },
+  );
+
+  // SPA-10137: the fleet-wide run ceiling (packages/server heartbeat.ts
+  // `fleetMaxConcurrentRuns()`), as a live DB-backed instance setting. A
+  // dedicated pair of routes rather than folding into the general-settings
+  // GET/PATCH above, so the effective-value + source response shape here
+  // never collides with the general-settings object's own shape, and so the
+  // admission-pass trigger and the dedicated activity-log action stay
+  // scoped to this one setting.
+  router.get("/instance/settings/fleet-max-concurrent-runs", async (req, res) => {
+    // Readable by any authenticated org member or instance admin, matching
+    // the general/experimental GET endpoints above. Writing is instance-admin
+    // only (assertCanManageInstanceSettings below) — agents get 403 from
+    // assertBoardOrgAccess because they are not board actors at all.
+    assertBoardOrgAccess(req);
+    res.json(await heartbeat.getFleetMaxConcurrentRunsStatus());
+  });
+
+  router.patch(
+    "/instance/settings/fleet-max-concurrent-runs",
+    validate(patchFleetMaxConcurrentRunsSchema),
+    async (req, res) => {
+      assertCanManageInstanceSettings(req);
+      // No operator-hidden-settings floor here (unlike general/experimental
+      // above): that registry pairs each key with a UI nav/page section to
+      // hide (see packages/shared/src/settings-visibility.ts), and this is a
+      // board/ops control with no UI surface, same as the task-drain routes
+      // below, which also skip it.
+
+      // Invalidate first so this read is never served a cache entry a
+      // concurrent write populated moments ago, then snapshot the
+      // pre-write value for the activity log and the raise/lower decision.
+      heartbeat.invalidateFleetMaxConcurrentRunsCache();
+      const previousGeneral = await svc.getGeneral();
+      const previousStatus = await heartbeat.getFleetMaxConcurrentRunsStatus();
+
+      const updated = await svc.updateGeneral({ fleetMaxConcurrentRuns: req.body.value });
+
+      // Invalidate again: the read above cached the PRE-write value, which is
+      // now stale. The next read (here, and the next admission check) must
+      // see the value this request just wrote, not wait out the TTL.
+      heartbeat.invalidateFleetMaxConcurrentRunsCache();
+      const nextStatus = await heartbeat.getFleetMaxConcurrentRunsStatus();
+
+      const actor = getActorInfo(req);
+      const companyIds = await svc.listCompanyIds();
+      await Promise.all(
+        companyIds.map((companyId) =>
+          logActivity(db, {
+            companyId,
+            actorType: actor.actorType,
+            actorId: actor.actorId,
+            agentId: actor.agentId,
+            runId: actor.runId,
+            agentApiKeyId: actor.agentApiKeyId,
+            action: "instance.settings.fleet_max_concurrent_runs_updated",
+            entityType: "instance_settings",
+            entityId: updated.id,
+            details: {
+              previous: previousGeneral.fleetMaxConcurrentRuns ?? null,
+              next: updated.general.fleetMaxConcurrentRuns ?? null,
+              previousEffective: previousStatus,
+              nextEffective: nextStatus,
+            },
+          }),
+        ),
+      );
+
+      // Raising the cap (or removing it) must start an admission pass right
+      // away instead of waiting for the next scheduled sweep (SPA-10137 item
+      // 4). Lowering it never kills a running run — the per-admission budget
+      // check (countRunningRunsGlobal) is what withholds new admissions until
+      // the running count falls back under the new ceiling, with no action
+      // needed here.
+      const isRaise =
+        nextStatus.value === null
+          ? previousStatus.value !== null
+          : previousStatus.value === null || nextStatus.value > previousStatus.value;
+      if (isRaise) {
+        void heartbeat.resumeQueuedRuns().catch((err) => {
+          logger.error({ err }, "fleet cap admission pass after a raise failed");
+        });
+      }
+
+      res.json(nextStatus);
     },
   );
 

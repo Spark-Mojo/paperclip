@@ -209,6 +209,13 @@ function normalizeGeneralSettings(raw: unknown): InstanceGeneralSettings {
       backupRetention: parsed.data.backupRetention ?? DEFAULT_BACKUP_RETENTION,
       // Absent => unrestricted; only carry through an explicit policy.
       ...(parsed.data.executionMode ? { executionMode: parsed.data.executionMode } : {}),
+      // Absent => not configured, so the fleet-wide run ceiling falls through
+      // to the env var (see heartbeat.ts fleetMaxConcurrentRuns()). An explicit
+      // `null` IS carried through: it is a deliberate "no ceiling" override
+      // that must win over the env var, not an absence.
+      ...(Object.prototype.hasOwnProperty.call(parsed.data, "fleetMaxConcurrentRuns")
+        ? { fleetMaxConcurrentRuns: parsed.data.fleetMaxConcurrentRuns ?? null }
+        : {}),
     };
   }
   return {
