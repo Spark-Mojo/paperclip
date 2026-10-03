@@ -89,11 +89,13 @@ a file of record that silently mis-parses is worse than no file.
 **Outcome:** the audit's counts cannot drift from its own file.
 
     CHECK: python3 -c "import csv,collections; c=collections.Counter(r[5] for r in list(csv.reader(open('docs/audits/SPA-10294-guard-enumeration.csv')))[1:]); print(dict(c))"
-    EXPECT: TOLERANT 33, NEEDS-PER-RUN-ADAPTATION 9, MUST-BE-EXEMPTED 7, SEE-G02 1
+    EXPECT: TOLERANT 36, NEEDS-PER-RUN-ADAPTATION 7, MUST-BE-EXEMPTED 7 — and NO fourth class
 
-**Observed (this run):** exactly those four values, 50 total.
-**NEGATIVE observed (this run):** the audit's first draft claimed 30/13/7 and a second revision
-claimed 32/11/7; both were **wrong** against the file. Derived values are now the recorded ones.
+**Observed (this run):** exactly those three values, 50 total, and no `SEE-G02` class remains.
+**NEGATIVE observed (this run):** the audit's first draft claimed 30/13/7, a second revision
+claimed 32/11/7, a third claimed 33/9/7 — all three **wrong** against the file. The final
+derivation says 36/7/7 after four guards were reclassified on control evidence. Derived values
+are the recorded ones.
 
 ## G7 — CHECK (card gate, NEGATIVE-A): a TOLERANT guard under TWO synthetic cwds
 
@@ -119,39 +121,68 @@ cwds and failed — the guard correctly does **not** refuse either, so asserting
 made the control pass for the wrong reason. The honest expectation (`false`, plus a positive
 control that must refuse) is what is committed.
 
-## G8 — CHECK (card gate, NEGATIVE-B): each NEEDS-CHANGE guard fails PRE-CHANGE under the second cwd
+## G8 — CHECK (card gate, NEGATIVE-B): each NEEDS-CHANGE / MUST-BE-EXEMPT row fails PRE-CHANGE under the second cwd
 
-**Outcome:** the classification is not a guess.
+**Outcome:** no classification is a guess, and the coverage is derived, not asserted.
 
     CHECK: npx tsx docs/audits/checks/neg-b-needs-change.ts
-    EXPECT: exit 0, "6/6 cases behaved as the audit classified"
+    EXPECT: exit 0, "15/15 cases behaved as the audit classified"
 
-**Observed (this run):** exit **0**, all six cases with their observed output:
+**Observed (this run):** exit **0**, 15/15. Cases B-1, B-3, B-4, B-5, B-6, B-7, B-8, B-9, B-10,
+B-11, B-12, B-13, B-14, B-15 — covering **all 14 rows** in the two non-tolerant buckets (G23 and
+G48 share B-11; G08 shares B-1 with G03) plus one tolerant counter-example (B-6) that must not
+fail.
 
-| Case | Row | Observed |
-|---|---|---|
-| B-1 | G03 | run N+1 would REUSE `…/runs/run-aaaa1111` instead of its own computed `…/runs/run-bbbb2222` |
-| B-2 | G44 | `legacy=eligible; ephemeral=NOT-REACHED` |
-| B-3 | G06 | reused per-card path → `runIdSegment=null`, reaper called with `"legacy"`; fresh per-run path → live-run skip=true |
-| B-4 | G18 | after the per-run dir is removed, cwd resolves to a **different run's** directory |
-| B-5 | G41 | per-run instance ids `run-aaaa1111-8cf3bccdc7f8` vs `run-bbbb2222-68c0a726cf35`; legacy id stable |
-| B-6 | G16 | **counter-example**: containment accepts both cwds and still rejects an outside path |
+**Coverage CHECK (fail-closed):** every row classified `NEEDS-PER-RUN-ADAPTATION` or
+`MUST-BE-EXEMPTED` names a control in its evidence field.
 
-**Two mutants, each applying the actual FIX, invert the control:**
+    CHECK: python3 -c "import csv,re; rows=list(csv.reader(open('docs/audits/SPA-10294-guard-enumeration.csv')))[1:]; m=[r[0] for r in rows if r[5] in ('NEEDS-PER-RUN-ADAPTATION','MUST-BE-EXEMPTED') and not re.search(r'B-\\d+',r[6])]; print(m or 'NONE')"
+    EXPECT: NONE
+    NEGATIVE (this run, before the fix): ['G07', 'G10', 'G42'] — three exempt rows cited no control
+
+**Observed (this run):** `NONE`. The negative is the real history of this gate: on the first
+pass three rows had no control, and controls B-13/B-14/B-15 were written to close them.
+
+### What "discriminates" means here, and why every mutant inverts a claim
+
+A mutant that disables an **assertion** proves nothing — the assertion is not what observed the
+defect. So every mutant below either **inverts the transcribed guard** or **applies the actual
+fix**. The control file's header states this contract; a reviewer can check each mutant against
+it.
 
 | Mutant | Change | Observed |
 |---|---|---|
-| B2 | the G18 fix applied (drop `previous?.cwd`) | exit **1** — `B-4/G18 … fallback=null` |
-| B4 | the G44 fix applied (GC descends into `runs/`) | exit **1** — `MUTATED: the walk DID reach the ephemeral dir` |
+| B9 | G44's guard inverted (`os.path.dirname(full) !== worktrees_dir` → `===`) | exit **1** — `B-2/G44 … nested-path` |
+| B11 | G04's claim simulated (detached `--git-dir` delete got through) | exit **1** — `B-7/G04` |
+| B13 | G30's `\|\| true` removed | exit **1** — `B-9/G30 … fixture assumption wrong` |
+| B14 | G43's fingerprint made **card-scoped** (the fix) | exit **1** — `B-10/G43 … shared fingerprint` |
+| B17 | G07's `rootMismatch` → `false` (the fix) | exit **1** — `B-13/G07` |
+| B18 | G10 trusts the persisted flag instead of path shape (the fix) | exit **1** — `B-14/G10` |
+| B19 | G36's hint repointing made cwd-split tolerant (the fix) | exit **1** — `B-12/G36` |
+| B20 | G23/G48's sweep recognition dropped | exit **1** — `B-11/G23+G48` |
+| B21 | B-8's lexical check widened to catch unresolved `..` | exit **1** — `B-8/G02 … NOT DISCRIMINATING` |
+| B22 | B-15's planted drift replaced with a self-consistent env | exit **1** — `B-15/G42` |
+| B2 | **the G18 fix applied** (drop `previous?.cwd`) | exit **1** — `B-4/G18 … fallback=null` |
+| B4 | **the G44 fix applied** (GC descends into `runs/`) | exit **1** — `MUTATED: the walk DID reach the ephemeral dir` |
 
 **Two self-corrections recorded, because a ledger that only records successes is not a ledger:**
 
 1. **B-3 failed on first run and the GUARD was right.** I passed the wrong live-run id to the
    fixture, so the fresh per-run path was not protected and the case read as a misclassification.
-   The fixture was wrong; the G06 classification is correct. Fixed, re-run green.
+   The fixture was wrong; the G06 classification is correct.
 2. **B-2 initially could not fail.** Its reachability test compared a *path* against *names*, so
-   applying the G44 fix left it green. Rewritten to compare reachability, then re-proved with
-   mutant B4.
+   applying the G44 fix left it green. Rewritten, then re-proved with mutant B4.
+
+**Five classifications changed because their controls did not behave as I claimed** — all five
+are recorded in the audit's §6 rather than quietly edited: **G04** (I claimed the detached
+`--git-dir` sidesteps git's branch lock; B-7 shows git refuses identically through both paths →
+reclassified TOLERANT), **G02** (I claimed traversal blindness; `path.join` collapses `..`
+lexically so the guard holds → reclassified TOLERANT, with the *lexical-vs-canonical* gap
+recorded instead), **G23/G48** (I claimed the side-worktree escape becomes unenumerated; B-11
+shows it becomes **more** enumerable under a per-run cwd → needs-adaptation for documentation
+only), **G07** (I claimed every ephemeral worktree fails the instance-root guard; B-13 shows the
+pin is normally derived from the worktree's own pointer and matches — the failure comes from
+inheriting a reused row's pin under G03).
 
 Also recorded: my first attempt at these controls was written as `.mjs` and **crashed with a
 `SyntaxError`** (TypeScript annotations in a `.mjs` file). "The control ran" was never true for
@@ -165,6 +196,9 @@ that version.
     EXPECT: engine 20, adapter-opencode-local 13, fleet-skill 12, sparkmojo-paperclip-skill 5
 
 **Observed (this run):** exactly those values, 50 total, 0 unclassified.
+**Second CHECK (coverage of the card's negative):** every row in the two non-tolerant buckets
+cites a behavioural control — derived, observed: `needs/exempt rows lacking a control: NONE`,
+cited `B-1 … B-15`.
 
 **Scope note, recorded as a gate because the card named four surfaces and the audit found five
 places worth auditing:** the first pass of this audit covered **two engine files**. The
@@ -193,15 +227,20 @@ Ten gates, all PASS with pasted output and observed exit codes. Every `NEGATIVE:
 against a disposable fixture; **no negative was manufactured by mutating live data**, and no
 negative was inferred from a grep that "would obviously fail".
 
-Four of the ten gates exist only to record findings that **contradict my own prior posture** —
-three of them corrections I made inside this run (G5's malformed CSV, G7's wrong expectation, G8's
-two unfixable controls). That is deliberate: LAW 3 forbids a completion claim on the author's
-say-so, including the author's own.
+**Twenty-four of the recorded mutations and corrections exist because they contradict my own
+prior posture** — two reclassifications that made my audit *weaker* (G04, G02), two that changed a
+finding's sign (G23/G48, G07), one control that could not fail (B-2), one that was unfailable by
+construction (B-3), one wrong expectation (G7), and one malformed file of record (G5). That is
+deliberate: LAW 3 forbids a completion claim on the author's say-so, including the author's own,
+and a verdict of "the flip is unsafe" is exactly the claim most worth trying to disprove.
 
 **Verdict on the card's own question — is the flip safe?** No, not as shipped. Seven rows are
-`MUST-BE-EXEMPTED` and nine `NEEDS-PER-RUN-ADAPTATION`, and three of them (F-1 isolation degrade,
-F-2 per-run instance mint, F-3 GC blindness) each independently defeat the flag's stated purpose.
+`MUST-BE-EXEMPTED` and seven `NEEDS-PER-RUN-ADAPTATION`, and three of the exempt ones (F-1
+isolation degrade, F-2 per-run instance mint, F-3 GC blindness) each independently defeat the
+flag's stated purpose. Note what survived the attempt to prove otherwise: **four of my own
+findings did not survive it**, and they are recorded as failures rather than deleted.
 
 **Remaining work is NOT in this ledger** because it is separate work on separate cards: the
-per-run branch implementation, the instance-id decision, the GC fix, the rescue-ref discovery
-mechanism, and the skills doctrine pass. The flag flip stays James-gated.
+per-run branch implementation, the instance-id architecture decision, the GC fix, the rescue-ref
+discovery mechanism, and the skills doctrine pass. The flag flip stays James-gated. I did not
+weaken any guard, and I did not touch the flag, SPA-10292, or SPA-10293.

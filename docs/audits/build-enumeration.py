@@ -42,9 +42,9 @@ ROWS = [
         "server/src/services/workspace-runtime.ts:3461-3472",
         "path",
         'path.relative(worktreeParentDir, worktreePath).startsWith("..") -> throw worktree_path_escapes_parent_dir',
-        NEED,
-        "runs/<runId> is joined FROM worktreeParentDir so path.relative is `runs/<runId>` and never starts with `..`; the guard still passes. It is a containment check with no run identity, so it cannot detect an escaping runIdSegment. The guard does not break; it is blind.",
-        "guard-intact-but-blind-to-run-identity",
+        TOL,
+        "CORRECTED. My first pass claimed this guard was blind to a traversal run id. Control B-8 shows that claim was WRONG: sanitizeBranchName (wr.ts:861) preserves '/', but path.join COLLAPSES '..' lexically, so all 5 crafted run ids normalise to runs/... and the relative check holds. What the guard genuinely does not do is compare CANONICAL paths - it is lexical, so a pre-existing runs/ symlink is not covered. Reclassified needs-change -> TOLERANT with the residual lexical-only gap recorded. Demonstrated by case B-8.",
+        "unchanged-verdict-residual-lexical-only",
     ),
     (
         "G03",
@@ -62,9 +62,9 @@ ROWS = [
         "server/src/services/workspace-runtime.ts:4415-4455",
         "branch+sha",
         "deleteGitBranchAtVerifiedTip: writes a detached HEAD at expectedHeadSha, then `git branch -d`",
-        NEED,
-        "Cleanup deletes workspace.branchName. Under the flag the per-run worktree owns that branch; deleting it from a detached HEAD sidesteps the worktree lock but destroys a per-run branch still checked out by another concurrent run. Intent (delete only the verified tip) survives; the mechanism must become run-scoped and refuse while a live worktree still has the branch checked out.",
-        "pre-change-deletes-live-per-run-branch",
+        TOL,
+        "CORRECTED. My first pass claimed the detached git-dir sidesteps git's worktree lock and deletes a branch a live per-run worktree still holds. Control B-7 FAILED TO FIND THAT DEFECT: git refuses the delete through the detached --git-dir too, with the same 'used by worktree' error, because the branch-lock check consults the repository's recorded worktrees rather than the invoking git-dir. Reclassified needs-change -> TOLERANT. The control is retained in the failure set specifically so a reviewer can see it hunting for a defect that is not there (case B-7).",
+        "unchanged-verdict",
     ),
     (
         "G05",
@@ -93,8 +93,8 @@ ROWS = [
         "instance-id",
         "INSTANCE_ID_RE + instanceId !== expectedInstanceId -> refuse instance cleanup",
         EXEMPT,
-        "expectedInstanceId derives from workspace.metadata[WORKTREE_INSTANCE_ROOT_METADATA_KEY] (wr.ts:4605-4608). Per-run worktrees minted by PR #108 carry no such per-run metadata, so every ephemeral worktree falls to the refusal branch and instance artifacts are never reclaimed: an unbounded growth axis the flag creates. The id-mismatch intent (never delete another workspace's instance) is correct; its identity must become the run's own instance id, not a card-scoped one.",
-        "pre-change-refuses-all-ephemeral-cleanup",
+        "The pin is normally taken from the worktree's own pointer (heartbeat.ts:22371-22390) and matches. But under G03 the pin is INHERITED from a reused row (heartbeat.ts:22362-22369), so the expected root is the card's earlier run and the comparison at cleanup :320-327 refuses with instance_root_workspace_mismatch, archiving nothing: per-run instance artifacts are never reclaimed, an unbounded growth axis the flag creates. The intent (never delete another workspace's instance) is correct; its identity must become the run's own instance root, not a card-scoped one. Demonstrated by case B-13.",
+        "pre-change-refuses-cleanup-under-reuse",
     ),
     (
         "G08",
@@ -103,7 +103,7 @@ ROWS = [
         "branch",
         "registeredBranchRef === actualBranchRef inside branch-incoherence evidence",
         NEED,
-        "Registered-vs-HEAD equality decides incoherence. Correct as written, but evaluated only on the reuse path, so under the flag it cannot answer whether the registry entry belongs to THIS run. That is G03 seen from the evidence builder.",
+        "Registered-vs-HEAD equality decides incoherence. Correct as written, but evaluated only on the reuse path, so under the flag it cannot answer whether the registry entry belongs to THIS run. That is G03 seen from the evidence builder, and it is covered by the same control (case B-1) rather than a case of its own.",
         "identity-key-must-gain-run-dimension",
     ),
     (
@@ -123,7 +123,7 @@ ROWS = [
         "path-shape",
         "two shape tests inferring ephemeral-ness from worktreePath shape rather than the persisted flag",
         EXEMPT,
-        "Both tests read path shape. The startsWith form is `.paperclip/worktrees/runs`-prefixed and never matches the configured /srv/bulk worktreeParentDir, so the basename(dirname()) === 'runs' test is the one that fires. Under G03's reuse path the worktreePath is a per-CARD path while ephemeralLifecycle is true, so the shape test disagrees with the persisted flag and the cleanup branch silently does not fire.",
+        "Both tests read path shape. The startsWith form is `.paperclip/worktrees/runs`-prefixed and never matches the configured /srv/bulk worktreeParentDir, so the basename(dirname()) === 'runs' test is the one that fires. Under G03's reuse path the worktreePath is a per-CARD path while ephemeralLifecycle is true, so the shape test disagrees with the persisted flag and the cleanup branch silently does not fire. Demonstrated by case B-14.",
         "shape-inference-contradicts-persisted-flag",
     ),
     (
@@ -219,12 +219,12 @@ ROWS = [
     (
         "G20",
         "engine",
-        "server/src/services/workspace-runtime.ts:3461 (cross-listed with G02)",
+        "server/src/services/workspace-runtime.ts:3459 (the join G02 contains)",
         "path",
-        "parent-dir containment coexisting with the branch-keyed registry",
-        SEE_G02,
-        "Cross-listed so the one-row-per-guard rule leaves neither bucket unclassified. The escape guard is tolerant of the runs/ shape; the registry it coexists with is not. Recorded under G02 as well; this row carries no independent verdict.",
-        "see-G02",
+        'path.join(worktreeParentDir, "runs", runIdSegment) - the shape G02 exists to contain',
+        TOL,
+        "RESOLVED. This row was a deliberate cross-listing of G02 and carried no independent verdict, which the advisor correctly flagged as a fourth classification the card does not define. It is now stated in its own right: the join always yields a path under worktreeParentDir because both operands are relative to it, and G02's containment check (now classified TOLERANT) covers it. Carries the same verdict as G02 and exists to keep the one-row-per-guard rule satisfiable without a non-taxonomy class.",
+        "unchanged-verdict-residual-lexical-only",
     ),
     (
         "G21",
@@ -253,7 +253,7 @@ ROWS = [
         "path",
         "side work via `git worktree add ../<new-dir> -b <new-branch> refs/remotes/origin/main`; never `git checkout` inside the existing worktree",
         NEED,
-        "The rule is right; its mechanism is path-relative. From a per-run cwd, `../<new-dir>` resolves to a sibling of the ephemeral runs/<runId> directory, i.e. the parent-dir level, not a sibling of the card worktree. Still correct and still outside the managed set, but it now creates worktrees that the /runs/ shape test (G06) does not recognise.",
+        "The rule is right; its mechanism is path-relative. From a per-run cwd, `../<new-dir>` resolves to a sibling of the ephemeral runs/<runId> directory, i.e. the parent-dir level, not a sibling of the card worktree. CORRECTED by control B-11: from a per-run cwd `../<new-dir>` lands at `<parent>/runs/<name>` - still inside runs/, and therefore now RECOGNISED by the /runs/ shape test (G06), where a per-card cwd's side worktree was not. The rule gets SAFER under the flag, not less safe; what changes is enumeration, silently. Reclassified as needs-adaptation for documentation only.",
         "still-correct-new-path-needs-enumeration",
     ),
     (
@@ -323,7 +323,7 @@ ROWS = [
         "path",
         'teardownCommand: `git worktree remove "$PAPERCLIP_WORKSPACE_CWD" || true`',
         NEED,
-        "The command reads the env var, so it is cwd-correct. But `|| true` swallows failure, and `git worktree remove` on a per-run directory races the engine's own force-removal at terminal status. Two removers on one per-run path is the new hazard; the intent (never leak worktrees) survives and the mechanism needs a per-run-aware teardown.",
+        "The command reads the env var, so it is cwd-correct. But `|| true` swallows failure, and `git worktree remove` on a per-run directory races the engine's own force-removal at terminal status. Two removers on one per-run path is the new hazard; the intent (never leak worktrees) survives and the mechanism needs a per-run-aware teardown. Demonstrated by case B-9.",
         "double-remover-race",
     ),
     (
@@ -383,7 +383,7 @@ ROWS = [
         "path",
         "hint.cwd === localWorkspaceCwd -> repoint at realizedWorkspaceCwd",
         NEED,
-        "Correct today. Under the flag both operands of the sibling-repo test at :3297-3301 (path.relative(localWorkspaceCwd, hintCwd)) move per run, so the relative form still matches. What needs re-verification is upstream: hints are minted by the engine from the run's own realization, and this row must be re-checked against that mint site once the flag ships.",
+        "Correct today. Under the flag both operands of the sibling-repo test at :3297-3301 (path.relative(localWorkspaceCwd, hintCwd)) move per run, so the relative form still matches. What needs re-verification is upstream: hints are minted by the engine from the run's own realization, and this row must be re-checked against that mint site once the flag ships. Demonstrated by case B-12.",
         "reverify-against-mint-site",
     ),
     (
@@ -443,7 +443,7 @@ ROWS = [
         "path",
         "the worktree's own .paperclip/.env must point at the worktree's own .paperclip/config.json; instance id must match WORKTREE_INSTANCE_ID",
         EXEMPT,
-        "The self-heal check holds per run because the directory is fresh, so it is trivially true and never exercises the cross-run drift it was written for (a worktree whose env still names a prior instance). Not a live failure - a guard that has stopped guarding, which the card's rule about weakening guards treats as worse than the meltdown.",
+        "The check's LOGIC still discriminates - it correctly rejects an env naming another instance - but its TRIGGER goes quiet: on a fresh per-run directory the drift it guards against (an env still naming a prior run's instance) is re-created by design every run, so it never fires through the path it was written for. Not a live failure - a guard that has stopped being reached, which the card's rule about weakening guards treats as worse than the meltdown. Demonstrated by case B-15.",
         "guard-becomes-vacuous",
     ),
     (
@@ -453,7 +453,7 @@ ROWS = [
         "path",
         "install fingerprint stored under the worktree's own .paperclip dir, compared to a hash of that worktree's package.json + pnpm-lock.yaml + patch manifest; node_modules relinked from the base workspace",
         NEED,
-        "A full `pnpm install --prod=false` plus node_modules relink per run. Intent (a run has working node_modules) survives; the mechanism must consult a cache shared by the card's runs instead of a per-run one, or the flip trades disk growth for an install storm.",
+        "A full `pnpm install --prod=false` plus node_modules relink per run. Intent (a run has working node_modules) survives; the mechanism must consult a cache shared by the card's runs instead of a per-run one, or the flip trades disk growth for an install storm. Demonstrated by case B-10.",
         "per-run-install-storm",
     ),
     (
@@ -503,7 +503,7 @@ ROWS = [
         "path",
         "never checkout/switch/reset inside the engine-allocated worktree; side work via `git worktree add ../<new-dir> -b <new-branch> refs/remotes/origin/main`",
         NEED,
-        "Same mechanism as G23, in the file every agent reads at wake. `../<new-dir>` from a per-run cwd lands at the parent-dir level, outside the /runs/ set the engine sweeps. Intent survives; the documented example path must be restated for a per-run cwd.",
+        "Same mechanism as G23, in the file every agent reads at wake, and the same correction: `../<new-dir>` from a per-run cwd lands inside runs/, so side work becomes sweepable where it previously was not. Not a safety hole - an undocumented behavioural change to the escape hatch, which is exactly the kind of change a doctrine file should state. Demonstrated by case B-11.",
         "same-change-as-G23",
     ),
     (
