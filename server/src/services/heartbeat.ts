@@ -14177,6 +14177,7 @@ export function heartbeatService(
       message?: string;
       payload?: Record<string, unknown>;
       retryExhaustion?: AppendHeartbeatRunEventInput["retryExhaustion"];
+      retrySuppression?: boolean;
     },
   ) {
     const eventAt = new Date();
@@ -14216,6 +14217,7 @@ export function heartbeatService(
       message: sanitizedMessage,
       payload: sanitizedPayload,
       retryExhaustion: event.retryExhaustion,
+      retrySuppression: event.retrySuppression,
     });
     if (persistedEvent.disposition === "duplicate") return;
     const seq = persistedEvent.row.seq;
@@ -15793,6 +15795,7 @@ export function heartbeatService(
           level: "warn",
           message:
             "Scheduled retry suppressed because the agent is not invokable",
+          retrySuppression: true,
           payload: {
             retryReason,
             scheduledRetryAttempt: nextAttempt,
@@ -15844,6 +15847,7 @@ export function heartbeatService(
           stream: "system",
           level: "warn",
           message: gate.reason,
+          retrySuppression: true,
           payload: {
             retryReason,
             scheduledRetryAttempt: nextAttempt,

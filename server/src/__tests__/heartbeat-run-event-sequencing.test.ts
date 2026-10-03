@@ -76,6 +76,46 @@ describe("P6-11..13 / P6-17 canonical event allocator", () => {
     }
   }, 60_000);
 
+  it("reuses consecutive retry-suppression receipts without touching terminal runs", async () => {
+    const temporary = await startEmbeddedPostgresTestDatabase("paperclip-suppression-events-");
+    const db = createDb(temporary.connectionString);
+    const otherDb = createDb(temporary.connectionString);
+    const companyId = "20000000-0000-4000-8000-000000000001";
+    const agentId = "20000000-0000-4000-8000-000000000002";
+    const runId = "20000000-0000-4000-8000-000000000003";
+    const event = {
+      companyId, agentId, runId, eventType: "lifecycle", stream: "system", level: "warn",
+      message: "Scheduled retry suppressed because issue dependencies are still blocked",
+      payload: { retryReason: "transient_failure", scheduledRetryAttempt: 1, maxAttempts: 2 },
+    };
+    try {
+      await db.insert(companies).values({ id: companyId, name: "Suppression fixture", issuePrefix: "SUP" });
+      await db.insert(agents).values({ id: agentId, companyId, name: "Suppression agent" });
+      await db.insert(heartbeatRuns).values({ id: runId, companyId, agentId, status: "failed" });
+      await appendHeartbeatRunEvent(db, event);
+      const before = (await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId)))[0]!;
+      const receipts = await Promise.all(Array.from({ length: 16 }, (_, index) =>
+        appendHeartbeatRunEvent(index % 2 ? db : otherDb, { ...event, retrySuppression: true })));
+      expect(receipts.every((receipt) => receipt.disposition === "duplicate")).toBe(true);
+      const after = (await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId)))[0]!;
+      expect(after.nextEventSeq).toBe(before.nextEventSeq);
+      expect(after.updatedAt).toEqual(before.updatedAt);
+      const changed = { ...event, message: "Scheduled retry suppressed because issue ownership changed" };
+      const changedReceipts = await Promise.all(Array.from({ length: 8 }, () =>
+        appendHeartbeatRunEvent(db, { ...changed, retrySuppression: true })));
+      expect(changedReceipts.filter((receipt) => receipt.disposition === "committed")).toHaveLength(1);
+      expect((await appendHeartbeatRunEvent(db, { ...event, retrySuppression: true })).disposition).toBe("committed");
+      expect((await appendHeartbeatRunEvent(db, {
+        ...event, payload: { ...event.payload, scheduledRetryAttempt: 2 }, retrySuppression: true,
+      })).disposition).toBe("committed");
+      await appendHeartbeatRunEvent(db, { ...event, eventType: "stdout", message: "retry resumed" });
+      expect((await appendHeartbeatRunEvent(db, { ...event, retrySuppression: true })).disposition).toBe("committed");
+      expect(await db.select().from(heartbeatRunEvents).where(eq(heartbeatRunEvents.runId, runId))).toHaveLength(6);
+    } finally {
+      await temporary.cleanup();
+    }
+  }, 60_000);
+
   it("serializes concurrent writers and rejects conflicting replay without cursor drift", async () => {
     const temporary = await startEmbeddedPostgresTestDatabase("paperclip-native-events-");
     const db = createDb(temporary.connectionString);

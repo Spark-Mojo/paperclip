@@ -250,6 +250,33 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
     });
   }
 
+  it("does not rewrite a terminal run on consecutive suppressed retry ticks", async () => {
+    const runId = randomUUID(), companyId = randomUUID(), agentId = randomUUID();
+    const now = new Date("2026-04-20T12:00:00.000Z");
+    await seedRetryFixture({ runId, companyId, agentId, now, errorCode: "adapter_failed" });
+    const issueId = randomUUID();
+    await db.insert(issues).values({ id: issueId, companyId, title: "Terminal task", status: "done", assigneeAgentId: agentId });
+    await db.update(heartbeatRuns).set({ contextSnapshot: { issueId } }).where(eq(heartbeatRuns.id, runId));
+    const liveEvents: string[] = [];
+    const unsubscribe = subscribeCompanyLiveEvents(companyId, (event) => { liveEvents.push(event.type); });
+    const options = { now, random: () => 0, retryReason: MAX_TURN_CONTINUATION_RETRY_REASON };
+    try {
+      expect(await heartbeat.scheduleBoundedRetry(runId, options)).toMatchObject({ outcome: "not_scheduled" });
+      const before = (await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId)))[0]!;
+      const eventsBefore = await db.select().from(heartbeatRunEvents).where(eq(heartbeatRunEvents.runId, runId));
+      expect(eventsBefore).toHaveLength(1);
+      expect(eventsBefore[0]?.message).toContain("Scheduled retry suppressed");
+      const publicationsBefore = liveEvents.length;
+      expect(await heartbeat.scheduleBoundedRetry(runId, options)).toMatchObject({ outcome: "not_scheduled" });
+      const after = (await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId)))[0]!;
+      expect(after).toEqual(before);
+      expect(await db.select().from(heartbeatRunEvents).where(eq(heartbeatRunEvents.runId, runId))).toEqual(eventsBefore);
+      expect(liveEvents).toHaveLength(publicationsBefore);
+    } finally {
+      unsubscribe();
+    }
+  });
+
   it("reuses one failure successor across concurrent and repeated scheduling", async () => {
     const runId = randomUUID(), companyId = randomUUID(), agentId = randomUUID();
     const now = new Date("2026-04-20T12:00:00.000Z");
