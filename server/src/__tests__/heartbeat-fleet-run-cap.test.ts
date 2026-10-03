@@ -15,10 +15,12 @@ import {
   executionWorkspaces,
   heartbeatRunEvents,
   heartbeatRuns,
+  instanceSettings,
   issueComments,
   issues,
   projects,
 } from "@paperclipai/db";
+import { instanceSettingsService } from "../services/instance-settings.ts";
 import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
@@ -30,9 +32,11 @@ import {
   FLEET_RUN_LIVENESS_WINDOW_ENV_VAR,
   computeAvailableRunSlots,
   heartbeatService,
+  invalidateFleetMaxConcurrentRunsCache,
   isFleetRunningRowLive,
   normalizeFleetMaxConcurrentRuns,
   normalizeFleetRunLivenessWindowMs,
+  resolveFleetMaxConcurrentRuns,
 } from "../services/heartbeat.ts";
 import {
   FLEET_ADMISSION_STALE_MS,
@@ -117,6 +121,58 @@ describe("fleet run ceiling helpers", () => {
     expect(normalizeFleetMaxConcurrentRuns("-1")).toBe(1);
     expect(normalizeFleetMaxConcurrentRuns(-4)).toBe(1);
     expect(normalizeFleetMaxConcurrentRuns(500)).toBe(50);
+  });
+
+  it("resolves precedence: an explicit DB value wins over the env var", () => {
+    expect(resolveFleetMaxConcurrentRuns({ dbValue: 5, envValue: "20" })).toEqual({
+      value: 5,
+      source: "db",
+    });
+    // An explicit DB null ("no ceiling") wins over a configured env var too.
+    expect(resolveFleetMaxConcurrentRuns({ dbValue: null, envValue: "20" })).toEqual({
+      value: null,
+      source: "db",
+    });
+  });
+
+  it("falls through to the env var when the DB value is absent (not configured)", () => {
+    expect(resolveFleetMaxConcurrentRuns({ dbValue: undefined, envValue: "7" })).toEqual({
+      value: 7,
+      source: "env",
+    });
+    expect(resolveFleetMaxConcurrentRuns({ dbValue: undefined, envValue: undefined })).toEqual({
+      value: null,
+      source: "none",
+    });
+  });
+
+  it("clamps a DB value to 1..50, same as the env var", () => {
+    expect(resolveFleetMaxConcurrentRuns({ dbValue: 500, envValue: undefined })).toEqual({
+      value: 50,
+      source: "db",
+    });
+    expect(resolveFleetMaxConcurrentRuns({ dbValue: 0, envValue: undefined })).toEqual({
+      value: 1,
+      source: "db",
+    });
+    expect(resolveFleetMaxConcurrentRuns({ dbValue: 1.9, envValue: undefined })).toEqual({
+      value: 1,
+      source: "db",
+    });
+  });
+
+  it("never silently reads a malformed DB value as no-ceiling; falls back to the env var", () => {
+    for (const malformed of ["garbage", "NaN", "Infinity", true, {}, [], "  "]) {
+      expect(resolveFleetMaxConcurrentRuns({ dbValue: malformed, envValue: "4" })).toEqual({
+        value: 4,
+        source: "env",
+      });
+      // ...and to "none" when no env var is set either -- still never "db".
+      expect(resolveFleetMaxConcurrentRuns({ dbValue: malformed, envValue: undefined })).toEqual({
+        value: null,
+        source: "none",
+      });
+    }
   });
 
   it("clamps the liveness window and falls back to the default when invalid", () => {
@@ -342,6 +398,9 @@ describeEmbeddedPostgres("fleet-wide agent run ceiling", () => {
     await heartbeatAtCeilingTwoB.drainActiveRunExecutions();
     runningProcesses.clear();
     startedRunIds.length = 0;
+    // Any test that set a DB fleet-cap override (or warmed the cache) must not
+    // leak it into the next test, which assumes "no DB override, env only".
+    invalidateFleetMaxConcurrentRunsCache();
     for (let attempt = 0; ; attempt += 1) {
       try {
         await db.delete(environmentLeases);
@@ -358,6 +417,7 @@ describeEmbeddedPostgres("fleet-wide agent run ceiling", () => {
         await db.delete(executionWorkspaces);
         await db.delete(companySkills);
         await db.delete(companies);
+        await db.delete(instanceSettings);
         break;
       } catch (error) {
         if (attempt >= 9) throw error;
@@ -702,6 +762,120 @@ describeEmbeddedPostgres("fleet-wide agent run ceiling", () => {
     expect(rows.filter((row) => row.status !== "succeeded")).toEqual([]);
     expect(new Set(executionsOf(seededRunIds))).toEqual(new Set(seededRunIds));
   }, 120_000);
+
+  describe("SPA-10137: live DB-backed fleet cap", () => {
+    // Uses `heartbeat` (no env ceiling configured) throughout, so the DB value
+    // is the sole source of truth and these tests cannot cross-talk with the
+    // env-ceiling fixtures (heartbeatAtCeilingOne/Two/TwoB) above.
+    async function setDbFleetCap(value: number | null) {
+      await instanceSettingsService(db).updateGeneral({ fleetMaxConcurrentRuns: value });
+    }
+
+    it("reads the DB override through heartbeatService and caches it until invalidated", async () => {
+      expect(await heartbeat.getFleetMaxConcurrentRunsStatus()).toEqual({
+        value: null,
+        source: "none",
+      });
+
+      await setDbFleetCap(3);
+      // Cache was never warmed yet in this test, but it may be warm from
+      // another `heartbeat.getFleetMaxConcurrentRunsStatus()` call elsewhere
+      // in this run; invalidate first so this read is guaranteed fresh.
+      invalidateFleetMaxConcurrentRunsCache();
+      expect(await heartbeat.getFleetMaxConcurrentRunsStatus()).toEqual({
+        value: 3,
+        source: "db",
+      });
+
+      // Write a new value WITHOUT invalidating: the cached read must still
+      // return the stale value until something invalidates it.
+      await setDbFleetCap(10);
+      expect(await heartbeat.getFleetMaxConcurrentRunsStatus()).toEqual({
+        value: 3,
+        source: "db",
+      });
+
+      invalidateFleetMaxConcurrentRunsCache();
+      expect(await heartbeat.getFleetMaxConcurrentRunsStatus()).toEqual({
+        value: 10,
+        source: "db",
+      });
+    });
+
+    it("raises the cap live and starts queued runs within one admission pass, no restart", async () => {
+      await setDbFleetCap(2);
+      invalidateFleetMaxConcurrentRunsCache();
+
+      const { seeded } = await seedCompanyWithQueuedRuns(4);
+      const seededRunIds = seeded.map((s) => s.runId);
+
+      await heartbeat.resumeQueuedRuns();
+      expect(await waitForExecutionsOf(seededRunIds, 2)).toBe(true);
+      await settle();
+      expect((await seededStatuses(seededRunIds)).running).toHaveLength(2);
+
+      // Raise the cap live, on the SAME heartbeatService instance (no
+      // restart) -- exactly what the instance-settings route does on a PATCH
+      // that raises the value -- then trigger one admission pass.
+      await setDbFleetCap(4);
+      invalidateFleetMaxConcurrentRunsCache();
+      expect(await heartbeat.getFleetMaxConcurrentRunsStatus()).toEqual({
+        value: 4,
+        source: "db",
+      });
+      await heartbeat.resumeQueuedRuns();
+      expect(await waitForExecutionsOf(seededRunIds, 4)).toBe(true);
+      await settle();
+
+      const statuses = await seededStatuses(seededRunIds);
+      expect(statuses.running).toHaveLength(4);
+      expect(statuses.queued).toHaveLength(0);
+      expect(statuses.other).toHaveLength(0);
+    }, 120_000);
+
+    it("lowers the cap live without killing any already-running run", async () => {
+      await setDbFleetCap(4);
+      invalidateFleetMaxConcurrentRunsCache();
+
+      const { seeded } = await seedCompanyWithQueuedRuns(6);
+      const seededRunIds = seeded.map((s) => s.runId);
+
+      await heartbeat.resumeQueuedRuns();
+      expect(await waitForExecutionsOf(seededRunIds, 4)).toBe(true);
+      await settle();
+      const before = await seededStatuses(seededRunIds);
+      expect(before.running).toHaveLength(4);
+      expect(before.queued).toHaveLength(2);
+
+      // Lower the cap below the current running count, then sweep again.
+      await setDbFleetCap(1);
+      invalidateFleetMaxConcurrentRunsCache();
+      await heartbeat.resumeQueuedRuns();
+      await settle();
+
+      // Every run that was already running stays running (none cancelled,
+      // none force-stopped); admission simply withholds the excess.
+      const after = await seededStatuses(seededRunIds);
+      expect(after.running.sort()).toEqual(before.running.sort());
+      expect(after.queued).toHaveLength(2);
+      expect(after.other).toHaveLength(0);
+    }, 120_000);
+
+    it("falls back to the env var when the DB value is unparseable (never silently no-ceiling)", async () => {
+      // Write a well-formed row, then corrupt just this key directly (bypasses
+      // API validation, simulating a manual DB edit / bad restore).
+      await setDbFleetCap(2);
+      await db
+        .update(instanceSettings)
+        .set({ general: sql`jsonb_set(${instanceSettings.general}, '{fleetMaxConcurrentRuns}', '"garbage"')` });
+      invalidateFleetMaxConcurrentRunsCache();
+
+      expect(await heartbeatAtCeilingTwo.getFleetMaxConcurrentRunsStatus()).toEqual({
+        value: 2,
+        source: "env",
+      });
+    });
+  });
 
   it("defers a claim's nested re-admission instead of stalling the fleet lock on it", async () => {
     // Agent A's two queued runs are budget-blocked (their project is paused for

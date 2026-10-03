@@ -48,9 +48,13 @@ export {
   managedSettingMetadataSchema,
   patchInstanceExperimentalSettingsSchema,
   patchInstanceSettingsSchema,
+  patchFleetMaxConcurrentRunsSchema,
+  fleetMaxConcurrentRunsSourceSchema,
+  fleetMaxConcurrentRunsStatusSchema,
   type InstanceExperimentalSettings,
   type PatchInstanceExperimentalSettings,
   type PatchInstanceSettings,
+  type PatchFleetMaxConcurrentRuns,
 } from "./instance.js";
 
 export {
