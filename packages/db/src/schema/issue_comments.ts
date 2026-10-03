@@ -5,7 +5,8 @@ import type {
   IssueCommentPresentation,
   SourceTrustMetadata,
 } from "@paperclipai/shared";
-import { pgTable, uuid, text, timestamp, index, jsonb, unique, integer } from "drizzle-orm/pg-core";
+import { pgTable, uuid, text, timestamp, index, jsonb, unique, uniqueIndex, integer } from "drizzle-orm/pg-core";
+import { sql } from "drizzle-orm";
 import { companies } from "./companies.js";
 import { issues } from "./issues.js";
 import { agents } from "./agents.js";
@@ -46,6 +47,12 @@ export const issueComments = pgTable(
   },
   (table) => ({
     clientRequestUq: unique("issue_comments_client_request_uq").on(table.issueId, table.authorUserId, table.clientRequestId),
+    // SPA-9687: the user-keyed unique above cannot fire for an agent comment
+    // (author_user_id is NULL there), so agent replays need their own
+    // constraint. Partial unique index, matching migration 9283.
+    agentClientRequestUq: uniqueIndex("issue_comments_agent_client_request_uq")
+      .on(table.issueId, table.authorAgentId, table.clientRequestId)
+      .where(sql`${table.clientRequestId} is not null and ${table.authorAgentId} is not null`),
     companyIdUq: unique("issue_comments_company_id_uq").on(table.companyId, table.id),
     issueIdx: index("issue_comments_issue_idx").on(table.issueId),
     companyIdx: index("issue_comments_company_idx").on(table.companyId),
