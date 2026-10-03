@@ -1,5 +1,55 @@
 # SPA-9437 gates
 
+## READ THIS FIRST — two things a reviewer will otherwise re-litigate
+
+**1. The `not_registered` -> `git_worktree_belongs_to_other_repo` reclassification
+in `routes non-reusable persisted git worktrees` is NOT an out-of-scope
+behaviour change, and the premise has been tested.** Verifier round 1 raised
+it as finding 6. I implemented the `not_a_registered_worktree` fall-through
+that finding implies, ran it, and it did not fire — which disproved the
+premise. Measured:
+
+    # the fixture nests a clone INSIDE the old repo
+    git -C origin worktree list --porcelain   -> REPORTS the nested clone path
+    git -C c1   worktree list --porcelain    -> reports itself
+
+`inspectManagedGitWorktreeBranch` takes `repoRoot` from the clone's OWN
+`--show-toplevel`, so the path IS a registered worktree and `git worktree
+remove --force` runs against the clone itself. Two consequences:
+
+  - The "pre-existing" `not_registered` expectation was never produced by this
+    fixture: `listLinkedGitWorktreePaths(repoRoot)` returns the clone, so the
+    pre-SPA-9437 code took `wrong_repository_root`. (Reasoned from the
+    fixture's construction, not measured at base — flagged as such below.)
+  - `git worktree remove` cannot delete another repository's directory, so the
+    guard's refusal is CORRECT here; the alternative leaves a directory no
+    cleanup path can ever remove.
+
+The fall-through was reverted. Production code at this head is byte-identical
+to what round 1 reviewed — only tests, comments and this ledger changed:
+
+    git diff f17538edf4..3c637c1585 -- server/src/services packages   # empty
+
+Boundary pinned by a new test rather than argued — gate 17:
+`still tears down a REGISTERED other-repo worktree` asserts the path IS in the
+old repo's worktree list BEFORE the call (precondition stated, not assumed)
+and is absent from disk AND pruned afterwards.
+
+**2. Base-red evidence uses an ANCESTOR stand-in, and it is recorded.** The
+base branch advanced 41 commits mid-run; GitHub's REST `.base.sha` still
+reports the open-time merge base `694d0fbe002a`, which is stale. The live tip
+`916919bb7c` is what CI built and what a merge lands on. Neither the stale pin
+nor the live tip has any `ci / …` run — exactly the WORKFLOW.md step 4
+clause-4 case, so an ancestor stands in:
+
+    A = f519242095fac059955387af6f68cc28e1408895   (PR #130 head)
+    git merge-base --is-ancestor f519242095... 916919bb7c  -> exit 0
+    check-runs at A -> 48 runs, 11 reds = a SUPERSET of all 9 head reds
+
+Full per-check signature match, blob-identity causal non-touch, and the
+local reproduction (base alone fails / guard's parent passes / base+head
+passes) are in "Base-advance supersession" and "Verifier round 1" below.
+
 ## Behavior contract
 
 When the issue's `projectWorkspaceId` changes, the next run must produce a fresh
