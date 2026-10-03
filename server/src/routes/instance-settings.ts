@@ -1,4 +1,5 @@
 import { Router, type Request } from "express";
+import { sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
   patchInstanceSettingsSchema,
@@ -19,6 +20,10 @@ import {
   publishActivity,
   type ActivityPublication,
 } from "../services/index.js";
+import {
+  FLEET_MAX_CONCURRENT_RUNS_ENV_VAR,
+  resolveFleetMaxConcurrentRuns,
+} from "../services/heartbeat.js";
 import { environmentService } from "../services/environments.js";
 import { assertEnvironmentSelectionForCompany } from "./environment-selection.js";
 import { assertBoardOrgAccess, getActorInfo } from "./authz.js";
@@ -113,28 +118,18 @@ function withTaskDrainTransition<T>(run: () => Promise<T>): Promise<T> {
   return turn;
 }
 
-// SPA-10137 / Mira review (PR #140): the fleet-max-concurrent-runs PATCH does
-// a read (previous value) - write - read (next value) - audit - raise-check
-// sequence. Without serialization, two concurrent PATCHes can each snapshot
-// the OTHER's pre-write value as their own "previous", so the audit record
-// and the raise/lower decision can describe a transition that never actually
-// happened (e.g. a lowering request reading a stale low "previous" and
-// misclassifying itself as a raise). Same shape as the task-drain race above
-// — reuse the identical queue-of-turns pattern so every PATCH's whole
-// snapshot-write-read-audit sequence runs as one atomic turn, in arrival
-// order.
-let fleetMaxConcurrentRunsTransitionQueue: Promise<void> = Promise.resolve();
-
-function withFleetMaxConcurrentRunsTransition<T>(run: () => Promise<T>): Promise<T> {
-  const turn = fleetMaxConcurrentRunsTransitionQueue.then(run);
-  // Normalize to a settled void promise for the next caller in line, so a
-  // rejected transition cannot wedge every later transition behind it.
-  fleetMaxConcurrentRunsTransitionQueue = turn.then(
-    () => undefined,
-    () => undefined,
-  );
-  return turn;
-}
+// SPA-10137 / Mira review (PR #140, two rounds): the fleet-max-concurrent-runs
+// PATCH does a read (previous value) - write - read (next value) - raise-check
+// sequence. Round 1 found that an in-process Promise queue (the same pattern
+// as withTaskDrainTransition above) fixes same-process races but not
+// cross-replica ones: two PATCHes landing on different server replicas still
+// share only the DB, so a process-local queue cannot serialize them. Round 2
+// (this fix) moves the critical section into a single DB transaction holding
+// a Postgres advisory lock for its duration — serialization that holds
+// regardless of how many server processes are running. The lock key is a
+// fixed string: this setting has exactly one row (the "default" singleton),
+// so there is nothing to scope the key to.
+const FLEET_MAX_CONCURRENT_RUNS_LOCK_KEY = "paperclip:instance-settings:fleet-max-concurrent-runs";
 
 export function instanceSettingsRoutes(db: Db) {
   const router = Router();
@@ -341,69 +336,90 @@ export function instanceSettingsRoutes(db: Db) {
       // board/ops control with no UI surface, same as the task-drain routes
       // below, which also skip it.
 
-      // The whole snapshot-write-read-audit-raise sequence runs as one queued
-      // transition (see withFleetMaxConcurrentRunsTransition above), so an
-      // overlapping PATCH cannot read this request's pre-write value as ITS
-      // "previous", or vice versa: every PATCH's "previous"/"next" pair
-      // describes a transition that actually happened, in request order.
-      const nextStatus = await withFleetMaxConcurrentRunsTransition(async () => {
-        // Invalidate first so this read is never served a cache entry a
-        // concurrent write populated moments ago, then snapshot the
-        // pre-write value for the activity log and the raise/lower decision.
-        heartbeat.invalidateFleetMaxConcurrentRunsCache();
-        const previousGeneral = await svc.getGeneral();
-        const previousStatus = await heartbeat.getFleetMaxConcurrentRunsStatus();
-
-        const updated = await svc.updateGeneral({ fleetMaxConcurrentRuns: req.body.value });
-
-        // Invalidate again: the read above cached the PRE-write value, which
-        // is now stale. The next read (here, and the next admission check)
-        // must see the value this request just wrote, not wait out the TTL.
-        heartbeat.invalidateFleetMaxConcurrentRunsCache();
-        const nextStatus = await heartbeat.getFleetMaxConcurrentRunsStatus();
-
-        const actor = getActorInfo(req);
-        const companyIds = await svc.listCompanyIds();
-        await Promise.all(
-          companyIds.map((companyId) =>
-            logActivity(db, {
-              companyId,
-              actorType: actor.actorType,
-              actorId: actor.actorId,
-              agentId: actor.agentId,
-              runId: actor.runId,
-              agentApiKeyId: actor.agentApiKeyId,
-              action: "instance.settings.fleet_max_concurrent_runs_updated",
-              entityType: "instance_settings",
-              entityId: updated.id,
-              details: {
-                previous: previousGeneral.fleetMaxConcurrentRuns ?? null,
-                next: updated.general.fleetMaxConcurrentRuns ?? null,
-                previousEffective: previousStatus,
-                nextEffective: nextStatus,
-              },
-            }),
-          ),
+      // The snapshot(previous)-write-snapshot(next) critical section runs
+      // inside one DB transaction holding a Postgres advisory lock for its
+      // whole duration (see FLEET_MAX_CONCURRENT_RUNS_LOCK_KEY above). This
+      // serializes concurrent PATCHes even across server replicas that share
+      // only this database — a process-local queue cannot do that (Mira
+      // review, PR #140 round 2). Both reads/writes run against `tx`, not the
+      // outer `db`, and both status values are computed directly with
+      // resolveFleetMaxConcurrentRuns from data read under the lock, rather
+      // than through heartbeat.getFleetMaxConcurrentRunsStatus()'s cache,
+      // which has no knowledge of this transaction or of other replicas.
+      const { previousValue, previousStatus, nextValue, nextStatus, updated } = await db.transaction(async (tx) => {
+        await tx.execute(
+          sql`select pg_advisory_xact_lock(hashtextextended(${FLEET_MAX_CONCURRENT_RUNS_LOCK_KEY}, 0))`,
         );
+        const previousGeneral = await svc.getGeneral({ db: tx });
+        const previousStatus = resolveFleetMaxConcurrentRuns({
+          dbValue: previousGeneral.fleetMaxConcurrentRuns,
+          envValue: process.env[FLEET_MAX_CONCURRENT_RUNS_ENV_VAR],
+        });
 
-        // Raising the cap (or removing it) must start an admission pass
-        // right away instead of waiting for the next scheduled sweep
-        // (SPA-10137 item 4). Lowering it never kills a running run — the
-        // per-admission budget check (countRunningRunsGlobal) is what
-        // withholds new admissions until the running count falls back under
-        // the new ceiling, with no action needed here.
-        const isRaise =
-          nextStatus.value === null
-            ? previousStatus.value !== null
-            : previousStatus.value === null || nextStatus.value > previousStatus.value;
-        if (isRaise) {
-          void heartbeat.resumeQueuedRuns().catch((err) => {
-            logger.error({ err }, "fleet cap admission pass after a raise failed");
-          });
-        }
+        const updated = await svc.updateGeneral(
+          { fleetMaxConcurrentRuns: req.body.value },
+          { db: tx },
+        );
+        const nextStatus = resolveFleetMaxConcurrentRuns({
+          dbValue: updated.general.fleetMaxConcurrentRuns,
+          envValue: process.env[FLEET_MAX_CONCURRENT_RUNS_ENV_VAR],
+        });
 
-        return nextStatus;
+        return {
+          previousValue: previousGeneral.fleetMaxConcurrentRuns ?? null,
+          previousStatus,
+          nextValue: updated.general.fleetMaxConcurrentRuns ?? null,
+          nextStatus,
+          updated,
+        };
       });
+
+      // Invalidate this process's cache immediately so the next admission
+      // check / GET here sees the committed value right away instead of
+      // waiting out the TTL. A different replica only learns of the change
+      // through its own cache's TTL (<=5s) — there is no cross-process
+      // invalidation channel, and SPA-10137 item 3 bounds that by design.
+      heartbeat.invalidateFleetMaxConcurrentRunsCache();
+
+      const actor = getActorInfo(req);
+      const companyIds = await svc.listCompanyIds();
+      await Promise.all(
+        companyIds.map((companyId) =>
+          logActivity(db, {
+            companyId,
+            actorType: actor.actorType,
+            actorId: actor.actorId,
+            agentId: actor.agentId,
+            runId: actor.runId,
+            agentApiKeyId: actor.agentApiKeyId,
+            action: "instance.settings.fleet_max_concurrent_runs_updated",
+            entityType: "instance_settings",
+            entityId: updated.id,
+            details: {
+              previous: previousValue,
+              next: nextValue,
+              previousEffective: previousStatus,
+              nextEffective: nextStatus,
+            },
+          }),
+        ),
+      );
+
+      // Raising the cap (or removing it) must start an admission pass right
+      // away instead of waiting for the next scheduled sweep (SPA-10137 item
+      // 4). Lowering it never kills a running run — the per-admission budget
+      // check (countRunningRunsGlobal) is what withholds new admissions
+      // until the running count falls back under the new ceiling, with no
+      // action needed here.
+      const isRaise =
+        nextStatus.value === null
+          ? previousStatus.value !== null
+          : previousStatus.value === null || nextStatus.value > previousStatus.value;
+      if (isRaise) {
+        void heartbeat.resumeQueuedRuns().catch((err) => {
+          logger.error({ err }, "fleet cap admission pass after a raise failed");
+        });
+      }
 
       res.json(nextStatus);
     },

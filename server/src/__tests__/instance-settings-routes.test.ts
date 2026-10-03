@@ -43,7 +43,11 @@ function registerModuleMocks() {
 
 // Identity object the mocked db.transaction hands to writers; tests assert
 // both the marker clear and the settings update receive THIS same tx.
-const TX_SENTINEL = { __tx: true };
+// `execute` is a no-op mock so the fleet-max-concurrent-runs PATCH route's
+// `tx.execute(sql\`select pg_advisory_xact_lock(...)\`)` lock acquisition has
+// something to call; its SQL argument is asserted directly in the tests that
+// care about it.
+const TX_SENTINEL = { __tx: true, execute: vi.fn().mockResolvedValue(undefined) };
 // Runs the callback with a sentinel tx and propagates throws, so a failing
 // write inside rejects the whole request exactly like a real transaction
 // rollback. This is the default mockDb.transaction implementation; a test
@@ -765,15 +769,16 @@ describe("instance settings routes", () => {
     });
 
     it("sets an explicit ceiling, invalidates the cache, and logs old/new/actor", async () => {
+      // Read (previous) and write (next) both happen inside the locked DB
+      // transaction now (Mira review round 2), driven by the real
+      // resolveFleetMaxConcurrentRuns -- not by a mocked effective-status
+      // sequence -- so the fixtures below carry the raw stored field.
       mockInstanceSettingsService.getGeneral.mockResolvedValueOnce({
         censorUsernameInLogs: false,
         keyboardShortcuts: false,
         feedbackDataSharingPreference: "prompt",
         fleetMaxConcurrentRuns: 2,
       });
-      mockHeartbeatService.getFleetMaxConcurrentRunsStatus
-        .mockResolvedValueOnce({ value: 2, source: "db" }) // read before the write
-        .mockResolvedValueOnce({ value: 10, source: "db" }); // read after the write
       mockInstanceSettingsService.updateGeneral.mockResolvedValueOnce({
         id: "instance-settings-1",
         general: {
@@ -791,9 +796,26 @@ describe("instance settings routes", () => {
 
       expect(res.status).toBe(200);
       expect(res.body).toEqual({ value: 10, source: "db" });
-      expect(mockInstanceSettingsService.updateGeneral).toHaveBeenCalledWith({ fleetMaxConcurrentRuns: 10 });
-      // Invalidated before the pre-write read and again after the write.
-      expect(mockHeartbeatService.invalidateFleetMaxConcurrentRunsCache).toHaveBeenCalledTimes(2);
+      expect(mockInstanceSettingsService.getGeneral).toHaveBeenCalledWith({ db: TX_SENTINEL });
+      expect(mockInstanceSettingsService.updateGeneral).toHaveBeenCalledWith(
+        { fleetMaxConcurrentRuns: 10 },
+        { db: TX_SENTINEL },
+      );
+      // The advisory lock is acquired as the first statement inside the
+      // transaction, before either read or write. drizzle's `sql` template
+      // keeps literal text as {value: [string]} chunks and an interpolated
+      // value as a bare element in queryChunks -- stringifying the object
+      // directly just yields "[object Object]".
+      expect(TX_SENTINEL.execute).toHaveBeenCalledTimes(1);
+      const lockQueryChunks = (TX_SENTINEL.execute.mock.calls[0]?.[0] as {
+        queryChunks: Array<{ value?: string[] } | string>;
+      }).queryChunks;
+      const lockQueryText = lockQueryChunks
+        .map((chunk) => (typeof chunk === "string" ? chunk : chunk.value?.[0] ?? ""))
+        .join("");
+      expect(lockQueryText).toContain("pg_advisory_xact_lock");
+      // Invalidated once, right after the transaction commits.
+      expect(mockHeartbeatService.invalidateFleetMaxConcurrentRunsCache).toHaveBeenCalledTimes(1);
       expect(mockLogActivity).toHaveBeenCalledTimes(2);
       expect(mockLogActivity).toHaveBeenCalledWith(
         expect.anything(),
@@ -811,9 +833,12 @@ describe("instance settings routes", () => {
     });
 
     it("maps the \"none\" sentinel to an explicit null (no ceiling) write", async () => {
-      mockHeartbeatService.getFleetMaxConcurrentRunsStatus
-        .mockResolvedValueOnce({ value: 5, source: "db" })
-        .mockResolvedValueOnce({ value: null, source: "db" });
+      mockInstanceSettingsService.getGeneral.mockResolvedValueOnce({
+        censorUsernameInLogs: false,
+        keyboardShortcuts: false,
+        feedbackDataSharingPreference: "prompt",
+        fleetMaxConcurrentRuns: 5,
+      });
       mockInstanceSettingsService.updateGeneral.mockResolvedValueOnce({
         id: "instance-settings-1",
         general: { fleetMaxConcurrentRuns: null },
@@ -825,13 +850,23 @@ describe("instance settings routes", () => {
         .send({ value: null });
 
       expect(res.status).toBe(200);
-      expect(mockInstanceSettingsService.updateGeneral).toHaveBeenCalledWith({ fleetMaxConcurrentRuns: null });
+      // An explicit DB null is a deliberate "no ceiling" override, so the
+      // source is "db" (not "none" -- "none" means nothing is configured at
+      // all, see resolveFleetMaxConcurrentRuns).
+      expect(res.body).toEqual({ value: null, source: "db" });
+      expect(mockInstanceSettingsService.updateGeneral).toHaveBeenCalledWith(
+        { fleetMaxConcurrentRuns: null },
+        { db: TX_SENTINEL },
+      );
     });
 
     it("triggers an admission pass when the write raises the cap", async () => {
-      mockHeartbeatService.getFleetMaxConcurrentRunsStatus
-        .mockResolvedValueOnce({ value: 2, source: "db" })
-        .mockResolvedValueOnce({ value: 10, source: "db" });
+      mockInstanceSettingsService.getGeneral.mockResolvedValueOnce({
+        censorUsernameInLogs: false,
+        keyboardShortcuts: false,
+        feedbackDataSharingPreference: "prompt",
+        fleetMaxConcurrentRuns: 2,
+      });
       mockInstanceSettingsService.updateGeneral.mockResolvedValueOnce({
         id: "instance-settings-1",
         general: { fleetMaxConcurrentRuns: 10 },
@@ -845,9 +880,12 @@ describe("instance settings routes", () => {
     });
 
     it("triggers an admission pass when the write removes the ceiling entirely", async () => {
-      mockHeartbeatService.getFleetMaxConcurrentRunsStatus
-        .mockResolvedValueOnce({ value: 2, source: "db" })
-        .mockResolvedValueOnce({ value: null, source: "db" });
+      mockInstanceSettingsService.getGeneral.mockResolvedValueOnce({
+        censorUsernameInLogs: false,
+        keyboardShortcuts: false,
+        feedbackDataSharingPreference: "prompt",
+        fleetMaxConcurrentRuns: 2,
+      });
       mockInstanceSettingsService.updateGeneral.mockResolvedValueOnce({
         id: "instance-settings-1",
         general: { fleetMaxConcurrentRuns: null },
@@ -861,9 +899,12 @@ describe("instance settings routes", () => {
     });
 
     it("does not trigger an admission pass when the write lowers the cap", async () => {
-      mockHeartbeatService.getFleetMaxConcurrentRunsStatus
-        .mockResolvedValueOnce({ value: 10, source: "db" })
-        .mockResolvedValueOnce({ value: 2, source: "db" });
+      mockInstanceSettingsService.getGeneral.mockResolvedValueOnce({
+        censorUsernameInLogs: false,
+        keyboardShortcuts: false,
+        feedbackDataSharingPreference: "prompt",
+        fleetMaxConcurrentRuns: 10,
+      });
       mockInstanceSettingsService.updateGeneral.mockResolvedValueOnce({
         id: "instance-settings-1",
         general: { fleetMaxConcurrentRuns: 2 },
@@ -876,104 +917,52 @@ describe("instance settings routes", () => {
       expect(mockHeartbeatService.resumeQueuedRuns).not.toHaveBeenCalled();
     });
 
-    it("serializes concurrent PATCHes so a queued request's \"previous\" reflects the prior request's committed write (Mira review)", async () => {
-      // Without serialization, a second PATCH's pre-write snapshot could be
-      // taken while the first PATCH is still in flight, so it would read the
-      // value from BEFORE the first PATCH committed -- misreporting its own
-      // transition (and potentially misclassifying a lowering request as a
-      // raise, per the review finding). This proves the two PATCHes run as
-      // one queued transition each, start to finish, in arrival order.
+    it("acquires the cross-replica advisory lock, scoped by a fixed key, as the first statement in the transaction", async () => {
+      // SPA-10137 Mira review round 2: a process-local queue cannot
+      // serialize two PATCHes landing on different server replicas that
+      // share only the database. The fix moved the critical section into a
+      // single DB transaction holding a Postgres advisory lock
+      // (pg_advisory_xact_lock) for its whole duration -- a mechanism this
+      // codebase already relies on elsewhere for the identical cross-
+      // replica problem (server/src/services/device-login-service.ts,
+      // server/src/routes/projects.ts, server/src/services/email-channels.ts)
+      // and already has a real-Postgres proof for
+      // (server/src/__tests__/folders-service.test.ts "rechecks nested
+      // folders after waiting for the company mutation lock"). A mocked
+      // db.transaction cannot re-prove Postgres's own mutual-exclusion
+      // guarantee, so this test asserts the one thing that IS this route's
+      // responsibility: it asks for the lock, with a fixed key (there is
+      // exactly one fleet-cap row, nothing to scope the key to), before
+      // reading or writing anything.
+      mockInstanceSettingsService.getGeneral.mockResolvedValueOnce({
+        censorUsernameInLogs: false,
+        keyboardShortcuts: false,
+        feedbackDataSharingPreference: "prompt",
+        fleetMaxConcurrentRuns: 2,
+      });
+      mockInstanceSettingsService.updateGeneral.mockResolvedValueOnce({
+        id: "instance-settings-1",
+        general: { fleetMaxConcurrentRuns: 10 },
+      });
       const app = await createApp(adminActor);
-      const callOrder: string[] = [];
 
-      let notifyPatch1Blocked: (() => void) | undefined;
-      const patch1Blocked = new Promise<void>((resolve) => {
-        notifyPatch1Blocked = resolve;
-      });
-      let releasePatch1Update: ((value: unknown) => void) | undefined;
+      await request(app).patch("/api/instance/settings/fleet-max-concurrent-runs").send({ value: 10 });
 
-      mockInstanceSettingsService.getGeneral.mockImplementation(async () => {
-        callOrder.push("getGeneral");
-        // First call is PATCH 1's pre-write snapshot (cap=2). Any later call
-        // is only reachable once PATCH 1 has committed (cap=10) -- if the
-        // route let the two PATCHes race, PATCH 2's snapshot could instead
-        // observe this same pre-PATCH-1 general object.
-        return callOrder.filter((c) => c === "getGeneral").length === 1
-          ? { censorUsernameInLogs: false, keyboardShortcuts: false, feedbackDataSharingPreference: "prompt", fleetMaxConcurrentRuns: 2 }
-          : { censorUsernameInLogs: false, keyboardShortcuts: false, feedbackDataSharingPreference: "prompt", fleetMaxConcurrentRuns: 10 };
-      });
-      mockInstanceSettingsService.updateGeneral.mockImplementation(
-        (patch: { fleetMaxConcurrentRuns: number | null }) => {
-          if (patch.fleetMaxConcurrentRuns === 10) {
-            callOrder.push("updateGeneral:start:raise-to-10");
-            return new Promise((resolve) => {
-              notifyPatch1Blocked?.();
-              releasePatch1Update = () => {
-                callOrder.push("updateGeneral:commit:raise-to-10");
-                resolve({ id: "instance-settings-1", general: { fleetMaxConcurrentRuns: 10 } });
-              };
-            });
-          }
-          callOrder.push("updateGeneral:lower-to-1");
-          return Promise.resolve({ id: "instance-settings-1", general: { fleetMaxConcurrentRuns: 1 } });
-        },
-      );
-      let fleetStatusCall = 0;
-      mockHeartbeatService.getFleetMaxConcurrentRunsStatus.mockImplementation(async () => {
-        fleetStatusCall += 1;
-        callOrder.push(`fleetStatus:${fleetStatusCall}`);
-        switch (fleetStatusCall) {
-          case 1: return { value: 2, source: "db" }; // PATCH 1 previous
-          case 2: return { value: 10, source: "db" }; // PATCH 1 next
-          // PATCH 2 previous: MUST be 10 (PATCH 1's committed write), never
-          // the stale pre-PATCH-1 value of 2.
-          case 3: return { value: 10, source: "db" };
-          case 4: return { value: 1, source: "db" }; // PATCH 2 next
-          default: throw new Error(`unexpected getFleetMaxConcurrentRunsStatus call ${fleetStatusCall}`);
-        }
-      });
-
-      // supertest only sends a request once something calls .then() on it
-      // (see the task-drain test above for the same gotcha), so force both
-      // requests to send now instead of waiting for the final Promise.all.
-      const patch1 = request(app)
-        .patch("/api/instance/settings/fleet-max-concurrent-runs")
-        .send({ value: 10 });
-      patch1.then(() => {}, () => {});
-      await patch1Blocked;
-
-      const patch2 = request(app)
-        .patch("/api/instance/settings/fleet-max-concurrent-runs")
-        .send({ value: 1 });
-      patch2.then(() => {}, () => {});
-      // Give PATCH 2 every chance to (wrongly) race ahead while PATCH 1 is
-      // still blocked on its update. It must not reach a second getGeneral
-      // call yet -- that would mean it skipped the queue.
-      await new Promise((resolve) => setImmediate(resolve));
-      await new Promise((resolve) => setImmediate(resolve));
-      expect(callOrder.filter((c) => c === "getGeneral")).toHaveLength(1);
-
-      releasePatch1Update?.(undefined);
-      const [res1, res2] = await Promise.all([patch1, patch2]);
-
-      expect(res1.status).toBe(200);
-      expect(res1.body).toEqual({ value: 10, source: "db" });
-      expect(res2.status).toBe(200);
-      expect(res2.body).toEqual({ value: 1, source: "db" });
-      // PATCH 1 (2 -> 10) raised the cap: one admission pass. PATCH 2
-      // (10 -> 1) lowered it: no admission pass for that one.
-      expect(mockHeartbeatService.resumeQueuedRuns).toHaveBeenCalledTimes(1);
-      expect(callOrder).toEqual([
-        "getGeneral",
-        "fleetStatus:1",
-        "updateGeneral:start:raise-to-10",
-        "updateGeneral:commit:raise-to-10",
-        "fleetStatus:2",
-        "getGeneral",
-        "fleetStatus:3",
-        "updateGeneral:lower-to-1",
-        "fleetStatus:4",
-      ]);
+      expect(mockDb.transaction).toHaveBeenCalledTimes(1);
+      expect(TX_SENTINEL.execute).toHaveBeenCalledTimes(1);
+      // drizzle's `sql` template keeps literal text as {value: [string]}
+      // chunks and an interpolated value (the lock key) as a bare element
+      // in `queryChunks` -- assert on that shape directly rather than on a
+      // stringified form, which just yields "[object Object]".
+      const lockQuery = TX_SENTINEL.execute.mock.calls[0]?.[0] as {
+        queryChunks: Array<{ value?: string[] } | string>;
+      };
+      const chunkText = lockQuery.queryChunks
+        .map((chunk) => (typeof chunk === "string" ? chunk : chunk.value?.[0] ?? ""))
+        .join("");
+      expect(chunkText).toContain("pg_advisory_xact_lock");
+      expect(chunkText).toContain("hashtextextended");
+      expect(chunkText).toContain("paperclip:instance-settings:fleet-max-concurrent-runs");
     });
 
   });
