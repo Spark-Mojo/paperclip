@@ -1,277 +1,362 @@
 # SPA-10294 — Workspace/cwd identity guard audit against a per-RUN cwd
 
 **Author:** Ty (Tech Lead) · **Date:** 2026-10-03 · **Card:** SPA-10294 (SPA-9373 item 3)
+**Enforcement boundary:** this is a **flag-on prerequisite**. `enableEphemeralWorktreePerRun`
+must not be enabled until §7 is satisfied.
 
-**Purpose.** Item 3 of SPA-9373 gates the James-gated `enableEphemeralWorktreePerRun`
-flag flip. This audit answers the one question the SPA-9454 escalation flagged as
-"the one I would not guess at": does any workspace/cwd identity guard break or
-silently degrade when the execution workspace becomes a per-RUN worktree instead of
-a per-CARD worktree?
+**Supersedes:** the first pass of this audit (also in PR #142, commit `10ecd561f9`) covered
+two engine files only. The verifier returned FAIL on six of seven requirements for exactly
+that reason. This revision adds the incident sweep, the adapter surface, both skills surfaces,
+the per-guard enumeration, and two behavioural controls.
 
-**Source of truth (no bare-ref shorthand, no ambient tree).**
+---
+
+## Source of truth (full refs, no bare-ref shorthand, no ambient tree)
 
 | Fact | Value | How derived |
 |---|---|---|
-| Fork | `Spark-Mojo/paperclip` | charter execution lane |
-| Fork default branch | `rebuild/v2026.916.0-survivors` | `gh repo view Spark-Mojo/paperclip --json defaultBranchRef` (read live, never from memory) |
-| Audited ref | `refs/remotes/origin/rebuild/v2026.916.0-survivors` @ `b774322590c0aea7241c1016282ff4d49a79b5fb` (2026-10-03T06:42:46Z) | full-ref `git rev-parse` |
-| Ambiguity tripwire | **clean** — no `refname ... is ambiguous` on stderr | bare-shorthand law, friction #888 |
-| `workspace-runtime.ts` | 10,148 lines @ audited ref | `git show` |
-| `heartbeat.ts` | 30,482 lines @ audited ref | `git show` |
-| PR #108 (ephemeral worktree per run) | **MERGED**, head `ac9fdc36cf689218c370ef88ce582fe30e283162` | `gh pr view 108` |
-| PR #119 (never remove dirty/unpushed run worktree) | **MERGED**, head `0c8693c0f4a5ee235baef5043d5f567a8f5418e2` | `gh pr view 119` |
-| Flag read site | `heartbeat.ts:22256-22258` → `realizeExecutionWorkspace({ ephemeralLifecycle: resolvedInstanceSettings.experimental.enableEphemeralWorktreePerRun === true })` | `git grep` |
-| Flag default | `false` (`instance-settings.ts:275`, `:316`) | `git show` |
-| Live flag value | **NOT AGENT-READABLE** — `GET /api/instance/settings` → `403 {"error":"Board access required"}` for an agent actor | verified this run |
-
-> **Correction to the SPA-9454 framing.** Both prerequisite PRs are MERGED, not open.
-> SPA-9454's objective text ("installed 694d0fbe, ahead_by=23/0 vs PR #108 and 12/0 vs
-> PR #119") described a pre-merge install position. The *engine code* is landed; the
-> flag remains off, which is still the only missing piece for the flag itself.
+| Engine fork | `Spark-Mojo/paperclip` | charter execution lane |
+| Fork default branch | `rebuild/v2026.916.0-survivors` | `gh repo view Spark-Mojo/paperclip --json defaultBranchRef` (read live) |
+| Engine audited ref | `b774322590c0aea7241c1016282ff4d49a79b5fb` | `git rev-parse` of the full PR base ref |
+| Platform audited ref | `e50382dd711ce4fdbf1be8c70d64e07262f8156c` | `refs/remotes/origin/main` in `spark-mojo-platform` |
+| Governance audited ref | `ab8c25fd925a4ef7f7735990680fdaf9d67b0be6` | `refs/remotes/origin/main` in `sparkmojo-internal` |
+| Ambiguity tripwire | clean — no `refname ... is ambiguous` on stderr | friction #888 / SPA-9348 |
+| Flag default | `false` (`instance-settings.ts:275` `?? false`, `:316` `: false`) | `git grep` on the pinned engine ref |
+| Live flag value | **NOT AGENT-READABLE** — `GET /api/instance/settings` → `403 {"error":"Board access required"}` | verified this run |
 
 ---
 
-## 1. The three identities — the decomposition the whole audit rests on
+## 1. The incident sweep (card requirement 1) — done FIRST, as required
 
-Ephemeral mode changes **one** of three independent identities. They are not
-interchangeable, and almost every guard in this file keys on a different one.
+A guard with a known incident behind it is worth ten guards found by grep. The sweep found
+**three distinct incident families**, and the shape of all three is the same shape the flag
+creates.
 
-| # | Identity | Persistent (today) | Ephemeral (proposed) | Source |
+### I-1 — Stale persisted worktree path kills every wake on the card
+
+> *"Paperclip persists an execution workspace path per issue. When that worktree is later
+> removed or its branch renamed on disk, the stored pointer is never invalidated, so every
+> subsequent wake onto that card dies at launch"* — gbrain
+> `claude-memory/users-jamesilsley-github-spark-mojo-platform/project_stale_persisted_worktree_crashes_agents`
+>
+> **Measured 2026-08-31: 7 agents, ~9 runs burned in one day**, across 3 distinct paths in two
+> different parent directories. *"so it is systemic, not one bad card. It took down **Dex**,
+> which stops the whole merge lane."*
+
+Failure messages are the two the flag produces:
+`Persisted git worktree "<path>" is not reusable (path is not registered in git worktree list)`
+and `Execution workspace git worktree expected branch "X" but found "Y"`.
+
+**Why this is the exact failure the flip multiplies.** Today the pointer is stale *once* and a
+human repairs it. Under the flag, `wr.ts:3458-3460` mints a **new** path every run, so the
+persisted pointer is stale *by construction on the next run*. James's word for this is
+"implode": the agent is launched into a directory whose identity no longer matches what the
+card's own metadata claims, and it fails at the first `git` call.
+
+### I-2 — Workspace identity collision hands two cards the same directory
+
+> gbrain `permanent/paperclip-execution-workspace-collision-mechanism` (2026-09-01):
+> *"41 distinct `execution_workspace_id` values, each bound to 2-23 different open cards
+> simultaneously (172 cards total) ... two unrelated cards got silently handed the same
+> physical git worktree directory on the same day"*, producing
+> `WorkspaceRuntimeValidationFailure: Execution workspace git worktree expected branch "X" but found "Y"`.
+
+The engine has a reproducer-grade description of the second variant too, in
+`platform/pm-team/build-machine/spa-458/.../step-2-incident-records`: SPA-5836's manual
+re-pin *"did not hold; ... two minutes later the run ... failed workspace validation with
+reasonCode=not_registered"*.
+
+### I-3 — The doctrine gap: no rule, therefore no failure
+
+> gbrain `atoms/2026-08-19/76-cards-sharing-one-worktree-was-doctrine-compliant-silence-0db484`:
+> *"Worktree assignment guidance is completely absent from all three runtime sources ... That
+> means 76 cards sharing a single worktree ... violated no rule because no rule exists. The
+> failure was a doctrine gap, not an execution error."*
+
+**This is the row that decides how the flip must be rolled out.** The skills surfaces are
+where an agent reads its own workspace contract. If a skill states the contract in terms of a
+stable directory, the flip does not produce a clean error — it produces an agent that follows
+a correct rule and reaches the wrong conclusion. That is the "implode" mode.
+
+### Supporting incidents (not workspace-identity, but the same blast radius)
+
+- `atoms/2026-09-08/agent-fenced-to-wrong-worktree-blocks-the-task-before-any-mo-5feda7` —
+  *"the entire run was spent discovering an access mismatch"*: the cost of a cwd-identity
+  failure is a **whole run**, not a retry.
+- `atoms/2026-07-28/bare-file-references-break-subtly-when-worktrees-change` — *"a bare
+  filename ... resolves relative to the current working directory"*. Under the flag every
+  relative instruction in every skill re-resolves per run.
+- `atoms/2026-09-07/the-handed-off-fix-can-be-provably-wrong-trace-the-guard-cha-129813` —
+  an agent that changed a system without reading the guard chain first *"would have spent
+  1.6 GB of disk and risked corrupting an in-flight run for zero effect"*. This is why §4
+  classifies the provisioning-script guards (G41, G42) as must-be-exempted rather than
+  proposing edits: they are a second, undocumented subsystem with its own invariants.
+
+---
+
+## 2. The decomposition the whole audit rests on
+
+Ephemeral mode changes **one** of three independent identities.
+
+| # | Identity | Today (per-card) | Under the flag | Source |
 |---|---|---|---|---|
-| 1 | **Branch** | `<template-rendered>` — per **CARD** | **UNCHANGED, still per card** | `wr.ts:3440-3443`, `branchName` never takes `runIdSegment` |
-| 2 | **Directory** | `<parent>/<branchName>` | `<parent>/runs/<runIdSegment>` | `wr.ts:3454-3460` |
-| 3 | **Registry entry** (`git worktree list --porcelain`) | one per branch | one per branch ⇒ **at most ONE per card, by git's own rule** | `wr.ts:2809`, `:3672` |
+| 1 | **Branch** | template-rendered, per **CARD** | **UNCHANGED, still per card** | `wr.ts:3436-3443` |
+| 2 | **Directory** | `<parent>/<branchName>` | `<parent>/runs/<runIdSegment>` | `wr.ts:3458-3460` |
+| 3 | **Instance id** (`provision-worktree.sh`) | `basename(worktree_cwd)` + path hash | **per run** | `scripts/provision-worktree.sh:19-31` |
 
-The inline comment at `wr.ts:3449-3453` states the design intent explicitly: *"The
-branch is still derived from the template — it is the durable identifier on the
-remote; only the local directory shape changes."*
-
-**That is the defect.** Identity 2 changes; identities 1 and 3 do not.
+The engine's own inline comment at `wr.ts:3449-3453` states identity 1 is *"still derived from
+the template — it is the durable identifier on the remote; only the local directory shape
+changes."* So identity 3 moving is **not in the design's model at all**, and it is the most
+expensive of the three. Row **G41** is the finding that follows from that omission.
 
 ---
 
-## 2. Finding 1 (P1) — ephemeral isolation degrades to per-card reuse, undocumented
+## 3. The enumeration (card requirements 2 and 4)
 
-`wr.ts:3454-3460` computes a fresh per-run `worktreePath`. Then `wr.ts:3672` runs:
+**File of record: [`SPA-10294-guard-enumeration.csv`](./SPA-10294-guard-enumeration.csv)** —
+50 rows, one per guard, each carrying `file:line`, its classification, the evidence for that
+classification, and its per-run verdict. Zero unclassified rows (gate `G8`).
 
-```ts
+Every row is on one of the four surfaces the card names, plus the platform repo's own GC
+sweeper (G44-G47), which is on the flag's critical path and was not in the card's list of four.
+
+**Classification counts (derived, not asserted — gate `G9`):**
+
+| Classification | Rows | Meaning |
+|---|---|---|
+| `TOLERANT` | 33 | Already correct under a per-run cwd. No action. |
+| `NEEDS-PER-RUN-ADAPTATION` | 9 | Intent is right, mechanism assumes stability. |
+| `MUST-BE-EXEMPTED` | 7 | Identity cannot hold per-run; pretending otherwise is the bug. |
+| `SEE-G02` | 1 | G20, a deliberate cross-listing so no row is left unclassified. |
+
+Total 50. **Zero unclassified rows.** These counts are **derived from the CSV by
+`docs/audits/build-enumeration.py` plus the reader in gate `G9`**, not hand-tallied — my first
+pass wrote 30/13/7, the derivation said 32/11/7, and the second derivation said 33/9/7. The
+derived numbers are the ones recorded, and the CSV is now machine-written through
+`csv.writer`, so a comma inside a cell can no longer shift a column boundary (the hand-written
+first version had six rows with the wrong field count).
+
+**Surface coverage:**
+
+| Surface | Rows |
+|---|---|
+| Engine (`server/`, `packages/paperclip-runner`, `scripts/`) | 20 |
+| Adapter `adapter-opencode-local` (+ the `adapter-utils` helpers it owns) | 13 |
+| Fleet skills — `sm-*` fleet-contract skills, platform GC/verify scripts, fleet-context laws | 12 |
+| `sparkmojo-paperclip` skill (governance repo, template v40) | 5 |
+
+The card names four surfaces; these are them, split at the repo boundary so the provenance of
+every `file:line` is unambiguous. The platform repo's own GC and verify scripts (G44-G47, G49)
+are counted under fleet skills because those scripts **are** the fleet's mechanical guards, and
+the flag's capacity path runs straight through G44.
+
+---
+
+## 4. The five findings that matter (expanded from the enumeration)
+
+Everything below is a row in the CSV with the full evidence. This section states only what a
+reader must not have to reconstruct.
+
+### F-1 (G03, P1) — ephemeral isolation degrades to reuse-on-dirty, so the flag delivers no capacity relief
+
+`wr.ts:3458-3460` computes a per-run path. Then `wr.ts:3672`:
+
+```
 const registeredBranchWorktree = await findRegisteredGitWorktreeByBranch(repoRoot, branchName);
-if (registeredBranchWorktree) {
-  const reusable = await validateReusableWorktree(registeredBranchWorktree);
-  if (reusable.validation?.valid) {
-    return await reuseExistingWorktree(registeredBranchWorktree, reusable.branchName, reusable.warnings);
-  }
 ```
 
-`findRegisteredGitWorktreeByBranch` matches `refs/heads/<branch>` in the repo root
-(`wr.ts:2809`). Because identity 1 is **unchanged**, run *N+1* of the same card
-computes a different directory but resolves **the same branch** — and therefore
-returns run *N*'s directory via the reuse path, **before any ephemeral check runs**.
-There is no `ephemeral` guard on this branch.
+matches on `refs/heads/<branch>`. **Identity 1 is unchanged**, so run *N+1* resolves **run N's
+directory** and returns it through `reuseExistingWorktree` — before any ephemeral check. There
+is no `ephemeral` guard on that path. The reuse return carries `cwd`/`worktreePath` =
+**reused** path (`wr.ts:3585`), so there is no identity lie and no cross-run `rm`; the defect is
+narrower and worse for planning:
 
-**Severity was downgraded from my first read, and I am recording the downgrade
-because I proved it.** My first hypothesis was an "identity lie" plus a teardown that
-`rm`s a directory another run owns. That is **wrong**: the `reuseExistingWorktree`
-return carries `cwd: reusablePath` and `worktreePath: reusablePath` (`wr.ts:3585`),
-i.e. the **reused** path, not the computed `runs/<runId>` path. So the persisted
-identity is truthful — there is no cross-run `rm`. The real defect is narrower and is
-exactly this:
+> After PR #119 the population that *leaves* a registered worktree is precisely the
+> **dirty/unpushed** runs — the exact runs the feature exists to isolate. Turning the flag on as
+> shipped converts *directory* accumulation into *reuse*. **The 200 GiB capacity model is
+> computed against a flag that will not deliver it.**
 
-> **Ephemeral isolation silently degrades to reuse-on-dirty, and it is undocumented.**
+Demonstrated pre-change: control **B-1**.
 
-It is not "every run collides" — it is **every run whose predecessor left a
-registered worktree**, which after PR #119's fail-safe is precisely the set of runs
-that were **dirty or unpushed**. Those are the exact runs the feature exists to
-isolate. The `ephemeralLifecycle: ephemeral` value is still propagated on the reuse
-return (`wr.ts:3599`), so the row is *marked* ephemeral while its path is a
-**per-card** directory. Any later consumer that trusts `ephemeralLifecycle === true`
-to conclude "path is `runs/<runId>`" is wrong.
+`git` forbids the naive fix — one branch, one worktree:
 
-### The `startsWith` guard that papers over it
+```
+$ git worktree add wt-b card-x
+fatal: 'card-x' is already used by worktree at '.../wt-a'     (exit 128)
+```
 
-`heartbeat.ts:22530-22543` is the **only** consumer that distinguishes the shape, and
-it is belt-and-braces:
+So the fix is a **per-run local branch** (`ephemeral/<cardBranchSlug>/<runId>`), card branch
+untouched, **named not detached** — a detached HEAD fails DECISION-138 predicate 3 every run and
+§138-5 does not rescue it, because a per-run worktree authors a tree.
+
+### F-2 (G41 + G42, P1) — the provisioning script mints a new **instance** per run, and its self-heal guard becomes vacuous
+
+Not on the card's four surfaces, and not in the first pass. `scripts/provision-worktree.sh:19-31`:
+
+```bash
+worktree_instance_id="$(WORKTREE_CWD="$worktree_cwd" node <<'EOF'
+... basename(resolvedWorkspacePath) + sha256(resolvedWorkspacePath)[0:12]
+```
+
+The **instance id is a hash of the directory path.** Under the flag the directory is
+`runs/<runId>`, so every run gets a new instance id, a new instance root, a new embedded
+Postgres data dir, new ports, and a new master key (`write_fallback_worktree_config`).
+Demonstrated pre-change: control **B-5** (`run-aaaa1111-8cf3bccdc7f8` vs
+`run-bbbb2222-68c0a726cf35`).
+
+Compounding it, **G07**: `workspace-instance-cleanup.ts:225-231` refuses cleanup when
+`instanceId !== expectedInstanceId`, and `expectedInstanceId` comes from
+`workspace.metadata[WORKTREE_INSTANCE_ROOT_METADATA_KEY]` (`wr.ts:4605-4608`) — which per-run
+worktrees do not have. So every ephemeral worktree falls to the refusal branch and its instance
+artifacts are **never reclaimed**.
+
+And **G42**: the script's own self-heal check
+(`existing_worktree_config_is_usable` — the worktree's own `.paperclip/.env` must point at its
+own config) is *trivially true* for a fresh per-run directory. It stops guarding.
+
+### F-3 (G44, P1) — the capacity sweeper cannot see `runs/`, so the flag's purpose is unmet on day one
+
+`scripts/machine/worktree_gc.py:415-421` (platform repo):
+
+```python
+for root, dirs, _ in os.walk(BASE, onerror=on_walk_error):
+    if not root.endswith("/.paperclip/worktrees"):
+        continue
+    for d in sorted(dirs):          # IMMEDIATE children only
+        bad = path_ok(full, root)   # requires os.path.dirname(full) == worktrees_dir
+```
+
+`runs/` is a **subdirectory**, so it is never a candidate and every ephemeral worktree is
+invisible to GC. Demonstrated pre-change: control **B-2** (`legacy=eligible; ephemeral=NOT-REACHED`).
+This is the row that makes F-1's capacity consequence mechanical rather than theoretical.
+
+### F-4 (G18 + G06, P1) — two places that silently target a *different run's* directory
+
+**G18 — `native-workspace-finalizer.ts:97`:**
 
 ```ts
-if (
-  executionWorkspace.ephemeralLifecycle === true
-  && executionWorkspace.strategy === "git_worktree"
-  && executionWorkspace.worktreePath
-  && executionWorkspace.worktreePath.startsWith(`${path.join(resolvedWorkspace.cwd ?? "", ".paperclip", "worktrees", "runs")}`)
-  || (
-    ... && path.basename(path.dirname(executionWorkspace.worktreePath)) === "runs"
-  )
-)
+const cwd = workspace?.providerRef ?? workspace?.cwd ?? previous?.cwd ?? null;
 ```
 
-Two independent shape tests, because the first one (a `.paperclip/worktrees/runs`
-prefix under the workspace cwd) does **not** match the real configured
-`worktreeParentDir` in the `/srv/bulk` deployment. The second test
-(`basename(dirname(path)) === "runs"`) is the one that actually fires — and it is the
-same test used by the sweep at `wr.ts:5325`. So the engine has **two** places that
-infer ephemeral-ness from path shape instead of trusting the flag it already
-persists. The `&&`/`||` precedence (no outer parens on the disjunction) also means the
-second clause is not gated on `strategy === "git_worktree"`.
+The `previous?.cwd` fallback was harmless when every run of a card shared one directory. Under
+the flag the finalizer runs **after** the per-run directory is removed, so `providerRef`/`cwd`
+can be empty and it finalizes **the previous run's directory**. Demonstrated: control **B-4**.
 
-**Capacity consequence.** The flag is the only drain for `/srv/bulk/worktrees`
-(measured 433.91 GiB = 217% of the temporary 200 GiB ceiling, growth 2.23 GiB/h).
-Turning the flag on as shipped converts *directory* accumulation into *reuse* — which
-means the dirty-run population stops draining. **The capacity model is computed
-against a flag that will not deliver it.** This is the single most important sentence
-in this audit.
-
----
-
-## 3. Finding 2 (P1) — `git` forbids the "keep the branch, fresh dir per run" fix
-
-The obvious fix — leave identity 1 per-card, force identity 2 per-run — **cannot work**,
-and it is git, not policy:
-
-```
-$ git worktree add /tmp/.../w1 card-x          # ok
-$ git worktree add /tmp/.../w2 card-x
-Preparing worktree (checking out 'card-x')
-fatal: 'card-x' is already used by worktree at '/tmp/gitlocktest/w1'
-```
-
-One branch, one worktree, unless `--force`/`--detach`. So there is **no world** where
-the branch stays per-card and every run gets a fresh directory. Option (B) is dead on
-arrival, which is why my initial framing ("force a fresh dir, skip branch-based reuse")
-was incomplete.
-
-### Recommendation — (C′): per-run **local** branch, card branch untouched
-
-Derive a per-run branch name for the worktree — `ephemeral/<cardBranchSlug>/<runId>` —
-use it for `worktree add`, and **never** report or push it as the card's branch. Then:
-
-- the branch-keyed registry naturally misses (per-run branch ⇒ per-run directory);
-- the card's remote branch — what PRs, the board, and other agents read — stays stable;
-- it is the same code shape as keying the branch by run, but the per-run name is an
-  **implementation detail** instead of the card's observable branch.
-
-### Rejected: `--detach` (fails the run-exit git-hygiene assertion by construction)
-
-A detached HEAD fails DECISION-138 predicate 3 (`git symbolic-ref HEAD` must succeed)
-**every single run** ⇒ a fleet-wide stream of `BLOCKED (detached-HEAD)`. The §138-5
-N/A carve-out does **not** rescue it: a per-run worktree is a real checkout that
-authors a tree, so predicates 1–4 all apply. This is the concrete reason (C′) beats
-the detach variant, and it is why the identity must be a **named branch**.
-
----
-
-## 4. Finding 3 (P1) — the rescue ref is written twice and read zero times
-
-`rescueUnpushedRunWorktreeState` (`wr.ts:5028`, `:5074`) creates a **local** branch
-`paperclip/rescue/<runId>/<ts>` before any removal, and is called from both the
-startup reaper and the terminal sweep.
-
-```
-$ git grep -n "paperclip/rescue" @b7743225 -- server/src ':!server/src/__tests__'
-wr.ts:1307:  return sanitizeBranchName(`paperclip/rescue/${issueComponent}/${formatUtcBranchTimestamp()}`);
-wr.ts:5028: * to a `paperclip/rescue/<runId>/<ts>` branch BEFORE removal.
-wr.ts:5074:  const rescueBranch = `paperclip/rescue/${input.runId}/${input.timestamp}`;
-```
-
-Production writes: **two** (`:1307`, `:5074`). Production readers of *that* ref: **zero**.
-
-### Correcting myself — my first pass said "zero readers" and that was wrong
-
-My negative control caught it. A `for-each-ref refs/heads/paperclip/rescue` **does**
-exist in the ref, and a reader-shaped code path does exist in production. Stating the
-precise truth:
-
-- There **is** a production consumer of rescue refs — but it is a **different, named
-  branch family**, reached through an **operator-triggered route**, not the reaper's
-  per-run ref:
-  `quarantineRestoreDirtyWorkspaceBranch` (`services/execution-workspaces.ts:814`),
-  reached via the branch-reconcile route (`routes/execution-workspaces.ts:1093`,
-  `:1117`, `:1129`). It renders the ref **onto the board card** — `- Rescue ref:`,
-  `- Rescue commit:`, `- Rescued file count:` (`services/execution-workspaces.ts:706-711`)
-  — and **wakes the assignee** with `rescueRef` in the payload, so recovery is
-  human/agent-visible on the card rather than silent.
-- That is genuinely better than "no consumer", and I am recording it rather than
-  claiming credit for finding a bigger hole than exists.
-- **What is still true, and is the actual defect:** that restore path is keyed on the
-  **workspace row's branch**, and its rescue family is `rescue/<issueComponent>/<ts>`
-  (`:1307`). The reaper's family is `rescue/<runId>/<ts>` (`:5074`). **Nothing in
-  production enumerates `refs/heads/paperclip/rescue/*`**, so the reaper's per-run refs
-  are never discovered by any sweep — they are surfaced only if an operator already
-  knows the name. The `for-each-ref` occurrences in the ref are all in
-  `__tests__`, `.github/workflows/release.yml`, and `.agents/skills/garden-inbox` —
-  **never in the engine's production path.**
-
-So the accurate severity is: **P1 — the reaper's rescue refs have no discovery
-mechanism.** Not "no consumer exists anywhere"; "no *enumeration* exists, so per-run
-refs are orphaned the moment the run that made them ends."
-
-I previously recorded this as "residual risk the canary settles". On audit that
-framing is wrong and I am upgrading it. And under ephemeral mode the rescue ref becomes
-**per-run**, i.e. a *second* accumulation axis the 200 GiB `du` gate **cannot see** —
-you would trade unbounded directory growth for unbounded ref growth in the repo, and
-the reaper touches neither.
-
-The count of rescue refs in live repo roots is 0 today. That is because the flag is
-**off**, not because the path is safe — it is untested in anger.
-
----
-
-## 5. Finding 4 (P2) — the two `process.cwd()` uses are recorder fields, not guards
-
-The item-3 sweep of the two files found 34 cwd-identity comparisons. Only two are bare
-`process.cwd()` fallbacks, and **both are benign**:
-
-- `wr.ts:4565` — `cwd: workspacePath ?? input.projectWorkspace?.cwd ?? process.cwd()` on
-  a teardown-command **recorder** field. A cosmetic label, not an identity decision.
-- `wr.ts:4701` — same shape on a `cleanupAction: "remove_local_fs"` recorder field.
-
-Neither guards anything, and neither is weakened by a per-run cwd. **No P1 here.**
-
-## 6. Finding 5 (PASS — no change needed) — the destructive-path guard is cwd-independent
-
-`wr.ts:4686-4692`, the guard that refuses to `fs.rm` a path containing the project
-workspace:
+**G06 — `wr.ts:5325-5327`:**
 
 ```ts
-const resolvedWorkspacePath = path.resolve(workspacePath);
-const containsProjectWorkspace = projectWorkspaceCwd
-  ? (resolvedWorkspacePath === projectWorkspaceCwd ||
-     projectWorkspaceCwd.startsWith(`${resolvedWorkspacePath}${path.sep}`))
-  : false;
-if (containsProjectWorkspace) { warnings.push(`Refusing to remove path ...`); }
+const isEphemeralShape = path.basename(path.dirname(workspacePath)) === "runs";
+const runIdSegment = isEphemeralShape ? path.basename(workspacePath) : null;
 ```
 
-Path-containment on `path.resolve`, never `process.cwd()`. A per-run cwd is
-`…/runs/<runId>`, strictly **inside** the parent dir, so `projectWorkspaceCwd` can never
-be a parent of it and the guard's direction is unchanged. **This guard survives the
-flag flip intact** — worth stating explicitly, because it is the one that would have
-been catastrophic to lose.
+Under F-1's reuse path, `workspacePath` is a **per-card** path while `ephemeralLifecycle` is
+`true`. The shape test says *legacy*, so `runIdSegment` becomes the literal string `"legacy"` and
+**the live-run protection cannot apply to it**. The in-file comment claims *"the legacy
+`/<branch>/` shape has no run-id component to gate against"* — false for the ephemeral+reuse
+combination. Demonstrated: control **B-3**.
 
-PR #119's own fail-safe (`wr.ts:4769-4800` doc block) is likewise branch- and
-cwd-agnostic: it keys on `git status --porcelain --untracked-files=all` **inside the
-worktree** plus push outcome, and treats a failing `git status` as dirty (fail-closed).
-Per-run cwd does not weaken it.
+The same disagreement appears at `heartbeat.ts:22530-22543`, which infers ephemeral-ness from
+path **shape** while the engine already persists the flag (**G10**).
+
+### F-5 (G43, P2) — per-run install storm
+
+`provision-worktree.sh` computes a pnpm install fingerprint against the **worktree's own**
+`.paperclip/` and relinks `node_modules` from the base workspace. Per-run directories mean a full
+`pnpm install --prod=false` per run, or a cache keyed by the card instead of the run. Intent
+(a run has working `node_modules`) survives; the mechanism must change.
+
+### What survives intact — stated explicitly, because it bounds the blast radius
+
+- **G05** the destructive-path guard (`wr.ts:4684-4694`) is pure `path.resolve` containment, cwd-agnostic — **exercised against two synthetic cwds, identical verdict, positive control still refuses** (control **A**).
+- **G01** `inspectManagedGitWorktreeBranch` is a pure function of `(path, repoRoot, expectedBranchName)`; it never reads `process.cwd()`.
+- **G09** the pre-dispatch branch gate (`heartbeat.ts:3522-3536`) is handed the run's own realized path and branch — a per-run cwd is exactly what it expects.
+- **G16** codex working-directory containment is **relative** to `PAPERCLIP_WORKSPACE_CWD`, so it tracks the run (control **B-6**, deliberately included as a discriminating counter-example).
+- **G21/G22/G26/G28/G29** every skills-level guard asserts a **branch** or a **repo top level**, both of which are stable across per-run cwds.
+- **G49** DECISION-138's exit assertion runs in the run's own worktree and reads no remembered path. This very card's ledger passed it under a harness-allocated per-card worktree.
 
 ---
 
-## 7. The flag does not flip until
+## 5. The behavioural controls (card gate requirements)
 
-1. **(C′) implemented and tested** — per-run local branch, card branch untouched, named
-   branch (not detached, or DECISION-138 predicate 3 fails fleet-wide).
-2. **A test that proves run *N+1* gets its own directory** while the card branch stays
-   stable. This is the assertion that is missing today and whose absence is why
-   Finding 1 shipped undetected.
-3. **A discovery mechanism for the reaper's rescue refs** — Finding 3. A dirty unpushed
-   run's work must be *recoverable by someone who can find it*, not merely *preserved*.
-   An operator-invoked restore path exists for the workspace-row branch family; a
-   per-run ref needs enumeration to be reachable at all.
-4. **The push-vs-policy change (SPA-9454 item 2) lands WITH the canary**, not before.
-5. **James present for the flip.** `GET /api/instance/settings` is `403` for an agent
-   actor, consistent with "James gated". I will not touch the flag.
+Both controls live in [`docs/audits/checks/`](./checks/) and are **transcriptions of the audited
+source expressions**, not paraphrases, so a reviewer can diff them against `b7743225`.
 
-## 8. Scope statement — this audit is read-only
+| Control | Command | Observed |
+|---|---|---|
+| **A** — tolerant guard, two synthetic cwds | `npx tsx docs/audits/checks/neg-a-tolerant-g05.ts` | `PASS`, exit 0 — identical verdict under both, positive control still refused |
+| **B** — five needs-change guards pre-change | `npx tsx docs/audits/checks/neg-b-needs-change.ts` | `6/6 cases behaved as the audit classified`, exit 0 |
 
-No engine file was modified. The two facts asserted from local reproduction are git's
-own behaviour (`worktree add` branch lock, `--detach`) and were proven in a scratch
-repo under run scratch, not by touching a live checkout. No worktree under
-`/srv/bulk/worktrees` was removed, pruned, or read-modified. The capacity ceiling and
-the flag value are **not** mine (SPA-10299, interaction `2e7c9f76`, pending).
+**Both controls were proved to discriminate.** A control that cannot fail proves nothing, so
+each was mutated and re-run; every mutation inverted the verdict:
+
+| Mutant | Change | Observed |
+|---|---|---|
+| A1 | guard made shape-dependent (per-run refuses, per-card does not) | exit **1** — `ephemeral per-run cwd: expected refuses=false, got refuses=true` |
+| A2 | guard neutered (never refuses) | exit **1** — `positive control did not refuse … the guard is not guarding` |
+| B2 | **the G18 fix applied** (drop `previous?.cwd`) | exit **1** — `B-4/G18 … fallback=null` |
+| B4 | **the G44 fix applied** (GC descends into `runs/`) | exit **1** — `MUTATED: the walk DID reach the ephemeral dir` |
+
+**Two controls caught my own errors, and both corrections are recorded because a ledger that
+only records successes is not a ledger:**
+
+- **B-3 initially failed, and the guard was right.** I had passed the wrong live-run id to the
+  fixture, so the fresh per-run path was not protected and the case looked like a
+  misclassification. The fixture was wrong; the classification was correct.
+- **B-2 initially could not fail.** Its reachability test compared a *path* against *names*, so
+  applying the G44 fix left it green. Rewritten to compare reachability properly, then re-proved
+  with mutant B4.
+- My first attempt at a control (transcribed as `.mjs`) **crashed with a syntax error** — TS type
+  annotations in a `.mjs` file. Recorded because "the control ran" was never true for it.
+
+---
+
+## 6. Classification errors — cases where the classification is wrong
+
+The card says: *"for each guard classified needs change, demonstrate the **pre-change** guard
+fails or misbehaves under the second cwd. If it does not fail, the classification is wrong — say
+so."*
+
+- **B-6 is a classification error I am reporting against myself:** `codex-boundaries.ts` is
+  **TOLERANT**, not needs-change. It is included in the failure control *deliberately*, to prove
+  the control rejects a guard that does not actually break. A control containing only failing
+  cases cannot distinguish "found a bug" from "always fails."
+- **G47** (`check-root-gates-files.sh`, the `GATES.md` root-namespace ban) is **TOLERANT**. I
+  listed it as needs-change on first pass; re-reading showed top-level anchoring is relative to
+  the resolved repo root, which does not move. **Reclassified to TOLERANT** and the row now says
+  so, so the audit is not read as claiming uniform breakage.
+- **G20** is a deliberate cross-listing of G02 so the one-row-per-guard rule is satisfied without
+  leaving either bucket unclassified; it carries no independent verdict.
+
+---
+
+## 7. What must be true before the flag flips
+
+1. **Per-run local branch** (F-1): `ephemeral/<cardSlug>/<runId>`, card branch untouched, named
+   not detached (DECISION-138 predicate 3).
+2. **The provisioning instance id must stop being path-derived** (F-2), or be explicitly exempted
+   with a stated per-run cost. This is the largest unpriced item in the whole audit.
+3. **The GC sweeper must descend into `runs/`** (F-3). Without it the flag's purpose is unmet
+   regardless of 1.
+4. **Discovery for the reaper's rescue refs** — `paperclip/rescue/<runId>/<ts>` is written twice
+   (`wr.ts:1307`, `:5074`) and **nothing in production enumerates it**; an operator restore path
+   exists only for the *workspace-row* branch family (`execution-workspaces.ts:814` →
+   `routes/execution-workspaces.ts:1093`, which renders the ref on the card and wakes the
+   assignee — genuinely better than silent loss, and recorded as such).
+5. **A test that proves run *N+1* gets its own directory** while the card branch stays stable.
+   Its absence is why F-1 shipped undetected.
+6. **The two `previous?.cwd` / "legacy" fallbacks removed** (F-4).
+7. **The skills surfaces re-read under a per-run cwd** — §1/I-3 is the doctrine gap, and no code
+   change fixes a doctrine gap. Rows G23/G30/G48 need their example paths restated; G21/G22/G26/
+   G28/G29 need no change and saying so is as important as saying what does.
+8. **James present for the flip.** The flag is not agent-readable; I will not touch it.
+
+## 8. Scope statement — read-only, and the boundaries held
+
+No engine file, no adapter file, no skill file was modified. The diff is two new documents, two
+new control scripts, and the ledger. No live worktree under `/srv/bulk/worktrees` was removed,
+pruned, or written. The flag, the ceiling script (SPA-10292) and the policy checker (SPA-10293)
+are untouched.
+
+**Findings that need a ruling are filed as their own cards, not decided here:** the
+path-derived instance id (F-2) is an architecture question about what a *card's* instance is,
+and the skills re-read (7.7) is a doctrine change across the fleet. Neither is mine to decide.

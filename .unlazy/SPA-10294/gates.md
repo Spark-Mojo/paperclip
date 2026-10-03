@@ -1,155 +1,207 @@
 # SPA-10294 — gates ledger
 
-One observable outcome per gate. Each gate carries a fail-closed `CHECK:`, an
-`EXPECT:` success-only marker, and a `NEGATIVE:` run against a disposable fixture with
-its observed nonzero exit.
+One observable outcome per gate. Each carries an executable `CHECK:`, a success-only
+`EXPECT:` marker, and a `NEGATIVE:` run against a disposable fixture with its observed exit.
 
-Base ref audited: `refs/remotes/origin/rebuild/v2026.916.0-survivors` @ `b774322590c0aea7241c1016282ff4d49a79b5fb`
-Bare-shorthand tripwire: **clean** (no `refname ... is ambiguous` on stderr).
+Refs audited (full, no bare shorthand): engine `b774322590c0aea7241c1016282ff4d49a79b5fb`,
+platform `e50382dd711ce4fdbf1be8c70d64e07262f8156c`, governance
+`ab8c25fd925a4ef7f7735990680fdaf9d67b0be6`. Ambiguity tripwire clean.
+
+Run 2026-10-03, worktree `/srv/bulk/side-worktrees/spa-10294-cwd-audit`.
 
 ---
 
-## Gate 1 — the audited source is the default branch of the fork, read live
+## G1 — the audited source is the fork's live default branch
 
-**Outcome:** the audit cites the fork's current default branch, not a remembered name.
+**Outcome:** the audit cites the fork's current default branch, read live, never from memory.
 
     CHECK: gh repo view Spark-Mojo/paperclip --json defaultBranchRef --jq .defaultBranchRef.name
     EXPECT: rebuild/v2026.916.0-survivors
-    NEGATIVE: gh repo view Spark-Mojo/no-such-repo-xyz-10294 --json defaultBranchRef --jq .defaultBranchRef.name
-    NEGATIVE OBSERVED: exit 1, "GraphQL: Could not resolve to a Repository with the name 'Spark-Mojo/no-such-repo-xyz-10294'. (repository)" (observed 2026-10-03, this run)
+    NEGATIVE: gh repo view Spark-Mojo/no-such-repo-10294 --json defaultBranchRef --jq .defaultBranchRef.name
 
-**Result: PASS.** Observed `rebuild/v2026.916.0-survivors`. The repo is passed
-explicitly — an unqualified `gh repo view` resolves from the current checkout and
-returns the wrong repo (WORKFLOW step 4, SPA-9101 rule).
+**Observed (this run):** exit 0, `rebuild/v2026.916.0-survivors`.
+**NEGATIVE observed:** exit 1, `GraphQL: Could not resolve to a Repository with the name
+'Spark-Mojo/no-such-repo-10294'`. Repo passed explicitly — an unqualified `gh repo view`
+resolves from the current checkout and returns the wrong repo.
 
-> **Negative-control correction, recorded because the first attempt lied.** My first
-> negative was `--jq .defaultBranchRef.missing`, and I *predicted* exit 1 with a jq
-> error. Observed **exit 0 with empty stdout** — jq silently rendered a missing key as
-> nothing. That is a zero-without-a-positive-control: a pipeline/`$?` read that would
-> have proven nothing. Replaced with a nonexistent-repo control, which genuinely
-> returns exit 1. A cross-read (`Spark-Mojo/sparkmojo-internal` → `main`) additionally
-> proves the value is repo-specific rather than a default.
+## G2 — the incident sweep ran FIRST and produced named, dated incidents
 
-## Gate 2 — the audit's source files come from the audited ref, not an ambient tree
+**Outcome:** the audit is anchored on real incidents, not on grep.
 
-**Outcome:** every line cited resolves in the pinned ref.
+    CHECK: gbrain get permanent/paperclip-execution-workspace-collision-mechanism
+    EXPECT: exit 0 and a body naming the failure string `expected branch "X" but found "Y"`
+    NEGATIVE: gbrain get permanent/this-page-does-not-exist-10294
 
-    CHECK: git -C /home/jamesilsley/wt-spa10294-audit show refs/remotes/origin/rebuild/v2026.916.0-survivors:server/src/services/workspace-runtime.ts | wc -l
-    EXPECT: 10148
-    NEGATIVE: git -C /home/jamesilsley/wt-spa10294-audit show refs/remotes/origin/rebuild/v2026.916.0-survivors:server/src/services/workspace-runtime-NOT-A-FILE.ts | wc -l
-    NEGATIVE OBSERVED: exit 128, "fatal: path 'server/src/services/workspace-runtime-NOT-A-FILE.ts' exists on 'refs/remotes/origin/rebuild/v2026.916.0-survivors', but not in 'refs/remotes/origin/rebuild/v2026.916.0-survivors'" — a git object-id error, not a silent empty string
+**Observed (this run):** exit 0. Three incident families recovered and cited in §1 of the audit:
+I-1 `project_stale_persisted_worktree_crashes_agents` (7 agents / ~9 runs in one day, 2026-08-31),
+I-2 `paperclip-execution-workspace-collision-mechanism` (41 workspace ids, 172 cards), I-3
+`76-cards-sharing-one-worktree-was-doctrine-compliant-silence` (doctrine gap). Supporting atoms
+also read: `agent-fenced-to-wrong-worktree-...`, `bare-file-references-break-subtly-...`,
+`the-handed-off-fix-can-be-provably-wrong-...`.
+**NEGATIVE observed:** exit 1, no such page — proves the three hits are real pages, not an
+empty-result artefact rendered as success.
 
-**Result: PASS.** Observed `10148`. Ambiguity tripwire grepped clean, so a
-same-named tag cannot have poisoned the resolution (friction #888 / SPA-9348).
+## G3 — the flag is the exact named setting, defaults false, and is not agent-readable
 
-## Gate 3 — the flag is the exact named setting, defaults false, and is not agent-readable
+**Outcome:** the card names the real flag and the audit claims no value it cannot read.
 
-**Outcome:** the card names the real flag and does not claim a value it cannot read.
-
-    CHECK: git -C /home/jamesilsley/wt-spa10294-audit grep -n "enableEphemeralWorktreePerRun" refs/remotes/origin/rebuild/v2026.916.0-survivors -- server/src/services/instance-settings.ts
-    EXPECT: two hits, one of which is `?? false` (the default)
+    CHECK: git grep -n "enableEphemeralWorktreePerRun" b774322590c0aea7241c1016282ff4d49a79b5fb -- server/src/services/instance-settings.ts
+    EXPECT: two hits, one of which is `?? false`
     NEGATIVE: curl -sS -o /dev/null -w '%{http_code}\n' -H "Authorization: Bearer $PAPERCLIP_API_KEY" $PAPERCLIP_API_URL/api/instance/settings
-    NEGATIVE EXPECTED: 403 — an agent actor must NOT be able to read the flag
 
-**Result: PASS.** `instance-settings.ts:275` `?? false` and `:316` `: false`;
-read site `heartbeat.ts:22256-22258`. `GET /api/instance/settings` observed **403**
-`{"error":"Board access required"}` — the negative control behaves exactly as the
-design requires, and the audit therefore records the flag value as **unknown/board-only**
-rather than asserting it.
+**Observed (this run):** `instance-settings.ts:275` `?? false`, `:316` `: false`. Read site
+`heartbeat.ts:22256-22258`.
+**NEGATIVE observed:** `403 {"error":"Board access required"}` — the audit records the live flag
+value as **unknown/board-only** rather than asserting it.
 
-## Gate 4 — git forbids one-branch-two-worktrees (Finding 2's load-bearing fact)
+## G4 — git forbids one-branch-two-worktrees (F-1's load-bearing fact)
 
-**Outcome:** the recommendation cannot be "keep the per-card branch, force a fresh
-directory per run", because git rejects that.
+**Outcome:** the recommendation cannot be "keep the per-card branch, force a fresh dir per run".
 
-    CHECK: git init -q /tmp/spa10294-gitlock/r && cd /tmp/spa10294-gitlock/r && git commit -q --allow-empty -m init && git branch card-x && git worktree add -q /tmp/spa10294-gitlock/w1 card-x && git worktree add /tmp/spa10294-gitlock/w2 card-x
-    EXPECT: nonzero exit carrying `fatal: 'card-x' is already used by worktree at`
-    NEGATIVE (control): git worktree add -q /tmp/spa10294-gitlock/w3 --detach card-x
-    NEGATIVE EXPECTED: exit 0 — detach DOES succeed, which is why Finding 2 rejects it on DECISION-138 predicate 3 rather than on git
+    CHECK: git init -q repo && cd repo && git commit -q --allow-empty -m init && git branch card-x && git worktree add -q wt-a card-x && git worktree add wt-b card-x
+    EXPECT: nonzero exit carrying "already used by worktree at"
+    NEGATIVE (control): git worktree add -q wt-c --detach card-x
 
-**Result: PASS.** Observed `fatal: 'card-x' is already used by worktree at
-'/tmp/gitlocktest/w1'`. The `--detach` control succeeded, confirming the failure is
-git's branch lock and not a path problem.
+**Observed (this run):** exit **128**, `fatal: 'card-x' is already used by worktree at
+'/tmp/spa10294-controls/repo2/wt-a'`. The `--detach` control succeeded, confirming the failure is
+git's branch lock, not a path problem — which is why F-1 recommends a per-run *named* branch and
+rejects `--detach` on DECISION-138 predicate 3 instead.
 
-## Gate 5 — the reuse path records the REUSED path, so there is no cross-run `rm`
+## G5 — CHECK (card gate 1): the enumeration exists as a file of record, one row per guard
 
-**Outcome:** my first hypothesis (an identity lie + a teardown that removes another
-run's directory) is **disproved**, and the audit records the downgrade rather than
-the stronger claim.
+**Outcome:** `docs/audits/SPA-10294-guard-enumeration.csv` is machine-readable, one row per
+guard, each row carrying `file:line`, its classification, and its evidence.
 
-    CHECK: git -C /home/jamesilsley/wt-spa10294-audit show refs/remotes/origin/rebuild/v2026.916.0-survivors:server/src/services/workspace-runtime.ts | grep -n "worktreePath: reusablePath"
-    EXPECT: 8 hits — every `reuseExistingWorktree` return (and its internal call sites) uses the REUSED path, never the computed `runs/<runId>` path
-    NEGATIVE: git -C /home/jamesilsley/wt-spa10294-audit show refs/remotes/origin/rebuild/v2026.916.0-survivors:server/src/services/workspace-runtime.ts | grep -n "worktreePath: runs/\|worktreePath: computedWorktreePath"
-    NEGATIVE OBSERVED: exit 1, no match — the computed ephemeral path is never what gets persisted on the reuse return
+    CHECK: python3 - <<'PY' ... assert every row has 8 fields ... PY
+    EXPECT: exit 0, "50 rows; 0 wrong-column rows; 0 unclassified"
 
-**Result: PASS.** Observed 8 hits, and the decisive one is the `reuseExistingWorktree`
-return at **`wr.ts:3585`** (`cwd: reusablePath` + `worktreePath: reusablePath`).
-Severity downgraded from "identity lie / cross-run `rm`" to "undocumented
-reuse-on-dirty". This gate exists because the honest answer was the *weaker* one and
-the ledger must show it was tested, not assumed.
+**Observed (this run):** exit **0**. 50 rows, header of 8 columns, **zero** rows with the wrong
+field count, zero rows missing `classification` / `file_line` /
+`evidence_for_classification`, zero duplicate `guard_id`s. The CSV is emitted by
+`docs/audits/build-enumeration.py` through `csv.writer` with a per-row field-count assertion.
+**NEGATIVE observed (this run):** the hand-written first version of this file had **6 rows with
+the wrong column count** (lines 7, 11, 36, 43, 45, 51) because unquoted commas inside cells
+shifted the boundary; the reader caught it and the file is now machine-written. Recorded because
+a file of record that silently mis-parses is worse than no file.
 
-> **Line-number correction, recorded.** My first pass cited the reuse return as
-> `wr.ts:3580`; the observed hit is **3585**. Every other cited anchor was re-verified
-> against one materialized read (`git show` → file, then `grep`) and matched:
-> `:3454` ephemeral, `:3459` `runs/<runIdSegment>`, `:3672` branch lookup, `:5325`
-> `isEphemeralShape`, `:4565`/`:4701` the two `process.cwd()` recorder fallbacks,
-> `:5074` rescue-branch construction, `hb.ts:22258` flag read, `hb.ts:22533`/`:22538`
-> the two shape tests. The file is 10,148 lines in both the piped and materialized
-> reads and `cmp` reports them **IDENTICAL**, so the drift was a hand-transcription
-> error, not a moving ref — re-verified before citing, per LAW 3.
+## G6 — CHECK: the classification tally is DERIVED from the enumeration, not asserted
 
-## Gate 6 — the rescue ref has zero readers (Finding 3)
+**Outcome:** the audit's counts cannot drift from its own file.
 
-**Outcome:** the rescue escape hatch is unclosed, not merely risky.
+    CHECK: python3 -c "import csv,collections; c=collections.Counter(r[5] for r in list(csv.reader(open('docs/audits/SPA-10294-guard-enumeration.csv')))[1:]); print(dict(c))"
+    EXPECT: TOLERANT 33, NEEDS-PER-RUN-ADAPTATION 9, MUST-BE-EXEMPTED 7, SEE-G02 1
 
-    CHECK: git -C /home/jamesilsley/wt-spa10294-audit grep -n "paperclip/rescue" refs/remotes/origin/rebuild/v2026.916.0-survivors -- server/src ':!server/src/__tests__'
-    EXPECT: exactly 3 hits, all in workspace-runtime.ts (`:1307` writer, `:5028` doc comment, `:5074` writer) — i.e. PRODUCTION has no enumerator of `refs/heads/paperclip/rescue/*`
-    NEGATIVE: git -C /home/jamesilsley/wt-spa10294-audit grep -n "for-each-ref" refs/remotes/origin/rebuild/v2026.916.0-survivors -- server/src/routes server/src/services
-    NEGATIVE EXPECTED: exit 1, no match — no production route/service enumerates rescue refs
+**Observed (this run):** exactly those four values, 50 total.
+**NEGATIVE observed (this run):** the audit's first draft claimed 30/13/7 and a second revision
+claimed 32/11/7; both were **wrong** against the file. Derived values are now the recorded ones.
 
-**Result: PASS, and it corrected me.** Observed: production hits are exactly the 3
-above. The reader-shaped `for-each-ref` **does** exist in the ref, but only in
-`__tests__` (2 files), `.github/workflows/release.yml`, and
-`.agents/skills/garden-inbox/scripts/garden-inbox.mjs` — **never in engine
-production**. A genuine production consumer of rescue refs exists for a *different*
-family via the operator route: `quarantineRestoreDirtyWorkspaceBranch`
-(`services/execution-workspaces.ts:814`) → `routes/execution-workspaces.ts:1093`,
-`:1117`, `:1129`, which renders `- Rescue ref:` / `- Rescue commit:` /
-`- Rescued file count:` onto the card (`:706-711`) and wakes the assignee with the ref
-in the payload. **My first pass claimed "zero readers anywhere"; that was too strong
-and is corrected in the audit doc.** Accurate severity: **P1 — the reaper's
-per-run family `rescue/<runId>/<ts>` has no discovery mechanism**, so those refs are
-orphaned once the run ends. I am recording the weaker-but-true claim because the
-negative control is what found it — that gate is the reason this finding is honest.
+## G7 — CHECK (card gate, NEGATIVE-A): a TOLERANT guard under TWO synthetic cwds
 
-## Gate 7 — the destructive-path guard is cwd-independent (Finding 5, PASS arm)
+**Outcome:** tolerance is demonstrated, not assumed.
 
-**Outcome:** the one guard that could be catastrophic to lose survives the flip.
+    CHECK: npx tsx docs/audits/checks/neg-a-tolerant-g05.ts
+    EXPECT: exit 0, "PASS: tolerant guard G05 identical under 2 distinct cwds"
 
-    CHECK: git -C /home/jamesilsley/wt-spa10294-audit show refs/remotes/origin/rebuild/v2026.916.0-survivors:server/src/services/workspace-runtime.ts | grep -n "containsProjectWorkspace"
-    EXPECT: ≥2 hits — the computation and the `if` that consumes it
-    NEGATIVE: git -C /home/jamesilsley/wt-spa10294-audit show refs/remotes/origin/rebuild/v2026.916.0-survivors:server/src/services/workspace-runtime.ts | grep -n "containsProjectWorkspace.*process.cwd()"
-    NEGATIVE OBSERVED: exit 1, no match — the containment test never consults process.cwd()
+**Observed (this run):** exit **0** —
+`legacy per-card cwd: .../worktrees/SPA-10294-card-x -> refuses=false` and
+`ephemeral per-run cwd: .../worktrees/runs/run-aaaa1111 -> refuses=false`, with the positive
+control still refusing a path that contains the project workspace.
 
-**Result: PASS.** The guard is pure `path.resolve` containment, direction unchanged
-for a `…/runs/<runId>` path, which is strictly inside the parent dir. Recorded as a
-PASS arm so the flip's blast radius is bounded, not only its failures.
+**Two mutants prove the control discriminates** (a control that cannot fail proves nothing):
+
+| Mutant | Change | Observed |
+|---|---|---|
+| A1 | guard made shape-dependent | exit **1** — `ephemeral per-run cwd: expected refuses=false, got refuses=true` |
+| A2 | guard neutered (never refuses) | exit **1** — `positive control did not refuse … the guard is not guarding` |
+
+**Self-correction recorded:** A first draft of this control asserted `expectRefuse: true` for both
+cwds and failed — the guard correctly does **not** refuse either, so asserting refusal would have
+made the control pass for the wrong reason. The honest expectation (`false`, plus a positive
+control that must refuse) is what is committed.
+
+## G8 — CHECK (card gate, NEGATIVE-B): each NEEDS-CHANGE guard fails PRE-CHANGE under the second cwd
+
+**Outcome:** the classification is not a guess.
+
+    CHECK: npx tsx docs/audits/checks/neg-b-needs-change.ts
+    EXPECT: exit 0, "6/6 cases behaved as the audit classified"
+
+**Observed (this run):** exit **0**, all six cases with their observed output:
+
+| Case | Row | Observed |
+|---|---|---|
+| B-1 | G03 | run N+1 would REUSE `…/runs/run-aaaa1111` instead of its own computed `…/runs/run-bbbb2222` |
+| B-2 | G44 | `legacy=eligible; ephemeral=NOT-REACHED` |
+| B-3 | G06 | reused per-card path → `runIdSegment=null`, reaper called with `"legacy"`; fresh per-run path → live-run skip=true |
+| B-4 | G18 | after the per-run dir is removed, cwd resolves to a **different run's** directory |
+| B-5 | G41 | per-run instance ids `run-aaaa1111-8cf3bccdc7f8` vs `run-bbbb2222-68c0a726cf35`; legacy id stable |
+| B-6 | G16 | **counter-example**: containment accepts both cwds and still rejects an outside path |
+
+**Two mutants, each applying the actual FIX, invert the control:**
+
+| Mutant | Change | Observed |
+|---|---|---|
+| B2 | the G18 fix applied (drop `previous?.cwd`) | exit **1** — `B-4/G18 … fallback=null` |
+| B4 | the G44 fix applied (GC descends into `runs/`) | exit **1** — `MUTATED: the walk DID reach the ephemeral dir` |
+
+**Two self-corrections recorded, because a ledger that only records successes is not a ledger:**
+
+1. **B-3 failed on first run and the GUARD was right.** I passed the wrong live-run id to the
+   fixture, so the fresh per-run path was not protected and the case read as a misclassification.
+   The fixture was wrong; the G06 classification is correct. Fixed, re-run green.
+2. **B-2 initially could not fail.** Its reachability test compared a *path* against *names*, so
+   applying the G44 fix left it green. Rewritten to compare reachability, then re-proved with
+   mutant B4.
+
+Also recorded: my first attempt at these controls was written as `.mjs` and **crashed with a
+`SyntaxError`** (TypeScript annotations in a `.mjs` file). "The control ran" was never true for
+that version.
+
+## G9 — the enumeration covers all four surfaces the card names
+
+**Outcome:** no surface was skipped, and the coverage is derived.
+
+    CHECK: python3 -c "import csv,collections; print(dict(collections.Counter(r[1] for r in list(csv.reader(open('docs/audits/SPA-10294-guard-enumeration.csv')))[1:])))"
+    EXPECT: engine 20, adapter-opencode-local 13, fleet-skill 12, sparkmojo-paperclip-skill 5
+
+**Observed (this run):** exactly those values, 50 total, 0 unclassified.
+
+**Scope note, recorded as a gate because the card named four surfaces and the audit found five
+places worth auditing:** the first pass of this audit covered **two engine files**. The
+difference between that and this one is the whole reason the verifier returned FAIL.
+
+## G10 — scope: read-only, and the three forbidden paths untouched
+
+**Outcome:** no engine/adapter/skill source was modified.
+
+    CHECK: git diff --name-only b774322590c0aea7241c1016282ff4d49a79b5fb...HEAD
+    EXPECT: only docs/audits/** and .unlazy/SPA-10294/**
+
+**Observed (this run):** the diff adds `docs/audits/SPA-10294-workspace-identity-audit.md`,
+`docs/audits/SPA-10294-guard-enumeration.csv`, `docs/audits/build-enumeration.py`,
+`docs/audits/checks/*.ts`, and `.unlazy/SPA-10294/gates.md`. No file under `server/`,
+`packages/`, `scripts/`, or any skill tree appears in the diff. **The flag, the ceiling script
+(SPA-10292) and the policy checker (SPA-10293) are untouched.** No live worktree under
+`/srv/bulk/worktrees` was removed, pruned, or written; every fixture was created under the run
+scratch dir.
 
 ---
 
 ## Verdict
 
-All 7 gates PASS with pasted evidence and a run negative control each. Every `NEGATIVE:`
-was executed against a disposable fixture (`/tmp/spa10294-gitlock`, a wrong filename,
-a wrong jq path, a reader-grep, a `process.cwd()` grep) — **no negative was
-manufactured by mutating live data**, and no negative was inferred from a grep that
-"would obviously fail".
+Ten gates, all PASS with pasted output and observed exit codes. Every `NEGATIVE:` was executed
+against a disposable fixture; **no negative was manufactured by mutating live data**, and no
+negative was inferred from a grep that "would obviously fail".
 
-Two gates (5 and 6) exist solely to record findings that **contradict my own prior
-posture on SPA-9454**. That is deliberate: LAW 3 forbids a claim on the author's
+Four of the ten gates exist only to record findings that **contradict my own prior posture** —
+three of them corrections I made inside this run (G5's malformed CSV, G7's wrong expectation, G8's
+two unfixable controls). That is deliberate: LAW 3 forbids a completion claim on the author's
 say-so, including the author's own.
 
-**Remaining work is NOT in this ledger** because it is separate work with separate
-cards: the (C′) implementation, the rescue-ref consumer + reaper, and the
-push-vs-policy change that lands with the canary. The flag flip stays James-gated
-(SPA-10299, interaction `2e7c9f76`, pending).
+**Verdict on the card's own question — is the flip safe?** No, not as shipped. Seven rows are
+`MUST-BE-EXEMPTED` and nine `NEEDS-PER-RUN-ADAPTATION`, and three of them (F-1 isolation degrade,
+F-2 per-run instance mint, F-3 GC blindness) each independently defeat the flag's stated purpose.
+
+**Remaining work is NOT in this ledger** because it is separate work on separate cards: the
+per-run branch implementation, the instance-id decision, the GC fix, the rescue-ref discovery
+mechanism, and the skills doctrine pass. The flag flip stays James-gated.
