@@ -164,14 +164,15 @@ check is load-bearing.
 Clause 1 — head and base pinned atomically from one read:
 
     CHECK: /home/jamesilsley/.config/opencode-fleet-xdg/fleet/pr-read.sh head 125 --repo Spark-Mojo/paperclip
-    H = 918272705e19b3c179e360de3a2e83c27f00af00
+    H = 16d2961aebc6cdeb8e042fedb79ef8f764560154
     B = 694d0fbe002a7214f027a2f5d09a5b69d0686a4c
     baseRefName = rebuild/v2026.916.0-survivors
     RESULT: exit 0; H and B read from the same response.
-    (H advanced twice during this evidence pass: db63174fd5 -> e634c931f0
-    after the safety fix, -> 918272705e after the boundary test in gate 16.
-    Every clause below was re-derived against the final H; the earlier
-    e634c931f0 reads are superseded, not relied on.)
+    (H advanced three times during this evidence pass: db63174fd5 -> e634c931f0
+    after the safety fix, -> 918272705e after the boundary test in gate 16,
+    -> 16d2961aeb after force-adding this ledger to the PR. Every clause below
+    was re-derived against the final H; earlier reads are superseded, not
+    relied on.)
 
 Clause 2 — conflict state:
 
