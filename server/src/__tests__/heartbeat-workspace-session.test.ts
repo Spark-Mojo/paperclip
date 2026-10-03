@@ -9,6 +9,7 @@ import { sessionCodec as codexSessionCodec } from "@paperclipai/adapter-codex-lo
 import { resolveDefaultAgentWorkspaceDir } from "../home-paths.js";
 import {
   applyPersistedExecutionWorkspaceConfig,
+  assertPinnedExecutionWorkspaceMatchesProjectWorkspace,
   assertGitSensitiveAdapterWorkspaceValid,
   assertGitWorktreeBaseWorkspaceReady,
   assertPushCapabilityCheckoutValid,
@@ -23,6 +24,7 @@ import {
   preflightLowTrustWorkspaceIsolation,
   applyProjectWorkspaceDefaultRefToWorktreeStrategy,
   prioritizeProjectWorkspaceCandidatesForRun,
+  requireSelectedProjectWorkspace,
   parseSessionCompactionPolicy,
   provisionExecutionWorkspaceForFreshnessDecision,
   reconcileReusedExecutionWorkspaceProjectWorkspaceId,
@@ -3397,6 +3399,49 @@ describe("formatRuntimeWorkspaceWarningLog", () => {
       stream: "stdout",
       chunk: "[paperclip] Using fallback workspace\n",
     });
+  });
+});
+
+describe("pinned repository selection", () => {
+  it("only materializes the selected registered repository", () => {
+    const rows = [{ id: "platform", repoUrl: "platform" }, { id: "engine", repoUrl: "paperclip" }];
+    expect(requireSelectedProjectWorkspace(rows, "engine")).toEqual([rows[1]]);
+    expect(requireSelectedProjectWorkspace(rows, null)).toEqual(rows);
+    expect(() => requireSelectedProjectWorkspace(rows, "missing")).toThrow(/not available on this project/);
+    expect(() => requireSelectedProjectWorkspace([], "engine")).toThrow(/not available on this project/);
+  });
+
+  it("refuses a previously pinned execution checkout from another project workspace", () => {
+    expect(() => assertPinnedExecutionWorkspaceMatchesProjectWorkspace({
+      selectedProjectWorkspaceId: "engine",
+      requestedExecutionWorkspaceId: "platform-execution",
+      executionWorkspacePreference: "reuse_existing",
+      existingExecutionWorkspace: { id: "platform-execution", projectWorkspaceId: "platform" },
+    })).toThrow(/Clear the issue's executionWorkspaceId and executionWorkspacePreference/);
+  });
+
+  it("refuses a recovered native checkout that conflicts with the selected repository", () => {
+    expect(() => assertPinnedExecutionWorkspaceMatchesProjectWorkspace({
+      selectedProjectWorkspaceId: "engine",
+      requestedExecutionWorkspaceId: "old-native",
+      executionWorkspacePreference: "reuse_existing",
+      existingExecutionWorkspace: { id: "old-native", projectWorkspaceId: "platform" },
+    })).toThrow(/Clear the issue's executionWorkspaceId and executionWorkspacePreference/);
+  });
+
+  it("allows a matching checkout and a cleared pin without changing the old worktree", () => {
+    expect(() => assertPinnedExecutionWorkspaceMatchesProjectWorkspace({
+      selectedProjectWorkspaceId: "engine",
+      requestedExecutionWorkspaceId: "engine-execution",
+      executionWorkspacePreference: "reuse_existing",
+      existingExecutionWorkspace: { id: "engine-execution", projectWorkspaceId: "engine" },
+    })).not.toThrow();
+    expect(() => assertPinnedExecutionWorkspaceMatchesProjectWorkspace({
+      selectedProjectWorkspaceId: "engine",
+      requestedExecutionWorkspaceId: null,
+      executionWorkspacePreference: null,
+      existingExecutionWorkspace: { id: "platform-execution", projectWorkspaceId: "platform" },
+    })).not.toThrow();
   });
 });
 
