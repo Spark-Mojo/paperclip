@@ -4,7 +4,7 @@ run-name: ${{ inputs.channel == 'preview' && format('Stack deploy {0} build', in
 on:
   push:
     branches:
-      - master
+      - rebuild/v2026.916.0-survivors
   schedule:
     # Nightly cut at 09:00 UTC, after the workday's merges have settled.
     - cron: "0 9 * * *"

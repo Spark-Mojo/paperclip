@@ -3,7 +3,7 @@ run-name: Cloud readiness ${{ github.sha }}
 
 on:
   push:
-    branches: [master]
+    branches: [rebuild/v2026.916.0-survivors]
   workflow_dispatch:
 
 permissions: {}
