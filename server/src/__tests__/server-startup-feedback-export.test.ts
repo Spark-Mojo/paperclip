@@ -83,6 +83,7 @@ const {
       issueIds: [],
     })),
     reconcileResolvedDependencyWakes: vi.fn(async () => ({ healed: 0 })),
+    pullIdleAgentTodoIssues: vi.fn(async () => ({ enabled: false, checked: 0, pulled: 0 })),
     reconcileTaskWatchdogs: vi.fn(async () => ({ triggered: 0 })),
     scanSilentActiveRuns: vi.fn(async () => ({ created: 0, escalated: 0 })),
     sweepStaleIssueLocks: vi.fn(async () => ({ cleared: 0 })),
