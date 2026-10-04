@@ -578,6 +578,20 @@ Re-confirmed live this run, not from memory:
 - `autoMergeRequest = null`, `isInMergeQueue = false`, `mergeStateStatus = UNSTABLE`.
 - `reviewThreads totalCount = 0` — no thread to resolve.
 
+## SPA-10520 rebase receipt (2026-10-04)
+
+Rebased the four commits including Dex's ledger correction onto fetched fork default-branch tip `b7a3a892d8add53f1b2e6166fdce6f7d0d6756f4` in a durable side worktree. The original allocated worktree remains on its assigned branch. The binding layer keeps base's `{ references, unresolved }` return shape and `addProse` relative-link detection; the coordination classification tags sources and relaxes only prose-derived, positively open references. An unresolved relative link refuses even with classification.
+
+CHECK: `timeout 900 pnpm --filter @paperclipai/server exec vitest run src/__tests__/issue-done-pr-merged-gate.test.ts`
+EXPECT: exit 0, both coordination and four pre-existing unresolved-link tests pass.
+RESULT: exit 0, `Test Files 1 passed (1); Tests 42 passed (42)` (28 base cases, 13 original coordination cases, one explicit unresolved-with-classification case).
+NEGATIVE: first run with the stale array-shape assertion against the new `{references, unresolved}` contract exited 1: `expected { references: [...], unresolved: [] } to deeply equal [...]`; correcting that assertion makes the same suite pass. The suite's positive case discriminates attached PR (409) versus cited open PR (200); unresolved relative-link case refuses without resolving it.
+
+CHECK: `timeout 900 pnpm --filter @paperclipai/server exec tsc --noEmit`
+RESULT: exit 1, missing-build-dependency baseline (`@paperclipai/plugin-sdk` and `@paperclipai/paperclip-runner` dist absent); no reported diagnostic in the four touched TypeScript files. Not claimed green.
+CHECK: `timeout 900 pnpm --filter @paperclipai/server exec eslint src/services/issue-done-gate.ts src/__tests__/issue-done-pr-merged-gate.test.ts`
+RESULT: exit 1, `Command "eslint" not found`; no lint script assumed to exist.
+
 ### Merge authority is UNRESOLVED and this ledger does not assert it
 
 Whether Dex may perform this merge is a charter/workflow conflict escalated to James

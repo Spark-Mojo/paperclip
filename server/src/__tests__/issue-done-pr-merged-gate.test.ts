@@ -330,6 +330,17 @@ describeEmbeddedPostgres("issue done gate — unmerged PR refuses done (SPA-8957
     expect(await gate.evaluateDoneGate({ id: bare.id, companyId, description: bare.description })).toEqual({ outcome: "allow" });
   });
 
+  it("coordination classification cannot relax an unresolved relative PR route", async () => {
+    const card = await createCard(db, companyId, { description: "PR: [#936](/SPA/pulls/936)" });
+    const gate = issueDoneGateService(db, {
+      resolvePullRequestDetails: async () => { throw new Error("unresolved route must not be resolved"); },
+    });
+    expect(await gate.evaluateDoneGate(
+      { id: card.id, companyId, description: card.description },
+      { coordinationClassification: true },
+    )).toMatchObject({ outcome: "refuse", reason: { kind: "unresolved_pull_request_reference", numbers: [936] } });
+  });
+
   it("an attached PR work product resolves the same-number relative route", async () => {
     const card = await createCard(db, companyId);
     await attachPullRequestWorkProduct(db, card, 936);
@@ -785,9 +796,10 @@ describeEmbeddedPostgres("issue done gate — unmerged PR refuses done (SPA-8957
       companyId,
       description: card.description,
     });
-    expect(bound).toEqual([
-      expect.objectContaining({ source: "work_product" }),
-    ]);
+    expect(bound).toEqual({
+      references: [expect.objectContaining({ source: "work_product" })],
+      unresolved: [],
+    });
     expect(
       await gate.evaluateDoneGate(
         { id: card.id, companyId, description: card.description },
