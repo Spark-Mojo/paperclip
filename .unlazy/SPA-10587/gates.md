@@ -389,3 +389,92 @@ construction; the file-level sha256 list is unchanged. PR run for this head:
 
 Base ref re-read live on this head as well:
 `gh repo view Spark-Mojo/paperclip --json defaultBranchRef` → `rebuild/v2026.916.0-survivors`.
+
+### (5) SPA-9702 clause 4 — the ancestor that DOES carry a bound `policy` run
+
+The verifier correctly refused the CI-only re-classification: `pr-read.sh checks B` has no
+`policy` entry, so step-3 clause 1 ("same check name + same conclusion on `H` and `B`")
+cannot hold on the base itself. Clause 4 permits an ancestor of `B` that carries a bound
+run, and one does exist.
+
+```
+$ gh api repos/Spark-Mojo/paperclip/commits/16d2961aebc6cdeb8e042fedb79ef8f764560154/check-runs \
+    --jq '.check_runs[]|select(.name|test("policy"))|{name,conclusion,status,html_url}'
+{"name":"ci / policy","status":"completed","conclusion":"cancelled",
+ "html_url":"…/actions/runs/37097351510/job/111129960511"}
+
+$ git merge-base --is-ancestor 16d2961aebc6cdeb8e042fedb79ef8f764560154 b7a3a892d…  →  YES
+```
+
+`A = 16d2961aebc6cdeb8e042fedb79ef8f764560154` (`docs(SPA-9437): attach the gates ledger
+to the PR`, 2026-10-03), an ancestor of `B`, and the only commit within `B`'s first-parent
+window whose check-run list contains a `ci / policy` entry. The three other candidate
+ancestors were checked and carry none:
+
+| Commit | `ci / policy` check-run present? |
+|---|---|
+| `694d0fbe…` (PR #125 base) | no — 22 `Release` jobs only |
+| `62bab46c…` (PR #140 base) | no — `total_count` 0 |
+| `05f3a88e…` (PR #136 base) | no — 22 `Release` jobs only |
+| `4f09066bc…`, `20bc87133…`, `e634c931f…` (PR #144 branch commits) | no |
+| **`16d2961ae…`** | **yes** |
+
+Its recorded conclusion is `cancelled`, NOT `failure` — so even taken at face value it does
+not show this check failing on an ancestor. That does not weaken the local reproduction
+below, and the distinction is recorded rather than glossed: the ancestor's run was cancelled
+(its PR was superseded mid-flight), so it anchors the check's EXISTENCE on an ancestor but
+cannot by itself prove the red. The local run against a detached worktree of `A` is what
+supplies the failure signature, and it is identical in kind to the `B` run:
+
+```
+$ git worktree add /srv/bulk/worktrees/SPA-10587-ancestor --detach 16d2961aebc6cdeb8e042fedb79ef8f764560154
+$ git rev-parse HEAD   →  16d2961aebc6cdeb8e042fedb79ef8f764560154
+$ node ./scripts/check-no-git-push.mjs            # on A, exit 1
+server/src/services/workspace-runtime.ts:5097
+server/src/__tests__/workspace-runtime.test.ts:4579
+server/src/__tests__/workspace-runtime.test.ts:4584
+```
+
+Same check name, same script, same three findings, same kind of assertion. Only the line
+NUMBERS shift (5097→5121, 4579→4625, 4584→4630) because unrelated commits landed between
+`A` and `B`; the offending CONTENT is unchanged:
+
+```
+$ git show 16d2961ae…:server/src/services/workspace-runtime.ts | grep -n 'git push origin'
+5097:  const message = … || `git push origin ${input.branchName} failed`;
+$ git show HEAD:server/src/services/workspace-runtime.ts | grep -n 'git push origin'
+5121:  const message = … || `git push origin ${input.branchName} failed`;
+```
+
+```
+$ git show 16d2961ae…:server/src/__tests__/workspace-runtime.test.ts | grep -n 'includes("git push")'
+4579 / 4584
+$ git show HEAD:server/src/__tests__/workspace-runtime.test.ts | grep -n 'includes("git push")'
+4625 / 4630     ← same two lines, same text
+```
+
+And the SCANNER and the WORKFLOW that invokes it are byte-identical across
+ancestor / base / head, so the rule that fires is provably the same rule:
+
+```
+scripts/check-no-git-push.mjs      ancestor=02b21f463019b624  base=02b21f463019b624  head=02b21f463019b624
+.github/workflows/pr-trusted.yml  ancestor=3911f8c7ecbd0142  base=3911f8c7ecbd0142  head=3911f8c7ecbd0142
+```
+
+`workspace-runtime.ts` and its test differ ancestor→base (unrelated SPA-9437 edits), but
+`base == head` for both, which is the comparison SPA-9702 clause 2 actually asks for.
+
+**Conclusion for the verifier.** `ci / policy` is red on `H` because of a `git push` string
+in `server/src/services/workspace-runtime.ts` that (a) predates this card, (b) is identical
+on `A`, `B` and `H`, (c) fires the same scanner that is byte-identical on all three, and
+(d) lives in a file this diff never touches. It is `PRE-EXISTING-BASE-RED`. Its true fix is
+a separate change to `workspace-runtime.ts` (the offending line is an error MESSAGE string
+about a push that the runtime must not perform — PAPA-432 territory), which is out of scope
+here and is filed as a follow-up.
+
+**A hard limit stated, not hidden.** If the verifier's step-3 clause 1 requires a CI-observed
+`failure` conclusion on the anchor and will not accept a local re-run against a detached
+worktree of `A` as clause-1 evidence, then the exemption is unavailable and the honest
+disposition is BLOCKED — not PASS. In that case the resolution is to land the
+`workspace-runtime.ts` fix on the base first and re-verify against a base that carries a
+green `policy` run. That is the correct outcome, not a reason to stretch clause 1.
