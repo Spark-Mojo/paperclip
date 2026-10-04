@@ -234,6 +234,12 @@ import {
   resolvePaperclipRunnerNativeProviderInput,
 } from "./native-runtime/provider-profile.js";
 import {
+  reclaimTerminalEnvironmentLeases as reclaimTerminalEnvironmentLeasesImpl,
+  reclaimTerminalEnvironmentLeasesForRestart as reclaimTerminalEnvironmentLeasesForRestartImpl,
+  installDriverTeardown,
+  installReplacementDispatcher,
+} from "./terminal-environment-leases.js";
+import {
   buildNativeHeartbeatPreparationSpans,
   buildNativeWakeIngressSpan,
   recordFailedSkillPreparation,
@@ -9874,6 +9880,71 @@ export function heartbeatService(
     environmentRuntime,
   });
   const workspaceOperationsSvc = workspaceOperationService(db);
+
+  // SPA-9423: install the lease-subsystem teardown + bounded-replacement
+  // dispatcher so the helper module can drive the existing orchestrator and
+  // scheduler without inverting the dependency. The teardown delegates to
+  // `envOrchestrator.releaseForRun` (the same path every terminal transition
+  // uses) so the native-ownership safeguard in `releaseEnvironmentLeasesForRun`
+  // continues to be the canonical guard on the other side of the wire.
+  installDriverTeardown(async ({ heartbeatRunId, companyId, leaseId }) => {
+    const targetRunId = heartbeatRunId ?? "";
+    if (!targetRunId) {
+      throw new Error(
+        `terminal lease teardown: missing heartbeatRunId for lease ${leaseId}`,
+      );
+    }
+    const run = await getRun(targetRunId);
+    if (!run) {
+      throw new Error(
+        `terminal lease teardown: run ${targetRunId} not found for lease ${leaseId}`,
+      );
+    }
+    // SPA-9423 D3 fix: route through `envOrchestrator.releaseForRun` directly
+    // (not `releaseEnvironmentLeasesForRun`) so per-lease errors surface. The
+    // orchestrator's releaseForRun returns `{ released: [], errors: [] }`; an
+    // empty released set with non-empty errors means the runtime select found
+    // zero rows (lease no longer active) OR every driver's teardown threw. We
+    // throw in either case so the sweep's catch handler stamps cleanupStatus =
+    // failed and the lease stays active for the next sweep tick. The
+    // `isNativeRunnerOwnershipHeld` guard still fires on the live-release path
+    // (called from the four existing terminal-transition sites in heartbeat.ts);
+    // it does NOT need to fire here because the sweep's resolveReclamationOwnerState
+    // already excludes native-owned runs from the candidate set.
+    const release = await envOrchestrator.releaseForRun({
+      heartbeatRunId: targetRunId,
+      companyId,
+      agentId: run.agentId,
+      status: leaseReleaseStatusForRunStatus(run.status),
+      failureReason: run.error ?? undefined,
+    });
+    if (release.released.length === 0) {
+      throw new Error(
+        `terminal lease teardown: runtime released zero leases for run ${targetRunId} (lease ${leaseId})`,
+      );
+    }
+    if (release.errors.length > 0) {
+      const errorMessages = release.errors
+        .map((e) =>
+          e.error instanceof Error ? e.error.message : String(e.error),
+        )
+        .join("; ");
+      throw new Error(
+        `terminal lease teardown: ${release.errors.length} per-lease error(s) for run ${targetRunId}: ${errorMessages}`,
+      );
+    }
+  });
+
+  installReplacementDispatcher(async ({ fromRunId }) => {
+    const run = await getRun(fromRunId);
+    if (!run) return { replacementRunId: null };
+    const agent = await getAgent(run.agentId);
+    if (!agent) return { replacementRunId: null };
+    const replacement = await enqueueProcessLossRetry(run, agent, new Date());
+    return replacement
+      ? { replacementRunId: replacement.id }
+      : { replacementRunId: null };
+  });
   const liveRunExecutions = {
     has(id: string) {
       return runningProcesses.has(id) || activeRunExecutions.has(id);
@@ -19158,6 +19229,33 @@ export function heartbeatService(
       .finally(() => drainRetainedRunnerdMaintenanceOperations());
     activeRunExecutionPromises.add(cleanup);
     void cleanup.finally(() => activeRunExecutionPromises.delete(cleanup));
+  }
+
+  // SPA-9423: terminal-environment-lease reclamation. The helper module owns
+  // the cross-company / ownership-changed / live-owner guards and the driver-
+  // failure isolation; this wrapper only calls it and exposes the outcome.
+  async function reclaimTerminalEnvironmentLeases(opts?: {
+    batchSize?: number;
+  }) {
+    return await reclaimTerminalEnvironmentLeasesImpl({
+      db,
+      batchSize: opts?.batchSize ?? 100,
+    });
+  }
+
+  async function reclaimTerminalEnvironmentLeasesForRestart(opts?: {
+    batchSize?: number;
+    onLeaseReleased?: (event: { runId: string; reason: "restart_reconciliation" }) => void;
+    onReplacementDispatched?: (event: { fromRunId: string; runId: string }) => void;
+  }) {
+    return await reclaimTerminalEnvironmentLeasesForRestartImpl({
+      db,
+      batchSize: opts?.batchSize ?? 100,
+      ...(opts?.onLeaseReleased ? { onLeaseReleased: opts.onLeaseReleased } : {}),
+      ...(opts?.onReplacementDispatched
+        ? { onReplacementDispatched: opts.onReplacementDispatched }
+        : {}),
+    });
   }
 
   async function reapOrphanedRuns(opts?: { staleThresholdMs?: number }) {
@@ -30220,6 +30318,8 @@ export function heartbeatService(
     recoverNativeRunsAfterRestart,
     reapOrphanedRuns,
     sweepPendingCleanupLeases,
+    reclaimTerminalEnvironmentLeases,
+    reclaimTerminalEnvironmentLeasesForRestart,
     // Override-aware scheduling-suppression check (honors the worktree
     // run-execution experimental setting). Callers outside the service that
     // gate on suppression should prefer this over the env-only resolver.
