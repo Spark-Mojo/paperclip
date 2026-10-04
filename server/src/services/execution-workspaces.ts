@@ -4001,7 +4001,216 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
         return cleared;
       });
     },
+
+    /**
+     * SPA-9437: retire an execution workspace whose row is still active but
+     * whose bound project workspace has changed. The board corrected the issue's
+     * `projectWorkspaceId` after its first run realized a worktree against the
+     * OLD repo. Without this retire, the next run deterministically fails
+     * `workspace_validation_failed` because the persisted cwd's `.git` points
+     * into a different repo's `.git/worktrees/` and the validator's
+     * `git worktree list` does not see the path.
+     *
+     * Guarded: refuses to retire when the OLD worktree has uncommitted files
+     * OR a branch tip that diverges from origin — never destroys work without
+     * surfacing a clear reason. The rejection reaches the issue PATCH caller
+     * (board / user) so they can choose to inspect and force the rebind by
+     * hand. A clean worktree whose branch ref is runtime-owned, OR a clean
+     * worktree with no live branch ref (or whose tip is reachable from
+     * `origin/<branch>`), is safely archivable.
+     *
+     * Idempotent on rows whose status is already `archived` / `cleanup_failed`
+     * / has a `closedAt` — those are skipped, not errored.
+     */
+    retireExecutionWorkspaceAfterProjectWorkspaceRebind: async (input: {
+      companyId: string;
+      executionWorkspaceId: string;
+      sourceIssueId: string;
+      reason: string;
+    }): Promise<
+      | { outcome: "retired"; executionWorkspaceId: string; worktreePath: string | null }
+      | { outcome: "skipped_already_closed"; executionWorkspaceId: string }
+      | { outcome: "refused_dirty"; executionWorkspaceId: string; worktreePath: string | null; dirtyReason: string }
+      | { outcome: "refused_unpushed"; executionWorkspaceId: string; worktreePath: string | null; unpushedReason: string }
+      | { outcome: "not_found"; executionWorkspaceId: string }
+    > => {
+      const row = await db
+        .select()
+        .from(executionWorkspaces)
+        .where(and(
+          eq(executionWorkspaces.id, input.executionWorkspaceId),
+          eq(executionWorkspaces.companyId, input.companyId),
+        ))
+        .then((rows) => rows[0] ?? null);
+      if (!row) return { outcome: "not_found", executionWorkspaceId: input.executionWorkspaceId };
+      if (isClosedExecutionWorkspaceStatus(row.status) || row.closedAt) {
+        return { outcome: "skipped_already_closed", executionWorkspaceId: row.id };
+      }
+      const workspace = toExecutionWorkspace(row);
+      const leafPath = readNullableString(row.providerRef) ?? readNullableString(row.cwd);
+      // A missing leaf is already the success state of a previous cleanup
+      // attempt — nothing to inspect, nothing to lose.
+      const leafMissing = row.providerType === "git_worktree" && Boolean(leafPath) && !existsSync(leafPath!);
+      const { git, statusInspectionSucceeded } = await inspectGitCloseReadiness(workspace);
+      if (!statusInspectionSucceeded && !leafMissing) {
+        throw new Error(
+          `Refusing to retire execution workspace ${row.id}: git status could not be inspected. Inspect the worktree at "${leafPath ?? "unknown"}" by hand and retry.`,
+        );
+      }
+      if (git && (git.hasDirtyTrackedFiles || git.hasUntrackedFiles)) {
+        const dirtyReason = [
+          git.hasDirtyTrackedFiles ? `${git.dirtyEntryCount} modified or staged file(s)` : null,
+          git.hasUntrackedFiles ? `${git.untrackedEntryCount} untracked file(s)` : null,
+        ].filter(Boolean).join(", ");
+        return {
+          outcome: "refused_dirty",
+          executionWorkspaceId: row.id,
+          worktreePath: leafPath ?? null,
+          dirtyReason,
+        };
+      }
+      // The worktree is clean. Now check that the branch tip either is
+      // runtime-owned (the engine can recreate it on demand) or already exists
+      // on origin (a future pull can re-attach it without data loss). A clean
+      // worktree whose branch ref has NO live upstream — local refs deleted
+      // AND no `origin/<branch>` — would lose work; refuse.
+      if (row.providerType === "git_worktree" && leafPath && !leafMissing) {
+        const reachable = await assertBranchRefReachableForRetire({
+          repoRoot: git?.repoRoot ?? null,
+          branchName: row.branchName ?? "<detached>",
+          worktreePath: leafPath,
+          branchCreatedByRuntime: git?.createdByRuntime ?? false,
+        });
+        if (!reachable.reachable) {
+          return {
+            outcome: "refused_unpushed",
+            executionWorkspaceId: row.id,
+            worktreePath: leafPath ?? null,
+            unpushedReason: reachable.reason,
+          };
+        }
+      }
+      const retired = await archiveWorkspaceForRebind(db, input, row);
+      return {
+        outcome: "retired",
+        executionWorkspaceId: row.id,
+        worktreePath: leafPath ?? null,
+        ...(retired.detachedIssue ? { detachedIssue: true as const } : {}),
+      };
+    },
+
+    /**
+     * SPA-9437: a clean worktree is safe to retire only when its branch tip
+     * is recoverable. "Recoverable" means EITHER the engine can recreate the
+     * branch on demand (runtime-owned), OR the branch ref still exists on
+     * origin and a future restore-from-origin path would re-attach the same
+     * tip. A worktree whose branch ref has no live upstream — deleted locally
+     * AND no `origin/<branch>` — would lose work on retire; that case
+     * refuses.
+     */
+    assertBranchRefReachableForRetire: (
+      input: {
+        repoRoot: string | null;
+        branchName: string;
+        worktreePath: string;
+        branchCreatedByRuntime: boolean;
+      },
+    ) => assertBranchRefReachableForRetire(input),
   };
+}
+
+/**
+ * SPA-9437: a clean worktree is safe to retire only when its branch tip is
+ * recoverable. See `executionWorkspaceService(...).assertBranchRefReachableForRetire`
+ * for the contract; this implementation must remain a private helper because
+ * it reads git refs synchronously through the shared `readGitStdout`.
+ */
+async function assertBranchRefReachableForRetire(input: {
+  repoRoot: string | null;
+  branchName: string;
+  worktreePath: string;
+  branchCreatedByRuntime: boolean;
+}): Promise<{ reachable: true } | { reachable: false; reason: string }> {
+  try {
+    const commits = await readGitStdout(["rev-list", "--count", "HEAD", "--not", "--remotes=origin"], input.worktreePath);
+    if (commits === "0") return { reachable: true };
+  } catch {
+    return { reachable: false, reason: `Could not verify that the worktree at "${input.worktreePath}" is reachable from origin.` };
+  }
+  return {
+    reachable: false,
+    reason: `Branch "${input.branchName}" has commits not reachable from origin. Push the branch before rebinding the card.`,
+  };
+}
+
+/**
+ * SPA-9437: archive a single execution workspace after the bound issue's
+ * project workspace has changed. Run under the lifecycle lock and on the
+ * live row, so a concurrent reopen raises the generation and wins.
+ * `sourceIssueId` (optional) clears `issue.executionWorkspaceId` so the
+ * next run's allocator refuses the reuse binding (status=archived,
+ * SPA-7090) and provisions a fresh workspace against the new project
+ * workspace. The transaction's row predicate mirrors the reaper's archive
+ * statement: only the snapshot generation may move to `archived`, only
+ * when the row is in the live set, and only while `closedAt` is null.
+ */
+async function archiveWorkspaceForRebind(
+  db: Db,
+  input: {
+    companyId: string;
+    executionWorkspaceId: string;
+    sourceIssueId: string;
+    reason: string;
+  },
+  row: ExecutionWorkspaceRow,
+): Promise<{ detachedIssue: boolean }> {
+  const snapshotGeneration = readExecutionWorkspaceLifecycleGeneration(
+    row.metadata as Record<string, unknown> | null,
+  );
+  const archivedMetadata = bumpExecutionWorkspaceLifecycleGeneration(
+    row.metadata as Record<string, unknown> | null,
+  );
+  return db.transaction(async (tx: Parameters<Parameters<Db["transaction"]>[0]>[0]) => {
+    await acquireExecutionWorkspaceLifecycleLock(tx, row.id);
+    const archived = await tx
+      .update(executionWorkspaces)
+      .set({
+        status: "archived",
+        closedAt: new Date(),
+        cleanupEligibleAt: new Date(),
+        cleanupReason: `project_workspace_rebind: ${input.reason}`,
+        metadata: archivedMetadata,
+        updatedAt: new Date(),
+      })
+      .where(and(
+        eq(executionWorkspaces.id, row.id),
+        eq(executionWorkspaces.companyId, row.companyId),
+        inArray(executionWorkspaces.status, ["active", "idle", "in_review"]),
+        isNull(executionWorkspaces.closedAt),
+        sql<boolean>`COALESCE((${executionWorkspaces.metadata} ->> ${EXECUTION_WORKSPACE_LIFECYCLE_GENERATION_METADATA_KEY}::text)::int, 0) = ${snapshotGeneration}`,
+      ))
+      .returning()
+      .then((rows: Array<ExecutionWorkspaceRow>) => rows[0] ?? null);
+    if (!archived) return { detachedIssue: false };
+    // Clear the issue's binding so the next run's allocator refuses the
+    // reuse request (status=archived, SPA-7090) and provisions a fresh
+    // workspace bound to the new project workspace.
+    let detachedIssue = false;
+    if (input.sourceIssueId) {
+      const updated = await tx
+        .update(issues)
+        .set({ executionWorkspaceId: null, updatedAt: new Date() })
+        .where(and(
+          eq(issues.id, input.sourceIssueId),
+          eq(issues.companyId, row.companyId),
+          eq(issues.executionWorkspaceId, row.id),
+        ))
+        .returning({ id: issues.id })
+        .then((rows: Array<{ id: string }>) => rows[0] ?? null);
+      detachedIssue = Boolean(updated);
+    }
+    return { detachedIssue };
+  });
 }
 
 export { toExecutionWorkspace };

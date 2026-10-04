@@ -99,6 +99,8 @@ import {
   type RoutineRevisionSnapshotV1,
   type RunLivenessState,
   type SourceTrustMetadata,
+  type FleetMaxConcurrentRunsSource,
+  type FleetMaxConcurrentRunsStatus,
 } from "@paperclipai/shared";
 import {
   agents,
@@ -655,17 +657,30 @@ const HEARTBEAT_MAX_CONCURRENT_RUNS_MAX = 50;
 // Fleet-wide ceiling on concurrently RUNNING agent runs for the whole instance
 // (ported from upstream paperclipai/paperclip#13621).
 //
-// OFF unless the operator sets PAPERCLIP_MAX_CONCURRENT_AGENT_RUNS. With it
-// unset, run admission is exactly the per-agent behaviour: no fleet count, no
-// fleet lock, no ordering change. `heartbeat.maxConcurrentRuns` is per agent, so
-// with N agents at a per-agent cap of 1 the instance can still run N at once;
-// this knob bounds the instance on a constrained host. Clamped to 1..50 when
-// set; unparseable values mean "no ceiling".
+// OFF unless a ceiling is configured. With none configured, run admission is
+// exactly the per-agent behaviour: no fleet count, no fleet lock, no ordering
+// change. `heartbeat.maxConcurrentRuns` is per agent, so with N agents at a
+// per-agent cap of 1 the instance can still run N at once; this knob bounds
+// the instance on a constrained host. Clamped to 1..50 when set; unparseable
+// values mean "no ceiling" (for the env var — see resolveFleetMaxConcurrentRuns
+// for the DB value, which never falls back to "no ceiling" on a bad write).
+//
+// SPA-10137: the ceiling is a live, DB-backed instance setting
+// (`InstanceGeneralSettings.fleetMaxConcurrentRuns`), read with a short
+// in-process cache (see `fleetMaxConcurrentRunsCache` below) and invalidated
+// immediately on write (`invalidateFleetMaxConcurrentRunsCache`). The env var
+// below is now consulted ONLY as the boot-time default when no DB value is
+// set — see `resolveFleetMaxConcurrentRuns` for the precedence: DB, then env,
+// then no ceiling. Raising the cap (or removing it) triggers an admission
+// pass immediately (see the instance-settings route); lowering it never kills
+// a running run, it only withholds new admissions until the count falls back
+// under the new ceiling.
 const HEARTBEAT_FLEET_MAX_CONCURRENT_RUNS_MIN = 1;
 const HEARTBEAT_FLEET_MAX_CONCURRENT_RUNS_MAX = 50;
 
-/** No ceiling. The fleet term is skipped unless the operator opts in. */
+/** No ceiling. The fleet term is skipped unless an operator opts in. */
 export const FLEET_MAX_CONCURRENT_RUNS_DEFAULT: number | null = null;
+// Boot-time default only once a DB value exists (see module comment above).
 export const FLEET_MAX_CONCURRENT_RUNS_ENV_VAR =
   "PAPERCLIP_MAX_CONCURRENT_AGENT_RUNS";
 
@@ -694,13 +709,100 @@ function readFiniteNumber(value: unknown): number | null {
   return null;
 }
 
+function clampFleetMaxConcurrentRuns(value: number): number {
+  return Math.max(
+    HEARTBEAT_FLEET_MAX_CONCURRENT_RUNS_MIN,
+    Math.min(HEARTBEAT_FLEET_MAX_CONCURRENT_RUNS_MAX, Math.floor(value)),
+  );
+}
+
 export function normalizeFleetMaxConcurrentRuns(value: unknown): number | null {
   const parsed = readFiniteNumber(value);
   if (parsed === null) return FLEET_MAX_CONCURRENT_RUNS_DEFAULT;
-  return Math.max(
-    HEARTBEAT_FLEET_MAX_CONCURRENT_RUNS_MIN,
-    Math.min(HEARTBEAT_FLEET_MAX_CONCURRENT_RUNS_MAX, Math.floor(parsed)),
-  );
+  return clampFleetMaxConcurrentRuns(parsed);
+}
+
+/**
+ * Resolve the effective fleet-wide run ceiling from the DB-stored override and
+ * the env var, in that precedence order (SPA-10137).
+ *
+ * - `dbValue === undefined` -- not configured in the DB; fall through to the
+ *   env var.
+ * - `dbValue === null` -- an explicit DB "no ceiling" override. Wins over the
+ *   env var even if the env var is set, because it is a deliberate choice.
+ * - `dbValue` parses to a finite number -- clamped 1..50, wins over the env
+ *   var.
+ * - `dbValue` is anything else (a string, object, boolean, NaN, ...) -- an
+ *   unparseable/malformed DB value. This must never be silently read as "no
+ *   ceiling": fall through to the env var exactly as if the DB value were
+ *   absent. (In practice the write path validates the value with
+ *   `patchFleetMaxConcurrentRunsSchema` before it ever reaches storage, so
+ *   this branch only matters for a row edited outside the API — e.g. a
+ *   restore or a manual DB edit.)
+ *
+ * The env var itself keeps its existing "unparseable/unset -> no ceiling"
+ * behaviour (see `normalizeFleetMaxConcurrentRuns`); that is a long-standing,
+ * intentional default, not the write-safety concern this function guards.
+ */
+export function resolveFleetMaxConcurrentRuns(input: {
+  dbValue: unknown;
+  envValue: unknown;
+}): FleetMaxConcurrentRunsStatus {
+  if (input.dbValue !== undefined) {
+    if (input.dbValue === null) {
+      return { value: null, source: "db" };
+    }
+    const parsedDb = readFiniteNumber(input.dbValue);
+    if (parsedDb !== null) {
+      return { value: clampFleetMaxConcurrentRuns(parsedDb), source: "db" };
+    }
+    // Fall through: an unparseable DB value is treated as not-configured,
+    // never as an explicit "no ceiling".
+  }
+  const parsedEnv = readFiniteNumber(input.envValue);
+  if (parsedEnv !== null) {
+    return { value: clampFleetMaxConcurrentRuns(parsedEnv), source: "env" };
+  }
+  return { value: null, source: "none" };
+}
+
+// Module-scope cache for the resolved fleet cap (shared across every
+// heartbeatService() instance, like taskDrainState above) — a route handler
+// and the scheduler loop each construct their own heartbeatService(db), so a
+// cache living inside that factory's closure would not see the other's
+// writes. Keyed by the raw env value at cache time (not just a TTL) so a
+// caller that deliberately runs with a different env value (tests construct
+// several heartbeatService() instances against one DB with different
+// PAPERCLIP_MAX_CONCURRENT_AGENT_RUNS values to exercise different ceilings)
+// always gets a value computed for ITS env, never a stale one left behind by
+// a different instance. In production one process has one env value for its
+// whole lifetime, so this key never changes there.
+const FLEET_MAX_CONCURRENT_RUNS_CACHE_TTL_MS = 5_000;
+interface FleetMaxConcurrentRunsCacheEntry {
+  envRawValue: string | undefined;
+  resolved: FleetMaxConcurrentRunsStatus;
+  expiresAt: number;
+}
+let fleetMaxConcurrentRunsCache: FleetMaxConcurrentRunsCacheEntry | null = null;
+// Bumped by invalidateFleetMaxConcurrentRunsCache(). A cache-miss read spans
+// an `await`, so an invalidation can land while a read is already in flight:
+// without this guard, a pre-write read that started before a PATCH's
+// invalidate+write could still complete AFTER the PATCH's own post-write read
+// populates the cache, overwriting the fresh value with the stale one for
+// another full TTL window. Capturing the generation before the read and only
+// publishing if it is unchanged makes a read that was invalidated out from
+// under it a no-op instead of a stale write (Mira review, PR #140).
+let fleetMaxConcurrentRunsCacheGeneration = 0;
+
+/**
+ * Invalidate the fleet-cap cache immediately. Call this right after any
+ * write to `InstanceGeneralSettings.fleetMaxConcurrentRuns` so the next
+ * admission check (and the next settings read) sees the new value instead of
+ * waiting out the cache TTL.
+ */
+export function invalidateFleetMaxConcurrentRunsCache(): void {
+  fleetMaxConcurrentRunsCache = null;
+  fleetMaxConcurrentRunsCacheGeneration += 1;
 }
 
 export function normalizeFleetRunLivenessWindowMs(value: unknown): number {
@@ -17305,10 +17407,45 @@ export function heartbeatService(
     return Number(count ?? 0);
   }
 
-  function fleetMaxConcurrentRuns() {
-    return normalizeFleetMaxConcurrentRuns(
-      runtimeEnv[FLEET_MAX_CONCURRENT_RUNS_ENV_VAR],
-    );
+  // Resolve + cache the effective fleet cap (DB, then env, then none; see
+  // resolveFleetMaxConcurrentRuns). Cached for up to
+  // FLEET_MAX_CONCURRENT_RUNS_CACHE_TTL_MS so admission does not round-trip
+  // the DB on every claim, and invalidated immediately on a settings write
+  // (see invalidateFleetMaxConcurrentRunsCache, called from the instance-
+  // settings route).
+  async function getFleetMaxConcurrentRunsStatus(): Promise<FleetMaxConcurrentRunsStatus> {
+    const envRawValue = runtimeEnv[FLEET_MAX_CONCURRENT_RUNS_ENV_VAR];
+    const now = Date.now();
+    if (
+      fleetMaxConcurrentRunsCache
+      && fleetMaxConcurrentRunsCache.envRawValue === envRawValue
+      && fleetMaxConcurrentRunsCache.expiresAt > now
+    ) {
+      return fleetMaxConcurrentRunsCache.resolved;
+    }
+    // Capture the generation before the read, which spans an await: if an
+    // invalidation lands while this read is in flight (a concurrent PATCH),
+    // publishing below would overwrite that PATCH's fresh post-write cache
+    // entry with this now-stale value. Skip the write when the generation
+    // moved instead (Mira review, PR #140).
+    const generation = fleetMaxConcurrentRunsCacheGeneration;
+    const general = await instanceSettings.getGeneral();
+    const resolved = resolveFleetMaxConcurrentRuns({
+      dbValue: general.fleetMaxConcurrentRuns,
+      envValue: envRawValue,
+    });
+    if (generation === fleetMaxConcurrentRunsCacheGeneration) {
+      fleetMaxConcurrentRunsCache = {
+        envRawValue,
+        resolved,
+        expiresAt: Date.now() + FLEET_MAX_CONCURRENT_RUNS_CACHE_TTL_MS,
+      };
+    }
+    return resolved;
+  }
+
+  async function fleetMaxConcurrentRuns(): Promise<number | null> {
+    return (await getFleetMaxConcurrentRunsStatus()).value;
   }
 
   // Fleet-wide counterpart of countRunningRunsForAgent: running runs across the
@@ -19684,7 +19821,7 @@ export function heartbeatService(
     // could starve. Without a ceiling every agent is admitted anyway, so the
     // query is left exactly as before.
     const queuedRuns =
-      fleetMaxConcurrentRuns() === null
+      (await fleetMaxConcurrentRuns()) === null
         ? await queuedRunsQuery
         : await queuedRunsQuery.orderBy(
             asc(heartbeatRuns.createdAt),
@@ -20015,7 +20152,7 @@ export function heartbeatService(
 
     // Read once per admission; null (the default) keeps admission exactly as
     // before: per-agent cap only, no fleet count, no fleet lock.
-    const fleetCeiling = fleetMaxConcurrentRuns();
+    const fleetCeiling = await fleetMaxConcurrentRuns();
     if (fleetCeiling === null) {
       return startNextQueuedRunForAgentUnderLocks(agentId, null, null);
     }
@@ -30144,6 +30281,12 @@ export function heartbeatService(
     retryScheduledRetryNow,
 
     resumeQueuedRuns,
+
+    // SPA-10137: live fleet-cap read + the matching cache invalidation. The
+    // instance-settings route calls these so a cap write takes effect
+    // immediately instead of waiting out the cache TTL.
+    getFleetMaxConcurrentRunsStatus,
+    invalidateFleetMaxConcurrentRunsCache,
 
     scheduleBoundedRetry: async (
       runId: string,
