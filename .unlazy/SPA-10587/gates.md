@@ -317,3 +317,75 @@ produces a red is byte-identical to base, and the only test file the diff modifi
 claimed as base-reproduced here. It is left for the verifier to classify on its own
 evidence, and if it proves head-only it refuses. Recording it as exempt without
 evidence would be exactly the falsification SPA-9702 exists to prevent.
+
+### (2b) Correction: `ci / e2e` and `ci / verify` are transitive, not independent
+
+The table above listed `ci / e2e` with no extracted signature. It is not a separate
+finding — both aggregate jobs are **derived entirely** from the lane jobs already
+exempted above, so their base reproduction follows by construction rather than needing
+its own local run.
+
+`.github/workflows/pr-trusted.yml` (byte-identical on base and head):
+
+```yaml
+  e2e:
+    # Preserve the legacy required-check name while the specs run sharded
+    name: e2e
+    if: ${{ always() }}
+    needs: [gate, policy, e2e_shards]
+    steps:
+      - name: Fail if any e2e shard failed
+        env:
+          POLICY_RESULT: ${{ needs.policy.result }}
+          E2E_SHARDS_RESULT: ${{ needs.e2e_shards.result }}
+        run: |
+          test "$POLICY_RESULT" = "success"
+          case "$FULL_CI" in
+            true) test "$E2E_SHARDS_RESULT" = "success" ;;
+            false) test "$E2E_SHARDS_RESULT" = "skipped" ;;
+```
+
+Observed on the head's run `37189641576`:
+
+- `ci / e2e shard (1/8)` … `(8/8)` — **all 8 `conclusion: success`**.
+  The e2e specs are green on the head; nothing in this diff breaks them.
+- `ci / e2e` fails at its only step with `exit 1` and no test output, and its
+  failing line is `test "$POLICY_RESULT" = "success"` — it is red purely because the
+  `policy` job it depends on is red.
+
+`ci / verify` is the same shape one level up (`Fail if any split verify lane failed`,
+`needs: […, verify_lanes]`): the three `Verify serialized server suites (5/9|6/9|7/9)`
+lanes it aggregates are the base-reproduced test failures enumerated in (3), and the
+`gate`/`policy` inputs carry the same `check-no-git-push.mjs` finding.
+
+So the exempt set on the head is exactly:
+
+```
+check-no-git-push.mjs policy violation            (base-reproduced, identical locations)
+4 test cases in 4 files asserting agent_root_issue_requires_project / fleet-max-concurrent-runs
+                                                    (base-reproduced, identical signatures)
++ ci/verify, ci/e2e                                (pure aggregates of the above)
+```
+
+and nothing else is red. The e2e specs themselves pass on the head.
+
+### (4) Re-established for the new head `6a6c263e778eebcfb50d2125d55693ebf0b6af57`
+
+The base-reproduction above was measured on `d09f1e61`. A docs-only commit
+(`.unlazy/SPA-10587/gates.md`) then landed at `6a6c263e7`, so the head advanced and the
+evidence is re-pinned to it. `6a6c263e7` touches no file under `server/`, `packages/`,
+`scripts/` or `.github/`, so every identical-hash claim in (3b) still holds by
+construction; the file-level sha256 list is unchanged. PR run for this head:
+`37191448578`.
+
+`pr-read.sh head 144` on the new head:
+
+```
+{"baseRefName":"rebuild/v2026.916.0-survivors",
+ "baseRefOid":"b7a3a892d8add53f1b2e6166fdce6f7d0d6756f4",
+ "headRefOid":"6a6c263e778eebcfb50d2125d55693ebf0b6af57",
+ "url":"https://github.com/Spark-Mojo/paperclip/pull/144"}
+```
+
+Base ref re-read live on this head as well:
+`gh repo view Spark-Mojo/paperclip --json defaultBranchRef` → `rebuild/v2026.916.0-survivors`.
