@@ -709,6 +709,23 @@ export const IDLE_TODO_PULL_WAKE_REASON = "idle_todo_pull";
 export const IDLE_TODO_PULL_IDEMPOTENCY_PREFIX = `${IDLE_TODO_PULL_WAKE_REASON}:`;
 const IDLE_TODO_PULL_CANDIDATE_LIMIT = 500;
 
+// SPA-10513 slice 2 revert switch. The cross-agent queued-run sweep admits by
+// card priority, then by queue age, so a flood of releases cannot hold a slot
+// ahead of critical work. Setting this var to `fifo` restores the previous
+// oldest-ticket-first sweep ordering for the whole instance. The per-agent
+// ordering inside startNextQueuedRunForAgentUnderLocks (continuation readiness,
+// then priority, then age) is not affected by either ordering. Any other value,
+// including unset, keeps priority ordering: only an explicit recognized value
+// reverts, so a typo cannot silently change admission order. No schema change,
+// no restart: the var is read per sweep through this service's runtimeEnv.
+export const QUEUED_RUN_PRIORITY_ORDER_ENV_VAR = "PAPERCLIP_QUEUED_RUN_ORDER";
+
+export function isQueuedRunPriorityOrderEnabled(raw: string | undefined): boolean {
+  const normalized = (typeof raw === "string" ? raw : "").trim().toLowerCase();
+  if (normalized === "") return true;
+  return normalized !== "fifo";
+}
+
 // Env values always arrive as strings, which `asNumber` treats as absent.
 // Parse both shapes here.
 function readFiniteNumber(value: unknown): number | null {
@@ -9920,6 +9937,8 @@ export function heartbeatService(
   };
   const resolveIdleTodoPullGate = () =>
     resolveIdleTodoPullCanary(runtimeEnv[IDLE_TODO_PULL_ENV_VAR]);
+  const queuedRunPriorityOrderEnabled = () =>
+    isQueuedRunPriorityOrderEnabled(runtimeEnv[QUEUED_RUN_PRIORITY_ORDER_ENV_VAR]);
 
   const runLogStore = getRunLogStore();
   const traceStore = providerTraceStore(db);
@@ -19860,9 +19879,16 @@ export function heartbeatService(
     }
 
     const queuedRunsQuery = db
-      .select({ agentId: heartbeatRuns.agentId })
+      .select({ agentId: heartbeatRuns.agentId, createdAt: heartbeatRuns.createdAt, id: heartbeatRuns.id, issuePriority: issues.priority })
       .from(heartbeatRuns)
       .innerJoin(companies, eq(companies.id, heartbeatRuns.companyId))
+      .leftJoin(
+        issues,
+        and(
+          eq(issues.companyId, heartbeatRuns.companyId),
+          sql`${issues.id}::text = ${heartbeatRuns.contextSnapshot}->>'issueId'`,
+        ),
+      )
       .where(
         and(
           eq(heartbeatRuns.status, "queued"),
@@ -19870,20 +19896,50 @@ export function heartbeatService(
           cutoff ? gte(heartbeatRuns.createdAt, cutoff) : undefined,
         ),
       );
-    // With a fleet ceiling the sweep decides which waiting ticket gets a freed
-    // slot, so visit agents oldest-ticket first; otherwise agents that sort late
-    // could starve. Without a ceiling every agent is admitted anyway, so the
-    // query is left exactly as before.
-    const queuedRuns =
-      (await fleetMaxConcurrentRuns()) === null
-        ? await queuedRunsQuery
-        : await queuedRunsQuery.orderBy(
-            asc(heartbeatRuns.createdAt),
-            asc(heartbeatRuns.id),
-          );
+    const queuedRuns = await queuedRunsQuery;
+    // The sweep, not the per-agent admission, decides which waiting ticket gets
+    // a freed slot, so it orders every queued ticket in the instance: critical
+    // before high before medium before low, then oldest first inside a priority
+    // band. Without that a flood of releases can hold every slot ahead of
+    // critical work. Each agent is then admitted in turn from that one shared
+    // order, so the first slot freed goes to the highest-priority pending
+    // ticket rather than to whichever agent sorted first.
+    //
+    // Both orderings read the same rows through one query shape: an agent with
+    // several queued tickets must appear once per ticket, not once, or it would
+    // be admitted at most once per sweep and a slot could be withheld from an
+    // idle agent.
+    //
+    // Left join: a ticket whose card is missing (deleted issue, or a snapshot
+    // issueId from another company) sorts last, exactly like an unknown
+    // priority in the per-agent order, instead of dropping out of the sweep.
+    //
+    // Reversible to the previous oldest-ticket-first sweep by
+    // QUEUED_RUN_PRIORITY_ORDER_ENV_VAR=fifo. Without a ceiling every agent is
+    // admitted anyway, so the ordering cannot change what runs; the query is
+    // read unbounded exactly as before, which keeps a long waiting backlog fully
+    // visible instead of truncating it.
+    const orderedAgentIds = [
+      ...new Set(
+        [...queuedRuns]
+          .sort((left, right) => {
+            const byAge = left.createdAt.getTime() - right.createdAt.getTime();
+            if (!queuedRunPriorityOrderEnabled()) {
+              if (byAge !== 0) return byAge;
+              return left.id < right.id ? -1 : left.id > right.id ? 1 : 0;
+            }
+            const byPriorityRank =
+              issueRunPriorityRank(left.issuePriority) -
+              issueRunPriorityRank(right.issuePriority);
+            if (byPriorityRank !== 0) return byPriorityRank;
+            if (byAge !== 0) return byAge;
+            return left.id < right.id ? -1 : left.id > right.id ? 1 : 0;
+          })
+          .map(({ agentId }) => agentId),
+      ),
+    ];
 
-    const agentIds = [...new Set(queuedRuns.map((r) => r.agentId))];
-    for (const agentId of agentIds) {
+    for (const agentId of orderedAgentIds) {
       await startNextQueuedRunForAgent(agentId);
     }
   }
