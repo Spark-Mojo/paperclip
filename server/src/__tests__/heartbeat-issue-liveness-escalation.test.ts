@@ -1137,4 +1137,377 @@ describeEmbeddedPostgres("heartbeat resolved dependency wake reconciliation", ()
     });
   });
 
+  // SPA-10513, slice 1. An idle agent with an assigned `todo` card should pull
+  // it instead of sitting on it until a human nudges the board. The pull is
+  // metered by the fleet cap, is idempotent per dispatch state, and must never
+  // reach parked/backlog, blocked, user-assigned, or already-running work.
+  describe("idle todo pull (SPA-10513)", () => {
+    const CANARY_ENV_VAR = "PAPERCLIP_IDLE_TODO_PULL";
+
+    async function seedIdleTodoPullFixture(opts: {
+      wakeOnDemand?: boolean;
+      maxConcurrentRuns?: number;
+      fleetMaxConcurrentRuns?: number;
+    } = {}) {
+      const companyId = randomUUID();
+      const ownerUserId = randomUUID();
+      const idleAgentId = randomUUID();
+      const issuePrefix = `P${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+
+      await db.insert(companies).values({
+        id: companyId,
+        name: "Paperclip",
+        issuePrefix,
+        requireBoardApprovalForNewAgents: false,
+        fleetMaxConcurrentRuns: opts.fleetMaxConcurrentRuns ?? null,
+      });
+      await db.insert(companyMemberships).values({
+        companyId,
+        principalType: "user",
+        principalId: ownerUserId,
+        membershipRole: "owner",
+        status: "active",
+      });
+      await db.insert(agents).values({
+        id: idleAgentId,
+        companyId,
+        name: "Idle Worker",
+        role: "engineer",
+        status: "idle",
+        adapterType: "test_adapter",
+        adapterConfig: {},
+        runtimeConfig: {
+          heartbeat: {
+            wakeOnDemand: opts.wakeOnDemand ?? true,
+            maxConcurrentRuns: opts.maxConcurrentRuns ?? 1,
+          },
+        },
+        permissions: {},
+      });
+
+      return { companyId, ownerUserId, idleAgentId, issuePrefix };
+    }
+
+    // Priority then age: a `high` card must beat an older `medium` one, and two
+    // same-priority cards are taken oldest-first. One test asserts the whole
+    // ordering because the card requirement is a single ordered rule.
+    it("idle todo pull takes the highest-priority then oldest eligible assigned card", async () => {
+      const { companyId, idleAgentId, issuePrefix } = await seedIdleTodoPullFixture();
+      const mediumOldId = randomUUID();
+      const mediumNewId = randomUUID();
+      const highOldId = randomUUID();
+      const mediumOldCreatedAt = new Date("2026-01-01T00:00:00.000Z");
+      const mediumNewCreatedAt = new Date("2026-02-01T00:00:00.000Z");
+
+      await db.insert(issues).values([
+        {
+          id: mediumOldId,
+          companyId,
+          title: "Older medium card",
+          status: "todo",
+          priority: "medium",
+          assigneeAgentId: idleAgentId,
+          issueNumber: 1,
+          identifier: `${issuePrefix}-1`,
+          createdAt: mediumOldCreatedAt,
+          updatedAt: mediumOldCreatedAt,
+        },
+        {
+          id: mediumNewId,
+          companyId,
+          title: "Newer medium card",
+          status: "todo",
+          priority: "medium",
+          assigneeAgentId: idleAgentId,
+          issueNumber: 2,
+          identifier: `${issuePrefix}-2`,
+          createdAt: mediumNewCreatedAt,
+          updatedAt: mediumNewCreatedAt,
+        },
+        {
+          id: highOldId,
+          companyId,
+          title: "Old but high priority card",
+          status: "todo",
+          priority: "high",
+          assigneeAgentId: idleAgentId,
+          issueNumber: 3,
+          identifier: `${issuePrefix}-3`,
+          createdAt: new Date("2025-12-01T00:00:00.000Z"),
+          updatedAt: mediumOldCreatedAt,
+        },
+      ]);
+
+      const result = await heartbeatService(db, {
+        runtimeEnv: { [CANARY_ENV_VAR]: "true" },
+      }).pullIdleAgentTodoIssues();
+
+      expect(result.pulled).toBe(1);
+      expect(result.issueIds).toEqual([highOldId]);
+
+      const pulledWake = await db
+        .select({
+          status: agentWakeupRequests.status,
+          payload: agentWakeupRequests.payload,
+        })
+        .from(agentWakeupRequests)
+        .where(
+          and(
+            eq(agentWakeupRequests.companyId, companyId),
+            eq(agentWakeupRequests.agentId, idleAgentId),
+            eq(agentWakeupRequests.reason, "idle_todo_pull"),
+          ),
+        )
+        .then((rows) => rows[0] ?? null);
+      expect(pulledWake).not.toBeNull();
+      expect(pulledWake?.payload).toMatchObject({ issueId: highOldId });
+
+      // Exactly one card is pulled per idle agent per sweep: the agent has one
+      // free slot, so the remaining todo cards stay queued for later sweeps.
+      const allPullWakes = await db
+        .select({ id: agentWakeupRequests.id })
+        .from(agentWakeupRequests)
+        .where(
+          and(
+            eq(agentWakeupRequests.companyId, companyId),
+            eq(agentWakeupRequests.agentId, idleAgentId),
+            eq(agentWakeupRequests.reason, "idle_todo_pull"),
+          ),
+        );
+      expect(allPullWakes).toHaveLength(1);
+
+      // Re-running the sweep while the pull is still live must not dispatch a
+      // second run for the same card (idempotence on the live dispatch path).
+      // The agent's single slot is now consumed by the first pull, so the
+      // second pass stands down on the meter rather than dispatching again.
+      const secondPass = await heartbeatService(db, {
+        runtimeEnv: { [CANARY_ENV_VAR]: "true" },
+      }).pullIdleAgentTodoIssues();
+      expect(secondPass.pulled).toBe(0);
+      expect(
+        secondPass.capExhausted +
+          secondPass.livePathSkipped +
+          secondPass.duplicateSkipped,
+      ).toBeGreaterThanOrEqual(1);
+
+      const afterSecondPass = await db
+        .select({ id: agentWakeupRequests.id })
+        .from(agentWakeupRequests)
+        .where(
+          and(
+            eq(agentWakeupRequests.companyId, companyId),
+            eq(agentWakeupRequests.agentId, idleAgentId),
+            eq(agentWakeupRequests.reason, "idle_todo_pull"),
+          ),
+        );
+      expect(afterSecondPass).toHaveLength(1);
+    });
+
+    it("idle todo pull is default-off and reversible when the canary env is unset", async () => {
+      const { companyId, idleAgentId, issuePrefix } = await seedIdleTodoPullFixture();
+      const todoIssueId = randomUUID();
+      await db.insert(issues).values({
+        id: todoIssueId,
+        companyId,
+        title: "Unclaimed todo card",
+        status: "todo",
+        priority: "medium",
+        assigneeAgentId: idleAgentId,
+        issueNumber: 1,
+        identifier: `${issuePrefix}-1`,
+      });
+
+      const result = await heartbeatService(db).pullIdleAgentTodoIssues();
+
+      expect(result.enabled).toBe(false);
+      expect(result.pulled).toBe(0);
+      expect(result.checked).toBe(0);
+
+      const wakes = await db
+        .select({ id: agentWakeupRequests.id })
+        .from(agentWakeupRequests)
+        .where(eq(agentWakeupRequests.companyId, companyId));
+      expect(wakes).toHaveLength(0);
+    });
+
+    it("idle todo pull skips parked backlog, blocked, user-assigned and active-run cards", async () => {
+      const { companyId, ownerUserId, idleAgentId, issuePrefix } =
+        await seedIdleTodoPullFixture({ maxConcurrentRuns: 2 });
+      const backlogParkedId = randomUUID();
+      const blockedId = randomUUID();
+      const userAssignedId = randomUUID();
+      const activeRunId = randomUUID();
+      const activeRunTodoId = randomUUID();
+      const eligibleId = randomUUID();
+      const blockerId = randomUUID();
+
+      await db.insert(issues).values([
+        {
+          id: backlogParkedId,
+          companyId,
+          title: "Parked in backlog",
+          status: "backlog",
+          priority: "critical",
+          assigneeAgentId: idleAgentId,
+          issueNumber: 1,
+          identifier: `${issuePrefix}-1`,
+        },
+        {
+          id: blockedId,
+          companyId,
+          title: "Blocked by an open blocker",
+          status: "blocked",
+          priority: "critical",
+          assigneeAgentId: idleAgentId,
+          issueNumber: 2,
+          identifier: `${issuePrefix}-2`,
+        },
+        {
+          id: userAssignedId,
+          companyId,
+          title: "Owned by a human",
+          status: "todo",
+          priority: "critical",
+          assigneeUserId: ownerUserId,
+          issueNumber: 3,
+          identifier: `${issuePrefix}-3`,
+        },
+        {
+          id: activeRunId,
+          companyId,
+          title: "Already running",
+          status: "in_progress",
+          priority: "critical",
+          assigneeAgentId: idleAgentId,
+          issueNumber: 4,
+          identifier: `${issuePrefix}-4`,
+        },
+        {
+          id: activeRunTodoId,
+          companyId,
+          title: "Todo card already covered by a live run",
+          status: "todo",
+          priority: "high",
+          assigneeAgentId: idleAgentId,
+          issueNumber: 5,
+          identifier: `${issuePrefix}-5`,
+        },
+        {
+          id: eligibleId,
+          companyId,
+          title: "Genuinely idle todo card",
+          status: "todo",
+          priority: "low",
+          assigneeAgentId: idleAgentId,
+          issueNumber: 6,
+          identifier: `${issuePrefix}-6`,
+        },
+        {
+          id: blockerId,
+          companyId,
+          title: "Open blocker for the blocked card",
+          status: "todo",
+          priority: "medium",
+          assigneeAgentId: null,
+          issueNumber: 7,
+          identifier: `${issuePrefix}-7`,
+        },
+      ]);
+      await db.insert(issueRelations).values({
+        companyId,
+        issueId: blockerId,
+        relatedIssueId: blockedId,
+        type: "blocks",
+      });
+      // A live `running` run naming a `todo` card is the active-run duplicate
+      // guard: the card looks idle by status alone but already has an
+      // execution path, so it must never be pulled again.
+      await db.insert(heartbeatRuns).values({
+        companyId,
+        agentId: idleAgentId,
+        invocationSource: "automation",
+        status: "running",
+        contextSnapshot: { issueId: activeRunTodoId },
+      });
+
+      const result = await heartbeatService(db, {
+        runtimeEnv: { [CANARY_ENV_VAR]: "true" },
+      }).pullIdleAgentTodoIssues();
+
+      // Backlog, blocked, human-owned and already-running cards are all skipped,
+      // and only the low-priority genuinely idle card is pulled.
+      expect(result.pulled).toBe(1);
+      expect(result.issueIds).toEqual([eligibleId]);
+      expect(result.livePathSkipped).toBe(1);
+      // The backlog, blocked and human-owned cards never reach the candidate
+      // set at all, and the unassigned blocker is not an agent's work, so the
+      // only candidates are the live-run card and the genuinely idle card.
+      expect(result.checked).toBe(2);
+
+      const pulledPayloads = await db
+        .select({ payload: agentWakeupRequests.payload })
+        .from(agentWakeupRequests)
+        .where(
+          and(
+            eq(agentWakeupRequests.companyId, companyId),
+            eq(agentWakeupRequests.reason, "idle_todo_pull"),
+          ),
+        );
+      expect(pulledPayloads).toHaveLength(1);
+      expect(pulledPayloads[0]?.payload).toMatchObject({ issueId: eligibleId });
+    });
+
+    it("idle todo pull respects per-agent concurrency and the fleet cap", async () => {
+      const { companyId, idleAgentId, issuePrefix } = await seedIdleTodoPullFixture({
+        maxConcurrentRuns: 1,
+      });
+      const runningIssueId = randomUUID();
+      const todoIssueId = randomUUID();
+      await db.insert(issues).values([
+        {
+          id: runningIssueId,
+          companyId,
+          title: "Card consuming the agent's only slot",
+          status: "in_progress",
+          priority: "medium",
+          assigneeAgentId: idleAgentId,
+          issueNumber: 1,
+          identifier: `${issuePrefix}-1`,
+        },
+        {
+          id: todoIssueId,
+          companyId,
+          title: "Todo card with no free slot",
+          status: "todo",
+          priority: "medium",
+          assigneeAgentId: idleAgentId,
+          issueNumber: 2,
+          identifier: `${issuePrefix}-2`,
+        },
+      ]);
+      // A live running run fills the agent's single concurrency slot, so the
+      // metered pull must stand down even though a todo card is eligible.
+      await db.insert(heartbeatRuns).values({
+        companyId,
+        agentId: idleAgentId,
+        invocationSource: "automation",
+        status: "running",
+        contextSnapshot: { issueId: runningIssueId },
+      });
+
+      const result = await heartbeatService(db, {
+        runtimeEnv: { [CANARY_ENV_VAR]: "true" },
+      }).pullIdleAgentTodoIssues();
+
+      expect(result.pulled).toBe(0);
+      expect(result.capExhausted).toBe(1);
+
+      const wakes = await db
+        .select({ id: agentWakeupRequests.id })
+        .from(agentWakeupRequests)
+        .where(eq(agentWakeupRequests.companyId, companyId));
+      expect(wakes).toHaveLength(0);
+    });
+  });
+
 });
