@@ -7,6 +7,7 @@ import {
   resolveCommandContext,
   type BaseClientOptions,
 } from "./common.js";
+import { addFleetMaxConcurrentRunsCommands } from "./instance.js";
 
 interface CompanyOptions extends BaseClientOptions {
   companyId?: string;
@@ -263,6 +264,10 @@ export function registerAccessCommands(program: Command): void {
   );
 
   const instance = program.command("instance").description("Instance operations");
+  // SPA-10137: live, DB-backed fleet-wide run ceiling. See instance.ts for why
+  // this mounts onto the `instance` Command built here instead of creating
+  // its own top-level `instance` command.
+  addFleetMaxConcurrentRunsCommands(instance);
   addSimpleGet(instance, "scheduler-heartbeats", "List scheduler heartbeat agents", "/api/instance/scheduler-heartbeats");
   addSimpleGet(instance, "settings:general", "Get general instance settings", "/api/instance/settings/general");
   addJsonPatch(instance, "settings:general:update", "Update general instance settings", "/api/instance/settings/general");
