@@ -281,7 +281,13 @@ describe("task watchdog subtree classifier", () => {
   it("excludes task-watchdog issues and their descendants from watched subtree scans", () => {
     const result = classify({
       issues: [
-        issue({ status: "done" }),
+        issue({ status: "todo" }),
+        issue({
+          id: childId,
+          identifier: "PAP-2",
+          parentId: sourceId,
+          status: "blocked",
+        }),
         issue({
           id: watchdogId,
           identifier: "PAP-3",
@@ -302,8 +308,15 @@ describe("task watchdog subtree classifier", () => {
       activeRuns: [{ companyId, issueId: "watchdog-child-1", agentId: "agent-1", status: "running" }],
     });
 
+    // A non-terminal leaf of its own is what makes this a `stopped` verdict at
+    // all: without one the classifier reports `not_applicable` (SPA-9452). The
+    // active run sits on an EXCLUDED watchdog descendant, so it must not
+    // promote the subtree to `live`.
     expect(result.state).toBe("stopped");
-    expect(result.includedIssueIds).toEqual([sourceId]);
+    expect(result.includedIssueIds).toEqual([sourceId, childId]);
+    expect(result.stoppedLeaves).toEqual([
+      expect.objectContaining({ issueId: childId, status: "blocked" }),
+    ]);
   });
 
   it("defers a stopped verdict for an issue created inside the first-run grace window", () => {
@@ -386,5 +399,42 @@ describe("task watchdog subtree classifier", () => {
     });
 
     expect(result.state).toBe("not_applicable");
+  });
+
+  it("SPA-9452: does not report a stop when the watched root is the only issue and is terminal", () => {
+    const result = classify({ issues: [issue({ status: "done" })] });
+
+    expect(result.state).toBe("not_applicable");
+    if (result.state !== "not_applicable") return;
+    expect(result.reason).toBe("Watched subtree has no non-terminal leaves.");
+    expect(result.includedIssueIds).toEqual([sourceId]);
+  });
+
+  it("SPA-9452: does not report a stop when every leaf under a terminal root is terminal", () => {
+    const result = classify({
+      issues: [
+        issue({ status: "done" }),
+        issue({ id: childId, identifier: "PAP-2", parentId: sourceId, status: "cancelled" }),
+      ],
+    });
+
+    expect(result.state).toBe("not_applicable");
+    if (result.state !== "not_applicable") return;
+    expect(result.includedIssueIds).toEqual([sourceId, childId]);
+  });
+
+  it("SPA-9452: keeps reporting a real stop when a terminal root has one non-terminal leaf", () => {
+    const result = classify({
+      issues: [
+        issue({ status: "done" }),
+        issue({ id: childId, identifier: "PAP-2", parentId: sourceId, status: "blocked" }),
+      ],
+    });
+
+    expect(result.state).toBe("stopped");
+    if (result.state !== "stopped") return;
+    expect(result.stoppedLeaves).toEqual([
+      expect.objectContaining({ issueId: childId, status: "blocked" }),
+    ]);
   });
 });

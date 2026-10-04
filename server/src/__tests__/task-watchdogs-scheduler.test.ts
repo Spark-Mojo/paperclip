@@ -169,6 +169,9 @@ describeEmbeddedPostgres("task watchdog scheduler", () => {
   it("creates one reusable watchdog issue and wakes the watchdog on the initial stopped state", async () => {
     const companyId = await seedCompany();
     const sourceId = await seedIssue(companyId, { identifier: "WDOG-1", status: "done" });
+    // A non-terminal leaf is what makes this subtree "stopped" rather than
+    // nothing-to-report: a stop with no leaf at all is not a stop (SPA-9452).
+    await seedIssue(companyId, { parentId: sourceId, status: "blocked" });
     const agentId = await seedAgent(companyId);
     await seedWatchdog(companyId, sourceId, agentId);
     const { service, wakes } = createService();
@@ -223,15 +226,16 @@ describeEmbeddedPostgres("task watchdog scheduler", () => {
     expect(watchdog?.lastObservedStopSnapshot).toMatchObject({
       version: 2,
       fingerprint: watchdog?.lastObservedFingerprint,
-      materialLeaves: [],
       waitsByIssueId: {},
     });
+    expect(watchdog?.lastObservedStopSnapshot?.materialLeaves).toHaveLength(1);
     expect(watchdog?.triggerCount).toBe(1);
   });
 
   it("does not append duplicate review comments for an already-open same-fingerprint review", async () => {
     const companyId = await seedCompany();
     const sourceId = await seedIssue(companyId, { identifier: "WDOG-DUPE", status: "done" });
+    await seedIssue(companyId, { parentId: sourceId, status: "blocked" });
     const agentId = await seedAgent(companyId);
     await seedWatchdog(companyId, sourceId, agentId);
     const { service, wakes } = createService();
@@ -264,6 +268,7 @@ describeEmbeddedPostgres("task watchdog scheduler", () => {
   it("re-wakes a same-fingerprint watchdog review stuck in stale in_review", async () => {
     const companyId = await seedCompany();
     const sourceId = await seedIssue(companyId, { identifier: "WDOG-STALE", status: "done" });
+    await seedIssue(companyId, { parentId: sourceId, status: "blocked" });
     const agentId = await seedAgent(companyId);
     await seedWatchdog(companyId, sourceId, agentId);
     const { service, wakes } = createService();
@@ -361,6 +366,8 @@ describeEmbeddedPostgres("task watchdog scheduler", () => {
     const companyId = await seedCompany();
     const sourceId = await seedIssue(companyId, { identifier: "WDOG-NEST", status: "done" });
     const agentId = await seedAgent(companyId);
+    // The real leaf: a non-watchdog child that is NOT itself a watchdog.
+    await seedIssue(companyId, { parentId: sourceId, status: "blocked" });
     const nestedWatchdogIssueId = await seedIssue(companyId, {
       parentId: sourceId,
       status: "in_progress",
@@ -391,7 +398,7 @@ describeEmbeddedPostgres("task watchdog scheduler", () => {
   it("reconciles ancestor watchdogs for a descendant issue mutation", async () => {
     const companyId = await seedCompany();
     const sourceId = await seedIssue(companyId, { identifier: "WDOG-ANCESTOR", status: "done" });
-    const childId = await seedIssue(companyId, { parentId: sourceId, status: "done" });
+    const childId = await seedIssue(companyId, { parentId: sourceId, status: "todo" });
     const agentId = await seedAgent(companyId);
     await seedWatchdog(companyId, sourceId, agentId);
     const { service, wakes } = createService();
@@ -405,7 +412,10 @@ describeEmbeddedPostgres("task watchdog scheduler", () => {
   it("marks a completed watchdog fingerprint reviewed, then reuses the same issue for a later stopped state", async () => {
     const companyId = await seedCompany();
     const sourceId = await seedIssue(companyId, { identifier: "WDOG-3", status: "done" });
-    const childId = await seedIssue(companyId, { parentId: sourceId, status: "done" });
+    // Starts blocked so the first evaluation is a real stop with a real leaf;
+    // it is driven to `in_review` below so the retigger changes the snapshot
+    // rather than merely re-blocking the same leaf.
+    const childId = await seedIssue(companyId, { parentId: sourceId, status: "blocked" });
     const agentId = await seedAgent(companyId);
     await seedWatchdog(companyId, sourceId, agentId);
     const { service, wakes } = createService();
@@ -425,7 +435,7 @@ describeEmbeddedPostgres("task watchdog scheduler", () => {
 
     await db
       .update(issues)
-      .set({ status: "blocked", updatedAt: new Date(Date.now() + 60_000) })
+      .set({ status: "in_review", updatedAt: new Date(Date.now() + 60_000) })
       .where(eq(issues.id, childId));
     const retriggered = await service.reconcileTaskWatchdogs({ companyId });
 
@@ -491,7 +501,7 @@ describeEmbeddedPostgres("task watchdog scheduler", () => {
   it("does not let an old terminal watchdog review mark a newer observed fingerprint reviewed", async () => {
     const companyId = await seedCompany();
     const sourceId = await seedIssue(companyId, { identifier: "WDOG-STALE", status: "done" });
-    const childId = await seedIssue(companyId, { parentId: sourceId, status: "done" });
+    const childId = await seedIssue(companyId, { parentId: sourceId, status: "blocked" });
     const agentId = await seedAgent(companyId);
     await seedWatchdog(companyId, sourceId, agentId);
     const { service, wakes } = createService();
@@ -512,7 +522,7 @@ describeEmbeddedPostgres("task watchdog scheduler", () => {
 
     await db
       .update(issues)
-      .set({ status: "blocked", updatedAt: new Date(Date.now() + 60_000) })
+      .set({ status: "in_review", updatedAt: new Date(Date.now() + 60_000) })
       .where(eq(issues.id, childId));
     const changedWhileReviewLive = await service.reconcileTaskWatchdogs({ companyId });
     expect(changedWhileReviewLive).toMatchObject({ checked: 1, triggered: 0, live: 1 });
@@ -786,6 +796,59 @@ describeEmbeddedPostgres("task watchdog scheduler", () => {
       .from(issues)
       .where(and(eq(issues.companyId, companyId), eq(issues.originKind, "task_watchdog")));
     expect(watchdogIssues).toHaveLength(1);
+  });
+
+  it("SPA-9452: does not trigger or wake when the watched subtree has no non-terminal leaf", async () => {
+    const companyId = await seedCompany();
+    const sourceId = await seedIssue(companyId, { identifier: "WDOG-EMPTY", status: "done" });
+    const agentId = await seedAgent(companyId);
+    await seedWatchdog(companyId, sourceId, agentId);
+    const { service, wakes } = createService();
+
+    const result = await service.reconcileTaskWatchdogs({ companyId });
+
+    expect(result).toMatchObject({ checked: 1, triggered: 0 });
+    expect(wakes).toHaveLength(0);
+    const [watchdog] = await db.select().from(issueWatchdogs).where(eq(issueWatchdogs.issueId, sourceId));
+    expect(watchdog?.triggerCount).toBe(0);
+    expect(watchdog?.lastObservedFingerprint).toBeNull();
+    // Nothing to report, so no watchdog review issue is minted at all.
+    const watchdogIssues = await db
+      .select({ id: issues.id })
+      .from(issues)
+      .where(and(eq(issues.companyId, companyId), eq(issues.originKind, "task_watchdog")));
+    expect(watchdogIssues).toHaveLength(0);
+
+    // Re-evaluating must stay quiet too: the empty leaf set is not a stop that
+    // re-arms once a fingerprint has been reviewed.
+    const second = await service.reconcileTaskWatchdogs({ companyId });
+
+    expect(second).toMatchObject({ checked: 1, triggered: 0 });
+    expect(wakes).toHaveLength(0);
+    const [stillQuiet] = await db.select().from(issueWatchdogs).where(eq(issueWatchdogs.issueId, sourceId));
+    expect(stillQuiet?.triggerCount).toBe(0);
+  });
+
+  it("SPA-9452: refuses wake-scope access when the watched subtree has no non-terminal leaf", async () => {
+    const companyId = await seedCompany();
+    const sourceId = await seedIssue(companyId, { identifier: "WDOG-EMPTY-SCOPE", status: "done" });
+    const agentId = await seedAgent(companyId);
+    const watchdogRow = await seedWatchdog(companyId, sourceId, agentId);
+    const { service } = createService();
+
+    const verdict = await service.revalidateMutationScope({
+      kind: "watchdog",
+      watchdogId: watchdogRow.id,
+      companyId,
+      watchedIssueId: sourceId,
+      stopFingerprint: `task_watchdog_stop:${"0".repeat(64)}`,
+      wakeStopSnapshot: null,
+    });
+
+    expect(verdict.allowed).toBe(false);
+    if (verdict.allowed) return;
+    expect(verdict.classification.state).toBe("not_applicable");
+    expect(verdict.reason).toContain("not-applicable");
   });
 
   it("handles an armed cutoff when no watchdogs are active", async () => {
