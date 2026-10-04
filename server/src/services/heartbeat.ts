@@ -29933,10 +29933,11 @@ export function heartbeatService(
       companyId: string,
       agentId?: string,
       limit?: number,
-      options: { summary?: boolean } = {},
+      options: { summary?: boolean; offset?: number } = {},
     ) => {
       const safeForLegacyEncoding = await hasUnsafeTextProjectionDatabase();
       const summary = options.summary === true;
+      const offset = options.offset ?? 0;
       const query = db
         .select(
           summary
@@ -29967,7 +29968,15 @@ export function heartbeatService(
         )
         .orderBy(desc(heartbeatRuns.createdAt));
 
-      const rows = limit ? await query.limit(limit) : await query;
+      const pageQuery =
+        offset > 0
+          ? limit === undefined
+            ? query.offset(offset)
+            : query.limit(limit).offset(offset)
+          : limit === undefined
+            ? query
+            : query.limit(limit);
+      const rows = await pageQuery;
       return rows.map((row) => {
         const {
           contextIssueId,
