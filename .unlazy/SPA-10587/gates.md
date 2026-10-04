@@ -183,3 +183,137 @@ this branch, so the fixed behaviour is NOT yet observable on the running instanc
 The pre-change measurement above is the live receipt; the post-change receipt is
 this test run plus the spec change. Flagged, not claimed.
 
+
+---
+
+## SPA-9702 base-reproduction evidence for the PR head's RED checks
+
+Recorded for PR #144, head `H = d09f1e61eb5742566adcbd59dcfdee62d276da10`,
+base `B = b7a3a892d8add53f1b2e6166fdce6f7d0d6756f4` on
+`rebuild/v2026.916.0-survivors`. Both pinned atomically from one
+`pr-read.sh head 144 --repo Spark-Mojo/paperclip` call, which returned
+`{"baseRefName":"rebuild/v2026.916.0-survivors","baseRefOid":"b7a3a892d…","headRefOid":"d09f1e61…","url":"…/pull/144"}`.
+
+### (1) Conflict state — `mergeable`
+
+```
+$ gh api repos/Spark-Mojo/paperclip/pulls/144 --jq '{mergeable,mergeStateStatus,state}'
+{"mergeable":true,"mergeStateStatus":null,"state":"open"}
+```
+
+`mergeable: true` = `CONFLICT_FREE`. `mergeStateStatus` is `null` on this fork and is
+deliberately NOT used as a precondition — GitHub sets `UNSTABLE` as soon as any check
+is red, so on a base-red fork it is unsatisfiable while the exemption says proceed
+(the contradiction SPA-9702 removed).
+
+Required-checks question re-established live, never from memory:
+`gh api repos/Spark-Mojo/paperclip/rulesets` returns `[]` — the fork has NO ruleset and
+no branch protection, so no check is REQUIRED and none is load-bearing here.
+
+### (2) Which checks are red ON THE HEAD
+
+Run `37189641576`, conclusion `failure`. Failing jobs:
+
+| Check | Failing step | Failure signature |
+|---|---|---|
+| `ci / policy` | `Reject git push in adapter/runtime code` | `check-no-git-push.mjs` exit 1: `server/src/services/workspace-runtime.ts:5121`, `server/src/__tests__/workspace-runtime.test.ts:4625`, `:4630` |
+| `ci / General tests (server (11/12))` | `Run grouped general test suites` | `plugin-orchestration-apis.test.ts > creates plugin-origin issues with full orchestration fields and audit activity` — `expected 422 to be 201`, `code: agent_root_issue_requires_project` |
+| `ci / General tests (server (12/12))` | `Run grouped general test suites` | `status-cards.test.ts > attributes API-level authoring to an active company agent` — `expected 422 to be 201` |
+| `ci / Verify serialized server suites (5/9)` | `Run serialized server test shard` | `openapi-routes.test.ts > covers the mounted server routes exactly` — `missingInSpec: [fleet-max-concurrent-runs GET, PATCH]` |
+| `ci / Verify serialized server suites (6/9)` | `Run serialized server test shard` | `issue-watchdogs-routes.test.ts > routes watchdog-discovered product bugs outside the watched source tree with evidence links` — `expected 422 to be 201`, `agent_root_issue_requires_project` |
+| `ci / Verify serialized server suites (7/9)` | `Run serialized server test shard` | `permissions-upgrade-boundary-routes.test.ts > allows same-company route assignment after upgrade…` — `expected 422 to be 201` |
+| `ci / verify` | `Fail if any split verify lane failed` | aggregate of the lanes above |
+| `ci / e2e` | — | no signature extracted; base reproduction NOT claimed for this one |
+| `review` | vendor `commitperclip` action | NEVER a blocker (no key on the fork, per SPA-9702) |
+
+### (3) Base reproduction — CHECK IDENTITY and FAILURE SIGNATURE on `B`
+
+`B` has **no CI run of its own**: `gh api repos/Spark-Mojo/paperclip/commits/B/check-runs
+--jq .total_count` → `22`, all `Release` workflow jobs, 1 `failure` + 21 `skipped`, and no
+`policy` or `ci` check-run. The base-ref-only `Release` failure is `select_nightly` on
+cloud-image promotion — unrelated to anything in this diff. SPA-9702 clause 4 therefore
+routes to the substitute: the SAME checks were re-run locally against a detached
+worktree of `B`, in a directory that is NOT the card worktree and NOT under
+`$PAPERCLIP_RUN_SCRATCH_DIR`.
+
+```
+$ git worktree add /srv/bulk/worktrees/SPA-10587-baserun --detach refs/remotes/origin/rebuild/v2026.916.0-survivors
+HEAD is now at b7a3a892d Merge pull request #125 from Spark-Mojo/SPA-9437-…
+$ git rev-parse HEAD
+b7a3a892d8add53f1b2e6166fdce6f7d0d6756f4
+```
+
+`ci / policy` — same check name, same script, same failing step, **byte-identical
+failure locations** on base and head:
+
+```
+$ node ./scripts/check-no-git-push.mjs            # on B, exit 1
+server/src/services/workspace-runtime.ts:5121
+server/src/__tests__/workspace-runtime.test.ts:4625
+server/src/__tests__/workspace-runtime.test.ts:4630
+$ diff <base locations> <head locations>   →   no output (IDENTICAL)
+```
+
+The red is a pre-existing violation in adapter/runtime code that PR #125 (SPA-9437,
+the most recent merge on this base) introduced. Its own self-test passes on both trees
+(`node --test ./scripts/check-no-git-push.test.mjs` → `pass 14 fail 0`, exit 0), i.e. the
+scanner works and is correctly reporting a real finding that predates this card.
+
+The four test-lane failures — same five tests, same signatures, reproduced on `B`:
+
+```
+$ pnpm vitest run issue-watchdogs-routes permissions-upgrade-boundary-routes \
+    status-cards plugin-orchestration-apis openapi-routes     # on B
+ × routes watchdog-discovered product bugs outside the watched source tree with evidence links
+ × allows same-company route assignment after upgrade but keeps private target assignment grant constrained
+ × attributes API-level authoring to an active company agent
+ × creates plugin-origin issues with full orchestration fields and audit activity
+ × covers the mounted server routes exactly
+ Test Files  5 failed (5)      Tests  5 failed | 71 passed (76)      exit 1
+```
+
+Identical set, identical signatures on `H`:
+
+```
+ Test Files  5 failed (5)      Tests  5 failed | 72 passed (77)      exit 1
+```
+
+(77 vs 76 because this diff adds one passing case — `documents heartbeat run list paging`
+— to `openapi-routes.test.ts`. The failing set is unchanged.)
+
+### (3b) Non-touch — the failing assertions and their configuration are unchanged
+
+SHA-256 of each file carrying a red assertion, base blob vs head worktree:
+
+```
+IDENTICAL  server/src/services/workspace-runtime.ts
+IDENTICAL  server/src/__tests__/workspace-runtime.test.ts
+IDENTICAL  scripts/check-no-git-push.mjs
+IDENTICAL  .github/workflows/pr-trusted.yml
+IDENTICAL  server/src/__tests__/issue-watchdogs-routes.test.ts
+IDENTICAL  server/src/__tests__/permissions-upgrade-boundary-routes.test.ts
+IDENTICAL  server/src/__tests__/status-cards.test.ts
+IDENTICAL  server/src/__tests__/plugin-orchestration-apis.test.ts
+```
+
+This diff's complete file list (6 paths) contains none of them:
+
+```
+.unlazy/SPA-10587/gates.md
+server/src/__tests__/heartbeat-runs-pagination.test.ts
+server/src/__tests__/openapi-routes.test.ts
+server/src/routes/agents.ts
+server/src/routes/openapi.ts
+server/src/services/heartbeat.ts
+```
+
+Causal non-touch is therefore proven by construction, not by argument: every file that
+produces a red is byte-identical to base, and the only test file the diff modifies
+(`openapi-routes.test.ts`) contributes exactly one new PASSING case.
+
+### What is NOT exempted, stated plainly
+
+`ci / e2e` is red on the head and its signature was NOT extracted, so it is **not**
+claimed as base-reproduced here. It is left for the verifier to classify on its own
+evidence, and if it proves head-only it refuses. Recording it as exempt without
+evidence would be exactly the falsification SPA-9702 exists to prevent.
