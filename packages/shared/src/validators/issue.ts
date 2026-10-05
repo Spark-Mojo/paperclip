@@ -843,6 +843,20 @@ const issueCommentAttachmentIdsSchema = z
     message: "Attachment ids must be unique",
   });
 
+// Caller-supplied compare-and-set expectations for ownership-transfer CAS
+// (SPA-10357 / SPA-10429 / SPA-10859). When a caller writes to status,
+// assigneeUserId, or assigneeAgentId, the matching expected* field MUST be
+// present and MUST equal the row's current value as re-read under the issue
+// write service's existing `for("update")` row lock. Mismatch returns 409
+// and leaves the row untouched. These fields are optional in the schema so
+// callers that don't change those fields (e.g. title-only edits) keep
+// working unchanged.
+const issueWriteOwnershipCASSchema = z.object({
+  expectedStatus: z.enum(ISSUE_STATUSES).optional(),
+  expectedAssigneeUserId: z.string().trim().min(1).nullable().optional(),
+  expectedAssigneeAgentId: z.string().trim().min(1).nullable().optional(),
+});
+
 export const updateIssueSchema = objectWithoutDefaults(
   createIssueBaseSchema.omit({
     createdByUserId: true,
@@ -867,7 +881,8 @@ export const updateIssueSchema = objectWithoutDefaults(
     /** Assignment-only handoff; the following structured goal action owns the wake. */
     deferWakeForGoal: z.boolean().optional(),
     hiddenAt: z.string().datetime().nullable().optional(),
-  });
+  })
+  .merge(issueWriteOwnershipCASSchema);
 
 export type UpdateIssue = z.infer<typeof updateIssueSchema>;
 export type IssueExecutionWorkspaceSettings = z.infer<
