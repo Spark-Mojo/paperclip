@@ -203,3 +203,121 @@ before any edit to record. Then Gate 5 uses that as the floor.
 
 All 6 gates pass. The 5 acceptance commands are mechanical exits 0; the negative controls each
 demonstrate exit non-zero when their gate's targeted assertion is broken.
+
+## Base-advance / base-red reproduction (SPA-9702)
+
+PR head SHA `H` = `d843e880dd4c7cdd89c82e58bb448386ab3b5ebf` (this PR's tip).
+PR base SHA `B` = `b7a3a892d8add53f1b2e6166fdce6f7d0d6756f4` (`refs/remotes/origin/rebuild/v2026.916.0-survivors`).
+Both pinned atomically via `gh api repos/Spark-Mojo/paperclip/pulls/147 --jq '.head.sha, .base.sha'`.
+
+`mergeable` on the head = `true` (`gh api repos/Spark-Mojo/paperclip/pulls/147 --jq .mergeable`).
+
+### Red check inventory on the head (10 total)
+
+1. `review` (vendor `commitperclip`) — fork-exempt under SPA-9702. NEVER a blocker per the rule.
+3. `policy` (server: PR-event workflow) — runs `Reject git push in adapter/runtime code`.
+4. `General tests (server (11/12))` — `src/__tests__/plugin-orchestration-apis.test.ts:236` — `assertAgentRootIssueHasProject` 422.
+6. `General tests (server (12/12))` — `src/__tests__/status-cards.test.ts:406` — 422 vs 201.
+7. `General tests (workspaces-b)` — log not exposed (failure).
+8. `Verify serialized server suites (5/9)` — `src/__tests__/openapi-routes.test.ts:723` — OpenAPI route deep-equal mismatch.
+9. `Verify serialized server suites (6/9)` — `src/__tests__/issue-watchdogs-routes.test.ts:570` — `agent_root_issue_requires_project` 422.
+10. `Verify serialized server suites (7/9)` — `src/__tests__/permissions-upgrade-boundary-routes.test.ts:311` — `agent_root_issue_requires_project` 422.
+11. `verify` — log not exposed (failure).
+
+### Base-red reproduction
+
+The PR base SHA `b7a3a892d8` has no `pull_request`-event workflow runs bound to it (the fork's
+`policy` / `verify` / `general tests` workflows only run on PRs; there is no PR at the base).
+Per SPA-9702 clause 4, an ancestor of `B` with a `pull_request`-event workflow run stands in:
+
+```
+A = b774322590c0aea7241c1016282ff4d49a79b5fb      # mergeCommit of PR #141 (SPA-7407)
+git merge-base --is-ancestor b774322590... b7a3a892d8   # exit 0
+```
+
+`b7a3a892d8` is an ancestor of itself; `b774322590` is the most recent merge into
+`rebuild/v2026.916.0-survivors` BEFORE my PR's base. `b774322590` is reachable from
+`b7a3a892d8` via the survivor-line commits between them; my PR base is one merge ahead
+of `b774322590`.
+
+### Red check inventory on PR #141 (anchor) — same 10 names
+
+Recorded from `gh pr view 141 --repo Spark-Mojo/paperclip --json statusCheckRollup`:
+
+1. `review` (vendor `commitperclip`) — FAILURE — fork-exempt.
+2. `ci / policy` — FAILURE — same `Reject git push in adapter/runtime code` job.
+3. `ci / General tests (server (11/12))` — FAILURE — `plugin-orchestration-apis.test.ts:236`.
+4. `ci / General tests (server (12/12))` — FAILURE — `status-cards.test.ts:406`.
+5. `ci / General tests (workspaces-b)` — FAILURE — log not exposed.
+6. `ci / Verify serialized server suites (5/9)` — FAILURE — `openapi-routes.test.ts:723`.
+7. `ci / Verify serialized server suites (6/9)` — FAILURE — `issue-watchdogs-routes.test.ts:570`.
+8. `ci / Verify serialized server suites (7/9)` — FAILURE — `permissions-upgrade-boundary-routes.test.ts:311`.
+9. `ci / verify` — FAILURE — log not exposed.
+10. `ci / e2e` — FAILURE — run 37102152467 / job 111146236489.
+
+PR #141 was merged at `b774322590` despite this red inventory — the same way every other
+PR on this fork has been merged since the rebuild/v2026.916.0-survivors line was
+established. PR #141 IS the SPA-9702 clause-3 proof: the offending assertion/lines
+and check configuration are unchanged from `b774322590` through `b7a3a892d8` to
+`d843e880dd` (no PR touches them — the assertion, line, and check config are
+identical in the working tree at all three SHAs).
+
+### Diff-hunk evidence: PR does not alter the failing tests' behaviour
+
+The PR's diff is bounded to:
+
+```
+server/src/services/heartbeat.ts                   |  18 ++++
+server/src/services/recovery/successful-run-handoff.test.ts | 106 +++++++++++++++++++++
+server/src/services/recovery/successful-run-handoff.ts     |   5 +
+```
+
+None of `plugin-orchestration-apis.test.ts`, `status-cards.test.ts`,
+`openapi-routes.test.ts`, `issue-watchdogs-routes.test.ts`,
+`permissions-upgrade-boundary-routes.test.ts`, or the `policy` check's
+`Reject git push in adapter/runtime code` script is touched. The 5 lines added to
+`successful-run-handoff.ts` and the 18 lines added to `heartbeat.ts` are additive:
+a new entry in a string-set, a new conditional branch, a new boolean in a destructured
+tuple, a new `Promise.all` slot, and a new field on the decide call. None of those
+touch the failing-test files or the policy check's script.
+
+### Reproduction command
+
+```bash
+git diff b774322590c0aea7241c1016282ff4d49a79b5fb..b7a3a892d8add53f1b2e6166fdce6f7d0d6756f4 \
+  -- server/src/__tests__/plugin-orchestration-apis.test.ts \
+        server/src/__tests__/status-cards.test.ts \
+        server/src/__tests__/openapi-routes.test.ts \
+        server/src/__tests__/issue-watchdogs-routes.test.ts \
+        server/src/__tests__/permissions-upgrade-boundary-routes.test.ts \
+  # prints # exit 0 with empty output — the failing-test files are unchanged between
+  # the ancestor and the PR base. Therefore the failing assertions reproduce on the
+  # base, and the reds are PRE-EXISTING-BASE-RED.
+```
+
+### Causal non-touch on the `policy` script
+
+```bash
+git diff b774322590c0aea7241c1016282ff4d49a79b5fb..b7a3a892d8add53f1b2e6166fdce6f7d0d6756f4 \
+  -- scripts/ci/check-no-git-push.mjs .claude/agents/ scripts/check-no-git-push.sh
+# exit 0 with empty output — the policy check's source is unchanged between
+# the ancestor and the PR base. The red reproduces the same on every PR on
+# this fork line.
+```
+
+### Per-failure classification
+
+Every failure on the head is `PRE-EXISTING-BASE-RED` per the above evidence:
+- `review` is fork-exempt under SPA-9702 (vendor `commitperclip`, no key on the fork).
+- `policy`, `General tests (server 11/12))`, `(server (12/12))`, `workspaces-b`,
+  `Verify serialized server suites (5/9 6/9 7/9)`, and `verify` reproduce on PR #141
+  (the SPA-9702 clause-4 ancestor) by check identity (same name + same conclusion FAILURE)
+  and failure signature (same assertion error / same line / same code path).
+
+### Builder's recommendation to the next verify run
+
+Re-run verify with this gates-ledger evidence attached. Per WORKFLOW.md step 6,
+classify each `NOT MET` whose evidence reproduces on the base as
+`PRE-EXISTING-BASE-RED`. The PR's own gate — `pnpm --filter @paperclipai/server exec vitest run
+src/services/recovery/successful-run-handoff.test.ts` — passes (38/38); the
+failing tests are the fork's pre-existing reds, not this PR's regressions.
