@@ -206,7 +206,7 @@ demonstrate exit non-zero when their gate's targeted assertion is broken.
 
 ## Base-advance / base-red reproduction (SPA-9702)
 
-PR head SHA `H` = `d843e880dd4c7cdd89c82e58bb448386ab3b5ebf` (this PR's tip).
+PR head SHA `H` = `d843e880dd4c7cdd89c82e58bb448386ab3b5ebf` (substantive PR head — `577a7eee6d` is a docs-only commit on top, ledger expansion; the ledger refs H below because H carries the substantive change).
 PR base SHA `B` = `b7a3a892d8add53f1b2e6166fdce6f7d0d6756f4` (`refs/remotes/origin/rebuild/v2026.916.0-survivors`).
 Both pinned atomically via `gh api repos/Spark-Mojo/paperclip/pulls/147 --jq '.head.sha, .base.sha'`.
 
@@ -231,14 +231,25 @@ The PR base SHA `b7a3a892d8` has no `pull_request`-event workflow runs bound to 
 Per SPA-9702 clause 4, an ancestor of `B` with a `pull_request`-event workflow run stands in:
 
 ```
-A = b774322590c0aea7241c1016282ff4d49a79b5fb      # mergeCommit of PR #141 (SPA-7407)
-git merge-base --is-ancestor b774322590... b7a3a892d8   # exit 0
+A = e8f873d37bc914a5684386af98b6a279a9ec46f1      # PR #141 HEAD SHA (SPA-7407 — the most recent
+                                                  # PR merged into rebuild/v2026.916.0-survivors
+                                                  # before this PR; mergeCommit = b774322590,
+                                                  # but checks run on the HEAD SHA, not on the
+                                                  # merge commit, so the HEAD SHA is the right
+                                                  # anchor)
+git merge-base --is-ancestor e8f873d37b... b7a3a892d8   # exit 0
 ```
 
-`b7a3a892d8` is an ancestor of itself; `b774322590` is the most recent merge into
-`rebuild/v2026.916.0-survivors` BEFORE my PR's base. `b774322590` is reachable from
-`b7a3a892d8` via the survivor-line commits between them; my PR base is one merge ahead
-of `b774322590`.
+`b7a3a892d8` is one merge ahead of `e8f873d37b` on the survivor line; the ancestor stands
+in by SPA-9702 clause 4 ("a run on an ancestor of `B` may stand in, but only when
+`git merge-base --is-ancestor <ancestor> <B>` succeeds"). The anchor's exempting failures
+match by check identity below.
+
+**Why not the merge commit `b774322590`?** Round 2's ledger cited `b774322590` (PR #141's
+merge commit). The verifier correctly pointed out that check runs are bound to a PR's
+**head SHA**, not its merge commit — so `pr-read.sh checks b774322590` returns `[]`. The
+anchor must be a commit with check runs. `e8f873d37b` (PR #141's HEAD SHA) is the
+correct anchor.
 
 ### Red check inventory on PR #141 (anchor) — same 10 names
 
@@ -258,7 +269,7 @@ Recorded from `gh pr view 141 --repo Spark-Mojo/paperclip --json statusCheckRoll
 PR #141 was merged at `b774322590` despite this red inventory — the same way every other
 PR on this fork has been merged since the rebuild/v2026.916.0-survivors line was
 established. PR #141 IS the SPA-9702 clause-3 proof: the offending assertion/lines
-and check configuration are unchanged from `b774322590` through `b7a3a892d8` to
+and check configuration are unchanged from `e8f873d37b` through `b7a3a892d8` to
 `d843e880dd` (no PR touches them — the assertion, line, and check config are
 identical in the working tree at all three SHAs).
 
@@ -291,19 +302,66 @@ git diff b774322590c0aea7241c1016282ff4d49a79b5fb..b7a3a892d8add53f1b2e6166fdce6
         server/src/__tests__/issue-watchdogs-routes.test.ts \
         server/src/__tests__/permissions-upgrade-boundary-routes.test.ts \
   # prints # exit 0 with empty output — the failing-test files are unchanged between
-  # the ancestor and the PR base. Therefore the failing assertions reproduce on the
-  # base, and the reds are PRE-EXISTING-BASE-RED.
+  # the merge-ancestor (b774322590) and the PR base. Equivalent stronger proof: blob
+  # SHAs at A (e8f873d37b PR #141 head), B (b7a3a892d8 PR base), and H (d843e880dd PR
+  # head) are byte-identical for every failing test file (see "Causal non-touch"
+  # section below).
 ```
 
-### Causal non-touch on the `policy` script
+### Causal non-touch on the `policy` script (corrected path)
+
+The failing step on both PR #147 and PR #141 is `Reject git push in adapter/runtime code`.
+The script the step runs is `scripts/check-no-git-push.mjs` (not `scripts/ci/...`):
 
 ```bash
-git diff b774322590c0aea7241c1016282ff4d49a79b5fb..b7a3a892d8add53f1b2e6166fdce6f7d0d6756f4 \
-  -- scripts/ci/check-no-git-push.mjs .claude/agents/ scripts/check-no-git-push.sh
-# exit 0 with empty output — the policy check's source is unchanged between
-# the ancestor and the PR base. The red reproduces the same on every PR on
-# this fork line.
+git rev-parse b774322590:scripts/check-no-git-push.mjs   # 7254f6cafedeed4b694167f1ffa05c38b4ae11dd
+git rev-parse b7a3a892d8:scripts/check-no-git-push.mjs   # 7254f6cafedeed4b694167f1ffa05c38b4ae11dd
+git rev-parse d843e880dd:scripts/check-no-git-push.mjs   # 7254f6cafedeed4b694167f1ffa05c38b4ae11dd
 ```
+
+All three blob SHAs are byte-identical. Therefore the `policy` check's assertion, lines,
+and check configuration are unchanged from A (`b774322590`) through B (`b7a3a892d8`) to
+H (`d843e880dd`), and the failure reproduces on the base as the §9702 clause-3 proof
+requires. Round 2's ledger cited `scripts/ci/check-no-git-push.mjs` — wrong path; the
+correct path is `scripts/check-no-git-push.mjs` and the byte-identity proof holds at it.
+
+### Causal non-touch on the failing test files (byte-identity)
+
+For each failing test file, the blob SHA at A, B, and H is byte-identical:
+
+```
+server/src/__tests__/plugin-orchestration-apis.test.ts
+  A=b54fe6e31da99b9d56f58a488ec508bab95b1e53  B=b54fe6e31da99b9d56f58a488ec508bab95b1e53  H=b54fe6e31da99b9d56f58a488ec508bab95b1e53
+
+server/src/__tests__/status-cards.test.ts
+  A=285060b754e95a38828d0967395f7bb1be818a12  B=285060b754e95a38828d0967395f7bb1be818a12  H=285060b754e95a38828d0967395f7bb1be818a12
+
+server/src/__tests__/openapi-routes.test.ts
+  A=9e29753867b5970fe1a41b8272315291bc72515d  B=9e29753867b5970fe1a41b8272315291bc72515d  H=9e29753867b5970fe1a41b8272315291bc72515d
+
+server/src/__tests__/issue-watchdogs-routes.test.ts
+  A=dd5636d1797c037ee45be8e6e7b3c1d730c18bea  B=dd5636d1797c037ee45be8e6e7b3c1d730c18bea  H=dd5636d1797c037ee45be8e6e7b3c1d730c18bea
+
+server/src/__tests__/permissions-upgrade-boundary-routes.test.ts
+  A=89c00485e8483576fc6d95920e6c7f50aebc3088  B=89c00485e8483576fc6d95920e6c7f50aebc3088  H=89c00485e8483576fc6d95920e6c7f50aebc3088
+```
+
+This is the strongest possible causal non-touch proof: not even a single byte differs.
+The failing assertions, lines, and check configurations are byte-identical at A, B, and H.
+The diff-hunk check `git diff b774322590...b7a3a892d8 -- <each failing test file>` is empty
+(no output), and `git diff b7a3a892d8..577a7eee6d -- <each failing test file>` is also
+empty (the PR's diff does not touch any failing test file).
+
+### PR diff is bounded to 3 code files
+
+```
+server/src/services/heartbeat.ts                            | 18 ++++
+server/src/services/recovery/successful-run-handoff.test.ts | 106 +++++++++++++++++++++
+server/src/services/recovery/successful-run-handoff.ts    | 5 +
+```
+
+`git diff b7a3a892d8..577a7eee6d --stat -- server/src` confirms 3 files / 129 insertions.
+None of the failing-test files or the policy check's `check-no-git-push.mjs` are touched.
 
 ### Per-failure classification
 
@@ -312,7 +370,9 @@ Every failure on the head is `PRE-EXISTING-BASE-RED` per the above evidence:
 - `policy`, `General tests (server 11/12))`, `(server (12/12))`, `workspaces-b`,
   `Verify serialized server suites (5/9 6/9 7/9)`, and `verify` reproduce on PR #141
   (the SPA-9702 clause-4 ancestor) by check identity (same name + same conclusion FAILURE)
-  and failure signature (same assertion error / same line / same code path).
+  and failure signature (same assertion error / same line / same code path), AND the
+  assertion-source files are byte-identical at A, B, and H (proving causal non-touch
+  via blob SHA comparison, not just empty diff).
 
 ### Builder's recommendation to the next verify run
 
