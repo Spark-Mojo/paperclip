@@ -3359,6 +3359,8 @@ describe("realizeExecutionWorkspace", () => {
     await fs.writeFile(path.join(worktreePath, "actual.txt"), "actual branch work\n", "utf8");
     await runGit(worktreePath, ["add", "actual.txt"]);
     await runGit(worktreePath, ["commit", "-m", "Add actual branch work"]);
+    const priorRescue = "paperclip/rescue/PAP-457/20260901T000000Z";
+    await runGit(repoRoot, ["branch", priorRescue, actualBranch]);
 
     let error: unknown = null;
     try {
@@ -3400,6 +3402,23 @@ describe("realizeExecutionWorkspace", () => {
       error = err;
     }
 
+    const actualHead = await readGit(worktreePath, ["rev-parse", "HEAD"]);
+    const rescueBranch = (error as Error).message.match(/paperclip\/rescue\/PAP-457\/\d{8}T\d{6}Z/)?.[0];
+    expect(rescueBranch).toBe(priorRescue);
+    expect((error as Error).message).toContain(actualHead);
+    await expect(readGit(repoRoot, ["rev-parse", `refs/heads/${rescueBranch}`])).resolves.toBe(actualHead);
+    await expect(readGit(worktreePath, ["branch", "--show-current"])).resolves.toBe(actualBranch);
+    await expect(readGit(repoRoot, ["show", `${rescueBranch}:actual.txt`])).resolves.toBe("actual branch work");
+    const firstRescueRefs = await readGit(repoRoot, ["for-each-ref", "--format=%(refname)", "refs/heads/paperclip/rescue/PAP-457"]);
+    await expect(ensurePersistedExecutionWorkspaceAvailable({
+      base: { baseCwd: repoRoot, source: "project_primary", projectId: "project-1", workspaceId: "workspace-1", repoUrl: null, repoRef: "HEAD" },
+      workspace: { id: "execution-workspace-diverged", mode: "isolated_workspace", strategyType: "git_worktree", cwd: worktreePath, providerRef: worktreePath, projectId: "project-1", projectWorkspaceId: "workspace-1", repoUrl: null, baseRef: "HEAD", branchName: expectedBranch, metadata: RUNTIME_OWNED_GIT_BRANCH_METADATA },
+      issue: { id: "issue-diverged", identifier: "PAP-457", title: "Classify diverged branch incoherence" },
+      agent: { id: "agent-1", name: "Codex Coder", companyId: "company-1" },
+      enableWorkspaceBranchReconcileForward: true,
+    })).rejects.toThrow(rescueBranch!);
+    await expect(readGit(repoRoot, ["for-each-ref", "--format=%(refname)", "refs/heads/paperclip/rescue/PAP-457"])).resolves.toBe(firstRescueRefs);
+
     expect(error).toMatchObject({
       code: "workspace_validation_failed",
       resultJson: {
@@ -3421,6 +3440,64 @@ describe("realizeExecutionWorkspace", () => {
         }),
       },
     });
+  }, 15_000);
+
+  it("creates a rescue ref for unique clean side-branch commits without restoring the recorded branch", async () => {
+    const repoRoot = await createTempRepo();
+    const expectedBranch = "PAP-459-recorded";
+    const actualBranch = "PAP-459-side";
+    const worktreePath = path.join(repoRoot, ".paperclip", "worktrees", expectedBranch);
+    await fs.mkdir(path.dirname(worktreePath), { recursive: true });
+    await runGit(repoRoot, ["branch", expectedBranch]);
+    await runGit(repoRoot, ["worktree", "add", "-b", actualBranch, worktreePath, "HEAD"]);
+    await runGit(repoRoot, ["checkout", expectedBranch]);
+    await fs.writeFile(path.join(repoRoot, "recorded.txt"), "recorded\n");
+    await runGit(repoRoot, ["add", "recorded.txt"]);
+    await runGit(repoRoot, ["commit", "-m", "Recorded work"]);
+    await fs.writeFile(path.join(worktreePath, "actual.txt"), "unique\n");
+    await runGit(worktreePath, ["add", "actual.txt"]);
+    await runGit(worktreePath, ["commit", "-m", "Side work"]);
+    const sideHead = await readGit(worktreePath, ["rev-parse", "HEAD"]);
+    let error: unknown;
+    try {
+      await ensurePersistedExecutionWorkspaceAvailable({
+        base: { baseCwd: repoRoot, source: "project_primary", projectId: "project-1", workspaceId: "workspace-1", repoUrl: null, repoRef: "HEAD" },
+        workspace: { id: "execution-workspace-unique", mode: "isolated_workspace", strategyType: "git_worktree", cwd: worktreePath, providerRef: worktreePath, projectId: "project-1", projectWorkspaceId: "workspace-1", repoUrl: null, baseRef: "HEAD", branchName: expectedBranch, metadata: RUNTIME_OWNED_GIT_BRANCH_METADATA },
+        issue: { id: "issue-unique", identifier: "PAP-459", title: "Unique side commits" },
+        agent: { id: "agent-1", name: "Codex Coder", companyId: "company-1" },
+      });
+    } catch (err) {
+      error = err;
+    }
+    expect(error).toMatchObject({ code: "workspace_validation_failed" });
+    const rescue = (error as Error).message.match(/paperclip\/rescue\/PAP-459\/\d{8}T\d{6}Z/)?.[0];
+    expect(rescue).toBeTruthy();
+    expect((error as Error).message).toContain(sideHead);
+    await expect(readGit(repoRoot, ["rev-parse", `refs/heads/${rescue}`])).resolves.toBe(sideHead);
+    await expect(readGit(worktreePath, ["branch", "--show-current"])).resolves.toBe(actualBranch);
+    await expect(readGit(repoRoot, ["show", `${rescue}:actual.txt`])).resolves.toBe("unique");
+  }, 15_000);
+
+  it("does not rescue a clean side branch whose commit is already on the recorded branch", async () => {
+    const repoRoot = await createTempRepo();
+    const expectedBranch = "PAP-457-recorded-no-unique";
+    const actualBranch = "PAP-457-side-no-unique";
+    const worktreePath = path.join(repoRoot, ".paperclip", "worktrees", expectedBranch);
+    await fs.mkdir(path.dirname(worktreePath), { recursive: true });
+    await runGit(repoRoot, ["branch", expectedBranch]);
+    await runGit(repoRoot, ["worktree", "add", "-b", actualBranch, worktreePath, "HEAD"]);
+    await runGit(repoRoot, ["checkout", expectedBranch]);
+    await fs.writeFile(path.join(repoRoot, "recorded.txt"), "recorded\n", "utf8");
+    await runGit(repoRoot, ["add", "recorded.txt"]);
+    await runGit(repoRoot, ["commit", "-m", "Recorded work"]);
+    const before = await readGit(repoRoot, ["for-each-ref", "--format=%(refname)", "refs/heads/paperclip/rescue"]);
+    await expect(ensurePersistedExecutionWorkspaceAvailable({
+      base: { baseCwd: repoRoot, source: "project_primary", projectId: "project-1", workspaceId: "workspace-1", repoUrl: null, repoRef: "HEAD" },
+      workspace: { id: "execution-workspace-no-unique", mode: "isolated_workspace", strategyType: "git_worktree", cwd: worktreePath, providerRef: worktreePath, projectId: "project-1", projectWorkspaceId: "workspace-1", repoUrl: null, baseRef: "HEAD", branchName: expectedBranch, metadata: RUNTIME_OWNED_GIT_BRANCH_METADATA },
+      issue: { id: "issue-no-unique", identifier: "PAP-457", title: "No unique side commits" },
+      agent: { id: "agent-1", name: "Codex Coder", companyId: "company-1" },
+    })).rejects.toMatchObject({ code: "workspace_validation_failed" });
+    await expect(readGit(repoRoot, ["for-each-ref", "--format=%(refname)", "refs/heads/paperclip/rescue"])).resolves.toBe(before);
   }, 15_000);
 
   it("routes a deleted recorded branch with a clean worktree to forward adoption when reconcile-forward is enabled", async () => {
