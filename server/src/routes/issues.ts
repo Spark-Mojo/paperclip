@@ -13599,28 +13599,36 @@ export function issueRoutes(
       // rejects with 409 when the target field is being changed without a
       // matching expected, or with a stale expected. Callers that don't
       // change status/assignee don't need to supply expected*.
-      const issueUpdateData = {
+      const issueUpdateData: Record<string, unknown> = {
         ...updateFields,
         actorAgentId: actor.agentId ?? null,
         actorUserId: actor.actorType === "user" ? actor.actorId : null,
-        // SPA-10357 / SPA-10429 ownership-transfer CAS expectations.
-        expectedStatus: req.body.expectedStatus,
-        expectedAssigneeUserId: req.body.expectedAssigneeUserId,
-        expectedAssigneeAgentId: req.body.expectedAssigneeAgentId,
         // SPA-8957: route-minted override reaches the service only for
         // user/board actors (agents were rejected above).
-        ...(doneOverrideRequested
-          ? {
-            doneGateOverride: {
-              reason: doneOverrideRequested.reason,
-              actorType: actor.actorType,
-              actorId: actor.actorId,
-              agentId: actor.agentId ?? null,
-              runId: actor.runId ?? null,
-            },
-          }
-          : {}),
       };
+      // SPA-10357 / SPA-10429 ownership-transfer CAS expectations. Only
+      // forward keys the caller actually supplied — `undefined` here would
+      // make the service-side `hasOwnProperty` check always return true and
+      // collapse the helper into a no-op cas-missing rejection. Forwarding
+      // a literal `undefined` is therefore a defect, not a no-op.
+      if (req.body.expectedStatus !== undefined) {
+        issueUpdateData.expectedStatus = req.body.expectedStatus;
+      }
+      if (req.body.expectedAssigneeUserId !== undefined) {
+        issueUpdateData.expectedAssigneeUserId = req.body.expectedAssigneeUserId;
+      }
+      if (req.body.expectedAssigneeAgentId !== undefined) {
+        issueUpdateData.expectedAssigneeAgentId = req.body.expectedAssigneeAgentId;
+      }
+      if (doneOverrideRequested) {
+        issueUpdateData.doneGateOverride = {
+          reason: doneOverrideRequested.reason,
+          actorType: actor.actorType,
+          actorId: actor.actorId,
+          agentId: actor.agentId ?? null,
+          runId: actor.runId ?? null,
+        };
+      }
       const shouldCollectCompletionPublication =
         actor.actorType === "user" &&
         existing.status !== "done" &&

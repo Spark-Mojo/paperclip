@@ -277,19 +277,86 @@ describeEmbeddedPostgres("SPA-10357 / SPA-10429 ownership-transfer CAS", () => {
       .patch(`/api/issues/${issueId}`)
       .send({ title: "Updated title via new path" });
 
-    // Title-only edit must not be blocked by the CAS guard. The CAS guard
-    // only fires when status / assigneeUserId / assigneeAgentId is being
-    // changed; downstream guards may still 4xx, but the request must
-    // survive the CAS check (no 400/409 from the cas-mismatch path).
-    expect([200, 403, 422], JSON.stringify(res.body)).toContain(res.status);
-    if (res.status === 200) {
-      const row = await db
-        .select({ title: issues.title })
-        .from(issues)
-        .where(eq(issues.id, issueId))
-        .then((r) => r[0]);
-      expect(row?.title).toBe("Updated title via new path");
-    }
+    // Title-only edit must not be blocked by the CAS guard. Title edits do
+    // not change status / assigneeUserId / assigneeAgentId, so the helper
+    // returns immediately without checking expected.
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(JSON.stringify(res.body)).not.toMatch(/issue_write_ownership_cas_/);
+    const row = await db
+      .select({ title: issues.title })
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((r) => r[0]);
+    expect(row?.title).toBe("Updated title via new path");
+  });
+
+  // --- positive control (the done condition the card requires) -----------
+
+  it("positive: PATCH succeeds when caller expected matches the live row", async () => {
+    // The SPA-10357 named control's done condition includes a positive
+    // control: a PATCH that supplies matching expected* must succeed.
+    // We use the `todo → in_review` transition so the service-side
+    // status-transition validation accepts the change.
+    const { companyId } = await seedCompanyAndAgent();
+    const issueId = await seedIssue({
+      companyId,
+      status: "todo",
+      assigneeUserId: "local-board",
+    });
+
+    const res = await request(createApp(boardActor(companyId)))
+      .patch(`/api/issues/${issueId}`)
+      .send({
+        status: "in_review",
+        expectedStatus: "todo",
+        expectedAssigneeUserId: "local-board",
+      });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(JSON.stringify(res.body)).not.toMatch(/issue_write_ownership_cas_/);
+
+    const row = await db
+      .select({ status: issues.status, assigneeUserId: issues.assigneeUserId })
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((r) => r[0]);
+    expect(row).toEqual({ status: "in_review", assigneeUserId: "local-board" });
+  });
+
+  it("positive: TOCTOU — caller expected matches the locked snapshot even when pre-lock differs", async () => {
+    // The done condition's other half: when a concurrent write has flipped
+    // the row between the caller's read and the engine's lock, the CAS
+    // helper uses the LOCKED snapshot for both change-detection and
+    // comparison. A caller who observed `expectedStatus: "todo"` and the
+    // row is now `in_progress` (because someone else moved it just now)
+    // must see the CAS helper treat status as changed and reject with
+    // cas-mismatch. This proves the locked snapshot is the comparison
+    // surface — the pre-lock read is informational only.
+    const { companyId } = await seedCompanyAndAgent();
+    const issueId = await seedIssue({
+      companyId,
+      status: "todo",
+      assigneeUserId: "local-board",
+    });
+
+    // Simulate the concurrent write: flip status to in_review BEFORE the
+    // caller's PATCH lands. The caller's `expectedStatus: "todo"` is stale
+    // against the locked snapshot.
+    await db
+      .update(issues)
+      .set({ status: "in_review" })
+      .where(eq(issues.id, issueId));
+
+    const res = await request(createApp(boardActor(companyId)))
+      .patch(`/api/issues/${issueId}`)
+      .send({
+        status: "done",
+        expectedStatus: "todo", // <-- stale against the now-in_review row
+      });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(409);
+    expect(JSON.stringify(res.body)).toMatch(/issue_write_ownership_cas_mismatch/);
+    expect(JSON.stringify(res.body)).toMatch(/expectedStatus/);
   });
 
   // --- TOCTOU control is actor-agnostic -----------------------------------
