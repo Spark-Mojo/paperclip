@@ -139,6 +139,7 @@ const SUCCESSFUL_RUN_HANDOFF_VALID_PATH_SKIP_REASONS = new Set([
   "issue is under an active pause hold",
   "corrective handoff wake already exists for this source run",
   "chat conversation already owns the next action",
+  "armed task watchdog owns the next action",
 ]);
 
 export function isSuccessfulRunHandoffValidPathSkip(
@@ -476,6 +477,7 @@ export function decideSuccessfulRunHandoff(input: {
   hasOpenRecoveryIssue: boolean;
   hasPauseHold: boolean;
   hasActiveRoutineContinuation: boolean;
+  hasArmedTaskWatchdog: boolean;
   budgetBlocked: boolean;
   idempotentWakeExists: boolean;
 }): SuccessfulRunHandoffDecision {
@@ -512,6 +514,9 @@ export function decideSuccessfulRunHandoff(input: {
   }
   if (input.hasActiveRoutineContinuation) {
     return { kind: "skip", reason: "active routine continuation owns the next action" };
+  }
+  if (input.hasArmedTaskWatchdog) {
+    return { kind: "skip", reason: "armed task watchdog owns the next action" };
   }
   if (!isProductiveSuccessfulRun(input)) {
     return { kind: "skip", reason: "successful run did not produce handoff-relevant progress" };

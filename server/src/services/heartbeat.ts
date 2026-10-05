@@ -140,6 +140,7 @@ import {
   issueRelations,
   issueThreadInteractions,
   issues,
+  issueWatchdogs,
   issueWorkProducts,
   nativeRunFinalizations,
   projects,
@@ -13823,6 +13824,7 @@ export function heartbeatService(
       budgetBlock,
       pauseHold,
       activeRoutineContinuation,
+      armedTaskWatchdog,
     ] = await Promise.all([
       issue
         ? db
@@ -13968,6 +13970,21 @@ export function heartbeatService(
             .limit(1)
             .then((rows) => rows[0] ?? null)
         : Promise.resolve(null),
+      issue
+        ? db
+            .select({ id: issueWatchdogs.id })
+            .from(issueWatchdogs)
+            .where(
+              and(
+                eq(issueWatchdogs.companyId, issue.companyId),
+                eq(issueWatchdogs.issueId, issue.id),
+                eq(issueWatchdogs.status, "active"),
+                gt(issueWatchdogs.triggerCount, 0),
+              ),
+            )
+            .limit(1)
+            .then((rows) => rows[0] ?? null)
+        : Promise.resolve(null),
     ]);
 
     const decision = decideSuccessfulRunHandoff({
@@ -13989,6 +14006,7 @@ export function heartbeatService(
       hasOpenRecoveryIssue: Boolean(openRecoveryIssue),
       hasPauseHold: Boolean(pauseHold),
       hasActiveRoutineContinuation: Boolean(activeRoutineContinuation),
+      hasArmedTaskWatchdog: Boolean(armedTaskWatchdog),
       budgetBlocked: Boolean(budgetBlock),
       idempotentWakeExists: Boolean(existingWake),
     });
