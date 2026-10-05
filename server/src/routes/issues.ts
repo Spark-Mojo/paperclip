@@ -13594,10 +13594,19 @@ export function issueRoutes(
       } = { value: null };
       const postCommitActivityPublications: ActivityPublication[] = [];
       const postCommitIssueActions: IssuePostCommitAction[] = [];
+      // SPA-10357 / SPA-10429 ownership-transfer CAS. The service compares
+      // the caller-supplied expected* against the row's locked snapshot and
+      // rejects with 409 when the target field is being changed without a
+      // matching expected, or with a stale expected. Callers that don't
+      // change status/assignee don't need to supply expected*.
       const issueUpdateData = {
         ...updateFields,
         actorAgentId: actor.agentId ?? null,
         actorUserId: actor.actorType === "user" ? actor.actorId : null,
+        // SPA-10357 / SPA-10429 ownership-transfer CAS expectations.
+        expectedStatus: req.body.expectedStatus,
+        expectedAssigneeUserId: req.body.expectedAssigneeUserId,
+        expectedAssigneeAgentId: req.body.expectedAssigneeAgentId,
         // SPA-8957: route-minted override reaches the service only for
         // user/board actors (agents were rejected above).
         ...(doneOverrideRequested

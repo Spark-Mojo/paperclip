@@ -6612,6 +6612,78 @@ async function countBlockedInboxIssues(
   }, 0);
 }
 
+// SPA-10429 / SPA-10357 ownership-transfer CAS. The caller must supply the
+// row's current value for each field it is changing; a stale value (the
+// caller observed a value that has since been overwritten) returns 409 and
+// leaves the row untouched. The check is intended to run AFTER the row has
+// been re-read under the service's `for("update")` lock, so the comparison is
+// against the locked snapshot, not against a read the caller may have made
+// earlier.
+//
+// When the caller DOES NOT supply the corresponding expected* but IS
+// changing the target field, the helper rejects as `cas_missing` — the
+// SPA-10357 silent-write class is closed only when expected is mandatory for
+// status / assignee changes. Title-only and description-only edits are
+// unaffected.
+export type IssueWriteOwnershipCASExpectations = {
+  expectedStatus?: string | null;
+  expectedAssigneeUserId?: string | null;
+  expectedAssigneeAgentId?: string | null;
+};
+
+export type IssueWriteOwnershipCASRow = {
+  status: string;
+  assigneeUserId: string | null;
+  assigneeAgentId: string | null;
+};
+
+export type IssueWriteOwnershipCASChanges = {
+  statusChanged: boolean;
+  assigneeUserIdChanged: boolean;
+  assigneeAgentIdChanged: boolean;
+};
+
+export function assertIssueWriteOwnershipCAS(
+  existing: IssueWriteOwnershipCASRow,
+  expected: IssueWriteOwnershipCASExpectations | undefined,
+  changes: IssueWriteOwnershipCASChanges,
+) {
+  if (!expected) expected = {};
+  const compare = (
+    key: "expectedStatus" | "expectedAssigneeUserId" | "expectedAssigneeAgentId",
+    liveValue: string | null,
+    changed: boolean,
+  ) => {
+    if (!changed) return;
+    const suppliedRaw = (expected as Record<string, string | null | undefined>)[key];
+    if (suppliedRaw === undefined) {
+      throw conflict(
+        `Issue write rejected: caller did not supply expected value for ${key}; ownership-transfer CAS is required when changing this field (SPA-10357)`,
+        {
+          code: "issue_write_ownership_cas_missing",
+          field: key,
+        },
+      );
+    }
+    const suppliedNorm = suppliedRaw ?? null;
+    const liveNorm = liveValue ?? null;
+    if (suppliedNorm !== liveNorm) {
+      throw conflict(
+        `Issue write rejected: caller-supplied expected value for ${key} does not match the row's current value`,
+        {
+          code: "issue_write_ownership_cas_mismatch",
+          field: key,
+          callerExpected: suppliedNorm,
+          live: liveNorm,
+        },
+      );
+    }
+  };
+  compare("expectedStatus", existing.status, changes.statusChanged);
+  compare("expectedAssigneeUserId", existing.assigneeUserId, changes.assigneeUserIdChanged);
+  compare("expectedAssigneeAgentId", existing.assigneeAgentId, changes.assigneeAgentIdChanged);
+}
+
 export function issueService(db: Db) {
   const instanceSettings = instanceSettingsService(db);
   const treeControlSvc = issueTreeControlService(db);
@@ -10628,6 +10700,16 @@ export function issueService(db: Db) {
          * completions (watchdog evaluation folds). Never settable from HTTP.
          */
         doneGateBypass?: boolean;
+        /**
+         * SPA-10357 / SPA-10429 ownership-transfer CAS. Each expected* field
+         * is the value the caller observed before submitting this PATCH; if
+         * it does not match the row's locked snapshot at write time, the
+         * PATCH fails 409 without mutating. The route handler enforces
+         * "required iff the corresponding target field is changing".
+         */
+        expectedStatus?: string | null;
+        expectedAssigneeUserId?: string | null;
+        expectedAssigneeAgentId?: string | null;
       },
       dbOrTx: any = db,
       postCommitActivityPublications?: ActivityPublication[],
@@ -10675,8 +10757,38 @@ export function issueService(db: Db) {
         companyGuard,
         doneGateOverride,
         doneGateBypass,
+        expectedStatus,
+        expectedAssigneeUserId,
+        expectedAssigneeAgentId,
         ...issueData
       } = data;
+      const writeOwnershipCASExpectations: IssueWriteOwnershipCASExpectations = {
+        expectedStatus,
+        expectedAssigneeUserId,
+        expectedAssigneeAgentId,
+      };
+      const writeOwnershipCASChanges: IssueWriteOwnershipCASChanges = {
+        statusChanged: issueData.status !== undefined && issueData.status !== existing.status,
+        assigneeUserIdChanged:
+          issueData.assigneeUserId !== undefined &&
+          issueData.assigneeUserId !== existing.assigneeUserId,
+        assigneeAgentIdChanged:
+          issueData.assigneeAgentId !== undefined &&
+          issueData.assigneeAgentId !== existing.assigneeAgentId,
+      };
+      const hasAnyCASExpectation =
+        Object.prototype.hasOwnProperty.call(
+          writeOwnershipCASExpectations,
+          "expectedStatus",
+        ) ||
+        Object.prototype.hasOwnProperty.call(
+          writeOwnershipCASExpectations,
+          "expectedAssigneeUserId",
+        ) ||
+        Object.prototype.hasOwnProperty.call(
+          writeOwnershipCASExpectations,
+          "expectedAssigneeAgentId",
+        );
       if (
         issueData.assigneeAgentId !== undefined &&
         issueData.assigneeAgentId !== existing.assigneeAgentId
@@ -10984,6 +11096,15 @@ export function issueService(db: Db) {
           .for("update")
           .then((rows: Array<typeof issues.$inferSelect>) => rows[0] ?? null);
         if (!receiptExisting) return null;
+        // SPA-10357 / SPA-10429 ownership-transfer CAS. The locked snapshot
+        // is the only comparison surface; the caller's earlier read is not.
+        // Fires whenever the caller is changing status, assigneeUserId, or
+        // assigneeAgentId — supplying expected* is mandatory.
+        assertIssueWriteOwnershipCAS(
+          receiptExisting,
+          hasAnyCASExpectation ? writeOwnershipCASExpectations : {},
+          writeOwnershipCASChanges,
+        );
         if (actorAgentId && patch.status === "done") {
           const [review] = await tx.select({ id: toolActionRequests.id }).from(toolActionRequests).where(and(eq(toolActionRequests.companyId, existing.companyId), eq(toolActionRequests.issueId, id), inArray(toolActionRequests.status, ["pending", "approved", "executing"]))).limit(1);
           if (review) throw conflict("This task is waiting for a connection review. Finish unrelated work, then yield in_review without retrying the governed call.", { code: "tool_review_pending", actionRequestId: review.id });
