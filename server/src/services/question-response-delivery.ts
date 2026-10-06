@@ -27,6 +27,7 @@ const DELIVERY_CLAIM_STALE_MS = 30_000;
 const DELIVERY_CLAIM_REFRESH_MS = 10_000;
 const MAX_DELIVERY_ATTEMPTS = 5;
 const DELIVERY_CORRELATION_PREFIX = "question-response:";
+const ASSIGNEE_PENDING_CODE = "question_response_assignee_pending";
 const QUESTION_RESPONSE_WAKE_IDEMPOTENCY_CONSTRAINT =
   "agent_wakeup_requests_question_response_delivery_idempotency_uq";
 
@@ -604,7 +605,7 @@ export function questionResponseDeliveryService(
     const nextErrorCount = delivery.errorCount + (options.bounded ? 1 : 0);
     const exhausted =
       options.bounded && nextErrorCount >= MAX_DELIVERY_ATTEMPTS;
-    await db
+    const released = await db
       .update(issueQuestionResponseDeliveries)
       .set({
         // Keep an exhausted claim owned until recordTerminal commits its outcome.
@@ -622,8 +623,45 @@ export function questionResponseDeliveryService(
             delivery.attemptCount,
           ),
         ),
-      );
-    return exhausted;
+      )
+      .returning({ id: issueQuestionResponseDeliveries.id });
+    return { exhausted, released: released.length > 0 };
+  }
+
+  async function parkForAssignee(
+    delivery: DeliveryRow,
+    interaction: QuestionInteractionRow,
+    adapter: string,
+    issueStatus: string,
+  ): Promise<void> {
+    // One deferral notice per transition, so a card that stays unowned records
+    // the pending answer once rather than once per sweep tick.
+    const firstPark = delivery.lastErrorCode !== ASSIGNEE_PENDING_CODE;
+    const { released } = await releaseForRetry(delivery, ASSIGNEE_PENDING_CODE, {
+      bounded: false,
+    });
+    if (!firstPark || !released) return;
+    await logActivity(db, {
+      companyId: interaction.companyId,
+      actorType: "system",
+      actorId: "question-response-delivery",
+      agentId: interaction.createdByAgentId,
+      action: "issue.question_response_delivery_deferred",
+      entityType: "issue",
+      entityId: interaction.issueId,
+      details: {
+        deliveryId: delivery.id,
+        interactionId: interaction.id,
+        sourceRunId: interaction.sourceRunId,
+        correlationId: delivery.correlationId,
+        deliveryStatus: "pending",
+        deliveryMode: null,
+        adapter,
+        errorCode: ASSIGNEE_PENDING_CODE,
+        issueStatus,
+        reason: "no_agent_assignee",
+      },
+    });
   }
 
   async function withClaimLease<T>(
@@ -848,12 +886,7 @@ export function questionResponseDeliveryService(
           .then((rows) => rows[0] ?? null),
       ]);
     const adapter = agent?.adapterType ?? "unknown";
-    if (
-      !issue ||
-      !issue.assigneeAgentId ||
-      issue.status === "done" ||
-      issue.status === "cancelled"
-    ) {
+    if (!issue || issue.status === "done" || issue.status === "cancelled") {
       return recordTerminal({
         delivery: claimed,
         interaction,
@@ -865,6 +898,17 @@ export function questionResponseDeliveryService(
           ? "question_response_issue_missing"
           : "question_response_target_unavailable",
       });
+    }
+    if (!issue.assigneeAgentId) {
+      // The answer is already recorded, but no agent owns the issue, so there
+      // is no lawful `wake_assignee` target and nothing to steer. Park the
+      // receipt instead of failing it: `sweepPending` retries it, and the first
+      // run that holds the issue after an assignment receives the answer
+      // through the same idempotent wake key. Failing terminally here is what
+      // silently dropped every answer filed against a human-held card, leaving
+      // it stored and undelivered with no failure any agent could see.
+      await parkForAssignee(claimed, interaction, adapter, issue.status);
+      return null;
     }
     const assigneeAgentId = issue.assigneeAgentId;
     const inferredSourceCommentId =
@@ -1071,7 +1115,7 @@ export function questionResponseDeliveryService(
           error instanceof Error && compactLine(error.message)
             ? compactLine(error.message)!.slice(0, 160)
             : "external_chat_source_run_cancellation_failed";
-        const exhausted = await releaseForRetry(claimed, errorCode);
+        const { exhausted } = await releaseForRetry(claimed, errorCode);
         logger.warn(
           {
             err: error,
@@ -1127,7 +1171,7 @@ export function questionResponseDeliveryService(
           error instanceof Error && compactLine(error.message)
             ? compactLine(error.message)!.slice(0, 160)
             : "native_question_delivery_failed";
-        const exhausted = await releaseForRetry(claimed, errorCode);
+        const { exhausted } = await releaseForRetry(claimed, errorCode);
         logger.warn(
           {
             err: error,
@@ -1315,7 +1359,7 @@ export function questionResponseDeliveryService(
         error instanceof Error && compactLine(error.message)
           ? compactLine(error.message)!.slice(0, 160)
           : "question_response_wake_failed";
-      const exhausted = await releaseForRetry(claimed, errorCode);
+      const { exhausted } = await releaseForRetry(claimed, errorCode);
       logger.warn(
         {
           err: error,
