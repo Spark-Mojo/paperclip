@@ -95,6 +95,9 @@ describeEmbeddedPostgres("question response delivery", () => {
       successorStatus?: "queued" | "running";
       sourceCommentBody?: string;
       attachSourceCommentToInteraction?: boolean;
+      /** SPA-9862: a card held by a human has no lawful wake target. */
+      issueAssignee?: "agent" | "human";
+      issueStatus?: "in_progress" | "todo" | "done" | "cancelled";
     } = {},
   ) {
     const companyId = randomUUID();
@@ -132,9 +135,12 @@ describeEmbeddedPostgres("question response delivery", () => {
       companyId,
       goalId,
       title: "Deliver answers",
-      status: "in_progress",
+      status: args.issueStatus ?? "in_progress",
       priority: "medium",
-      assigneeAgentId: agentId,
+      assigneeAgentId: args.issueAssignee === "human" ? null : agentId,
+      ...(args.issueAssignee === "human"
+        ? { assigneeUserId: "board-user" }
+        : {}),
     });
     await db.insert(heartbeatRuns).values({
       id: sourceRunId,
@@ -1274,6 +1280,196 @@ describeEmbeddedPostgres("question response delivery", () => {
     expect(second?.duplicate).toBe(true);
     expect(steer).toHaveBeenCalledTimes(1);
     expect(wakeup).toHaveBeenCalledTimes(1);
+  });
+
+  async function deliveryActivityActions(issueId: string) {
+    return db
+      .select({ action: activityLog.action })
+      .from(activityLog)
+      .where(eq(activityLog.entityId, issueId))
+      .then((rows) => rows.map((row) => row.action));
+  }
+
+  async function deliveryRow(interactionId: string) {
+    const [row] = await db
+      .select()
+      .from(issueQuestionResponseDeliveries)
+      .where(eq(issueQuestionResponseDeliveries.interactionId, interactionId));
+    if (!row) throw new Error("Expected a question response delivery receipt");
+    return row;
+  }
+
+  it("parks the answer for retry when the issue has no agent assignee", async () => {
+    const seeded = await seed({ issueAssignee: "human" });
+    const wakeup = vi.fn();
+    const service = questionResponseDeliveryService(db, {
+      heartbeat: { wakeup } as never,
+    });
+
+    const outcome = await service.deliver(seeded.interaction.id);
+
+    expect(outcome).toBeNull();
+    expect(wakeup).not.toHaveBeenCalled();
+    expect(await deliveryRow(seeded.interaction.id)).toMatchObject({
+      status: "pending",
+      deliveryMode: null,
+      targetRunId: null,
+      lastErrorCode: "question_response_assignee_pending",
+      errorCount: 0,
+    });
+    const actions = await deliveryActivityActions(seeded.issueId);
+    expect(actions).toContain("issue.question_response_delivery_deferred");
+    expect(actions).not.toContain("issue.question_response_delivery_failed");
+  });
+
+  it("delivers the parked answer once the issue gains an agent assignee", async () => {
+    const seeded = await seed({ issueAssignee: "human" });
+    // A run row for another issue: it satisfies the `target_run_id` foreign key
+    // the terminal receipt writes, and being scoped to a different issue it is
+    // not a coalescing candidate, so the answer takes the wake path.
+    const fallbackRunId = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: fallbackRunId,
+      companyId: seeded.companyId,
+      agentId: seeded.agentId,
+      invocationSource: "automation",
+      status: "queued",
+      runtimeMode: "native",
+      driverKind: "codex",
+      contextSnapshot: { issueId: randomUUID() },
+    });
+    const wakeup = vi
+      .fn()
+      .mockResolvedValue({ id: fallbackRunId, driverKind: "codex" });
+    const service = questionResponseDeliveryService(db, {
+      heartbeat: { wakeup } as never,
+    });
+    expect(await service.deliver(seeded.interaction.id)).toBeNull();
+
+    await db
+      .update(issues)
+      .set({ assigneeAgentId: seeded.agentId, assigneeUserId: null })
+      .where(eq(issues.id, seeded.issueId));
+    const counts = await service.sweepPending();
+
+    expect(counts.wakeFallback).toBe(1);
+    expect(wakeup).toHaveBeenCalledTimes(1);
+    expect(await deliveryRow(seeded.interaction.id)).toMatchObject({
+      status: "fallback_queued",
+      deliveryMode: "wake_fallback",
+      lastErrorCode: null,
+    });
+    const actions = await deliveryActivityActions(seeded.issueId);
+    expect(actions).toContain("issue.question_response_delivery_deferred");
+    expect(actions).toContain("issue.question_response_delivered");
+  });
+
+  it("does not issue a second wake for a replayed delivery of the same interaction", async () => {
+    const seeded = await seed({ issueAssignee: "human" });
+    // A run row for another issue: it satisfies the `target_run_id` foreign key
+    // the terminal receipt writes, and being scoped to a different issue it is
+    // not a coalescing candidate, so the answer takes the wake path.
+    const fallbackRunId = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: fallbackRunId,
+      companyId: seeded.companyId,
+      agentId: seeded.agentId,
+      invocationSource: "automation",
+      status: "queued",
+      runtimeMode: "native",
+      driverKind: "codex",
+      contextSnapshot: { issueId: randomUUID() },
+    });
+    const wakeup = vi
+      .fn()
+      .mockResolvedValue({ id: fallbackRunId, driverKind: "codex" });
+    const service = questionResponseDeliveryService(db, {
+      heartbeat: { wakeup } as never,
+    });
+    await service.deliver(seeded.interaction.id);
+    await db
+      .update(issues)
+      .set({ assigneeAgentId: seeded.agentId, assigneeUserId: null })
+      .where(eq(issues.id, seeded.issueId));
+    await service.sweepPending();
+
+    await db
+      .update(issues)
+      .set({ assigneeAgentId: seeded.agentId })
+      .where(eq(issues.id, seeded.issueId));
+    const replay = await service.sweepPending();
+
+    expect(replay.wakeFallback).toBe(0);
+    expect(wakeup).toHaveBeenCalledTimes(1);
+    // The terminal receipt is what a duplicate assignment event, a replayed
+    // sweep, or a retried response can no longer reopen.
+    expect(await deliveryRow(seeded.interaction.id)).toMatchObject({
+      status: "fallback_queued",
+      deliveryMode: "wake_fallback",
+    });
+  });
+
+  it("keeps a terminal issue terminal", async () => {
+    const seeded = await seed();
+    // Production shape: the card was closed while the question was open, so
+    // the board's answer arrives against a card that can no longer move.
+    await db
+      .update(issues)
+      .set({ status: "done" })
+      .where(eq(issues.id, seeded.issueId));
+    const wakeup = vi.fn();
+    const service = questionResponseDeliveryService(db, {
+      heartbeat: { wakeup } as never,
+    });
+
+    const outcome = await service.deliver(seeded.interaction.id);
+
+    expect(outcome).toMatchObject({
+      status: "failed",
+      mode: null,
+      targetRunId: null,
+    });
+    expect(wakeup).not.toHaveBeenCalled();
+    expect(await deliveryRow(seeded.interaction.id)).toMatchObject({
+      status: "failed",
+      lastErrorCode: "question_response_target_unavailable",
+    });
+    const actions = await deliveryActivityActions(seeded.issueId);
+    expect(actions).not.toContain("issue.question_response_delivery_deferred");
+    expect(await service.sweepPending()).toMatchObject({
+      scanned: 0,
+      failed: 0,
+      wakeFallback: 0,
+    });
+    expect(wakeup).not.toHaveBeenCalled();
+  });
+
+  it("keeps a missing agent assignee retryable across sweeps", async () => {
+    const seeded = await seed({ issueAssignee: "human" });
+    const wakeup = vi.fn();
+    const service = questionResponseDeliveryService(db, {
+      heartbeat: { wakeup } as never,
+    });
+
+    await service.deliver(seeded.interaction.id);
+    for (let sweep = 0; sweep < 6; sweep += 1) {
+      await service.sweepPending();
+    }
+
+    expect(wakeup).not.toHaveBeenCalled();
+    // An availability state, not a delivery error: it must never consume the
+    // bounded attempt budget that ends in a terminal failure.
+    expect(await deliveryRow(seeded.interaction.id)).toMatchObject({
+      status: "pending",
+      errorCount: 0,
+      lastErrorCode: "question_response_assignee_pending",
+    });
+    const actions = await deliveryActivityActions(seeded.issueId);
+    expect(
+      actions.filter(
+        (action) => action === "issue.question_response_delivery_deferred",
+      ),
+    ).toHaveLength(1);
   });
 
   it("formats text, select labels, multi-select, and custom answers in order", async () => {
