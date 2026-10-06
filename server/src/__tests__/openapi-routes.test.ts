@@ -255,6 +255,37 @@ describe("openapi routes", () => {
     expect(wake.responses["409"]).toBeDefined();
     expect(wake.description).toContain("durable queued/deferred receipt");
   });
+  // SPA-10587: the company heartbeat-run list read `offset` and discarded it,
+  // clamped an over-cap `limit` silently, and documented none of it — so the
+  // only parameter a caller could see in the spec was `companyId`.
+  it("documents heartbeat run list paging", async () => {
+    const res = await request(createApp()).get("/api/openapi.json");
+    const spec = res.body.paths["/api/companies/{companyId}/heartbeat-runs"].get;
+
+    const names = (spec.parameters ?? [])
+      .filter((parameter: { in: string }) => parameter.in === "query")
+      .map((parameter: { name: string }) => parameter.name);
+    expect(names).toEqual(expect.arrayContaining(["agentId", "limit", "offset", "summary"]));
+
+    const limit = (spec.parameters ?? []).find(
+      (parameter: { in: string; name: string }) =>
+        parameter.in === "query" && parameter.name === "limit",
+    );
+    expect(limit.schema).toMatchObject({ type: "integer", minimum: 1, maximum: 1000 });
+
+    const offset = (spec.parameters ?? []).find(
+      (parameter: { in: string; name: string }) =>
+        parameter.in === "query" && parameter.name === "offset",
+    );
+    expect(offset.schema).toMatchObject({ type: "integer", minimum: 0 });
+
+    // A caller must be able to read the truncation contract off the spec.
+    expect(spec.description).toContain("X-Next-Offset");
+    expect(spec.description).toContain("rejected with 400");
+    expect(spec.responses["400"]).toBeDefined();
+    expect(spec.responses["403"]).toBeDefined();
+  });
+
   it("serves the generated OpenAPI document", async () => {
     const res = await request(createApp()).get("/api/openapi.json");
 

@@ -6460,8 +6460,43 @@ registry.registerPath({
   path: "/api/companies/{companyId}/heartbeat-runs",
   tags: ["runs"],
   summary: "List heartbeat runs for a company",
-  request: { params: z.object({ companyId: z.string() }) },
-  responses: { 200: r.ok(), 401: r.unauthorized },
+  description:
+    "Newest-first page of heartbeat runs for one company. Paging is offset-based and " +
+    "every response names the page it returned in `X-Page-Limit`/`X-Page-Offset`; " +
+    "`X-Next-Offset` is present only when more rows exist, so a caller can tell a " +
+    "truncated read from a complete one. `limit` above 1000 is rejected with 400 " +
+    "rather than silently clamped. Count with an explicit `limit` of at most 1000 " +
+    "and an `offset` loop that ends on a page shorter than `limit` (or without " +
+    "`X-Next-Offset`); an unpaged read is not a count.",
+  request: {
+    params: z.object({ companyId: z.string() }),
+    query: z.object({
+      agentId: z.string().optional(),
+      limit: z.coerce
+        .number()
+        .int()
+        .min(1)
+        .max(1000)
+        .optional()
+        .describe("Rows per page, 1-1000. Defaults to 200. Over the cap is a 400, never a silent clamp."),
+      offset: z.coerce
+        .number()
+        .int()
+        .min(0)
+        .optional()
+        .describe("Rows to skip in newest-first order. Defaults to 0."),
+      summary: z
+        .enum(["true", "1", "false", "0"])
+        .optional()
+        .describe("Return the reduced run summary projection."),
+    }),
+  },
+  responses: {
+    200: r.ok(),
+    400: r.badRequest,
+    401: r.unauthorized,
+    403: r.forbidden,
+  },
 });
 
 registry.registerPath({

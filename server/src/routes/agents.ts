@@ -292,6 +292,80 @@ function readLiveRunsQueryInt(value: unknown, max: number, fallback = 0) {
   return Math.min(max, Math.trunc(parsed));
 }
 
+// Company heartbeat-run listing caps. `limit` above the cap is REJECTED, not
+// clamped: a silent clamp returns a different page than the caller asked for
+// with no signal, which is the same unpaginable hazard as an inert `offset`
+// (SPA-10587). The cap itself matches the fleet pagination rule's ceiling.
+export const HEARTBEAT_RUN_LIST_MAX_LIMIT = 1000;
+export const HEARTBEAT_RUN_LIST_DEFAULT_LIMIT = 200;
+
+export type HeartbeatRunListPage = {
+  limit: number;
+  offset: number;
+};
+
+function parseHeartbeatRunListCount(value: unknown, fallback: number): number {
+  if (value === undefined) return fallback;
+  if (Array.isArray(value)) {
+    throw badRequest("limit and offset must be single scalar query parameters");
+  }
+  if (typeof value !== "string" || !/^\d+$/.test(value)) return Number.NaN;
+  return Number.parseInt(value, 10);
+}
+
+/**
+ * Parses `limit`/`offset` for the company heartbeat-run list. Every malformed,
+ * negative, or over-cap value is a 400 naming the rule, so no caller can be
+ * silently served a page it did not ask for.
+ */
+export function parseHeartbeatRunListPage(
+  query: Record<string, unknown>,
+): HeartbeatRunListPage {
+  const rawLimit = query.limit;
+  const rawOffset = query.offset;
+  if (Array.isArray(rawLimit) || Array.isArray(rawOffset)) {
+    throw badRequest("limit and offset must be single scalar query parameters");
+  }
+  const requestedLimit = parseHeartbeatRunListCount(
+    rawLimit,
+    HEARTBEAT_RUN_LIST_DEFAULT_LIMIT,
+  );
+  const requestedOffset = parseHeartbeatRunListCount(rawOffset, 0);
+  if (!Number.isInteger(requestedLimit) || requestedLimit < 1) {
+    throw badRequest(
+      `limit must be a positive integer up to ${HEARTBEAT_RUN_LIST_MAX_LIMIT}`,
+    );
+  }
+  if (requestedLimit > HEARTBEAT_RUN_LIST_MAX_LIMIT) {
+    throw badRequest(
+      `limit must be a positive integer up to ${HEARTBEAT_RUN_LIST_MAX_LIMIT}; got ${requestedLimit}`,
+      { requestedLimit, maxLimit: HEARTBEAT_RUN_LIST_MAX_LIMIT },
+    );
+  }
+  if (!Number.isInteger(requestedOffset) || requestedOffset < 0) {
+    throw badRequest("offset must be a non-negative integer");
+  }
+  return { limit: requestedLimit, offset: requestedOffset };
+}
+
+/**
+ * Publishes the page a caller actually received. `X-Page-Limit`/`X-Page-Offset`
+ * name the page; `X-Next-Offset` appears only when more rows exist, so a caller
+ * can distinguish a full page that is the last page from a truncated read —
+ * the detection the fleet pagination rule requires.
+ */
+export function setHeartbeatRunListPageHeaders(
+  res: Response,
+  page: HeartbeatRunListPage,
+  hasMore: boolean,
+) {
+  res.setHeader("X-Page-Limit", String(page.limit));
+  res.setHeader("X-Page-Offset", String(page.offset));
+  if (hasMore) {
+    res.setHeader("X-Next-Offset", String(page.offset + page.limit));
+  }
+}
+
 function readRunIssueId(context: Record<string, unknown> | null) {
   const directIssueId = context?.issueId;
   if (typeof directIssueId === "string" && isUuidLike(directIssueId)) return directIssueId;
@@ -6538,10 +6612,22 @@ export function agentRoutes(
     assertCompanyAccess(req, companyId);
     if (!(await assertRunTelemetryReadAllowed(req, res, companyId))) return;
     const agentId = req.query.agentId as string | undefined;
-    const limitParam = req.query.limit as string | undefined;
-    const limit = limitParam ? Math.max(1, Math.min(1000, parseInt(limitParam, 10) || 200)) : undefined;
+    // Reject a malformed or over-cap page request instead of silently
+    // substituting another number. A silently clamped `limit` (and an
+    // `offset` this route used to read and discard) made every page look full,
+    // so a caller could neither page nor detect that older runs existed — the
+    // count recipe the fleet laws require could not be executed at all.
+    const page = parseHeartbeatRunListPage(req.query);
     const summary = req.query.summary === "true" || req.query.summary === "1";
-    const runs = await heartbeat.list(companyId, agentId, limit, { summary });
+    // Fetch one row past the page so `hasMore` is exact rather than inferred
+    // from a full page; the probe row never reaches the response.
+    const fetched = await heartbeat.list(companyId, agentId, page.limit + 1, {
+      summary,
+      offset: page.offset,
+    });
+    const hasMore = fetched.length > page.limit;
+    const runs = hasMore ? fetched.slice(0, page.limit) : fetched;
+    setHeartbeatRunListPageHeaders(res, page, hasMore);
     res.json(await runRedactions.redactForRuns(companyId, runs));
   });
 
