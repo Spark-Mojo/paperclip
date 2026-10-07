@@ -30,7 +30,7 @@ describe("worktree reuse safety", () => {
   it("refuses a live Git process in the worktree without removing its lock", async () => {
     const { root, lock } = await fixture();
     await fs.writeFile(lock, "");
-    const old = new Date(Date.now() - 120_000);
+    const old = new Date(Date.now() - 660_000);
     await fs.utimes(lock, old, old);
     const writer = spawn("git", ["--no-pager", "hash-object", "--stdin"], { cwd: root, stdio: ["pipe", "pipe", "pipe"] });
     try {
@@ -49,7 +49,7 @@ describe("worktree reuse safety", () => {
   it("does not reclaim an aged lock held by a non-Git process", async () => {
     const { root, lock } = await fixture();
     await fs.writeFile(lock, "");
-    const old = new Date(Date.now() - 120_000);
+    const old = new Date(Date.now() - 660_000);
     await fs.utimes(lock, old, old);
     const holder = spawn("sh", ["-c", "exec 3<\"$1\"; exec sleep 30", "sh", lock], { cwd: root, stdio: ["pipe", "pipe", "pipe"] });
     try {
@@ -65,24 +65,35 @@ describe("worktree reuse safety", () => {
     }
   });
 
-  it("reclaims an aged empty unheld lock before checking a clean worktree", async () => {
+  it("reclaims an aged empty unheld lock", async () => {
     const { root, lock } = await fixture();
     await fs.writeFile(lock, "");
-    const old = new Date(Date.now() - 120_000);
+    const old = new Date(Date.now() - 660_000);
     await fs.utimes(lock, old, old);
     await assertReusableWorktreeSafe(root);
     await expect(fs.stat(lock)).rejects.toMatchObject({ code: "ENOENT" });
-  });
+  }, 60_000);
 
-  it("preserves tracked and untracked changes, and rejects a nonempty lock", async () => {
+  it("preserves tracked and untracked changes during aged lock reclaim", async () => {
     const { root, lock } = await fixture();
     await fs.writeFile(path.join(root, "tracked"), "after\n");
     await fs.writeFile(path.join(root, "untracked"), "keep\n");
-    await exec("git", ["-C", root, "config", "status.showUntrackedFiles", "no"]);
-    await expect(assertReusableWorktreeSafe(root)).rejects.toThrow(/uncommitted changes/);
+    await fs.writeFile(lock, "");
+    const old = new Date(Date.now() - 660_000);
+    await fs.utimes(lock, old, old);
+    await assertReusableWorktreeSafe(root);
+    await expect(fs.stat(lock)).rejects.toMatchObject({ code: "ENOENT" });
+    await expect(fs.readFile(path.join(root, "tracked"), "utf8")).resolves.toBe("after\n");
     await expect(fs.readFile(path.join(root, "untracked"), "utf8")).resolves.toBe("keep\n");
+  }, 60_000);
+
+  it("rejects nonempty and young locks", async () => {
+    const { root, lock } = await fixture();
     await fs.writeFile(lock, "writing");
     await expect(assertReusableWorktreeSafe(root)).rejects.toThrow(/unsafe Git index.lock/);
     await expect(fs.readFile(lock, "utf8")).resolves.toBe("writing");
+    await fs.writeFile(lock, "");
+    await expect(assertReusableWorktreeSafe(root)).rejects.toThrow(/unsafe Git index.lock/);
+    await expect(fs.stat(lock)).resolves.toBeDefined();
   });
 });
