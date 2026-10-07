@@ -2870,10 +2870,16 @@ async function inspectReusableWorktreeLock(worktreePath: string): Promise<void> 
     const gitProcesses = await executeProcess({ command: "pgrep", args: ["-x", "git"], cwd: worktreePath });
     if (gitProcesses.code !== 0 && gitProcesses.code !== 1) throw new Error("live Git writer detection failed");
     if (gitProcesses.stderr.trim() || gitProcesses.stdoutTruncated || gitProcesses.stderrTruncated) throw new Error("live Git writer detection failed");
+    let skippedPids = 0;
     for (const pid of gitProcesses.stdout.trim().split(/\s+/)) {
       if (!/^\d+$/.test(pid) || Number(pid) === process.pid) continue;
       const base = path.join("/proc", pid);
       try {
+        const owner = await fs.stat(base);
+        if (process.getuid && owner.uid !== process.getuid()) {
+          skippedPids++;
+          continue;
+        }
         const cwd = await fs.realpath(path.join(base, "cwd"));
         if (cwd === worktree || cwd.startsWith(`${worktree}${path.sep}`) || cwd === gitDir || cwd.startsWith(`${gitDir}${path.sep}`)) {
           throw new Error(`live Git writer in ${worktreePath}`);
@@ -2889,10 +2895,21 @@ async function inspectReusableWorktreeLock(worktreePath: string): Promise<void> 
           }
         }
       } catch (error) {
-        if (["ENOENT", "ESRCH"].includes((error as NodeJS.ErrnoException).code ?? "")) continue;
+        const code = (error as NodeJS.ErrnoException).code;
+        if (code === "ENOENT" || code === "ESRCH") {
+          skippedPids++;
+          continue;
+        }
+        if (code === "EACCES" || code === "EPERM") {
+          throw new WorkspaceRuntimeValidationFailure(
+            `Cannot inspect live Git process ${pid} during worktree reuse (${code})`,
+            { workspaceValidation: { reason: "live_git_writer_probe_unavailable", worktreePath } },
+          );
+        }
         throw error;
       }
     }
+    if (skippedPids > 0) console.warn(`[workspace-runtime] skipped ${skippedPids} inaccessible Git process(es) during worktree reuse scan`);
   };
   await probe();
   const lock = await fs.lstat(lockPath).catch((error: NodeJS.ErrnoException) => {
