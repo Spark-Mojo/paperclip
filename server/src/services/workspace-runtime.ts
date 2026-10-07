@@ -2861,7 +2861,12 @@ async function inspectReusableWorktreeLock(worktreePath: string): Promise<void> 
   const worktree = await fs.realpath(worktreePath);
   const lockPath = path.join(gitDir, "index.lock");
   const probe = async () => {
-    if (process.platform !== "linux") throw new Error("live Git writer detection is unavailable");
+    if (process.platform !== "linux") {
+      throw new WorkspaceRuntimeValidationFailure(
+        `Worktree reuse requires Linux live Git writer detection (current platform: ${process.platform})`,
+        { workspaceValidation: { reason: "live_git_writer_probe_unavailable", worktreePath } },
+      );
+    }
     const gitProcesses = await executeProcess({ command: "pgrep", args: ["-x", "git"], cwd: worktreePath });
     if (gitProcesses.code !== 0 && gitProcesses.code !== 1) throw new Error("live Git writer detection failed");
     if (gitProcesses.stderr.trim() || gitProcesses.stdoutTruncated || gitProcesses.stderrTruncated) throw new Error("live Git writer detection failed");
