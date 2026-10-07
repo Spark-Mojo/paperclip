@@ -81,7 +81,7 @@ export function assertIssueExecutionStagesComplete(issue: {
   if (!policy?.stages.length) return;
   const state = parseIssueExecutionState(issue.executionState);
   const incomplete = policy.stages.filter((stage) => !state?.completedStageIds.includes(stage.id));
-  if (state?.status === "completed" && state.lastDecisionOutcome === "approved" && incomplete.length === 0) return;
+  if (state?.status === "completed" && incomplete.length === 0) return;
   throw conflict(
     "Issue cannot be marked done: configured review or approval stage is incomplete. Enter in_review and record the stage verdict, or use an explicit board doneOverride with a reason.",
     { code: DONE_GATE_INCOMPLETE_STAGE_REFUSAL, incompleteStageIds: incomplete.map((stage) => stage.id) },

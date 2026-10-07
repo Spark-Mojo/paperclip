@@ -990,7 +990,7 @@ function applyIssueExecutionStageTransition(input: TransitionInput): TransitionR
 
   if (!shouldStartWorkflow) {
     if (requestedStatus === "blocked" && input.policy.stages.some((stage) => stage.type === "review") &&
-      existingState?.status !== COMPLETED_STATUS) {
+      !existingState?.currentStageId && existingState?.status !== COMPLETED_STATUS) {
       throw unprocessable("Cannot block an issue with an unactivated review stage; enter in_review to record the review verdict first");
     }
     return { patch };
