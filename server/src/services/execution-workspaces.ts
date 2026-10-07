@@ -967,7 +967,16 @@ async function inspectGitCloseReadiness(workspace: ExecutionWorkspace): Promise<
 
   if (repoRoot && baseRef) {
     try {
-      const counts = (await runGit(["rev-list", "--left-right", "--count", `${baseRef}...HEAD`], workspacePath)).stdout.trim();
+      const counts = (await runExpensiveGitStatus({
+        args: ["rev-list", "--left-right", "--count", `${baseRef}...HEAD`],
+        cwd: workspacePath,
+        operation: "execution_workspaces.close_readiness_ahead_behind",
+        fairnessKeys: [
+          `company:${workspace.companyId}`,
+          `workspace:${workspace.id}`,
+          ...(workspace.sourceIssueId ? [`issue:${workspace.sourceIssueId}`] : []),
+        ],
+      })).stdout.trim();
       const [behindRaw, aheadRaw] = counts.split(/\s+/);
       behindCount = behindRaw ? Number.parseInt(behindRaw, 10) : 0;
       aheadCount = aheadRaw ? Number.parseInt(aheadRaw, 10) : 0;
