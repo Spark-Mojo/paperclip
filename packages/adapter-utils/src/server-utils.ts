@@ -4918,11 +4918,20 @@ export async function runChildProcess(
           });
         }
 
+        let scopeCleanup: Promise<boolean> | null = null;
+        const cleanupScope = () => {
+          scopeCleanup ??= stopRunScope(scoped.unit).then(() => true, (stopError) => {
+            onLogError(stopError, runId, "failed to stop run scope");
+            return false;
+          });
+          return scopeCleanup;
+        };
+
         child.on("error", (err: Error) => {
           if (timeout) clearTimeout(timeout);
           clearTerminalCleanupTimers();
           runningProcesses.delete(runId);
-          void stopRunScope(scoped.unit).catch((stopError) => onLogError(stopError, runId, "failed to stop run scope"));
+          void cleanupScope();
           void target.cleanup?.();
           const errno = (err as NodeJS.ErrnoException).code;
           const pathValue = mergedEnv.PATH ?? mergedEnv.Path ?? "";
@@ -4935,6 +4944,7 @@ export async function runChildProcess(
 
         child.on("exit", () => {
           maybeArmTerminalResultCleanup();
+          void cleanupScope();
         });
 
         child.on(
@@ -4944,7 +4954,11 @@ export async function runChildProcess(
             clearTerminalCleanupTimers();
             runningProcesses.delete(runId);
             void logChain.finally(async () => {
-              await stopRunScope(scoped.unit).catch((stopError) => onLogError(stopError, runId, "failed to stop run scope"));
+              const scopeStopped = await cleanupScope();
+              if (!scopeStopped) {
+                reject(new Error("run_scope_stop_failed"));
+                return;
+              }
               void Promise.resolve()
                 .then(() => target.cleanup?.())
                 .finally(() => {
