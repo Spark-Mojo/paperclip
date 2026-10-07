@@ -67,6 +67,7 @@ import { isRuntimeOwnedGitBranch } from "./execution-workspace-branch-ownership.
 import { logActivity } from "./activity-log.js";
 import { readProjectWorkspaceRuntimeConfig } from "./project-workspace-runtime-config.js";
 import { workspaceGitOperationScheduler } from "./workspace-git-operation-scheduler.js";
+import { withWorktreeGitLease } from "./worktree-git-lease.js";
 import {
   cleanupWorktreeInstanceArtifacts,
   deriveWorktreeInstanceId,
@@ -949,6 +950,20 @@ async function executeProcess(input: {
   stdoutBytes: number;
   stderrBytes: number;
 }> {
+  if (input.command === "git") {
+    return withWorktreeGitLease(input.cwd, () => executeProcessUnlocked(input));
+  }
+  return executeProcessUnlocked(input);
+}
+
+async function executeProcessUnlocked(input: {
+  command: string;
+  args: string[];
+  cwd: string;
+  env?: NodeJS.ProcessEnv;
+  maxStdoutBytes?: number;
+  maxStderrBytes?: number;
+}) {
   const proc = await new Promise<{
     stdout: ProcessOutputAccumulator;
     stderr: ProcessOutputAccumulator;
@@ -984,16 +999,13 @@ async function executeProcess(input: {
 }
 
 async function runGit(args: string[], cwd: string, opts?: { env?: NodeJS.ProcessEnv }): Promise<string> {
-  const proc = await executeProcess({
-    command: "git",
-    args,
-    cwd,
-    env: opts?.env,
+  return withWorktreeGitLease(cwd, async () => {
+    const proc = await executeProcess({ command: "git", args, cwd, env: opts?.env });
+    if (proc.code !== 0) {
+      throw new Error(proc.stderr.trim() || proc.stdout.trim() || `git ${args.join(" ")} failed`);
+    }
+    return proc.stdout.trim();
   });
-  if (proc.code !== 0) {
-    throw new Error(proc.stderr.trim() || proc.stdout.trim() || `git ${args.join(" ")} failed`);
-  }
-  return proc.stdout.trim();
 }
 
 async function runExpensiveGitStatus(input: {
@@ -2838,6 +2850,12 @@ async function isGitCheckout(cwd: string): Promise<boolean> {
 }
 
 export async function assertReusableWorktreeSafe(worktreePath: string): Promise<void> {
+  return withWorktreeGitLease(worktreePath, async () => {
+    await inspectReusableWorktreeLock(worktreePath);
+  }, true);
+}
+
+async function inspectReusableWorktreeLock(worktreePath: string): Promise<void> {
   const gitDirRaw = await runGit(["rev-parse", "--absolute-git-dir"], worktreePath);
   const gitDir = await fs.realpath(gitDirRaw);
   const worktree = await fs.realpath(worktreePath);

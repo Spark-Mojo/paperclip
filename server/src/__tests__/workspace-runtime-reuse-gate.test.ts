@@ -5,6 +5,7 @@ import path from "node:path";
 import { promisify } from "node:util";
 import { afterEach, describe, expect, it } from "vitest";
 import { assertReusableWorktreeSafe } from "../services/workspace-runtime.js";
+import { withWorktreeGitLease } from "../services/worktree-git-lease.js";
 
 const exec = promisify(execFile);
 const roots: string[] = [];
@@ -86,6 +87,54 @@ describe("worktree reuse safety", () => {
     await expect(fs.readFile(path.join(root, "tracked"), "utf8")).resolves.toBe("after\n");
     await expect(fs.readFile(path.join(root, "untracked"), "utf8")).resolves.toBe("keep\n");
   }, 60_000);
+
+  it("serializes an engine Git scan against reclaim and permits nested acquisition", async () => {
+    const { root, lock } = await fixture();
+    await fs.writeFile(lock, "");
+    const old = new Date(Date.now() - 660_000);
+    await fs.utimes(lock, old, old);
+    let unlock!: () => void;
+    let entered!: () => void;
+    const held = new Promise<void>((resolve) => { unlock = resolve; });
+    const started = new Promise<void>((resolve) => { entered = resolve; });
+    const writer = withWorktreeGitLease(root, async () => {
+      entered();
+      await withWorktreeGitLease(root, async () => held);
+    });
+    await started;
+    const reclaim = assertReusableWorktreeSafe(root);
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    await expect(fs.stat(lock)).resolves.toBeDefined();
+    unlock();
+    await writer;
+    await reclaim;
+    await expect(fs.stat(lock)).rejects.toMatchObject({ code: "ENOENT" });
+  }, 60_000);
+
+  it("does not reuse a released lease inherited by a detached child", async () => {
+    const { root } = await fixture();
+    let resume!: () => void;
+    let child!: Promise<void>;
+    const suspended = new Promise<void>((resolve) => { resume = resolve; });
+    await withWorktreeGitLease(root, async () => {
+      child = suspended.then(() => withWorktreeGitLease(root, async () => {
+        await fs.writeFile(path.join(root, "child"), "written");
+      }));
+    });
+    let release!: () => void;
+    let entered!: () => void;
+    const held = new Promise<void>((resolve) => { release = resolve; });
+    const started = new Promise<void>((resolve) => { entered = resolve; });
+    const exclusive = withWorktreeGitLease(root, async () => { entered(); await held; }, true);
+    await started;
+    resume();
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    await expect(fs.stat(path.join(root, "child"))).rejects.toMatchObject({ code: "ENOENT" });
+    release();
+    await exclusive;
+    await child;
+    await expect(fs.readFile(path.join(root, "child"), "utf8")).resolves.toBe("written");
+  });
 
   it("rejects nonempty and young locks", async () => {
     const { root, lock } = await fixture();
