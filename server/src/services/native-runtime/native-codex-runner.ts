@@ -382,18 +382,24 @@ export async function executeNativeCodexRunner(input: {
     prepared.queueCommand("turn.start", { text: input.prompt }, `turn_${input.runId}`);
   }
 
-  const scoped = scopedRunCommand(input.runId, binary, buildNativeRunnerArguments({
-    connectUrl: prepared.connectUrl,
-    stateDirectory: runnerStateDirectory,
-    runnerInstanceId: input.runnerInstanceId,
-    environmentLeaseId: input.environmentLeaseId,
-    runId: input.runId,
-    normalizedSessionId: input.normalizedSessionId,
-    turnId: input.turnId,
-    itemId: input.itemId,
-    runnerDigest,
-    maxRuntimeMs: input.timeoutMs,
-  }));
+  let scoped: ReturnType<typeof scopedRunCommand>;
+  try {
+    scoped = scopedRunCommand(input.runId, binary, buildNativeRunnerArguments({
+      connectUrl: prepared.connectUrl,
+      stateDirectory: runnerStateDirectory,
+      runnerInstanceId: input.runnerInstanceId,
+      environmentLeaseId: input.environmentLeaseId,
+      runId: input.runId,
+      normalizedSessionId: input.normalizedSessionId,
+      turnId: input.turnId,
+      itemId: input.itemId,
+      runnerDigest,
+      maxRuntimeMs: input.timeoutMs,
+    }));
+  } catch (error) {
+    await prepared.release();
+    throw error;
+  }
   const child = spawn(scoped.command, scoped.args, {
     cwd: input.cwd,
     detached: process.platform !== "win32",
