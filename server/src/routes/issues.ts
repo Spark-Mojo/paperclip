@@ -13491,7 +13491,17 @@ export function issueRoutes(
         }
       }
 
-      if (assigneeWillChange && existing.assigneeAgentId) {
+      const attachingMidFlightReview =
+        req.body.executionPolicy !== undefined &&
+        existing.status === "in_progress" &&
+        !previousExecutionPolicy?.stages.length &&
+        !!nextExecutionPolicy?.stages.length &&
+        transition.workflowControlledAssignment === true &&
+        updateFields.status === "in_review" &&
+        parseIssueExecutionState(updateFields.executionState)?.status === "pending" &&
+        assigneeWillChange &&
+        !!existing.assigneeAgentId;
+      if (assigneeWillChange && existing.assigneeAgentId && !attachingMidFlightReview) {
         await stopRunnerGoalForOwnershipChange({
           companyId: existing.companyId,
           issueId: existing.id,
@@ -13855,6 +13865,47 @@ export function issueRoutes(
       for (const publication of postCommitActivityPublications)
         publishActivity(publication);
       await flushIssuePostCommitActions(postCommitIssueActions);
+
+      if (attachingMidFlightReview) {
+        try {
+          await stopRunnerGoalForOwnershipChange({
+            companyId: existing.companyId,
+            issueId: existing.id,
+            agentId: existing.assigneeAgentId!,
+          });
+          const runToStopForReassignment = await resolveActiveIssueRun(existing);
+          if (runToStopForReassignment) {
+            const cancelled = await heartbeat.cancelRun(
+              runToStopForReassignment.id,
+              "Cancelled after review stage activation",
+              {
+                errorCode: "issue_reassigned",
+                resultJson: { reassignmentStopConfirmed: true },
+                eventMessage: "run cancelled after review stage activation",
+                eventPayload: { issueId: existing.id },
+              },
+            );
+            if (!cancelled || cancelled.status !== "cancelled") {
+              throw new Error("The active agent run could not be stopped after review activation");
+            }
+            interruptedRunId = cancelled.id;
+          }
+        } catch (err) {
+          logger.warn({ err, issueId: existing.id }, "failed to stop builder after review activation");
+          await logActivity(db, {
+            companyId: existing.companyId,
+            actorType: actor.actorType,
+            actorId: actor.actorId,
+            agentId: actor.agentId,
+            runId: actor.runId,
+            action: "heartbeat.cancel_failed",
+            entityType: "heartbeat_run",
+            entityId: existing.executionRunId ?? existing.id,
+            issueId: existing.id,
+            details: { source: "mid_flight_review_activation", issueId: existing.id },
+          });
+        }
+      }
 
       if (enteringBlocked) {
         const blockedIssue = issue;
