@@ -67,6 +67,7 @@ import { isRuntimeOwnedGitBranch } from "./execution-workspace-branch-ownership.
 import { logActivity } from "./activity-log.js";
 import { readProjectWorkspaceRuntimeConfig } from "./project-workspace-runtime-config.js";
 import { workspaceGitOperationScheduler } from "./workspace-git-operation-scheduler.js";
+import { withWorktreeGitLease } from "./worktree-git-lease.js";
 import {
   cleanupWorktreeInstanceArtifacts,
   deriveWorktreeInstanceId,
@@ -949,6 +950,20 @@ async function executeProcess(input: {
   stdoutBytes: number;
   stderrBytes: number;
 }> {
+  if (input.command === "git") {
+    return withWorktreeGitLease(input.cwd, () => executeProcessUnlocked(input));
+  }
+  return executeProcessUnlocked(input);
+}
+
+async function executeProcessUnlocked(input: {
+  command: string;
+  args: string[];
+  cwd: string;
+  env?: NodeJS.ProcessEnv;
+  maxStdoutBytes?: number;
+  maxStderrBytes?: number;
+}) {
   const proc = await new Promise<{
     stdout: ProcessOutputAccumulator;
     stderr: ProcessOutputAccumulator;
@@ -984,16 +999,13 @@ async function executeProcess(input: {
 }
 
 async function runGit(args: string[], cwd: string, opts?: { env?: NodeJS.ProcessEnv }): Promise<string> {
-  const proc = await executeProcess({
-    command: "git",
-    args,
-    cwd,
-    env: opts?.env,
+  return withWorktreeGitLease(cwd, async () => {
+    const proc = await executeProcess({ command: "git", args, cwd, env: opts?.env });
+    if (proc.code !== 0) {
+      throw new Error(proc.stderr.trim() || proc.stdout.trim() || `git ${args.join(" ")} failed`);
+    }
+    return proc.stdout.trim();
   });
-  if (proc.code !== 0) {
-    throw new Error(proc.stderr.trim() || proc.stdout.trim() || `git ${args.join(" ")} failed`);
-  }
-  return proc.stdout.trim();
 }
 
 async function runExpensiveGitStatus(input: {
@@ -2725,6 +2737,7 @@ async function refreshUnstartedWorktreeToBase(input: {
     return { refreshed: false, baseRefSha: null };
   }
 
+  await assertReusableWorktreeSafe(input.worktreePath);
   await recordGitOperation(input.recorder, {
     phase: "worktree_prepare",
     args: ["reset", "--hard", input.currentBaseRefSha],
@@ -2834,6 +2847,80 @@ async function findRegisteredGitWorktreeByPath(repoRoot: string, worktreePath: s
 
 async function isGitCheckout(cwd: string): Promise<boolean> {
   return Boolean(await runGit(["rev-parse", "--git-dir"], cwd).catch(() => null));
+}
+
+export async function assertReusableWorktreeSafe(worktreePath: string): Promise<void> {
+  return withWorktreeGitLease(worktreePath, async () => {
+    await inspectReusableWorktreeLock(worktreePath);
+  }, true);
+}
+
+async function inspectReusableWorktreeLock(worktreePath: string): Promise<void> {
+  const gitDirRaw = await runGit(["rev-parse", "--absolute-git-dir"], worktreePath);
+  const gitDir = await fs.realpath(gitDirRaw);
+  const worktree = await fs.realpath(worktreePath);
+  const lockPath = path.join(gitDir, "index.lock");
+  const probe = async () => {
+    if (process.platform !== "linux") {
+      throw new WorkspaceRuntimeValidationFailure(
+        `Worktree reuse requires Linux live Git writer detection (current platform: ${process.platform})`,
+        { workspaceValidation: { reason: "live_git_writer_probe_unavailable", worktreePath } },
+      );
+    }
+    const gitProcesses = await executeProcess({ command: "pgrep", args: ["-x", "git"], cwd: worktreePath });
+    if (gitProcesses.code !== 0 && gitProcesses.code !== 1) throw new Error("live Git writer detection failed");
+    if (gitProcesses.stderr.trim() || gitProcesses.stdoutTruncated || gitProcesses.stderrTruncated) throw new Error("live Git writer detection failed");
+    for (const pid of gitProcesses.stdout.trim().split(/\s+/)) {
+      if (!/^\d+$/.test(pid) || Number(pid) === process.pid) continue;
+      const base = path.join("/proc", pid);
+      try {
+        const cwd = await fs.realpath(path.join(base, "cwd"));
+        if (cwd === worktree || cwd.startsWith(`${worktree}${path.sep}`) || cwd === gitDir || cwd.startsWith(`${gitDir}${path.sep}`)) {
+          throw new Error(`live Git writer in ${worktreePath}`);
+        }
+        const handles = await fs.readdir(path.join(base, "fd"));
+        for (const handle of handles) {
+          const target = await fs.readlink(path.join(base, "fd", handle)).catch((error: NodeJS.ErrnoException) => {
+            if (error.code === "ENOENT") return null;
+            throw error;
+          });
+          if (target && (target === lockPath || target === gitDir || target.startsWith(`${gitDir}${path.sep}`) || target === worktree || target.startsWith(`${worktree}${path.sep}`))) {
+            throw new Error(`live Git writer in ${worktreePath}`);
+          }
+        }
+      } catch (error) {
+        if (["ENOENT", "ESRCH"].includes((error as NodeJS.ErrnoException).code ?? "")) continue;
+        throw error;
+      }
+    }
+  };
+  await probe();
+  const lock = await fs.lstat(lockPath).catch((error: NodeJS.ErrnoException) => {
+    if (error.code === "ENOENT") return null;
+    throw error;
+  });
+  if (lock) {
+    if (!lock.isFile() || lock.size !== 0 || Date.now() - lock.mtimeMs < 600_000) {
+      throw new Error(`unsafe Git index.lock at ${lockPath}`);
+    }
+    await probe();
+    const holder = await executeProcess({ command: "fuser", args: [lockPath], cwd: worktreePath });
+    if (holder.code !== 1 || holder.stdout.trim() || holder.stderr.trim() || holder.stdoutTruncated || holder.stderrTruncated) {
+      throw new Error(`Git index.lock holder could not be excluded at ${lockPath}`);
+    }
+    const current = await fs.lstat(lockPath);
+    if (current.ino !== lock.ino || current.mtimeMs !== lock.mtimeMs || current.size !== 0) {
+      throw new Error(`Git index.lock changed during inspection at ${lockPath}`);
+    }
+  }
+  await probe();
+  if (lock) {
+    const current = await fs.lstat(lockPath);
+    if (current.ino !== lock.ino || current.mtimeMs !== lock.mtimeMs || current.size !== 0) {
+      throw new Error(`Git index.lock changed during inspection at ${lockPath}`);
+    }
+    await fs.unlink(lockPath);
+  }
 }
 
 async function detectRemoteDefaultBranch(
@@ -3672,6 +3759,7 @@ export async function realizeExecutionWorkspace(input: {
   }
 
   async function reuseExistingWorktree(reusablePath: string, effectiveBranchName = branchName, extraWarnings: string[] = []) {
+    await assertReusableWorktreeSafe(reusablePath);
     // An exact-branch attach must never move the requested branch, so skip
     // the unstarted-worktree fast-forward that template-derived reuse gets.
     const refresh = currentBaseRefSha && !requestedExistingBranch
@@ -4107,6 +4195,17 @@ export async function ensurePersistedExecutionWorkspaceAvailable(input: {
   if (await directoryExists(cwd)) {
     const reuseBaseRef = input.workspace.baseRef ?? input.base.repoRef ?? null;
     const reuseWorktreePath = realized.worktreePath ?? cwd;
+    try {
+      await assertReusableWorktreeSafe(reuseWorktreePath);
+    } catch (error) {
+      if (gitErrorIncludes(error, "index.lock")) {
+        throw new WorkspaceRuntimeValidationFailure(
+          `Persisted git worktree at "${reuseWorktreePath}" is not reusable: ${error instanceof Error ? error.message : String(error)}`,
+          { workspaceValidation: { reason: "unsafe_git_index_lock", worktreePath: reuseWorktreePath, executionWorkspaceId: input.workspace.id ?? null } },
+        );
+      }
+      throw error;
+    }
     const repairWarnings: string[] = [];
     // SPA-9437: the persisted cwd belongs to a different repo than the
     // current project workspace's repo. The issue's `projectWorkspaceId`
