@@ -158,7 +158,35 @@ async function runPnpm(cwd: string, args: string[]) {
 async function writeRegisteredSourceConfig(baseCwd: string, instanceId = "source-instance") {
   const configDir = path.join(baseCwd, ".paperclip");
   await fs.mkdir(configDir, { recursive: true });
-  await fs.writeFile(path.join(configDir, "config.json"), "{}\n", "utf8");
+  await fs.writeFile(path.join(configDir, "config.json"), JSON.stringify({
+    $meta: { version: 1, updatedAt: "2026-03-26T00:00:00.000Z", source: "doctor" },
+    database: {
+      mode: "embedded-postgres",
+      embeddedPostgresDataDir: path.join(configDir, "db"),
+      embeddedPostgresPort: 54329,
+      backup: { enabled: true, intervalMinutes: 60, retentionDays: 30, dir: path.join(configDir, "backups") },
+    },
+    logging: { mode: "file", logDir: path.join(configDir, "logs") },
+    server: {
+      deploymentMode: "local_trusted",
+      exposure: "private",
+      host: "127.0.0.1",
+      port: 3100,
+      allowedHostnames: [],
+      serveUi: true,
+    },
+    auth: { baseUrlMode: "auto", disableSignUp: false },
+    storage: {
+      provider: "local_disk",
+      localDisk: { baseDir: path.join(configDir, "storage") },
+      s3: { bucket: "paperclip", region: "us-east-1", prefix: "", forcePathStyle: false },
+    },
+    secrets: {
+      provider: "local_encrypted",
+      strictMode: false,
+      localEncrypted: { keyFilePath: path.join(configDir, "master.key") },
+    },
+  }, null, 2) + "\n", "utf8");
   await fs.writeFile(
     path.join(configDir, ".env"),
     `PAPERCLIP_INSTANCE_ID=${instanceId}\n`,
@@ -7698,12 +7726,8 @@ describeEmbeddedPostgres("workspace dirty quarantine branch repair", () => {
         code: "workspace_validation_failed",
         resultJson: {
           workspaceValidation: expect.objectContaining({
-            cleanliness: "dirty",
-            safeRepair: expect.objectContaining({
-              attempted: true,
-              succeeded: false,
-              reason: expect.stringContaining("index contention"),
-            }),
+            reason: "unsafe_git_index_lock",
+            worktreePath,
           }),
         },
       });
