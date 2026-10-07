@@ -53,7 +53,10 @@ export async function withWorktreeGitLease<T>(
     if (token) token.active = false;
     state.readers.delete(current);
     state.waiting -= 1;
-    if (state.waiting === 0) pending.delete(key);
+    if (state.waiting === 0) {
+      pending.delete(key);
+      poisoned.delete(key);
+    }
     release();
   }
 }

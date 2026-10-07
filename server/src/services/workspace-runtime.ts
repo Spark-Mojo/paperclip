@@ -2868,14 +2868,6 @@ async function inspectReusableWorktreeLock(worktreePath: string): Promise<void> 
     for (const pid of gitProcesses.stdout.trim().split(/\s+/)) {
       if (!/^\d+$/.test(pid) || Number(pid) === process.pid) continue;
       const base = path.join("/proc", pid);
-      let command: string;
-      try {
-        command = (await fs.readFile(path.join(base, "comm"), "utf8")).trim();
-      } catch (error) {
-        if (["ENOENT", "ESRCH"].includes((error as NodeJS.ErrnoException).code ?? "")) continue;
-        throw error;
-      }
-      if (command !== "git") continue;
       try {
         const cwd = await fs.realpath(path.join(base, "cwd"));
         if (cwd === worktree || cwd.startsWith(`${worktree}${path.sep}`) || cwd === gitDir || cwd.startsWith(`${gitDir}${path.sep}`)) {
@@ -4198,7 +4190,17 @@ export async function ensurePersistedExecutionWorkspaceAvailable(input: {
   if (await directoryExists(cwd)) {
     const reuseBaseRef = input.workspace.baseRef ?? input.base.repoRef ?? null;
     const reuseWorktreePath = realized.worktreePath ?? cwd;
-    await assertReusableWorktreeSafe(reuseWorktreePath);
+    try {
+      await assertReusableWorktreeSafe(reuseWorktreePath);
+    } catch (error) {
+      if (gitErrorIncludes(error, "index.lock")) {
+        throw new WorkspaceRuntimeValidationFailure(
+          `Persisted git worktree at "${reuseWorktreePath}" is not reusable: ${error instanceof Error ? error.message : String(error)}`,
+          { workspaceValidation: { reason: "unsafe_git_index_lock", worktreePath: reuseWorktreePath, executionWorkspaceId: input.workspace.id ?? null } },
+        );
+      }
+      throw error;
+    }
     const repairWarnings: string[] = [];
     // SPA-9437: the persisted cwd belongs to a different repo than the
     // current project workspace's repo. The issue's `projectWorkspaceId`

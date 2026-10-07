@@ -7698,12 +7698,8 @@ describeEmbeddedPostgres("workspace dirty quarantine branch repair", () => {
         code: "workspace_validation_failed",
         resultJson: {
           workspaceValidation: expect.objectContaining({
-            cleanliness: "dirty",
-            safeRepair: expect.objectContaining({
-              attempted: true,
-              succeeded: false,
-              reason: expect.stringContaining("index contention"),
-            }),
+            reason: "unsafe_git_index_lock",
+            worktreePath,
           }),
         },
       });
