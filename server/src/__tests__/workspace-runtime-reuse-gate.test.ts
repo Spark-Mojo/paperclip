@@ -28,6 +28,21 @@ afterEach(async () => {
 });
 
 describe("worktree reuse safety", () => {
+  it.skipIf(process.env.PAPERCLIP_REUSE_GATE_NEGATIVE !== "1")("negative control: live writer must not pass the reuse assertion", async () => {
+    const { root, lock } = await fixture();
+    await fs.writeFile(lock, "");
+    const old = new Date(Date.now() - 660_000);
+    await fs.utimes(lock, old, old);
+    const holder = spawn("sh", ["-c", "exec 3<\"$1\"; exec sleep 30", "sh", lock], { cwd: root, stdio: "ignore" });
+    try {
+      await new Promise<void>((resolve, reject) => { holder.once("spawn", resolve); holder.once("error", reject); });
+      await assertReusableWorktreeSafe(root);
+    } finally {
+      holder.kill();
+      await new Promise<void>((resolve) => { if (holder.exitCode !== null || holder.signalCode !== null) resolve(); else holder.once("close", () => resolve()); });
+    }
+  });
+
   it("refuses a live Git process in the worktree without removing its lock", async () => {
     const { root, lock } = await fixture();
     await fs.writeFile(lock, "");
@@ -63,6 +78,22 @@ describe("worktree reuse safety", () => {
     } finally {
       holder.kill();
       await new Promise((resolve) => holder.once("close", resolve));
+    }
+  });
+
+  it("rejects an aged lock held by a renamed process", async () => {
+    const { root, lock } = await fixture();
+    await fs.writeFile(lock, "");
+    const old = new Date(Date.now() - 660_000);
+    await fs.utimes(lock, old, old);
+    const holder = spawn("bash", ["-c", "exec -a renamed-writer sh -c 'exec 3<\"$1\"; exec sleep 30' sh \"$1\"", "bash", lock], { cwd: root, stdio: "ignore" });
+    try {
+      await new Promise<void>((resolve, reject) => { holder.once("spawn", resolve); holder.once("error", reject); });
+      await expect(assertReusableWorktreeSafe(root)).rejects.toThrow(/holder could not be excluded/);
+      await expect(fs.stat(lock)).resolves.toBeDefined();
+    } finally {
+      holder.kill();
+      await new Promise<void>((resolve) => { if (holder.exitCode !== null || holder.signalCode !== null) resolve(); else holder.once("close", () => resolve()); });
     }
   });
 
@@ -134,6 +165,24 @@ describe("worktree reuse safety", () => {
     await exclusive;
     await child;
     await expect(fs.readFile(path.join(root, "child"), "utf8")).resolves.toBe("written");
+  });
+
+  it("recovers from a lease timeout only after the holder has finished", async () => {
+    const { root } = await fixture();
+    let release!: () => void;
+    let entered!: () => void;
+    const held = new Promise<void>((resolve) => { release = resolve; });
+    const started = new Promise<void>((resolve) => { entered = resolve; });
+    const holder = withWorktreeGitLease(root, async () => { entered(); await held; });
+    await started;
+    try {
+      await expect(withWorktreeGitLease(root, async () => undefined, true, 10)).rejects.toThrow(/Timed out waiting/);
+      await expect(withWorktreeGitLease(root, async () => undefined)).rejects.toThrow(/lease timed out/);
+    } finally {
+      release();
+      await holder;
+    }
+    await expect(withWorktreeGitLease(root, async () => "recovered")).resolves.toBe("recovered");
   });
 
   it("rejects nonempty and young locks", async () => {

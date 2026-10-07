@@ -9,6 +9,7 @@ export async function withWorktreeGitLease<T>(
   workspacePath: string,
   operation: () => Promise<T>,
   exclusive = false,
+  timeoutMs = 30_000,
 ): Promise<T> {
   const key = await fs.realpath(workspacePath);
   if (poisoned.has(key)) throw new Error(`Worktree Git lease timed out at ${key}`);
@@ -37,7 +38,7 @@ export async function withWorktreeGitLease<T>(
       await Promise.race([
         preceding,
         new Promise<never>((_, reject) => {
-          timer = setTimeout(() => reject(new Error(`Timed out waiting for worktree Git lease at ${key}`)), 30_000);
+          timer = setTimeout(() => reject(new Error(`Timed out waiting for worktree Git lease at ${key}`)), timeoutMs);
         }),
       ]);
     } catch (error) {
