@@ -190,7 +190,9 @@ describe("worktree reuse safety", () => {
     await fs.writeFile(lock, "");
     const old = new Date(Date.now() - 660_000);
     await fs.utimes(lock, old, old);
-    const platform = vi.spyOn(process, "platform", "get").mockReturnValue("darwin");
+    const platform = Object.getOwnPropertyDescriptor(process, "platform");
+    if (!platform) throw new Error("process.platform descriptor unavailable");
+    Object.defineProperty(process, "platform", { ...platform, value: "darwin" });
     try {
       await expect(assertReusableWorktreeSafe(root)).rejects.toMatchObject({
         code: "workspace_validation_failed",
@@ -198,7 +200,7 @@ describe("worktree reuse safety", () => {
       } satisfies Partial<WorkspaceRuntimeValidationFailure>);
       await expect(fs.stat(lock)).resolves.toBeDefined();
     } finally {
-      platform.mockRestore();
+      Object.defineProperty(process, "platform", platform);
     }
   });
 
