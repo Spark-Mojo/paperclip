@@ -625,8 +625,22 @@ describe("issue execution policy routes", () => {
       return issue;
     });
     const builder = await createApp({ type: "agent", agentId: builderId, companyId: "company-1", runId });
+    mockHeartbeatService.getActiveRunForAgent.mockResolvedValueOnce({
+      id: runId,
+      status: "running",
+      contextSnapshot: { issueId },
+    });
+    mockHeartbeatService.cancelRun.mockImplementationOnce(async () => {
+      expect(issue).toMatchObject({ status: "in_review", assigneeAgentId: reviewerId });
+      throw new Error("cancellation unavailable");
+    });
     const attached = await request(builder).patch(`/api/issues/${issueId}`).send({ executionPolicy: policy });
     expect(attached.status).toBe(200);
+    expect(mockHeartbeatService.cancelRun).toHaveBeenCalledWith(runId, expect.any(String), expect.anything());
+    expect(mockLogActivity).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({ action: "heartbeat.cancel_failed", details: expect.objectContaining({ source: "mid_flight_review_activation" }) }),
+    );
     expect(issue).toMatchObject({
       status: "in_review",
       assigneeAgentId: reviewerId,
