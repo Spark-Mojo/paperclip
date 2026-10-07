@@ -3,8 +3,8 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
-import { afterEach, describe, expect, it } from "vitest";
-import { assertReusableWorktreeSafe } from "../services/workspace-runtime.js";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { assertReusableWorktreeSafe, WorkspaceRuntimeValidationFailure } from "../services/workspace-runtime.js";
 import { withWorktreeGitLease } from "../services/worktree-git-lease.js";
 
 const exec = promisify(execFile);
@@ -183,6 +183,23 @@ describe("worktree reuse safety", () => {
       await holder;
     }
     await expect(withWorktreeGitLease(root, async () => "recovered")).resolves.toBe("recovered");
+  });
+
+  it("refuses non-Linux reuse with a typed validation reason without touching the lock", async () => {
+    const { root, lock } = await fixture();
+    await fs.writeFile(lock, "");
+    const old = new Date(Date.now() - 660_000);
+    await fs.utimes(lock, old, old);
+    const platform = vi.spyOn(process, "platform", "get").mockReturnValue("darwin");
+    try {
+      await expect(assertReusableWorktreeSafe(root)).rejects.toMatchObject({
+        code: "workspace_validation_failed",
+        resultJson: { workspaceValidation: { reason: "live_git_writer_probe_unavailable", worktreePath: root } },
+      } satisfies Partial<WorkspaceRuntimeValidationFailure>);
+      await expect(fs.stat(lock)).resolves.toBeDefined();
+    } finally {
+      platform.mockRestore();
+    }
   });
 
   it("rejects nonempty and young locks", async () => {
