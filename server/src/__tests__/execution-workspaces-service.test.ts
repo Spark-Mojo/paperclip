@@ -572,6 +572,43 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
     expect(workspace).toMatchObject({ status: "archived", cleanupReason: "issue_terminal" });
   }, 20_000);
 
+  it("routes ahead behind through the bounded scheduler and retains real workspace counts", async () => {
+    const seeded = await seedAncestryTerminalWorkspace();
+    const originalRun = workspaceGitOperationScheduler.run.bind(workspaceGitOperationScheduler);
+    const scans: string[] = [];
+    const scanSpy = vi.spyOn(workspaceGitOperationScheduler, "run").mockImplementation(async (input) => {
+      scans.push(input.operation);
+      return originalRun(input);
+    });
+
+    try {
+      const readiness = await svc.getCloseReadiness(seeded.executionWorkspaceId);
+      expect(scans).toContain("execution_workspaces.close_readiness_ahead_behind");
+      expect(readiness?.git?.aheadCount).toBe(0);
+      expect(readiness?.git?.behindCount).toBe(0);
+    } finally {
+      scanSpy.mockRestore();
+    }
+  }, 20_000);
+
+  it("keeps ahead behind counts unknown when the bounded scan fails", async () => {
+    const seeded = await seedAncestryTerminalWorkspace();
+    const originalRun = workspaceGitOperationScheduler.run.bind(workspaceGitOperationScheduler);
+    const scanSpy = vi.spyOn(workspaceGitOperationScheduler, "run").mockImplementation(async (input) => {
+      if (input.operation === "execution_workspaces.close_readiness_ahead_behind") throw new Error("scan saturated");
+      return originalRun(input);
+    });
+
+    try {
+      const readiness = await svc.getCloseReadiness(seeded.executionWorkspaceId);
+      expect(readiness?.git?.aheadCount).toBeNull();
+      expect(readiness?.git?.behindCount).toBeNull();
+      expect(readiness?.warnings).toEqual(expect.arrayContaining([expect.stringContaining("scan saturated")]));
+    } finally {
+      scanSpy.mockRestore();
+    }
+  }, 20_000);
+
   it("fails closed before archive when git status inspection is unavailable", async () => {
     const seeded = await seedAncestryTerminalWorkspace();
     const statusSpy = vi.spyOn(workspaceGitOperationScheduler, "run")
