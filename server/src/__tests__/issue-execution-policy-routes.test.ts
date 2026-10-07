@@ -599,6 +599,50 @@ describe("issue execution policy routes", () => {
     expect(mockIssueService.update).not.toHaveBeenCalled();
   });
 
+  it("activates a review attached after checkout and refuses the builder's approval", async () => {
+    const builderId = "33333333-3333-4333-8333-333333333333";
+    const reviewerId = "44444444-4444-4444-8444-444444444444";
+    const issueId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    const runId = "55555555-5555-4555-8555-555555555555";
+    const policy = normalizeIssueExecutionPolicy({
+      stages: [{ type: "review", participants: [{ type: "agent", agentId: reviewerId }] }],
+    })!;
+    let issue: Record<string, unknown> = {
+      id: issueId,
+      companyId: "company-1",
+      status: "in_progress",
+      assigneeAgentId: builderId,
+      assigneeUserId: null,
+      createdByUserId: "local-board",
+      identifier: "PAP-1012",
+      title: "Mid-flight review",
+      executionPolicy: null,
+      executionState: null,
+    };
+    mockIssueService.getById.mockImplementation(async () => issue);
+    mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => {
+      issue = { ...issue, ...patch, updatedAt: new Date() };
+      return issue;
+    });
+    const builder = await createApp({ type: "agent", agentId: builderId, companyId: "company-1", runId });
+    const attached = await request(builder).patch(`/api/issues/${issueId}`).send({ executionPolicy: policy });
+    expect(attached.status).toBe(200);
+    expect(issue).toMatchObject({
+      status: "in_review",
+      assigneeAgentId: reviewerId,
+      executionState: {
+        status: "pending",
+        currentParticipant: { type: "agent", agentId: reviewerId },
+        returnAssignee: { type: "agent", agentId: builderId },
+      },
+    });
+    expect(mockHeartbeatService.wakeup).toHaveBeenCalled();
+    const builderDecision = await request(builder).patch(`/api/issues/${issueId}`).send({ status: "done", comment: "Approve" });
+    expect(builderDecision.status).toBe(422);
+    expect(issue.status).toBe("in_review");
+    expect((issue.executionState as { lastDecisionOutcome: unknown }).lastDecisionOutcome).toBeNull();
+  });
+
   it("allows an agent-authored in_review transition with a typed execution participant", async () => {
     const issue = {
       id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
