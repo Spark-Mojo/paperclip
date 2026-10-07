@@ -1,6 +1,6 @@
 import express from "express";
 import request from "supertest";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { normalizeIssueExecutionPolicy } from "../services/issue-execution-policy.ts";
 
 const mockIssueService = vi.hoisted(() => ({
@@ -24,6 +24,7 @@ const mockHeartbeatService = vi.hoisted(() => ({
   getRun: vi.fn(async () => null),
   getActiveRunForAgent: vi.fn(async () => null),
   cancelRun: vi.fn(async () => null),
+  cancelLiveRunsForIssue: vi.fn(async () => []),
 }));
 
 const mockAccessService = vi.hoisted(() => ({
@@ -32,6 +33,7 @@ const mockAccessService = vi.hoisted(() => ({
   hasPermission: vi.fn(async () => false),
 }));
 const mockDbSelectWhere = vi.hoisted(() => vi.fn(() => ({
+  orderBy: async () => [],
   for: () => ({
     then: (onFulfilled: (rows: unknown[]) => unknown, onRejected?: (reason: unknown) => unknown) =>
       Promise.resolve([{
@@ -193,15 +195,21 @@ async function createApp(actor?: TestActor) {
 }
 
 describe("issue execution policy routes", () => {
-  beforeEach(() => {
-    vi.resetModules();
-    vi.doUnmock("../services/index.js");
-    vi.doUnmock("../routes/issues.js");
-    vi.doUnmock("../middleware/index.js");
+  beforeAll(async () => {
     registerModuleMocks();
+    await createApp();
+  }, 60000);
+
+  beforeEach(() => {
     vi.clearAllMocks();
+    mockHeartbeatService.getActiveRunForAgent.mockResolvedValue(null);
+    mockHeartbeatService.cancelRun.mockResolvedValue(null);
+    mockHeartbeatService.cancelLiveRunsForIssue.mockResolvedValue([]);
+    mockLogActivity.mockResolvedValue(undefined);
     mockIssueService.assertCheckoutOwner.mockResolvedValue({ adoptedFromRunId: null });
     mockIssueService.getByIdForUpdate.mockImplementation(async () => mockIssueService.getById());
+    mockIssueService.getById.mockReset();
+    mockIssueService.update.mockReset();
     mockIssueService.findMentionedAgents.mockResolvedValue([]);
     mockIssueService.getRelationSummaries.mockResolvedValue({ blockedBy: [], blocks: [] });
     mockIssueService.listWakeableBlockedDependents.mockResolvedValue([]);
@@ -212,6 +220,7 @@ describe("issue execution policy routes", () => {
     mockDbSelect.mockImplementation(() => ({ from: mockDbSelectFrom }));
     mockDbSelectFrom.mockImplementation(() => ({ where: mockDbSelectWhere }));
     mockDbSelectWhere.mockImplementation(() => ({
+      orderBy: async () => [],
       for: () => ({
         then: (onFulfilled: (rows: unknown[]) => unknown, onRejected?: (reason: unknown) => unknown) =>
           Promise.resolve([{
