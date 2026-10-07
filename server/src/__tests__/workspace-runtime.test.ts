@@ -5344,7 +5344,6 @@ describeEmbeddedPostgres("ephemeral worktree per run sweep (SPA-9275)", () => {
       const { recorder } = createWorkspaceOperationRecorderDouble();
       const summary = await reconcileEphemeralWorktreesOnStartup({
         db: testDb,
-        liveRunIds: new Set<string>(),
         recorder,
       });
       expect(summary.reposScanned).toBeGreaterThanOrEqual(1);

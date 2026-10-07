@@ -1048,7 +1048,7 @@ async function startServerWithDatabaseTeardown(
   // 168-worktree HDD load. Periodic re-runs are out of scope for this
   // change — startup is sufficient for the steady-state contract; a
   // scheduler is a follow-up.
-  void reconcileEphemeralWorktreesOnStartup(db as any)
+  void reconcileEphemeralWorktreesOnStartup({ db })
     .then((result) => {
       if (result.reaper.removed > 0 || result.sweep.archived > 0) {
         logger.warn(
