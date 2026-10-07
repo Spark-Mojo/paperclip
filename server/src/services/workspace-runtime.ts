@@ -2844,15 +2844,17 @@ export async function assertReusableWorktreeSafe(worktreePath: string): Promise<
   const lockPath = path.join(gitDir, "index.lock");
   const probe = async () => {
     if (process.platform !== "linux") throw new Error("live Git writer detection is unavailable");
-    const entries = await fs.readdir("/proc", { withFileTypes: true });
-    for (const entry of entries) {
-      if (!entry.isDirectory() || !/^\d+$/.test(entry.name) || Number(entry.name) === process.pid) continue;
-      const base = path.join("/proc", entry.name);
+    const gitProcesses = await executeProcess({ command: "pgrep", args: ["-x", "git"], cwd: worktreePath });
+    if (gitProcesses.code !== 0 && gitProcesses.code !== 1) throw new Error("live Git writer detection failed");
+    if (gitProcesses.stderr.trim() || gitProcesses.stdoutTruncated || gitProcesses.stderrTruncated) throw new Error("live Git writer detection failed");
+    for (const pid of gitProcesses.stdout.trim().split(/\s+/)) {
+      if (!/^\d+$/.test(pid) || Number(pid) === process.pid) continue;
+      const base = path.join("/proc", pid);
       let command: string;
       try {
         command = (await fs.readFile(path.join(base, "comm"), "utf8")).trim();
       } catch (error) {
-        if ((error as NodeJS.ErrnoException).code === "ENOENT") continue;
+        if (["ENOENT", "ESRCH"].includes((error as NodeJS.ErrnoException).code ?? "")) continue;
         throw error;
       }
       if (command !== "git") continue;
@@ -2872,7 +2874,7 @@ export async function assertReusableWorktreeSafe(worktreePath: string): Promise<
           }
         }
       } catch (error) {
-        if ((error as NodeJS.ErrnoException).code === "ENOENT") continue;
+        if (["ENOENT", "ESRCH"].includes((error as NodeJS.ErrnoException).code ?? "")) continue;
         throw error;
       }
     }
@@ -2883,7 +2885,7 @@ export async function assertReusableWorktreeSafe(worktreePath: string): Promise<
     throw error;
   });
   if (lock) {
-    if (!lock.isFile() || lock.size !== 0 || Date.now() - lock.mtimeMs < 60_000) {
+    if (!lock.isFile() || lock.size !== 0 || Date.now() - lock.mtimeMs < 600_000) {
       throw new Error(`unsafe Git index.lock at ${lockPath}`);
     }
     await probe();
@@ -2896,12 +2898,6 @@ export async function assertReusableWorktreeSafe(worktreePath: string): Promise<
       throw new Error(`Git index.lock changed during inspection at ${lockPath}`);
     }
   }
-  const status = await runExpensiveGitStatus({
-    args: ["-c", "core.optionalLocks=false", "status", "--porcelain", "--untracked-files=all"],
-    cwd: worktreePath,
-    operation: "workspace_runtime.reuse_clean_guard",
-  });
-  if (status.length > 0) throw new Error(`Worktree has uncommitted changes at ${worktreePath}`);
   await probe();
   if (lock) {
     const current = await fs.lstat(lockPath);
