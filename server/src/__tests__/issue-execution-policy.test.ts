@@ -162,6 +162,54 @@ describe("parseIssueExecutionState", () => {
 });
 
 describe("issue execution policy transitions", () => {
+  it("activates a review attached mid-flight without accepting a builder decision", () => {
+    const policy = reviewOnlyPolicy();
+    const issue = {
+      status: "in_progress",
+      assigneeAgentId: coderAgentId,
+      assigneeUserId: null,
+      executionPolicy: null,
+      executionState: null,
+    };
+    const attachment = applyIssueExecutionPolicyTransition({
+      issue,
+      policy,
+      previousPolicy: null,
+      requestedAssigneePatch: {},
+      actor: { agentId: coderAgentId },
+    });
+    expect(attachment.patch).toMatchObject({
+      status: "in_review",
+      assigneeAgentId: qaAgentId,
+      executionState: {
+        status: "pending",
+        currentParticipant: { type: "agent", agentId: qaAgentId },
+        returnAssignee: { type: "agent", agentId: coderAgentId },
+      },
+    });
+    expect(attachment.decision).toBeUndefined();
+    const assignedIssue = { ...issue, ...attachment.patch, executionPolicy: policy };
+    expect(() => applyIssueExecutionPolicyTransition({
+      issue: assignedIssue,
+      policy,
+      previousPolicy: policy,
+      requestedStatus: "done",
+      requestedAssigneePatch: {},
+      actor: { agentId: coderAgentId },
+      commentBody: "Approve",
+    })).toThrow("Only the active reviewer or approver can advance");
+    const reviewerDecision = applyIssueExecutionPolicyTransition({
+      issue: assignedIssue,
+      policy,
+      previousPolicy: policy,
+      requestedStatus: "done",
+      requestedAssigneePatch: {},
+      actor: { agentId: qaAgentId },
+      commentBody: "Approved on current head",
+    });
+    expect(reviewerDecision.decision).toMatchObject({ outcome: "approved", body: "Approved on current head" });
+    expect(reviewerDecision.patch.executionState).toMatchObject({ lastDecisionOutcome: "approved" });
+  });
   describe("happy path: executor → review → approval → done", () => {
     const policy = twoStagePolicy();
 
