@@ -569,6 +569,15 @@ describe("adapter skill snapshots", () => {
 });
 
 describe("runChildProcess", () => {
+  it.skipIf(process.platform !== "linux")("places a spawned adapter and its descendants in a capped run scope", async () => {
+    const result = await runChildProcess(randomUUID(), process.execPath, ["-e", "const fs=require('fs');const {spawnSync}=require('child_process');const own=fs.readFileSync('/proc/self/cgroup','utf8').trim().split(':').at(-1);const child=spawnSync(process.execPath,['-e',\"process.stdout.write(require('fs').readFileSync('/proc/self/cgroup','utf8').trim().split(':').at(-1))\"]);process.stdout.write(JSON.stringify({own,child:child.stdout.toString(),tasks:fs.readFileSync('/sys/fs/cgroup'+own+'/pids.max','utf8').trim()}));"], { cwd: process.cwd(), env: {}, timeoutSec: 10, graceSec: 1, onLog: async () => {} });
+    expect(result.exitCode).toBe(0);
+    const observed = JSON.parse(result.stdout);
+    expect(observed.own).toMatch(/paperclip-agent-.*\.scope$/);
+    expect(observed.child).toBe(observed.own);
+    expect(observed.tasks).toBe(String(process.env.PAPERCLIP_RUN_TASKS_MAX ?? 2048));
+  });
+
   it("does not arm a timeout when timeoutSec is 0", async () => {
     const result = await runChildProcess(
       randomUUID(),
