@@ -1,5 +1,6 @@
 import type { ExecutionContinuationEnvelope } from "@paperclipai/shared";
 import { spawn, type ChildProcess } from "node:child_process";
+import { scopedRunCommand, stopRunScope } from "./run-resource-scope.js";
 import { createHash, randomUUID } from "node:crypto";
 import { constants as fsConstants, promises as fs, type Dirent } from "node:fs";
 import os from "node:os";
@@ -4744,9 +4745,12 @@ export async function runChildProcess(
           });
           childEnv[promptFileEnvName] = resolvedPromptFilePath;
         }
-        const child = spawn(target.command, target.args, {
+        const scoped = opts.remoteExecution
+          ? { command: target.command, args: target.args, unit: null, env: {} }
+          : scopedRunCommand(runId, target.command, target.args);
+        const child = spawn(scoped.command, scoped.args, {
           cwd: target.cwd ?? opts.cwd,
-          env: childEnv,
+          env: { ...childEnv, ...scoped.env },
           detached: process.platform !== "win32",
           shell: false,
           stdio: [stdinToPipe != null ? "pipe" : "ignore", "pipe", "pipe"],
@@ -4904,6 +4908,9 @@ export async function runChildProcess(
 
         const stdin = child.stdin;
         if (stdinToPipe != null && stdin) {
+          stdin.on("error", (err: NodeJS.ErrnoException) => {
+            if (err.code !== "EPIPE") onLogError(err, runId, "failed to send adapter stdin");
+          });
           void spawnPersistPromise.finally(() => {
             if (child.killed || stdin.destroyed) return;
             stdin.write(stdinToPipe as string);
@@ -4911,10 +4918,20 @@ export async function runChildProcess(
           });
         }
 
+        let scopeCleanup: Promise<boolean> | null = null;
+        const cleanupScope = () => {
+          scopeCleanup ??= stopRunScope(scoped.unit).then(() => true, (stopError) => {
+            onLogError(stopError, runId, "failed to stop run scope");
+            return false;
+          });
+          return scopeCleanup;
+        };
+
         child.on("error", (err: Error) => {
           if (timeout) clearTimeout(timeout);
           clearTerminalCleanupTimers();
           runningProcesses.delete(runId);
+          void cleanupScope();
           void target.cleanup?.();
           const errno = (err as NodeJS.ErrnoException).code;
           const pathValue = mergedEnv.PATH ?? mergedEnv.Path ?? "";
@@ -4927,6 +4944,7 @@ export async function runChildProcess(
 
         child.on("exit", () => {
           maybeArmTerminalResultCleanup();
+          void cleanupScope();
         });
 
         child.on(
@@ -4935,7 +4953,12 @@ export async function runChildProcess(
             if (timeout) clearTimeout(timeout);
             clearTerminalCleanupTimers();
             runningProcesses.delete(runId);
-            void logChain.finally(() => {
+            void logChain.finally(async () => {
+              const scopeStopped = await cleanupScope();
+              if (!scopeStopped) {
+                reject(new Error("run_scope_stop_failed"));
+                return;
+              }
               void Promise.resolve()
                 .then(() => target.cleanup?.())
                 .finally(() => {
