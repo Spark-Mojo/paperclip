@@ -214,6 +214,53 @@ describeEmbeddedPostgres("issue done gate — unmerged PR refuses done (SPA-8957
     });
   });
 
+  it("allows a completed self-review skip without a decision", async () => {
+    const policy = normalizeIssueExecutionPolicy({
+      stages: [{ type: "review", participants: [{ type: "agent", agentId }] }],
+    })!;
+    const card = await createCard(db, companyId, {
+      assigneeAgentId: agentId,
+      executionPolicy: policy,
+      executionState: {
+        status: "completed",
+        currentStageId: null,
+        currentStageIndex: null,
+        currentStageType: null,
+        currentParticipant: null,
+        returnAssignee: { type: "agent", agentId },
+        completedStageIds: [policy.stages[0].id],
+        lastDecisionId: null,
+        lastDecisionOutcome: null,
+      },
+    });
+    const updated = await issueService(db).update(card.id, { status: "done" });
+    expect(updated?.status).toBe("done");
+  });
+
+  it("refuses a stale completed state when policy stage IDs changed", async () => {
+    const policy = normalizeIssueExecutionPolicy({
+      stages: [{ type: "review", participants: [{ type: "agent", agentId }] }],
+    })!;
+    const card = await createCard(db, companyId, {
+      executionPolicy: policy,
+      executionState: {
+        status: "completed",
+        currentStageId: null,
+        currentStageIndex: null,
+        currentStageType: null,
+        currentParticipant: null,
+        returnAssignee: null,
+        completedStageIds: ["99999999-9999-4999-8999-999999999991"],
+        lastDecisionId: null,
+        lastDecisionOutcome: "approved",
+      },
+    });
+    await expect(issueService(db).update(card.id, { status: "done" })).rejects.toMatchObject({
+      status: 409,
+      details: { code: "issue_done_with_incomplete_execution_stage" },
+    });
+  });
+
   it("board override records why an incomplete review was closed", async () => {
     const policy = normalizeIssueExecutionPolicy({
       stages: [{ type: "review", participants: [{ type: "agent", agentId }] }],

@@ -1062,6 +1062,33 @@ describe("issue execution policy transitions", () => {
       })).toThrow(/unactivated.*review.*in_review/i);
     });
 
+    it("permits blocking while a review has requested changes", () => {
+      const stageId = policy.stages[0].id;
+      const result = applyIssueExecutionPolicyTransition({
+        issue: {
+          status: "in_progress",
+          assigneeAgentId: coderAgentId,
+          executionPolicy: policy,
+          executionState: {
+            status: "changes_requested",
+            currentStageId: stageId,
+            currentStageIndex: 0,
+            currentStageType: "review",
+            currentParticipant: { type: "agent", agentId: qaAgentId },
+            returnAssignee: { type: "agent", agentId: coderAgentId },
+            completedStageIds: [],
+            lastDecisionId: null,
+            lastDecisionOutcome: "changes_requested",
+          },
+        },
+        policy,
+        requestedStatus: "blocked",
+        requestedAssigneePatch: {},
+        actor: { agentId: coderAgentId },
+      });
+      expect(result.patch).toEqual({});
+    });
+
     it("re-enters the stage from an already blocked card", () => {
       const result = applyIssueExecutionPolicyTransition({
         issue: {
