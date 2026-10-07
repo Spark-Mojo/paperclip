@@ -1045,16 +1045,64 @@ describe("issue execution policy transitions", () => {
 
   describe("no-op transitions", () => {
     const policy = twoStagePolicy();
+
+    it.each(["in_progress", "todo"])("rejects an unactivated review stage on %s to blocked", (status) => {
+      expect(() => applyIssueExecutionPolicyTransition({
+        issue: {
+          status,
+          assigneeAgentId: coderAgentId,
+          assigneeUserId: null,
+          executionPolicy: policy,
+          executionState: null,
+        },
+        policy,
+        requestedStatus: "blocked",
+        requestedAssigneePatch: {},
+        actor: { agentId: coderAgentId },
+      })).toThrow(/unactivated.*review.*in_review/i);
+    });
+
+    it("re-enters the stage from an already blocked card", () => {
+      const result = applyIssueExecutionPolicyTransition({
+        issue: {
+          status: "blocked",
+          assigneeAgentId: coderAgentId,
+          assigneeUserId: null,
+          executionPolicy: policy,
+          executionState: null,
+        },
+        policy,
+        requestedStatus: "in_review",
+        requestedAssigneePatch: {},
+        actor: { agentId: coderAgentId },
+      });
+      expect(result.patch).toMatchObject({
+        status: "in_review",
+        assigneeAgentId: qaAgentId,
+        executionState: { status: "pending", currentStageId: policy.stages[0].id },
+      });
+    });
     const reviewStageId = policy.stages[0].id;
 
-    it("non-done status change without review context is a no-op", () => {
+    it("blocked transition after completed review leaves the stage completed", () => {
+      const completed = {
+        status: "completed" as const,
+        currentStageId: null,
+        currentStageIndex: null,
+        currentStageType: null,
+        currentParticipant: null,
+        returnAssignee: { type: "agent" as const, agentId: coderAgentId },
+        completedStageIds: policy.stages.map((stage) => stage.id),
+        lastDecisionId: null,
+        lastDecisionOutcome: "approved" as const,
+      };
       const result = applyIssueExecutionPolicyTransition({
         issue: {
           status: "in_progress",
           assigneeAgentId: coderAgentId,
           assigneeUserId: null,
           executionPolicy: policy,
-          executionState: null,
+          executionState: completed,
         },
         policy,
         requestedStatus: "blocked",

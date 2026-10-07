@@ -6,6 +6,7 @@ import {
   issues,
 } from "@paperclipai/db";
 import { conflict } from "../errors.js";
+import { normalizeIssueExecutionPolicy, parseIssueExecutionState } from "./issue-execution-policy.js";
 import { logActivity } from "./activity-log.js";
 import {
   createPullRequestMergeDetailsResolver,
@@ -70,6 +71,22 @@ import {
  */
 
 export const DONE_GATE_OPEN_PR_REFUSAL = "issue_done_with_unmerged_pull_request";
+export const DONE_GATE_INCOMPLETE_STAGE_REFUSAL = "issue_done_with_incomplete_execution_stage";
+
+export function assertIssueExecutionStagesComplete(issue: {
+  executionPolicy?: unknown;
+  executionState?: unknown;
+}) {
+  const policy = normalizeIssueExecutionPolicy(issue.executionPolicy ?? null);
+  if (!policy?.stages.length) return;
+  const state = parseIssueExecutionState(issue.executionState);
+  const incomplete = policy.stages.filter((stage) => !state?.completedStageIds.includes(stage.id));
+  if (state?.status === "completed" && state.lastDecisionOutcome === "approved" && incomplete.length === 0) return;
+  throw conflict(
+    "Issue cannot be marked done: configured review or approval stage is incomplete. Enter in_review and record the stage verdict, or use an explicit board doneOverride with a reason.",
+    { code: DONE_GATE_INCOMPLETE_STAGE_REFUSAL, incompleteStageIds: incomplete.map((stage) => stage.id) },
+  );
+}
 
 /**
  * SPA-9038: PR links parsed out of card prose (description/comments) bind the
