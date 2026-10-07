@@ -1,10 +1,53 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
+import { randomUUID } from "node:crypto";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
+const release = vi.hoisted(() => vi.fn(async () => {}));
+const prepare = vi.hoisted(() => vi.fn(async () => ({
+  release,
+  queueCommand: () => {},
+  semanticTools: [],
+  connectUrl: "ws://127.0.0.1:3100/runner",
+})));
+vi.mock("./runner-prp-coordinator.js", () => ({ runnerPrpCoordinator: () => ({ prepare }) }));
 
 import type { PaperclipSemanticToolDefinition } from "../../vendor/paperclip-runner/index.js";
 import {
   buildNativeRunnerArguments,
   buildNativeRunnerPreparePayload,
+  executeNativeCodexRunner,
 } from "./native-codex-runner.js";
+
+describe("native runner scope cleanup", () => {
+  it.skipIf(process.platform !== "linux")("releases the prepared PRP registration when the resource limit is malformed", async () => {
+    const root = await mkdtemp(join(tmpdir(), "native-scope-regression-"));
+    const binary = join(root, "runner-binary");
+    const prior = process.env.PAPERCLIP_RUN_TASKS_MAX;
+    await writeFile(binary, "fixture");
+    process.env.PAPERCLIP_RUN_TASKS_MAX = "invalid";
+    release.mockClear();
+    prepare.mockClear();
+    try {
+      await expect(executeNativeCodexRunner({
+        db: {} as Parameters<typeof executeNativeCodexRunner>[0]["db"],
+        companyId: randomUUID(), issueId: randomUUID(), runId: randomUUID(), agentId: randomUUID(),
+        runnerInstanceId: randomUUID(), environmentLeaseId: "lease-1", normalizedSessionId: randomUUID(),
+        turnId: "turn-1", itemId: "item-1", cwd: root, prompt: "test", model: null,
+        resumeProviderSessionId: null, completionContract: { revision: "1", criterionIds: [] },
+        timeoutMs: 1_000, environment: {}, runnerBinary: binary, runtimeRoot: root,
+        onLog: async () => {}, onSpawn: async () => {},
+      })).rejects.toThrow("invalid_run_resource_limit");
+      expect(prepare).toHaveBeenCalledOnce();
+      expect(release).toHaveBeenCalledOnce();
+    } finally {
+      if (prior === undefined) delete process.env.PAPERCLIP_RUN_TASKS_MAX;
+      else process.env.PAPERCLIP_RUN_TASKS_MAX = prior;
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+});
 
 describe("buildNativeRunnerArguments", () => {
   it("binds every durable identity without exposing the bootstrap ticket", () => {

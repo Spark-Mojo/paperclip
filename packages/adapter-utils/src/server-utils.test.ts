@@ -569,6 +569,27 @@ describe("adapter skill snapshots", () => {
 });
 
 describe("runChildProcess", () => {
+  it.skipIf(process.platform !== "linux")("places a spawned adapter and its descendants in a capped run scope", async () => {
+    const result = await runChildProcess(randomUUID(), process.execPath, ["-e", "const fs=require('fs');const {spawnSync}=require('child_process');const own=fs.readFileSync('/proc/self/cgroup','utf8').trim().split(':').at(-1);const child=spawnSync(process.execPath,['-e',\"process.stdout.write(require('fs').readFileSync('/proc/self/cgroup','utf8').trim().split(':').at(-1))\"]);process.stdout.write(JSON.stringify({own,child:child.stdout.toString(),tasks:fs.readFileSync('/sys/fs/cgroup'+own+'/pids.max','utf8').trim()}));"], { cwd: process.cwd(), env: {}, timeoutSec: 10, graceSec: 1, onLog: async () => {} });
+    expect(result.exitCode).toBe(0);
+    const observed = JSON.parse(result.stdout);
+    expect(observed.own).toMatch(/paperclip-agent-.*\.scope$/);
+    expect(observed.child).toBe(observed.own);
+    expect(observed.tasks).toBe(String(process.env.PAPERCLIP_RUN_TASKS_MAX ?? 2048));
+  });
+
+  it.skipIf(process.platform !== "linux")("reaps a descendant holding inherited stdout when the adapter exits", async () => {
+    const result = await Promise.race([
+      runChildProcess(randomUUID(), process.execPath, ["-e", "require('child_process').spawn('/bin/sleep',['8'],{stdio:['ignore','inherit','ignore']});process.stdout.write('parent-exited')"], {
+        cwd: process.cwd(), env: {}, timeoutSec: 0, graceSec: 1, onLog: async () => {},
+        terminalResultCleanup: { graceMs: 100, hasTerminalResult: ({ stdout }) => stdout.includes('parent-exited') },
+      }),
+      new Promise<never>((_, reject) => setTimeout(() => reject(new Error("scope_descendant_not_reaped")), 3_000)),
+    ]);
+    expect(result.terminalResultCleanup?.stopped).toBe(true);
+    expect(result.stdout).toBe("parent-exited");
+  });
+
   it("does not arm a timeout when timeoutSec is 0", async () => {
     const result = await runChildProcess(
       randomUUID(),
@@ -785,13 +806,17 @@ describe("runChildProcess", () => {
       );
       expect(result.timedOut).toBe(false);
       expect(result.exitCode).toBe(0);
-      expect(result.terminalResultCleanup).toMatchObject({
-        kind: "terminal_result_cleanup",
-        stopped: true,
-        stopReason: UNMANAGED_BACKGROUND_TASK_STOP_REASON,
-        reason: UNMANAGED_BACKGROUND_TASK_LIVENESS_REASON,
-        terminalResultSeen: true,
-      });
+      if (process.platform === "linux") {
+        expect(result.terminalResultCleanup).toBeNull();
+      } else {
+        expect(result.terminalResultCleanup).toMatchObject({
+          kind: "terminal_result_cleanup",
+          stopped: true,
+          stopReason: UNMANAGED_BACKGROUND_TASK_STOP_REASON,
+          reason: UNMANAGED_BACKGROUND_TASK_LIVENESS_REASON,
+          terminalResultSeen: true,
+        });
+      }
       expect(Number.isInteger(descendantPid) && descendantPid > 0).toBe(true);
       expect(await waitForPidExit(descendantPid, 2_000)).toBe(true);
     },
@@ -838,7 +863,7 @@ describe("runChildProcess", () => {
     },
   );
 
-  it.skipIf(process.platform === "win32")(
+  it.skipIf(process.platform === "win32" || process.platform === "linux")(
     "does not clean up noisy runs that have no terminal output",
     async () => {
       const runId = randomUUID();
