@@ -2396,6 +2396,113 @@ export async function ensureGitWorktreeBranchCoherent(input: {
   }
 
   if (!evidence.safeRepair.eligible) {
+    if (
+      evidence.cleanliness === "clean" &&
+      !evidence.inProgressOperation &&
+      evidence.provenance.expectedBranchExists &&
+      evidence.provenance.actualBranchExists === true &&
+      evidence.provenance.ancestryVerdict === "diverged" &&
+      evidence.provenance.registeredBranchMatchesHead &&
+      !evidence.contention &&
+      currentBranch &&
+      evidence.provenance.actualHeadSha
+    ) {
+      const pinnedHead = evidence.provenance.actualHeadSha;
+      const stillClean = await runExpensiveGitStatus({
+        args: ["status", "--porcelain", "--untracked-files=all"],
+        cwd: input.worktreePath,
+        operation: "workspace_runtime.clean_diverged_rescue_status",
+        fairnessKeys: input.executionWorkspaceId ? [`workspace:${input.executionWorkspaceId}`] : [],
+      }).catch(() => null);
+      const freshBranch = await runGit(["symbolic-ref", "--quiet", "--short", "HEAD"], input.worktreePath).catch(() => null);
+      const freshHead = await runGit(["rev-parse", "HEAD"], input.worktreePath).catch(() => null);
+      const freshExpected = await runGit(["rev-parse", "--verify", `refs/heads/${expectedBranchName}^{commit}`], input.repoRoot).catch(() => null);
+      const freshRegistration = await findRegisteredGitWorktreeByPath(input.repoRoot, input.worktreePath);
+      const freshContention = await findGitWorktreeBranchContention({
+        db: input.db,
+        sourceIssue: input.sourceIssue,
+        executionWorkspaceId: input.executionWorkspaceId ?? null,
+        worktreePath: input.worktreePath,
+        actualBranchName: currentBranch,
+      });
+      if (
+        stillClean === "" && freshBranch === currentBranch && freshHead === pinnedHead &&
+        freshExpected === evidence.provenance.expectedHeadSha &&
+        freshRegistration?.branch === `refs/heads/${currentBranch}` && !freshContention
+      ) {
+        const actualIsAlreadyOnExpected = await executeProcess({
+          command: "git",
+          args: ["merge-base", "--is-ancestor", pinnedHead, freshExpected!],
+          cwd: input.repoRoot,
+        }).catch(() => null);
+        if (actualIsAlreadyOnExpected?.code === 0) {
+          throw branchIncoherenceValidationFailure(evidence);
+        }
+        if (actualIsAlreadyOnExpected?.code !== 1) {
+          evidence.safeRepair.reason = "clean diverged rescue refused because unique commits could not be proven";
+          throw branchIncoherenceValidationFailure(evidence);
+        }
+        const issueComponent = sanitizeBranchName(input.sourceIssue?.identifier ?? input.sourceIssue?.id ?? "issue");
+        const existingRefs = await runGit([
+          "for-each-ref", "--format=%(refname:short)", "--points-at", pinnedHead,
+          `refs/heads/paperclip/rescue/${issueComponent}/`,
+        ], input.repoRoot).catch(() => "");
+        const existingRescue = existingRefs.split("\n").find((ref) => ref.startsWith(`paperclip/rescue/${issueComponent}/`));
+        const rescueBranch = existingRescue ?? buildDirtyQuarantineRescueBranch(input.sourceIssue);
+        try {
+          if (!existingRescue) {
+            await runGit(["update-ref", `refs/heads/${rescueBranch}`, pinnedHead, "0000000000000000000000000000000000000000"], input.repoRoot);
+          }
+          const rescuedHead = await runGit(["rev-parse", `refs/heads/${rescueBranch}`], input.repoRoot);
+          if (rescuedHead !== pinnedHead) throw new Error("rescue ref did not resolve to the pinned HEAD");
+          evidence.safeRepair.reason = `clean diverged commit ${pinnedHead} preserved on rescue branch ${rescueBranch}; recorded branch not restored`;
+          if (input.db && evidence.sourceIssueId && !existingRescue) {
+            const companyId = await readIssueCompanyId(input.db, evidence.sourceIssueId).catch(() => null);
+            if (companyId) {
+              const [auditComment] = await input.db.insert(issueComments).values({
+                companyId,
+                issueId: evidence.sourceIssueId,
+                authorAgentId: null,
+                authorUserId: null,
+                authorType: "system",
+                createdByRunId: input.heartbeatRunId ?? null,
+                body: [
+                  "Execution workspace clean diverged branch preserved; no branch was switched.",
+                  `- Source issue: ${formatIssueReference(evidence.sourceIssueId, evidence.sourceIdentifier)}`,
+                  `- Workspace: \`${evidence.executionWorkspaceId ?? "unpersisted"}\``,
+                  `- Worktree: \`${evidence.worktreePath}\``,
+                  `- Recorded branch: \`${evidence.expectedBranch}\``,
+                  `- Live branch: \`${currentBranch}\``,
+                  `- Rescue branch: \`${rescueBranch}\``,
+                  `- Rescue commit: \`${pinnedHead}\``,
+                  `- Fingerprint: \`${evidence.fingerprint}\``,
+                  "- State cleared after rescue: none; resolution preserved on the rescue branch. Manual restoration is required.",
+                ].join("\n"),
+              }).returning({ id: issueComments.id });
+              await logActivity(input.db, {
+                companyId,
+                actorType: "system",
+                actorId: "workspace_runtime",
+                runId: input.heartbeatRunId ?? null,
+                action: "execution_workspace.clean_diverged_branch_rescued",
+                entityType: evidence.executionWorkspaceId ? "execution_workspace" : "issue",
+                entityId: evidence.executionWorkspaceId ?? evidence.sourceIssueId,
+                details: { rescueBranch, rescueCommitSha: pinnedHead, fingerprint: evidence.fingerprint, auditCommentId: auditComment?.id ?? null },
+              }).catch(() => null);
+            }
+          }
+        } catch (error) {
+          if (!evidence.safeRepair.reason.includes("preserved on rescue branch")) {
+            const existingRescue = await runGit(["rev-parse", "--verify", `refs/heads/${rescueBranch}^{commit}`], input.repoRoot).catch(() => null);
+            evidence.safeRepair.reason = existingRescue === pinnedHead
+              ? `clean diverged commit ${pinnedHead} preserved on rescue branch ${rescueBranch}; recorded branch not restored`
+              : `clean diverged rescue failed: ${error instanceof Error ? error.message : String(error)}`;
+          }
+        }
+      } else {
+        evidence.safeRepair.reason = "clean diverged rescue refused because the worktree changed during inspection";
+      }
+    }
     throw branchIncoherenceValidationFailure(evidence);
   }
 
