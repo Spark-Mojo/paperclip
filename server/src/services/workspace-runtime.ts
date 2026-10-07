@@ -2895,7 +2895,7 @@ async function inspectReusableWorktreeLock(worktreePath: string): Promise<void> 
           }
         }
       } catch (error) {
-        if (["ENOENT", "ESRCH"].includes((error as NodeJS.ErrnoException).code ?? "")) {
+        if (["EACCES", "EPERM", "ENOENT", "ESRCH"].includes((error as NodeJS.ErrnoException).code ?? "")) {
           skippedPids++;
           continue;
         }

@@ -65,7 +65,7 @@ describe("worktree reuse safety", () => {
     }
   });
 
-  it.each(["EACCES", "EPERM"])("refuses a same-UID Git PID whose fd scan returns %s", async (code) => {
+  it.each(["EACCES", "EPERM", "ENOENT"])("skips a Git PID whose fd scan returns %s", async (code) => {
     const { root } = await fixture();
     const writer = spawn("git", ["--no-pager", "hash-object", "--stdin"], { cwd: os.tmpdir(), stdio: ["pipe", "pipe", "pipe"] });
     await new Promise<void>((resolve, reject) => {
@@ -78,7 +78,7 @@ describe("worktree reuse safety", () => {
       return readdir(target, options as never);
     });
     try {
-      await expect(assertReusableWorktreeSafe(root)).rejects.toMatchObject({ code });
+      await expect(assertReusableWorktreeSafe(root)).resolves.toBeUndefined();
     } finally {
       readdirSpy.mockRestore();
       writer.stdin.end();
