@@ -2665,6 +2665,71 @@ describe("realizeExecutionWorkspace", () => {
     expect(actualHead).toBe(expectedHead);
   });
 
+  it("restores a persisted worktree after an aged empty index lock", async () => {
+    const repoRoot = await createTempRepo();
+    const branchName = "PAP-9147-reuse";
+    const worktreePath = path.join(repoRoot, ".paperclip", "worktrees", branchName);
+    await fs.mkdir(path.dirname(worktreePath), { recursive: true });
+    await runGit(repoRoot, ["worktree", "add", "-b", branchName, worktreePath, "HEAD"]);
+    await fs.writeFile(path.join(worktreePath, "README.md"), "changed\n");
+    await fs.writeFile(path.join(worktreePath, "untracked.txt"), "preserve\n");
+    const head = await readGit(worktreePath, ["rev-parse", "HEAD"]);
+    const lockPath = await readGit(worktreePath, ["rev-parse", "--git-path", "index.lock"]);
+    await fs.writeFile(lockPath, "");
+    const old = new Date(Date.now() - 660_000);
+    await fs.utimes(lockPath, old, old);
+
+    const restored = await ensurePersistedExecutionWorkspaceAvailable({
+      base: { baseCwd: repoRoot, source: "project_primary", projectId: "project-1", workspaceId: "workspace-1", repoUrl: null, repoRef: "HEAD" },
+      workspace: {
+        id: "execution-workspace-9147", mode: "isolated_workspace", strategyType: "git_worktree",
+        cwd: worktreePath, providerRef: worktreePath, projectId: "project-1", projectWorkspaceId: "workspace-1",
+        repoUrl: null, baseRef: "HEAD", branchName, metadata: RUNTIME_OWNED_GIT_BRANCH_METADATA,
+      },
+      issue: { id: "issue-9147", identifier: "PAP-9147", title: "Persisted lock recovery" },
+      agent: { id: "agent-1", name: "Test Agent", companyId: "company-1" },
+    });
+
+    expect(restored?.cwd).toBe(worktreePath);
+    expect(restored?.branchName).toBe(branchName);
+    await expect(readGit(worktreePath, ["rev-parse", "HEAD"])).resolves.toBe(head);
+    await expect(fs.readFile(path.join(worktreePath, "README.md"), "utf8")).resolves.toBe("changed\n");
+    await expect(fs.readFile(path.join(worktreePath, "untracked.txt"), "utf8")).resolves.toBe("preserve\n");
+    await expect(fs.stat(lockPath)).rejects.toMatchObject({ code: "ENOENT" });
+  }, 30_000);
+
+  it.each([
+    { label: "recent", contents: "", ageMs: 0 },
+    { label: "nonempty", contents: "writer", ageMs: 660_000 },
+  ])("refuses persisted worktree restore for $label index locks", async ({ contents, ageMs }) => {
+    const repoRoot = await createTempRepo();
+    const branchName = "PAP-9147-refuse";
+    const worktreePath = path.join(repoRoot, ".paperclip", "worktrees", branchName);
+    await fs.mkdir(path.dirname(worktreePath), { recursive: true });
+    await runGit(repoRoot, ["worktree", "add", "-b", branchName, worktreePath, "HEAD"]);
+    const head = await readGit(worktreePath, ["rev-parse", "HEAD"]);
+    const lockPath = await readGit(worktreePath, ["rev-parse", "--git-path", "index.lock"]);
+    await fs.writeFile(lockPath, contents);
+    const mtime = new Date(Date.now() - ageMs);
+    await fs.utimes(lockPath, mtime, mtime);
+
+    await expect(ensurePersistedExecutionWorkspaceAvailable({
+      base: { baseCwd: repoRoot, source: "project_primary", projectId: "project-1", workspaceId: "workspace-1", repoUrl: null, repoRef: "HEAD" },
+      workspace: {
+        id: "execution-workspace-9147", mode: "isolated_workspace", strategyType: "git_worktree",
+        cwd: worktreePath, providerRef: worktreePath, projectId: "project-1", projectWorkspaceId: "workspace-1",
+        repoUrl: null, baseRef: "HEAD", branchName, metadata: RUNTIME_OWNED_GIT_BRANCH_METADATA,
+      },
+      issue: { id: "issue-9147", identifier: "PAP-9147", title: "Persisted lock refusal" },
+      agent: { id: "agent-1", name: "Test Agent", companyId: "company-1" },
+    })).rejects.toMatchObject({
+      code: "workspace_validation_failed",
+      resultJson: { workspaceValidation: { reason: "unsafe_git_index_lock", worktreePath, executionWorkspaceId: "execution-workspace-9147" } },
+    });
+    await expect(fs.readFile(lockPath, "utf8")).resolves.toBe(contents);
+    await expect(readGit(worktreePath, ["rev-parse", "HEAD"])).resolves.toBe(head);
+  }, 30_000);
+
   it("reattaches a missing persisted git worktree before manual control starts it", async () => {
     const repoRoot = await createTempRepo();
     const branchName = "PAP-451-restore-persisted-worktree";
