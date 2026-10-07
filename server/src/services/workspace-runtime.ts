@@ -2895,9 +2895,16 @@ async function inspectReusableWorktreeLock(worktreePath: string): Promise<void> 
           }
         }
       } catch (error) {
-        if (["EACCES", "EPERM", "ENOENT", "ESRCH"].includes((error as NodeJS.ErrnoException).code ?? "")) {
+        const code = (error as NodeJS.ErrnoException).code;
+        if (code === "ENOENT" || code === "ESRCH") {
           skippedPids++;
           continue;
+        }
+        if (code === "EACCES" || code === "EPERM") {
+          throw new WorkspaceRuntimeValidationFailure(
+            `Cannot inspect live Git process ${pid} during worktree reuse (${code})`,
+            { workspaceValidation: { reason: "live_git_writer_probe_unavailable", worktreePath } },
+          );
         }
         throw error;
       }
