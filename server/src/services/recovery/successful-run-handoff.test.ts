@@ -61,6 +61,7 @@ function decide(overrides: Partial<Parameters<typeof decideSuccessfulRunHandoff>
     hasOpenRecoveryIssue: false,
     hasPauseHold: false,
     hasActiveRoutineContinuation: false,
+    hasArmedTaskWatchdog: false,
     budgetBlocked: false,
     idempotentWakeExists: false,
     ...overrides,
@@ -609,5 +610,110 @@ describe("successful run handoff decision", () => {
     expect(isSuccessfulRunHandoffRequiredNoticeBody("## Successful run missing issue disposition\n\nold body")).toBe(true);
     expect(isSuccessfulRunHandoffRequiredNoticeBody("## This issue still needs a next step\n\nold body")).toBe(true);
     expect(isSuccessfulRunHandoffRequiredNoticeBody("Unrelated comment")).toBe(false);
+  });
+
+  describe("armed task watchdog (SPA-9724)", () => {
+    it("does not queue when an issue has an armed task watchdog and no other live continuation", () => {
+      const decision = decide({ hasArmedTaskWatchdog: true });
+
+      expect(decision).toEqual({
+        kind: "skip",
+        reason: "armed task watchdog owns the next action",
+      });
+      expect(isSuccessfulRunHandoffValidPathSkip(decision)).toBe(true);
+    });
+
+    it("credits the armed task watchdog ahead of every other non-status skip branch", () => {
+      // The watchdog branch runs after hasActiveRoutineContinuation but ahead of every
+      // remaining valid-path branch — verify the watchdog wins when both fire, so the
+      // agent is never nagged by a corrective handoff over the top of a watchdog that
+      // has already taken over. The two non-overlapping earlier branches
+      // (routine continuation, plugin lifecycle) are excluded by construction.
+      expect(decide({
+        hasArmedTaskWatchdog: true,
+        hasActiveExecutionPath: true,
+        hasQueuedWake: true,
+        hasPersistedMonitor: true,
+        hasExplicitBlockerPath: true,
+        hasOpenRecoveryIssue: true,
+        hasPauseHold: true,
+      })).toEqual({
+        kind: "skip",
+        reason: "armed task watchdog owns the next action",
+      });
+    });
+
+    it("does not suppress the handoff when the watchdog is disabled, exhausted, or has never fired", () => {
+      // hasArmedTaskWatchdog defaults to false (the decide() helper) and the field is
+      // not consulted unless it is set true. A disabled / exhausted / never-fired
+      // watchdog never sets the boolean at the call site, so the default behaviour
+      // — enqueue — must hold.
+      expect(decide({ hasArmedTaskWatchdog: false })).toMatchObject({ kind: "enqueue" });
+      expect(decide()).toMatchObject({ kind: "enqueue" });
+    });
+
+    it("keeps every pre-existing valid-path skip reason intact under the watchdog branch", () => {
+      // Regression coverage for the cardinality of SUCCESSFUL_RUN_HANDOFF_VALID_PATH_SKIP_REASONS.
+      // The pre-SPA-9724 set had 12 entries; the post-SPA-9724 set has 13. Every one of
+      // the twelve pre-existing reasons must still produce a valid-path skip after the
+      // watchdog branch is added — widening the credit must not silently widen it past
+      // the intended set. Assert each pre-existing reason by the boolean it reads.
+      // The two early-return run-state branches (`native semantic finalization`,
+      // `chat conversation already owns the next action`) and the issue-state branch
+      // (`issue has execution policy state`) are guarded by run/issue fields, not by
+      // caller booleans, and so are covered by the existing suite. This test pins the
+      // eight boolean-driven branches in the ordered skip chain.
+      expect(decide({ hasActiveRoutineContinuation: true })).toEqual({
+        kind: "skip",
+        reason: "active routine continuation owns the next action",
+      });
+      expect(decide({ hasActiveExecutionPath: true })).toEqual({
+        kind: "skip",
+        reason: "issue already has an active execution path",
+      });
+      expect(decide({ hasQueuedWake: true })).toEqual({
+        kind: "skip",
+        reason: "issue already has a queued or deferred wake",
+      });
+      expect(decide({ hasPendingInteractionOrApproval: true })).toEqual({
+        kind: "skip",
+        reason: "pending interaction or approval owns the next action",
+      });
+      expect(decide({ hasPersistedMonitor: true })).toEqual({
+        kind: "skip",
+        reason: "persisted issue monitor owns the next action",
+      });
+      expect(decide({ hasExplicitBlockerPath: true })).toEqual({
+        kind: "skip",
+        reason: "explicit blocker path owns the next action",
+      });
+      expect(decide({ hasOpenRecoveryIssue: true })).toEqual({
+        kind: "skip",
+        reason: "open recovery issue owns the ambiguity",
+      });
+      expect(decide({ hasPauseHold: true })).toEqual({
+        kind: "skip",
+        reason: "issue is under an active pause hold",
+      });
+      // `budgetBlocked` is not a valid-path skip — see isSuccessfulRunHandoffValidPathSkip.
+      expect(decide({ budgetBlocked: true })).toMatchObject({ kind: "skip" });
+      expect(isSuccessfulRunHandoffValidPathSkip(decide({ budgetBlocked: true }))).toBe(false);
+    });
+
+    it("orders the watchdog branch after the routine-continuation branch", () => {
+      // An active routine continuation wins over the armed watchdog, because the
+      // routine is the runtime-spawned persistence the engine manages and the watchdog
+      // is the runtime-spawned persistence the watchdog subsystem manages — both
+      // live continuations, but routine continuation is checked first in the
+      // skip chain. This pins the order so a future refactor cannot silently
+      // invert it.
+      expect(decide({
+        hasArmedTaskWatchdog: true,
+        hasActiveRoutineContinuation: true,
+      })).toEqual({
+        kind: "skip",
+        reason: "active routine continuation owns the next action",
+      });
+    });
   });
 });
