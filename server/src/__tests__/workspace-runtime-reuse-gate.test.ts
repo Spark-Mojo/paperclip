@@ -46,6 +46,25 @@ describe("worktree reuse safety", () => {
     }
   });
 
+  it("does not reclaim an aged lock held by a non-Git process", async () => {
+    const { root, lock } = await fixture();
+    await fs.writeFile(lock, "");
+    const old = new Date(Date.now() - 120_000);
+    await fs.utimes(lock, old, old);
+    const holder = spawn("sh", ["-c", "exec 3<\"$1\"; exec sleep 30", "sh", lock], { cwd: root, stdio: ["pipe", "pipe", "pipe"] });
+    try {
+      await new Promise<void>((resolve, reject) => {
+        holder.once("spawn", resolve);
+        holder.once("error", reject);
+      });
+      await expect(assertReusableWorktreeSafe(root)).rejects.toThrow(/holder could not be excluded/);
+      await expect(fs.stat(lock)).resolves.toBeDefined();
+    } finally {
+      holder.kill();
+      await new Promise((resolve) => holder.once("close", resolve));
+    }
+  });
+
   it("reclaims an aged empty unheld lock before checking a clean worktree", async () => {
     const { root, lock } = await fixture();
     await fs.writeFile(lock, "");
