@@ -578,6 +578,18 @@ describe("runChildProcess", () => {
     expect(observed.tasks).toBe(String(process.env.PAPERCLIP_RUN_TASKS_MAX ?? 2048));
   });
 
+  it.skipIf(process.platform !== "linux")("reaps a descendant holding inherited stdout when the adapter exits", async () => {
+    const result = await Promise.race([
+      runChildProcess(randomUUID(), process.execPath, ["-e", "require('child_process').spawn('/bin/sleep',['8'],{stdio:['ignore','inherit','ignore']});process.stdout.write('parent-exited')"], {
+        cwd: process.cwd(), env: {}, timeoutSec: 0, graceSec: 1, onLog: async () => {},
+        terminalResultCleanup: { graceMs: 100, hasTerminalResult: ({ stdout }) => stdout.includes('parent-exited') },
+      }),
+      new Promise<never>((_, reject) => setTimeout(() => reject(new Error("scope_descendant_not_reaped")), 3_000)),
+    ]);
+    expect(result.terminalResultCleanup?.stopped).toBe(true);
+    expect(result.stdout).toBe("parent-exited");
+  });
+
   it("does not arm a timeout when timeoutSec is 0", async () => {
     const result = await runChildProcess(
       randomUUID(),
@@ -794,13 +806,17 @@ describe("runChildProcess", () => {
       );
       expect(result.timedOut).toBe(false);
       expect(result.exitCode).toBe(0);
-      expect(result.terminalResultCleanup).toMatchObject({
-        kind: "terminal_result_cleanup",
-        stopped: true,
-        stopReason: UNMANAGED_BACKGROUND_TASK_STOP_REASON,
-        reason: UNMANAGED_BACKGROUND_TASK_LIVENESS_REASON,
-        terminalResultSeen: true,
-      });
+      if (process.platform === "linux") {
+        expect(result.terminalResultCleanup).toBeNull();
+      } else {
+        expect(result.terminalResultCleanup).toMatchObject({
+          kind: "terminal_result_cleanup",
+          stopped: true,
+          stopReason: UNMANAGED_BACKGROUND_TASK_STOP_REASON,
+          reason: UNMANAGED_BACKGROUND_TASK_LIVENESS_REASON,
+          terminalResultSeen: true,
+        });
+      }
       expect(Number.isInteger(descendantPid) && descendantPid > 0).toBe(true);
       expect(await waitForPidExit(descendantPid, 2_000)).toBe(true);
     },
@@ -847,7 +863,7 @@ describe("runChildProcess", () => {
     },
   );
 
-  it.skipIf(process.platform === "win32")(
+  it.skipIf(process.platform === "win32" || process.platform === "linux")(
     "does not clean up noisy runs that have no terminal output",
     async () => {
       const runId = randomUUID();
