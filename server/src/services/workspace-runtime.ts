@@ -2887,6 +2887,10 @@ export async function assertReusableWorktreeSafe(worktreePath: string): Promise<
       throw new Error(`unsafe Git index.lock at ${lockPath}`);
     }
     await probe();
+    const holder = await executeProcess({ command: "fuser", args: [lockPath], cwd: worktreePath });
+    if (holder.code !== 1 || holder.stdout.trim() || holder.stderr.trim() || holder.stdoutTruncated || holder.stderrTruncated) {
+      throw new Error(`Git index.lock holder could not be excluded at ${lockPath}`);
+    }
     const current = await fs.lstat(lockPath);
     if (current.ino !== lock.ino || current.mtimeMs !== lock.mtimeMs || current.size !== 0) {
       throw new Error(`Git index.lock changed during inspection at ${lockPath}`);
