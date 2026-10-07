@@ -981,7 +981,12 @@ function applyIssueExecutionStageTransition(input: TransitionInput): TransitionR
 
   const shouldStartWorkflow =
     requestedStatus === "done" ||
-    requestedStatus === "in_review";
+    requestedStatus === "in_review" ||
+    (requestedStatus === undefined &&
+      input.issue.status === "in_progress" &&
+      !(input.previousPolicy ?? normalizeIssueExecutionPolicy(input.issue.executionPolicy ?? null))?.stages.length &&
+      input.policy.stages.length > 0 &&
+      existingState?.status !== COMPLETED_STATUS);
 
   if (!shouldStartWorkflow) {
     return { patch };
