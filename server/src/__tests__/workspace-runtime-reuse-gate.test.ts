@@ -43,6 +43,80 @@ describe("worktree reuse safety", () => {
     }
   });
 
+  it.each(["EACCES", "EPERM"])("skips a foreign Git PID whose fd scan returns %s", async (code) => {
+    const { root } = await fixture();
+    const writer = spawn("git", ["--no-pager", "hash-object", "--stdin"], { cwd: os.tmpdir(), stdio: ["pipe", "pipe", "pipe"] });
+    await new Promise<void>((resolve, reject) => {
+      writer.once("spawn", resolve);
+      writer.once("error", reject);
+    });
+    const stat = fs.stat.bind(fs);
+    const statSpy = vi.spyOn(fs, "stat").mockImplementation(async (target, options) => {
+      const result = await stat(target, options as never);
+      if (String(target) === `/proc/${writer.pid}`) return Object.assign(Object.create(Object.getPrototypeOf(result)), result, { uid: (process.getuid?.() ?? 0) + 1 });
+      return result;
+    });
+    const readdir = fs.readdir.bind(fs);
+    const readdirSpy = vi.spyOn(fs, "readdir").mockImplementation(async (target, options) => {
+      if (String(target) === `/proc/${writer.pid}/fd`) throw Object.assign(new Error("process fd scan unavailable"), { code });
+      return readdir(target, options as never);
+    });
+    try {
+      await expect(assertReusableWorktreeSafe(root)).resolves.toBeUndefined();
+      expect(readdirSpy).not.toHaveBeenCalledWith(`/proc/${writer.pid}/fd`);
+    } finally {
+      readdirSpy.mockRestore();
+      statSpy.mockRestore();
+      writer.stdin.end();
+      await new Promise((resolve) => writer.once("close", resolve));
+    }
+  });
+
+  it.each(["EACCES", "EPERM"])("refuses a same-UID Git PID whose fd scan returns %s", async (code) => {
+    const { root } = await fixture();
+    const writer = spawn("git", ["--no-pager", "hash-object", "--stdin"], { cwd: os.tmpdir(), stdio: ["pipe", "pipe", "pipe"] });
+    await new Promise<void>((resolve, reject) => {
+      writer.once("spawn", resolve);
+      writer.once("error", reject);
+    });
+    const readdir = fs.readdir.bind(fs);
+    const readdirSpy = vi.spyOn(fs, "readdir").mockImplementation(async (target, options) => {
+      if (String(target) === `/proc/${writer.pid}/fd`) throw Object.assign(new Error("process fd scan unavailable"), { code });
+      return readdir(target, options as never);
+    });
+    try {
+      await expect(assertReusableWorktreeSafe(root)).rejects.toMatchObject({
+        code: "workspace_validation_failed",
+        resultJson: { workspaceValidation: { reason: "live_git_writer_probe_unavailable", worktreePath: root } },
+      } satisfies Partial<WorkspaceRuntimeValidationFailure>);
+    } finally {
+      readdirSpy.mockRestore();
+      writer.stdin.end();
+      await new Promise((resolve) => writer.once("close", resolve));
+    }
+  });
+
+  it("skips a vanished Git PID whose fd scan returns ENOENT", async () => {
+    const { root } = await fixture();
+    const writer = spawn("git", ["--no-pager", "hash-object", "--stdin"], { cwd: os.tmpdir(), stdio: ["pipe", "pipe", "pipe"] });
+    await new Promise<void>((resolve, reject) => {
+      writer.once("spawn", resolve);
+      writer.once("error", reject);
+    });
+    const readdir = fs.readdir.bind(fs);
+    const readdirSpy = vi.spyOn(fs, "readdir").mockImplementation(async (target, options) => {
+      if (String(target) === `/proc/${writer.pid}/fd`) throw Object.assign(new Error("process vanished"), { code: "ENOENT" });
+      return readdir(target, options as never);
+    });
+    try {
+      await expect(assertReusableWorktreeSafe(root)).resolves.toBeUndefined();
+    } finally {
+      readdirSpy.mockRestore();
+      writer.stdin.end();
+      await new Promise((resolve) => writer.once("close", resolve));
+    }
+  });
+
   it("refuses a live Git process in the worktree without removing its lock", async () => {
     const { root, lock } = await fixture();
     await fs.writeFile(lock, "");
