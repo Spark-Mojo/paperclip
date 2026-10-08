@@ -580,6 +580,18 @@ Observed exit 0. `git diff --check` exit 0.
 Scope: two heartbeat status setters now wrap legacy nested terminalization or normal status write and local ephemeral lease release in one outer transaction. Local driver has no external cleanup; its release implementation only writes the lease row. Company, owner, active status, ephemeral policy and native-ownership guards remain required.
 Still unproven: direct terminal writers outside these setters, nonlocal provider cleanup atomicity/retry, per-status atomicity coverage, full combined regression and final-head independent review. This is partial progress, not acceptance or merge clearance.
 
+## 2026-10-08 unknown-owner safety correction
+
+CHECK: `systemd-run --user --scope -q -p TasksMax=512 -- timeout 240 pnpm -C server exec vitest run src/services/terminal-environment-leases.test.ts`
+EXPECT: `Tests  16 passed (16)`
+Observed exit 0 at 14:57 UTC, 16 passed. Includes five eligible terminal statuses, shutdown rollback, native-held and retained safeguards, and unknown/queued/running/scheduled_retry owners with an orphan error code.
+NEGATIVE: before removing the orphan-error fallback, `systemd-run --user --scope -q -p TasksMax=512 -- timeout 240 pnpm -C server exec vitest run src/services/terminal-environment-leases.test.ts -t 'despite an orphan'`
+Observed exit 1 at 14:56 UTC, 1 failed / 3 passed / 12 skipped: unknown owner lease expected active, received released. The same assertion passes after removing the fallback. Error code alone no longer authorizes reclamation.
+CHECK: `systemd-run --user --scope -q -p TasksMax=512 -- timeout 240 pnpm -C server exec tsc --noEmit`
+EXPECT: exit 0, no diagnostics.
+Observed exit 0. No server lint command identified.
+Legacy clarification: legacyExecutionNeedsReconciliation governs action-outcome reconciliation, not a proven process-liveness predicate. Existing releaseEnvironmentLeasesForRun also uses the native ownership guard only. No new legacy policy or hold gate introduced; prior legacy risk remains an investigation question, not a demonstrated defect. Direct terminal writers, nonlocal cleanup persistence and full-head independent review remain incomplete.
+
 ## 2026-10-08 terminal coverage continuation
 
 CHECK: `systemd-run --user --scope -q -p TasksMax=512 -- timeout 240 pnpm -C server exec vitest run src/services/terminal-environment-leases.test.ts`

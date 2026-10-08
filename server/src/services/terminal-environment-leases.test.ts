@@ -250,6 +250,29 @@ describeEmbeddedPostgres("terminal environment leases (SPA-9423)", () => {
     },
   );
 
+  it.each(["unknown", "queued", "running", "scheduled_retry"])(
+    "preserves a %s owner despite an orphan error code",
+    async (status) => {
+      const { companyId, agentId } = await seedCompanyAndAgent();
+      const runId = await seedRun({ companyId, agentId, status });
+      await db.update(heartbeatRuns).set({ errorCode: "orphaned_running_run" })
+        .where(eq(heartbeatRuns.id, runId));
+      const { lease } = await environmentRuntimeService(db).acquireRunLease({
+        companyId,
+        environment: await seedEnvironment({ companyId, driver: "local" }),
+        issueId: null,
+        heartbeatRunId: runId,
+        persistedExecutionWorkspace: null,
+      });
+      const result = await heartbeatService(db).reclaimTerminalEnvironmentLeases({ batchSize: RECLAIM_BATCH });
+      const [after] = await db.select().from(environmentLeases).where(eq(environmentLeases.id, lease.id));
+      expect(after?.status).toBe("active");
+      expect(after?.releasedAt).toBeNull();
+      expect(result.reclaimed).toBe(0);
+      expect(result.driverFailures).toEqual([]);
+    },
+  );
+
   it("LEASE-GATES: terminal-release", async () => {
     const { companyId, agentId } = await seedCompanyAndAgent();
     const environment = await seedEnvironment({ companyId, driver: "local" });
