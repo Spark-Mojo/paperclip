@@ -5220,7 +5220,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       })
       .where(eq(issues.id, issueId));
 
-    const heartbeat = heartbeatService(db);
+    const heartbeat = heartbeatService(db, { runtimeEnv: {} });
 
     await heartbeat.resumeQueuedRuns();
     await waitForRunToSettle(heartbeat, runId, 5_000);
