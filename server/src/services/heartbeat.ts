@@ -12806,7 +12806,7 @@ export function heartbeatService(
       repoRef: readNonEmptyString(workspace.repoRef),
     }));
 
-    if (preferredProjectWorkspaceId) {
+    if (workspaceProjectId && preferredProjectWorkspaceId) {
       requireSelectedProjectWorkspace(projectWorkspaceRows, preferredProjectWorkspaceId);
     }
 
