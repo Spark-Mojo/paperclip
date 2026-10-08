@@ -7,10 +7,12 @@ import {
   createDb,
   documentRevisions,
   documents,
+  heartbeatRunEvents,
   heartbeatRuns,
   issueComments,
   issueDocuments,
   issues,
+  issueWorkProducts,
 } from "@paperclipai/db";
 import { ISSUE_CONTINUATION_SUMMARY_DOCUMENT_KEY } from "@paperclipai/shared";
 import {
@@ -47,6 +49,31 @@ async function waitForIssueRun(
   throw new Error(`Timed out waiting for issue run. Latest run count: ${latestRuns.length}`);
 }
 
+async function waitForEligibleStampPlateau(
+  db: ReturnType<typeof createDb>,
+  eligibleRunIds: Set<string>,
+  deadlineMs = 15_000,
+): Promise<number> {
+  const stampedCount = async () => {
+    const rows = await db.select().from(heartbeatRuns);
+    return rows.filter((row) => eligibleRunIds.has(row.id) && row.livenessState !== null).length;
+  };
+  let previous = await stampedCount();
+  let stableReads = 0;
+  const deadline = Date.now() + deadlineMs;
+  while (Date.now() < deadline && stableReads < 3) {
+    await new Promise((resolve) => setTimeout(resolve, 40));
+    const current = await stampedCount();
+    if (current === previous) {
+      stableReads += 1;
+    } else {
+      stableReads = 0;
+      previous = current;
+    }
+  }
+  return previous;
+}
+
 describeEmbeddedPostgres("activity service", () => {
   let db!: ReturnType<typeof createDb>;
   let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
@@ -57,11 +84,13 @@ describeEmbeddedPostgres("activity service", () => {
   }, 20_000);
 
   afterEach(async () => {
+    await db.delete(heartbeatRunEvents);
     await db.delete(activityLog);
     await db.delete(issueComments);
     await db.delete(issueDocuments);
     await db.delete(documentRevisions);
     await db.delete(documents);
+    await db.delete(issueWorkProducts);
     await db.delete(issues);
     await db.delete(heartbeatRuns);
     await db.delete(agents);
@@ -279,6 +308,302 @@ describeEmbeddedPostgres("activity service", () => {
     });
     await waitForIssueRun(service, companyId, issueId, (run) => run.runId === runId && run.livenessState !== null);
   });
+
+  it("drains every eligible run across batches when more than twenty legacy runs lack liveness", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const issueId = randomUUID();
+    const BATCH_BOUND = 20;
+    const ELIGIBLE = 47;
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "CodexCoder",
+      role: "engineer",
+      status: "idle",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Drain the legacy ledger",
+      description: "More un-backfilled runs than one bounded batch can take.",
+      status: "in_progress",
+      priority: "medium",
+      assigneeAgentId: agentId,
+    });
+
+    const baseCreatedAt = new Date("2026-04-18T21:00:00.000Z");
+    const eligibleRunIds = new Set<string>();
+    const tiedRunIds: string[] = [];
+
+    const eligibleRows = Array.from({ length: ELIGIBLE }, (_unused, index) => {
+      const id = randomUUID();
+      eligibleRunIds.add(id);
+      const createdAt = index < 3
+        ? baseCreatedAt
+        : new Date(baseCreatedAt.getTime() + (index - 2) * 1_000);
+      if (index < 3) tiedRunIds.push(id);
+      return {
+        id,
+        companyId,
+        agentId,
+        invocationSource: "assignment" as const,
+        status: "succeeded" as const,
+        startedAt: createdAt,
+        finishedAt: new Date(createdAt.getTime() + 1_000),
+        createdAt,
+        contextSnapshot: { issueId },
+        resultJson: { summary: "Next steps:\n- inspect files" },
+        livenessState: null,
+        livenessReason: null,
+      };
+    });
+
+    const ineligibleRows = [
+      {
+        id: randomUUID(),
+        status: "running" as const,
+        contextIssueId: issueId,
+        livenessState: null,
+      },
+      {
+        id: randomUUID(),
+        status: "queued" as const,
+        contextIssueId: issueId,
+        livenessState: null,
+      },
+      {
+        id: randomUUID(),
+        status: "succeeded" as const,
+        contextIssueId: issueId,
+        livenessState: "advanced" as const,
+      },
+      {
+        id: randomUUID(),
+        status: "succeeded" as const,
+        contextIssueId: issueId,
+        livenessState: "plan_only" as const,
+      },
+      {
+        id: randomUUID(),
+        status: "succeeded" as const,
+        contextIssueId: randomUUID(),
+        livenessState: null,
+      },
+      {
+        id: randomUUID(),
+        status: "succeeded" as const,
+        contextIssueId: null,
+        livenessState: null,
+      },
+    ].map((row, index) => {
+      const createdAt = new Date(baseCreatedAt.getTime() + (index - 2) * 500);
+      return {
+        id: row.id,
+        companyId,
+        agentId,
+        invocationSource: "assignment" as const,
+        status: row.status,
+        startedAt: createdAt,
+        finishedAt: new Date(createdAt.getTime() + 1_000),
+        createdAt,
+        contextSnapshot:
+          row.contextIssueId === null ? { taskId: randomUUID() } : { issueId: row.contextIssueId },
+        resultJson: { summary: "Finished." },
+        livenessState: row.livenessState,
+        livenessReason: row.livenessState === null ? null : "pre-existing",
+      };
+    });
+
+    await db.insert(heartbeatRuns).values([...eligibleRows, ...ineligibleRows]);
+
+    const service = activityService(db);
+
+    expect(eligibleRunIds.size).toBe(ELIGIBLE);
+    const pending = new Set(eligibleRunIds);
+    let reads = 0;
+    let firstReadStamped = 0;
+    const missingFromAnyRead: string[] = [];
+    const pendingEligibleCounts: number[] = [];
+    while (pending.size > 0 && reads < 60) {
+      reads += 1;
+      const runs = await service.runsForIssue(companyId, issueId);
+      const returnedIds = new Set(runs.map((run) => run.runId));
+      for (const id of eligibleRunIds) {
+        if (!returnedIds.has(id)) missingFromAnyRead.push(id);
+      }
+      pendingEligibleCounts.push(
+        runs.filter((run) => pending.has(run.runId) && run.livenessState === null).length,
+      );
+      if (reads === 1) {
+        firstReadStamped = await waitForEligibleStampPlateau(db, eligibleRunIds);
+      }
+      for (const run of runs) {
+        if (pending.has(run.runId) && run.livenessState !== null) {
+          pending.delete(run.runId);
+        }
+      }
+      if (pending.size === 0) break;
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+
+    expect(missingFromAnyRead).toEqual([]);
+    expect(pending).toEqual(new Set());
+    expect(reads).toBeGreaterThan(1);
+    expect(pendingEligibleCounts[0]).toBe(ELIGIBLE);
+    expect(firstReadStamped).toBe(BATCH_BOUND);
+    expect(Math.min(...pendingEligibleCounts)).toBeLessThanOrEqual(BATCH_BOUND);
+
+    const persisted = await db.select().from(heartbeatRuns);
+    const byId = new Map(persisted.map((row) => [row.id, row]));
+    for (const id of eligibleRunIds) {
+      expect(byId.get(id)).toMatchObject({
+        id,
+        livenessState: "plan_only",
+        livenessReason: "Run described runnable future work without concrete action evidence",
+        lastUsefulActionAt: null,
+      });
+    }
+    expect(tiedRunIds.length).toBe(3);
+    for (const id of tiedRunIds) {
+      expect(byId.get(id)?.livenessState).toBe("plan_only");
+    }
+
+    const untouched = new Map(ineligibleRows.map((row) => [row.id, row]));
+    for (const [id, original] of untouched) {
+      expect(byId.get(id)?.livenessState).toBe(original.livenessState);
+    }
+    const stampedEligible = [...eligibleRunIds].filter(
+      (id) => byId.get(id)?.livenessState === "plan_only",
+    );
+    expect(stampedEligible).toHaveLength(ELIGIBLE);
+    expect(eligibleRunIds.size).toBe(ELIGIBLE);
+  }, 60_000);
+
+  it("processes runs that fall outside the first bounded batch on the next read", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const issueId = randomUUID();
+    const FIRST_BATCH = 20;
+    const LATER = 5;
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "CodexCoder",
+      role: "engineer",
+      status: "idle",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Later work must survive the bound",
+      description: "Runs beyond the bounded head are still eligible.",
+      status: "in_progress",
+      priority: "medium",
+      assigneeAgentId: agentId,
+    });
+
+    const newestCreatedAt = new Date("2026-04-18T22:00:00.000Z");
+    const olderCreatedAt = new Date("2026-04-18T21:00:00.000Z");
+    const makeRun = (id: string, createdAt: Date) => ({
+      id,
+      companyId,
+      agentId,
+      invocationSource: "assignment" as const,
+      status: "succeeded" as const,
+      startedAt: createdAt,
+      finishedAt: new Date(createdAt.getTime() + 1_000),
+      createdAt,
+      contextSnapshot: { issueId },
+      resultJson: { summary: "Next steps:\n- inspect files" },
+      livenessState: null,
+      livenessReason: null,
+    });
+
+    const headRunIds = Array.from({ length: FIRST_BATCH }, () => randomUUID());
+    const laterRunIds = Array.from({ length: LATER }, () => randomUUID());
+    await db.insert(heartbeatRuns).values([
+      ...headRunIds.map((id, index) =>
+        makeRun(id, new Date(newestCreatedAt.getTime() - index * 1_000)),
+      ),
+      ...laterRunIds.map((id, index) =>
+        makeRun(id, new Date(olderCreatedAt.getTime() - index * 1_000)),
+      ),
+    ]);
+
+    const service = activityService(db);
+    const allRunIds = [...headRunIds, ...laterRunIds];
+    const missingFromAnyRead: string[] = [];
+
+    let headDone = false;
+    for (let attempt = 0; attempt < 60 && !headDone; attempt += 1) {
+      const runs = await service.runsForIssue(companyId, issueId);
+      const returnedIds = new Set(runs.map((entry) => entry.runId));
+      for (const id of allRunIds) {
+        if (!returnedIds.has(id)) missingFromAnyRead.push(id);
+      }
+      const stampedHead = headRunIds.filter((id) => {
+        const run = runs.find((entry) => entry.runId === id);
+        return run?.livenessState !== null && run?.livenessState !== undefined;
+      });
+      headDone = stampedHead.length === headRunIds.length;
+      if (!headDone) await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+    expect(headDone).toBe(true);
+    expect(missingFromAnyRead).toEqual([]);
+
+    let laterDone = false;
+    for (let attempt = 0; attempt < 60 && !laterDone; attempt += 1) {
+      const runs = await service.runsForIssue(companyId, issueId);
+      const returnedIds = new Set(runs.map((entry) => entry.runId));
+      for (const id of allRunIds) {
+        if (!returnedIds.has(id)) missingFromAnyRead.push(id);
+      }
+      const stampedLater = laterRunIds.filter((id) => {
+        const run = runs.find((entry) => entry.runId === id);
+        return run?.livenessState !== null && run?.livenessState !== undefined;
+      });
+      laterDone = stampedLater.length === laterRunIds.length;
+      if (!laterDone) await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+    expect(laterDone).toBe(true);
+    expect(missingFromAnyRead).toEqual([]);
+
+    const finalRows = await db.select().from(heartbeatRuns);
+    const finalById = new Map(finalRows.map((row) => [row.id, row]));
+    for (const id of laterRunIds) {
+      expect(finalById.get(id)).toMatchObject({
+        id,
+        livenessState: "plan_only",
+        livenessReason: "Run described runnable future work without concrete action evidence",
+      });
+    }
+    for (const id of headRunIds) {
+      expect(finalById.get(id)?.livenessState).toBe("plan_only");
+    }
+  }, 60_000);
 
   it("backfills missing liveness for completed issue runs before returning the ledger", async () => {
     const companyId = randomUUID();
