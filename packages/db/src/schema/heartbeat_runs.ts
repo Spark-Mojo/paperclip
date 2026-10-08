@@ -133,6 +133,9 @@ export const heartbeatRuns = pgTable(
       table.livenessState,
       table.createdAt,
     ),
+    companyMissingTerminalLivenessIdx: index("heartbeat_runs_company_missing_terminal_liveness_idx")
+      .on(table.companyId)
+      .where(sql`${table.livenessState} is null and ${table.status} not in ('queued', 'running')`),
     companyStatusLastOutputIdx: index("heartbeat_runs_company_status_last_output_idx").on(
       table.companyId,
       table.status,
