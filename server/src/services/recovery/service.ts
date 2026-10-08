@@ -5091,6 +5091,7 @@ export function recoveryService(
                 currentStageId: pendingExecutionState.currentStageId ?? null,
                 currentStageType: pendingExecutionState.currentStageType,
                 stageEnteredAt: pendingExecutionState.stageEnteredAt,
+                reviewStageEntryRecovery: true,
                 reviewRecoveryInstruction: "The review stage has no participant run or queued wake. Submit the review decision now, or mark the issue blocked with the exact unblock action.",
               },
             });
