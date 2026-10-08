@@ -9261,6 +9261,119 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     }
   });
 
+  it("SPA-10069 reissues a lost stage-entry wake after the threshold without duplicating a queued wake", async () => {
+    const { companyId, agentId, issueId, runId, wakeupRequestId, stageId } =
+      await seedInReviewParticipantRunFixture();
+    await db.update(issues).set({ executionRunId: null, executionLockedAt: null, updatedAt: new Date(Date.now() - 20 * 60_000) }).where(eq(issues.id, issueId));
+    await db.delete(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+    await db.delete(agentWakeupRequests).where(eq(agentWakeupRequests.id, wakeupRequestId));
+    await db.update(issues).set({ executionState: { status: "pending", currentStageId: stageId, currentStageIndex: 0, currentStageType: "review", stageEnteredAt: new Date(Date.now() - 20 * 60_000).toISOString(), currentParticipant: { type: "agent", agentId, userId: null }, returnAssignee: { type: "agent", agentId, userId: null }, reviewRequest: null, completedStageIds: [], lastDecisionId: null, lastDecisionOutcome: null } }).where(eq(issues.id, issueId));
+    const heartbeat = heartbeatService(db, { runtimeEnv: { ...process.env, PAPERCLIP_IN_WORKTREE: "false" } });
+    const first = await heartbeat.reconcileStrandedAssignedIssues();
+    expect(first.reviewParticipantRequeued).toBe(1);
+    const wakes = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, agentId));
+    expect(wakes).toHaveLength(1);
+    expect(wakes[0]?.payload).toMatchObject({ issueId, currentStageId: stageId });
+    const second = await heartbeat.reconcileStrandedAssignedIssues();
+    expect(second.reviewParticipantRequeued).toBe(0);
+    expect(await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, agentId))).toHaveLength(1);
+    expect(companyId).toBeTruthy();
+  });
+
+  it("SPA-10069 cancels a queued recovery wake when its stage changes at claim", async () => {
+    const { agentId, issueId, runId, wakeupRequestId, stageId } = await seedInReviewParticipantRunFixture();
+    await db.update(issues).set({ executionRunId: null, executionLockedAt: null }).where(eq(issues.id, issueId));
+    await db.delete(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+    await db.delete(agentWakeupRequests).where(eq(agentWakeupRequests.id, wakeupRequestId));
+    const [issue] = await db.select().from(issues).where(eq(issues.id, issueId));
+    const entryAt = new Date(Date.now() - 20 * 60_000).toISOString();
+    await db.update(issues).set({ executionState: { ...issue!.executionState, stageEnteredAt: entryAt } }).where(eq(issues.id, issueId));
+    const heartbeat = heartbeatService(db, {
+      runtimeEnv: { ...process.env, PAPERCLIP_IN_WORKTREE: "false" },
+      beforeChatControlRecoveryCheck: async ({ stage }) => {
+        if (stage !== "claim") return;
+        const [current] = await db.select().from(issues).where(eq(issues.id, issueId));
+        await db.update(issues).set({ executionState: { ...current!.executionState, currentStageId: randomUUID() } }).where(eq(issues.id, issueId));
+      },
+    });
+    expect((await heartbeat.reconcileStrandedAssignedIssues()).reviewParticipantRequeued).toBe(1);
+    await heartbeat.resumeQueuedRuns();
+    const [recovery] = await db.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.agentId, agentId), sql`${heartbeatRuns.contextSnapshot} ->> 'source' = 'issue.execution_review_recovery'`));
+    expect(recovery).toMatchObject({ status: "cancelled", errorCode: "review_stage_changed" });
+    expect((await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, recovery!.wakeupRequestId!)))[0]?.status).toBe("cancelled");
+    expect(mockAdapterExecute).not.toHaveBeenCalled();
+    expect((await db.select().from(issues).where(eq(issues.id, issueId)))[0]?.executionState?.currentStageId).not.toBe(stageId);
+  });
+
+  it("SPA-10069 emits one recovery wake across concurrent sweeps", async () => {
+    const { companyId, agentId, issueId, runId, wakeupRequestId } = await seedInReviewParticipantRunFixture();
+    await db.update(issues).set({ executionRunId: null, executionLockedAt: null }).where(eq(issues.id, issueId));
+    await db.delete(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+    await db.delete(agentWakeupRequests).where(eq(agentWakeupRequests.id, wakeupRequestId));
+    const [issue] = await db.select().from(issues).where(eq(issues.id, issueId));
+    await db.update(issues).set({ executionState: { ...issue!.executionState, stageEnteredAt: new Date(Date.now() - 20 * 60_000).toISOString() } }).where(eq(issues.id, issueId));
+    const opts = { runtimeEnv: { ...process.env, PAPERCLIP_IN_WORKTREE: "false" } };
+    const [first, second] = await Promise.all([
+      heartbeatService(db, opts).reconcileStrandedAssignedIssues(),
+      heartbeatService(db, opts).reconcileStrandedAssignedIssues(),
+    ]);
+    const wakes = await db.select().from(agentWakeupRequests).where(and(eq(agentWakeupRequests.companyId, companyId), eq(agentWakeupRequests.agentId, agentId)));
+    expect(first.reviewParticipantRequeued + second.reviewParticipantRequeued).toBe(1);
+    expect(wakes).toHaveLength(1);
+    expect(wakes[0]?.idempotencyKey).toMatch(/^issue_review_path_lost:/);
+  });
+
+  it("SPA-10069 recovers a stage whose participant only ran before stage entry", async () => {
+    const { agentId, issueId, runId, wakeupRequestId } = await seedInReviewParticipantRunFixture();
+    await db.update(issues).set({ executionRunId: null, executionLockedAt: null }).where(eq(issues.id, issueId));
+    await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date(Date.now() - 60 * 60_000), createdAt: new Date(Date.now() - 60 * 60_000) }).where(eq(heartbeatRuns.id, runId));
+    await db.update(agentWakeupRequests).set({ status: "completed" }).where(eq(agentWakeupRequests.id, wakeupRequestId));
+    const [issue] = await db.select().from(issues).where(eq(issues.id, issueId));
+    await db.update(issues).set({ executionState: { ...issue!.executionState, stageEnteredAt: new Date(Date.now() - 20 * 60_000).toISOString() } }).where(eq(issues.id, issueId));
+    const result = await heartbeatService(db, { runtimeEnv: { ...process.env, PAPERCLIP_IN_WORKTREE: "false" } }).reconcileStrandedAssignedIssues();
+    expect(result.reviewParticipantRequeued).toBe(1);
+    expect(await db.select().from(issueComments).where(eq(issueComments.issueId, issueId))).toHaveLength(0);
+    expect((await db.select().from(issues).where(eq(issues.id, issueId)))[0]?.monitorNextCheckAt).toBeNull();
+  });
+
+  it("SPA-10069 fails closed for a legacy review stage without a stage-entry clock", async () => {
+    const { agentId, issueId, runId, wakeupRequestId } = await seedInReviewParticipantRunFixture();
+    await db.update(issues).set({ executionRunId: null, executionLockedAt: null, updatedAt: new Date(Date.now() - 60 * 60_000) }).where(eq(issues.id, issueId));
+    await db.delete(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+    await db.delete(agentWakeupRequests).where(eq(agentWakeupRequests.id, wakeupRequestId));
+    const result = await heartbeatService(db, { runtimeEnv: { ...process.env, PAPERCLIP_IN_WORKTREE: "false" } }).reconcileStrandedAssignedIssues();
+    expect(result.reviewParticipantRequeued).toBe(0);
+    expect(await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, agentId))).toHaveLength(0);
+  });
+
+  it.each(["queued", "running", "recent", "non-pending"] as const)("SPA-10069 leaves %s review stage alone", async (mode) => {
+    const { agentId, issueId, runId, wakeupRequestId } = await seedInReviewParticipantRunFixture();
+    await db.update(issues).set({
+      executionRunId: mode === "running" ? runId : null,
+      executionLockedAt: null,
+      updatedAt: new Date(Date.now() - (mode === "recent" ? 1 : 20) * 60_000),
+      ...(mode === "non-pending" ? { executionState: { status: "changes_requested" } } : {}),
+    }).where(eq(issues.id, issueId));
+    if (mode === "running") {
+      await db.update(heartbeatRuns).set({ status: "running" }).where(eq(heartbeatRuns.id, runId));
+      await db.update(agentWakeupRequests).set({ status: "completed" }).where(eq(agentWakeupRequests.id, wakeupRequestId));
+    } else if (mode !== "queued") {
+      await db.delete(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+      if (mode === "recent") {
+        await db.delete(agentWakeupRequests).where(eq(agentWakeupRequests.id, wakeupRequestId));
+        const [current] = await db.select().from(issues).where(eq(issues.id, issueId));
+        await db.update(issues).set({ executionState: { ...current!.executionState, stageEnteredAt: new Date().toISOString() } }).where(eq(issues.id, issueId));
+      } else {
+        await db.delete(agentWakeupRequests).where(eq(agentWakeupRequests.id, wakeupRequestId));
+      }
+    }
+    const heartbeat = heartbeatService(db, { runtimeEnv: { ...process.env, PAPERCLIP_IN_WORKTREE: "false" } });
+    const result = await heartbeat.reconcileStrandedAssignedIssues();
+    expect(result.reviewParticipantRequeued).toBe(0);
+    const wakes = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, agentId));
+    expect(wakes).toHaveLength(mode === "queued" || mode === "running" ? 1 : 0);
+  });
+
   it("does not let an active chat conversation suppress stranded execution-review participant recovery", async () => {
     const { companyId, agentId, issueId, runId, wakeupRequestId, stageId } =
       await seedInReviewParticipantRunFixture();
