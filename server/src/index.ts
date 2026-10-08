@@ -1547,14 +1547,21 @@ async function startServerWithDatabaseTeardown(
             "startup session-goal recovery resumed durable agent goals",
           );
         }
-        const reconciled = await heartbeat.reconcileStrandedAssignedIssues();
+        let reconciled: Awaited<ReturnType<typeof heartbeat.reconcileStrandedAssignedIssues>> | null = null;
+        try {
+          reconciled = await heartbeat.reconcileStrandedAssignedIssues();
+        } catch (err) {
+          logger.error({ err }, "startup assigned-issue reconciliation failed; serving with degraded recovery");
+        }
         if (
           promotion.promoted > 0 ||
-          reconciled.assignmentDispatched > 0 ||
-          reconciled.dispatchRequeued > 0 ||
-          reconciled.continuationRequeued > 0 ||
-          reconciled.successfulRunHandoffEscalated > 0 ||
-          reconciled.escalated > 0
+          (reconciled && (
+            reconciled.assignmentDispatched > 0 ||
+            reconciled.dispatchRequeued > 0 ||
+            reconciled.continuationRequeued > 0 ||
+            reconciled.successfulRunHandoffEscalated > 0 ||
+            reconciled.escalated > 0
+          ))
         ) {
           logger.warn(
             { promotedScheduledRetries: promotion.promoted, promotedScheduledRetryRunIds: promotion.runIds, ...reconciled },
