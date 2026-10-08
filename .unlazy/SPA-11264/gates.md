@@ -1,5 +1,29 @@
 # SPA-11264 gates
 
+## PR #161 correction-only prerequisite, 2026-10-08 16:59 manager contract
+
+**Prerequisite acceptance contract for PR #161:**
+1. Review the entire diff against its actual base at the exact final head, including ownership-query implementation, all tests, control scripts, diagnostics-test change and ledger. Preserve existing liveness fixes and SPA-10699 migration coordination; no new migration is authorized.
+2. Preserve original text-match semantics and native/context precedence for null, canonical, noncanonical, invalid and legacy inputs, including JSON edge cases. Prove identical result identities and ordering, adapter/process/group/lease evidence, and fresh decisions across concurrent ownership changes and transaction snapshots. No result cache across requests/transactions, ownership-hiding truncation or artificial correctness-breaking cap.
+3. Capture actual ORM-emitted full SQL safely in disposable fixtures. Demonstrate index-bounded access for BOTH native and context lookup branches using representative selective fixtures, with unchanged full predicates/projection/order. The currently unproven native-index assertion must be resolved before prerequisite PASS; context-only plan evidence is insufficient. Do not publish live bind values, identifiers, payloads or secrets. Fixture timings are not deployed performance acceptance.
+4. Retain executable whole-diff regression/type checks and isolated negative controls with baseline, intended-failure and restored receipts. Prove the control leaves workspace bytes and dependency links unchanged. Fix any content findings; do not relabel them deferred merely to get PASS.
+
+Required verdict scope: **prerequisite merge readiness only; full-incident acceptance remains FAIL/unproven**. Original requirements below retained verbatim and deferred from this prerequisite. No index-only closure permission. Upstream bound or board amendment, measured wakeup/cost disposition and deployed comparable-load oracle remain UNPROVEN. Activation authority/operator for this correction remains unestablished; previous activation grants do not authorize another install/restart. Dex coordinates exact-head merge only after independent PASS and fork gates; authorized activation then returns still-open card to Ty with containment/process-after-install receipts.
+
+### Final-head candidate checks (parent re-derived 2026-10-08 17:45–17:54Z)
+
+- CHECK: timeout 900 pnpm exec vitest run server/src/__tests__/conversation-ownership-query.test.ts server/src/__tests__/heartbeat-query-diagnostics.test.ts server/src/__tests__/heartbeat-lease-not-released-retry.test.ts
+  EXPECT: Test Files 3 passed (3); Tests 31 passed (31)
+  RESULT: exit 0, exact EXPECT matched. Earlier invocation misspelled lease-retry filename and ran only 2 suites/28 tests; not counted as whole-diff proof. Correct command above rerun successfully.
+  NEGATIVE: timeout 1800 bash scripts/spa-11264-ownership-negative-control.sh
+  EXPECT: each targeted mutation exit 1, baseline/restored exit 0 with 8 executed tests; ISOLATED_CONTROLS_PASS workspace-links-unchanged
+  RESULT: parent exit 0; baseline exit=0 executed=8; native-equality-non-sargable exit=1 executed=8 (named native plan assertion failed); context-expression-non-sargable exit=1 executed=8 (named context plan assertion failed); dropped-native-null-guard exit=1 executed=8 (named semantic differential failed); restored exit=0 executed=8. WORKSPACE_SHA256=7120289dbc64e6b8ee768333a8a82923370ccfbad21883158b84fdd75c0e6218; ISOLATED_CONTROLS_PASS workspace-links-unchanged. Vitest JSON assertion status proves intended rejection, not name appearance or aggregate failure alone. Context concat mutation may also break oracle parsing; its named full-plan assertion independently rejects loss of index binding.
+- CHECK: timeout 900 pnpm exec tsc --noEmit -p server/tsconfig.json
+  EXPECT: exit 0 without diagnostics
+  RESULT: parent exit 0 without output. Root package.json contains no lint script; git diff --check exit 0.
+
+Both actual ORM captures are EXPLAIN ANALYZE JSON planned without planner coercion over 1200 clutter rows (same-company terminal/nonterminal and foreign-company terminal), matching rows and precedence decoy. Executed native/context index nodes each have issue-specific and company Index Cond plus positive row yield; heartbeat_runs identified by Relation Name, no executed sequential scan; exact fixture IDs/order equal original coalesce oracle. Existing semantic and transaction snapshot tests retained. No production or migration edits in this continuation; only tests and isolated control hardened. Old native-plan UNPROVEN statements below are superseded by these receipts, not erased. Fixture proof is not runtime acceptance.
+
 ## Indexed correction continuation 2026-10-08 16:01 manager direction
 
 Index-only closure NOT authorized. Implement independent indexed ownership reads now; trace safe upstream bound separately. No result cache, candidate truncation, new migration, activation or restart.
