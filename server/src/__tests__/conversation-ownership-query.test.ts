@@ -39,7 +39,7 @@ function rawClientOf(database: Db): RawClient {
 }
 
 function issuePredicateSpan(statement: string): [number, number] {
-  const compare = statement.match(/"context_snapshot"->>'issueId' = \$\d+/);
+  const compare = statement.match(/"context_snapshot"->>'issueId'(?:', ''\))?\s*=\s*\$\d+/);
   if (!compare || compare.index === undefined) throw new Error(`no issue arm in: ${statement}`);
   const end = compare.index + compare[0].length;
   let depth = 0;
@@ -76,7 +76,7 @@ function issuePredicateSpan(statement: string): [number, number] {
 function withOriginalIssuePredicate(statement: string, params: unknown[]): [string, unknown[]] {
   const [start, end] = issuePredicateSpan(statement);
   const predicate = statement.slice(start, end);
-  const textBind = predicate.match(/->>'issueId' = \$(\d+)/);
+  const textBind = predicate.match(/= \$(\d+)/);
   if (!textBind) throw new Error(`no text arm bind in: ${predicate}`);
   const original = `${statement.slice(0, start)}coalesce("heartbeat_runs"."native_issue_id"::text, "heartbeat_runs"."context_snapshot"->>'issueId') = $${textBind[1]}${statement.slice(end)}`;
   const mapping = new Map<number, number>();
@@ -101,6 +101,68 @@ function withOriginalIssuePredicate(statement: string, params: unknown[]): [stri
 
 function ids(rows: Array<Record<string, unknown>>): string[] {
   return rows.map((row) => String(row.id));
+}
+
+type PlanNode = {
+  "Node Type": string;
+  "Relation Name"?: string;
+  "Index Name"?: string;
+  "Index Cond"?: string;
+  "Actual Rows"?: number;
+  "Actual Loops"?: number;
+  "Rows Removed by Filter"?: number;
+  "Rows Removed by Index Recheck"?: number;
+  Plans?: PlanNode[];
+};
+
+type IssueIndex = { name: string; key: "native" | "context" };
+
+const CLUTTER_ROWS = 1200;
+
+function planNodes(node: PlanNode): PlanNode[] {
+  return [node, ...(node.Plans ?? []).flatMap(planNodes)];
+}
+
+function executed(node: PlanNode): boolean {
+  return Number(node["Actual Loops"] ?? 0) > 0;
+}
+
+function indexScans(root: PlanNode): PlanNode[] {
+  return planNodes(root).filter((node) => node["Index Name"] !== undefined && executed(node));
+}
+
+function rowsDiscardedByFilters(root: PlanNode): number {
+  return planNodes(root).filter(executed).reduce((total, node) =>
+    total + Number(node["Rows Removed by Filter"] ?? 0) + Number(node["Rows Removed by Index Recheck"] ?? 0), 0);
+}
+
+function scanOfHeartbeatRuns(root: PlanNode): PlanNode | null {
+  return planNodes(root).find((node) =>
+    node["Relation Name"] === "heartbeat_runs" && executed(node)
+    && (node["Node Type"] === "Seq Scan" || node["Node Type"] === "Bitmap Heap Scan"
+      || node["Node Type"] === "Index Scan" || node["Node Type"] === "Index Only Scan")) ?? null;
+}
+
+async function issueIndexesOnHeartbeatRuns(client: RawClient): Promise<IssueIndex[]> {
+  const rows = await client.unsafe(`
+    select i.relname as name,
+           pg_get_indexdef(x.indexrelid) as definition,
+           pg_get_expr(x.indexprs, x.indrelid) as expressions
+      from pg_class t
+      join pg_index x on t.oid = x.indrelid
+      join pg_class i on i.oid = x.indexrelid
+     where t.relname = 'heartbeat_runs'`);
+  const found: IssueIndex[] = [];
+  for (const row of rows) {
+    const name = String(row.name);
+    const definition = String(row.definition ?? "");
+    const expressions = String(row.expressions ?? "");
+    if (/btree \((?:company_id, )?native_issue_id/.test(definition)) found.push({ name, key: "native" });
+    else if (/context_snapshot ->> 'issueId'/.test(expressions) && /company_id/.test(definition)) {
+      found.push({ name, key: "context" });
+    }
+  }
+  return found;
 }
 
 describeEmbeddedPostgres("SPA-11264 conversation ownership lookup is index-bounded", () => {
@@ -342,31 +404,167 @@ describeEmbeddedPostgres("SPA-11264 conversation ownership lookup is index-bound
     }
   }, 180_000);
 
-  it("plans the captured production read against the existing issue indexes", async () => {
-    for (let index = 0; index < 400; index += 1) {
+async function seedSelectiveFixture() {
+    const terminal = ["failed", "timed_out", "interrupted", "cancelled"] as const;
+    for (let index = 0; index < 600; index += 1) {
+      const byEvent = index % 3 === 0;
       await seedRun({
-        status: index % 5 === 0 ? "running" : "succeeded",
+        status: terminal[index % terminal.length],
+        adapterDispatch: byEvent ? null : "opencode_local",
+        adapterEvent: byEvent ? "claude_local" : null,
         contextIssueId: index % 2 === 0 ? randomUUID() : null,
         nativeIssueId: index % 2 === 0 ? null : randomUUID(),
-        processPid: index % 2 === 0 ? 4_000 + index : null,
+        processPid: 20_000 + index,
         createdAt: new Date(Date.UTC(2026, 0, 1, 0, 0, index)),
       });
     }
-    await seedRun({ contextIssueId, processGroupId: 999_005, createdAt: new Date("2026-01-09T00:00:00Z") });
+    for (let index = 0; index < 300; index += 1) {
+      await seedRun({
+        status: index % 2 === 0 ? "running" : "succeeded",
+        adapterDispatch: "cursor",
+        contextIssueId: randomUUID(),
+        processPid: 60_000 + index,
+        createdAt: new Date(Date.UTC(2026, 0, 5, 0, 0, index)),
+      });
+    }
+    const foreignCompany = randomUUID();
+    await db.insert(companies).values({
+      id: foreignCompany,
+      name: "SPA-11264 other",
+      issuePrefix: `S${foreignCompany.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+    });
+    for (let index = 0; index < 300; index += 1) {
+      await db.insert(heartbeatRuns).values({
+        id: randomUUID(),
+        companyId: foreignCompany,
+        agentId,
+        invocationSource: "assignment",
+        triggerDetail: "system",
+        status: terminal[index % terminal.length],
+        runtimeMode: "legacy",
+        contextSnapshot: { issueId: randomUUID(), taskId: randomUUID() },
+        runnerProfileJson: { adapterDispatch: { adapterType: "opencode_local" } },
+        processPid: 40_000 + index,
+        createdAt: new Date(Date.UTC(2026, 0, 2, 0, 0, index)),
+      });
+    }
+    const nativeNewer = await seedRun({
+      nativeIssueId, processPid: process.pid, createdAt: new Date("2026-06-01T00:00:00Z"),
+    });
+    const nativeOlder = await seedRun({
+      nativeIssueId, processGroupId: 999_005, createdAt: new Date("2026-05-01T00:00:00Z"),
+    });
+    const precedenceDecoy = await seedRun({
+      nativeIssueId: randomUUID(), contextIssueId: nativeIssueId,
+      processPid: 70_001, createdAt: new Date("2026-07-01T00:00:00Z"),
+    });
+    const contextOwned = await seedRun({
+      contextIssueId, processPid: process.pid, createdAt: new Date("2026-04-01T00:00:00Z"),
+    });
     await raw`ANALYZE heartbeat_runs`;
+    await raw`ANALYZE heartbeat_run_events`;
+    return { nativeNewer, nativeOlder, precedenceDecoy, contextOwned };
+  }
 
-    const { sql: rewritten, params } = await captureOwnership(contextIssueId);
-    const planOf = async (statement: string) =>
-      (await raw.unsafe(`EXPLAIN (ANALYZE, BUFFERS, FORMAT TEXT) ${statement}`, params))
-        .map((row) => String(Object.values(row)[0]))
-        .join("\n");
+  async function explainCaptured(capture: { sql: string; params: unknown[] }): Promise<PlanNode> {
+    const rows = await raw.unsafe(
+      `EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) ${capture.sql}`, capture.params,
+    );
+    const reported = rows[0]!["QUERY PLAN"];
+    const plan = (typeof reported === "string" ? JSON.parse(reported) : reported) as Array<{ Plan: PlanNode }>;
+    return plan[0]!.Plan;
+  }
 
-    const rewrittenPlan = await planOf(rewritten);
+  function expectSelectivityBound(root: PlanNode, label: string) {
+    expect(rowsDiscardedByFilters(root), `${label}: must not discard a clutter-sized row set`)
+      .toBeLessThan(CLUTTER_ROWS / 4);
+  }
 
-    expect(rewrittenPlan).toContain("heartbeat_runs_company_ctx_issue_created_idx");
-    expect(rewrittenPlan).not.toMatch(/Seq Scan on heartbeat_runs/);
-    expect(rewrittenPlan).not.toMatch(/Sort\s+cost/);
-  }, 240_000);
+  function issueBoundNode(root: PlanNode, candidates: IssueIndex[], key: "native" | "context"): {
+    name: string; node: PlanNode;
+  } | null {
+    const scans = indexScans(root);
+    for (const candidate of candidates.filter((entry) => entry.key === key)) {
+      const node = scans.find((scan) => scan["Index Name"] === candidate.name);
+      if (node) return { name: candidate.name, node };
+    }
+    return null;
+  }
+
+  function expectIssueBound(root: PlanNode, candidates: IssueIndex[], key: "native" | "context", label: string) {
+    const declared = candidates.filter((entry) => entry.key === key).map((entry) => entry.name);
+    expect(declared.length, `${label}: catalogue declares a ${key} issue index`).toBeGreaterThan(0);
+    const bound = issueBoundNode(root, candidates, key);
+    expect(bound, `${label}: no executed ${key} index scan among ${declared}`).not.toBeNull();
+    const cond = bound!.node["Index Cond"]!;
+    expect(cond, `${label}: ${bound!.name} Index Cond names the ${key} column`)
+      .toContain(key === "native" ? "native_issue_id" : "(context_snapshot ->> 'issueId'");
+    expect(cond, `${label}: ${bound!.name} Index Cond binds company_id`).toContain("company_id");
+    expect(cond.trim(), `${label}: ${bound!.name} Index Cond is a restriction`).not.toBe("true");
+  }
+
+  it("binds the native uuid arm to a native-issue index with an issue-specific Index Cond", async () => {
+    const fixture = await seedSelectiveFixture();
+    const candidates = await issueIndexesOnHeartbeatRuns(raw);
+
+    const capture = await captureOwnership(nativeIssueId);
+    const nativeIds = ids(await raw.unsafe(capture.sql, capture.params));
+    expect(nativeIds).toEqual([fixture.nativeNewer, fixture.nativeOlder]);
+
+    const root = await explainCaptured(capture);
+    expectIssueBound(root, candidates, "native", "native arm");
+    const nativeBound = issueBoundNode(root, candidates, "native")!;
+    expect(Number(nativeBound.node["Actual Rows"] ?? 0), "native index yields the owned rows")
+      .toBeGreaterThan(0);
+    expect(nativeBound.node["Index Cond"], "the native arm's Index Cond carries the probed issue")
+      .toContain(nativeIssueId);
+    expectSelectivityBound(root, "native arm");
+  }, 300_000);
+
+  it("binds the context arm to the context-issue index with an issue-specific Index Cond", async () => {
+    const fixture = await seedSelectiveFixture();
+    const candidates = await issueIndexesOnHeartbeatRuns(raw);
+
+    const capture = await captureOwnership(contextIssueId);
+    const contextIds = ids(await raw.unsafe(capture.sql, capture.params));
+    expect(contextIds).toEqual([fixture.contextOwned]);
+
+    const root = await explainCaptured(capture);
+    expectIssueBound(root, candidates, "context", "context arm");
+    const contextBound = issueBoundNode(root, candidates, "context")!;
+    expect(Number(contextBound.node["Actual Rows"] ?? 0), "context index yields the owned row")
+      .toBeGreaterThan(0);
+    expect(contextBound.node["Index Cond"], "the context arm's Index Cond carries the probed issue")
+      .toContain(contextIssueId);
+    expectSelectivityBound(root, "context arm");
+  }, 300_000);
+
+  it("reads heartbeat_runs through an index scan for both arms, never a sequential scan", async () => {
+    await seedSelectiveFixture();
+    for (const [label, issue] of [["native arm", nativeIssueId], ["context arm", contextIssueId]] as const) {
+      const root = await explainCaptured(await captureOwnership(issue));
+      const scan = scanOfHeartbeatRuns(root);
+      expect(scan, `${label}: no node scans heartbeat_runs`).not.toBeNull();
+      expect(scan!["Node Type"], `${label}: heartbeat_runs scan must be index-bounded`)
+        .toMatch(/^(?:Bitmap Heap Scan|Index Scan|Index Only Scan)$/);
+      expectSelectivityBound(root, label);
+    }
+  }, 300_000);
+
+  it("keeps the result set equal to the coalesce oracle on the selective fixture", async () => {
+    const fixture = await seedSelectiveFixture();
+    const nativeCapture = await captureOwnership(nativeIssueId);
+    expect(ids(await raw.unsafe(nativeCapture.sql, nativeCapture.params)))
+      .toEqual([fixture.nativeNewer, fixture.nativeOlder]);
+    const [nativeOracle, nativeOracleParams] = withOriginalIssuePredicate(nativeCapture.sql, nativeCapture.params);
+    expect(ids(await raw.unsafe(nativeOracle, nativeOracleParams)))
+      .toEqual([fixture.nativeNewer, fixture.nativeOlder]);
+
+    const contextCapture = await captureOwnership(contextIssueId);
+    expect(ids(await raw.unsafe(contextCapture.sql, contextCapture.params))).toEqual([fixture.contextOwned]);
+    const [contextOracle, contextOracleParams] = withOriginalIssuePredicate(contextCapture.sql, contextCapture.params);
+    expect(ids(await raw.unsafe(contextOracle, contextOracleParams))).toEqual([fixture.contextOwned]);
+  }, 300_000);
 
   it("observes ownership that changes between two reads", async () => {
     const first = await seedRun({ contextIssueId });
