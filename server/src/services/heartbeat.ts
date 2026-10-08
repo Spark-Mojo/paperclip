@@ -13156,6 +13156,25 @@ export function heartbeatService(
     void reportRunFailure(db, updated);
   }
 
+  async function releaseTerminalLocalLeases(
+    tx: Parameters<Parameters<Db["transaction"]>[0]>[0],
+    run: typeof heartbeatRuns.$inferSelect,
+  ) {
+    if (!isHeartbeatRunTerminalStatus(run.status) || isNativeRunnerOwnershipHeld(run)) return;
+    await tx.update(environmentLeases).set({
+      status: "released",
+      releasedAt: new Date(),
+      cleanupStatus: "success",
+      updatedAt: new Date(),
+    }).where(and(
+      eq(environmentLeases.heartbeatRunId, run.id),
+      eq(environmentLeases.companyId, run.companyId),
+      eq(environmentLeases.status, "active"),
+      eq(environmentLeases.leasePolicy, "ephemeral"),
+      eq(environmentLeases.provider, "local"),
+    ));
+  }
+
   async function setRunStatus(
     runId: string,
     status: string,
@@ -13185,7 +13204,9 @@ export function heartbeatService(
         },
       };
     }
-    const updated =
+    const updated = await db.transaction(async (tx) => {
+      const db = tx as unknown as Db;
+      const updated =
       previousStatus &&
       legacyExecutionNeedsReconciliation({
         ...previousStatus,
@@ -13209,6 +13230,9 @@ export function heartbeatService(
             .where(eq(heartbeatRuns.id, runId))
             .returning()
             .then((rows) => rows[0] ?? null);
+      if (updated) await releaseTerminalLocalLeases(tx, updated);
+      return updated;
+    });
 
     if (updated) {
       publishLiveEvent({
@@ -13269,7 +13293,9 @@ export function heartbeatService(
         },
       };
     }
-    const updated =
+    const updated = await db.transaction(async (tx) => {
+      const db = tx as unknown as Db;
+      const updated =
       previousStatus &&
       legacyExecutionNeedsReconciliation({
         ...previousStatus,
@@ -13302,6 +13328,9 @@ export function heartbeatService(
             )
             .returning()
             .then((rows) => rows[0] ?? null);
+      if (updated) await releaseTerminalLocalLeases(tx, updated);
+      return updated;
+    });
 
     if (updated) {
       publishLiveEvent({

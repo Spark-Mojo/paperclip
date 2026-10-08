@@ -559,3 +559,23 @@ SPA-9702: never a blocker.
 matching check identity and matching failure signature.** No red is attributed to this PR. No
 red is suppressed. The local worktree reproductions in the previous section stand as
 independent corroboration, not as the load-bearing evidence.
+
+## 2026-10-08 atomic local-ephemeral continuation (partial)
+
+Dependency preparation authorized by board comment 60030250:
+`systemd-run --user --scope -q -p TasksMax=512 -- timeout 900 pnpm install --frozen-lockfile`
+Exit 0; 1305 packages installed; lockfile unchanged.
+
+CHECK: `systemd-run --user --scope -q -p TasksMax=512 -- timeout 240 pnpm -C server exec vitest run src/services/terminal-environment-leases.test.ts`
+EXPECT: `Tests  6 passed (6)`
+Observed exit 0, 6 passed, 2026-10-08 06:12 UTC.
+NEGATIVE: before implementation, `systemd-run --user --scope -q -p TasksMax=512 -- timeout 180 pnpm -C server exec vitest run src/services/terminal-environment-leases.test.ts -t 'atomically releases'`
+Observed exit 1: expected released, received active.
+Rollback control installs a disposable database trigger rejecting the lease transition; requires the exact SPA9351_LEASE_RELEASE_REJECTED error and byte-equal original run plus active/unreleased lease after rollback. Before implementation its focused invocation exited 1: promise resolved instead of rejecting. Final suite above passes this assertion.
+
+CHECK: `systemd-run --user --scope -q -p TasksMax=512 -- timeout 240 pnpm -C server exec tsc --noEmit`
+EXPECT: exit 0 without diagnostics.
+Observed exit 0. `git diff --check` exit 0.
+
+Scope: two heartbeat status setters now wrap legacy nested terminalization or normal status write and local ephemeral lease release in one outer transaction. Local driver has no external cleanup; its release implementation only writes the lease row. Company, owner, active status, ephemeral policy and native-ownership guards remain required.
+Still unproven: direct terminal writers outside these setters, nonlocal provider cleanup atomicity/retry, per-status atomicity coverage, full combined regression and final-head independent review. This is partial progress, not acceptance or merge clearance.

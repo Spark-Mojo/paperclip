@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { eq } from "drizzle-orm";
+import { eq, sql } from "drizzle-orm";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
@@ -156,6 +156,67 @@ describeEmbeddedPostgres("terminal environment leases (SPA-9423)", () => {
     });
     return runId;
   }
+
+  it("atomically releases a local ephemeral lease with its terminal run", async () => {
+    const { companyId, agentId } = await seedCompanyAndAgent();
+    const runId = await seedRun({ companyId, agentId, status: "running" });
+    const lease = await environmentRuntimeService(db).acquireRunLease({
+      companyId,
+      environment: await seedEnvironment({ companyId, driver: "local" }),
+      issueId: null,
+      heartbeatRunId: runId,
+      persistedExecutionWorkspace: null,
+    });
+
+    await heartbeatService(db).terminalizeRunOnLeaseRelease(
+      await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId)).then(rows => rows[0]!),
+    );
+    const [terminalRun] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+    const [terminalLease] = await db.select().from(environmentLeases).where(eq(environmentLeases.id, lease.lease.id));
+    expect(terminalRun?.status).toBe("interrupted");
+    expect(terminalLease?.status).toBe("released");
+  });
+
+  it("rolls back terminal run state when durable lease release fails", async () => {
+    const { companyId, agentId } = await seedCompanyAndAgent();
+    const runId = await seedRun({ companyId, agentId, status: "running" });
+    const { lease } = await environmentRuntimeService(db).acquireRunLease({
+      companyId,
+      environment: await seedEnvironment({ companyId, driver: "local" }),
+      issueId: null,
+      heartbeatRunId: runId,
+      persistedExecutionWorkspace: null,
+    });
+    const [originalRun] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+    await db.execute(sql.raw(`CREATE FUNCTION spa9351_reject_lease_release() RETURNS trigger LANGUAGE plpgsql AS $$
+      BEGIN
+        IF NEW.id = '${lease.id}' AND OLD.status = 'active'
+          AND NEW.status IN ('released', 'pending_cleanup') THEN
+          RAISE EXCEPTION 'SPA9351_LEASE_RELEASE_REJECTED';
+        END IF;
+        RETURN NEW;
+      END $$`));
+    await db.execute(sql.raw(`CREATE TRIGGER spa9351_reject_lease_release
+      BEFORE UPDATE ON environment_leases FOR EACH ROW
+      EXECUTE FUNCTION spa9351_reject_lease_release()`));
+    try {
+      const failure = await heartbeatService(db).terminalizeRunOnLeaseRelease(originalRun!).then(
+        () => null,
+        (error: unknown) => error,
+      );
+      expect(failure).toBeInstanceOf(Error);
+      const databaseError = (failure as Error & { cause?: Error }).cause ?? failure;
+      expect(String(databaseError)).toContain("SPA9351_LEASE_RELEASE_REJECTED");
+      const [runAfter] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+      const [leaseAfter] = await db.select().from(environmentLeases).where(eq(environmentLeases.id, lease.id));
+      expect(runAfter).toEqual(originalRun);
+      expect(leaseAfter?.status).toBe("active");
+      expect(leaseAfter?.releasedAt).toBeNull();
+    } finally {
+      await db.execute(sql.raw("DROP TRIGGER spa9351_reject_lease_release ON environment_leases"));
+      await db.execute(sql.raw("DROP FUNCTION spa9351_reject_lease_release()"));
+    }
+  });
 
   it("LEASE-GATES: terminal-release", async () => {
     const { companyId, agentId } = await seedCompanyAndAgent();
