@@ -18056,7 +18056,7 @@ export function heartbeatService(
     const claimed = queuedCommentClaim
       ? queuedCommentClaim.run
       : await withChatControlRecoveryGate(run, "claim", async (tx) => {
-          if (context.source === "issue.execution_review_recovery") {
+          if (context.source === "issue.execution_review_recovery" && context.reviewStageEntryRecovery === true) {
             const [stageIssue] = await tx.select({ status: issues.status, executionState: issues.executionState })
               .from(issues).where(and(eq(issues.companyId, run.companyId), eq(issues.id, issueId!))).limit(1);
             const stage = parseIssueExecutionState(stageIssue?.executionState);
