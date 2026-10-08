@@ -1,6 +1,7 @@
 import { and, desc, eq, inArray, isNotNull, or, sql } from "drizzle-orm";
 import { environmentLeases, heartbeatRunEvents, heartbeatRuns, issueRecoveryActions, type Db } from "@paperclipai/db";
 import { readProcessStartedAt } from "./hot-restart.js";
+import { HEARTBEAT_QUERY_DIAGNOSTIC_TAGS, measureHeartbeatQuery } from "./heartbeat-query-diagnostics.js";
 
 // These adapters accept a conversation turn. Retrying a process or webhook can
 // replay the action itself, so those adapters retain their recovery contract.
@@ -102,14 +103,15 @@ export async function getConversationOwnershipBlocker(db: Db, companyId: string,
       and (${environmentLeases.releasedAt} is null
         or ${environmentLeases.status} = 'pending_cleanup'
         or ${environmentLeases.cleanupStatus} = 'failed'))`;
-  const candidates = await db.select({ run: heartbeatRuns, activeLease }).from(heartbeatRuns)
-    .where(and(
-      eq(heartbeatRuns.companyId, companyId), eq(heartbeatRuns.runtimeMode, "legacy"),
-      conversationRunPredicate(),
-      sql`coalesce(${heartbeatRuns.nativeIssueId}::text, ${heartbeatRuns.contextSnapshot}->>'issueId') = ${issueId}`,
-      inArray(heartbeatRuns.status, ["failed", "timed_out", "interrupted", "cancelled"]),
-      or(isNotNull(heartbeatRuns.processPid), isNotNull(heartbeatRuns.processGroupId), activeLease),
-    )).orderBy(desc(heartbeatRuns.createdAt), desc(heartbeatRuns.id));
+  const candidates = await measureHeartbeatQuery(HEARTBEAT_QUERY_DIAGNOSTIC_TAGS[0], () =>
+    db.select({ run: heartbeatRuns, activeLease }).from(heartbeatRuns)
+      .where(and(
+        eq(heartbeatRuns.companyId, companyId), eq(heartbeatRuns.runtimeMode, "legacy"),
+        conversationRunPredicate(),
+        sql`coalesce(${heartbeatRuns.nativeIssueId}::text, ${heartbeatRuns.contextSnapshot}->>'issueId') = ${issueId}`,
+        inArray(heartbeatRuns.status, ["failed", "timed_out", "interrupted", "cancelled"]),
+        or(isNotNull(heartbeatRuns.processPid), isNotNull(heartbeatRuns.processGroupId), activeLease),
+      )).orderBy(desc(heartbeatRuns.createdAt), desc(heartbeatRuns.id)));
   for (const { run, activeLease: leaseHeld } of candidates) {
     let pidAlive = run.processPid !== null && processMayBeAlive(run.processPid);
     if (pidAlive && run.processStartedAt) {
