@@ -63,7 +63,7 @@ describe("worktree reuse safety", () => {
     });
     try {
       await expect(assertReusableWorktreeSafe(root)).resolves.toBeUndefined();
-      expect(readdirSpy).not.toHaveBeenCalledWith(`/proc/${writer.pid}/fd`);
+      expect(readdirSpy).toHaveBeenCalledWith(`/proc/${writer.pid}/fd`);
     } finally {
       readdirSpy.mockRestore();
       statSpy.mockRestore();
@@ -72,7 +72,7 @@ describe("worktree reuse safety", () => {
     }
   });
 
-  it.each(["EACCES", "EPERM"])("refuses a same-UID Git PID whose fd scan returns %s", async (code) => {
+  it.each(["EACCES", "EPERM"])("skips an unrelated same-UID Git PID whose fd scan returns %s", async (code) => {
     const { root } = await fixture();
     const writer = spawn("git", ["--no-pager", "hash-object", "--stdin"], { cwd: os.tmpdir(), stdio: ["pipe", "pipe", "pipe"] });
     await new Promise<void>((resolve, reject) => {
@@ -85,12 +85,85 @@ describe("worktree reuse safety", () => {
       return readdir(target, options as never);
     });
     try {
-      await expect(assertReusableWorktreeSafe(root)).rejects.toMatchObject({
-        code: "workspace_validation_failed",
-        resultJson: { workspaceValidation: { reason: "live_git_writer_probe_unavailable", worktreePath: root } },
-      } satisfies Partial<WorkspaceRuntimeValidationFailure>);
+      await expect(assertReusableWorktreeSafe(root)).resolves.toBeUndefined();
     } finally {
       readdirSpy.mockRestore();
+      writer.stdin.end();
+      await new Promise((resolve) => writer.once("close", resolve));
+    }
+  });
+
+  it.each(["EACCES", "EPERM"])("rechecks a vanished PID after %s", async (code) => {
+    const { root } = await fixture();
+    const writer = spawn("git", ["hash-object", "--stdin"], { cwd: os.tmpdir(), stdio: ["pipe", "pipe", "pipe"] });
+    await new Promise<void>((resolve, reject) => { writer.once("spawn", resolve); writer.once("error", reject); });
+    let denied = false;
+    let rechecked = false;
+    const stat = fs.stat.bind(fs);
+    const statSpy = vi.spyOn(fs, "stat").mockImplementation(async (target, options) => {
+      if (String(target) === `/proc/${writer.pid}` && denied) {
+        rechecked = true;
+        throw Object.assign(new Error("vanished"), { code: "ENOENT" });
+      }
+      return stat(target, options as never);
+    });
+    const readdir = fs.readdir.bind(fs);
+    const fdSpy = vi.spyOn(fs, "readdir").mockImplementation(async (target, options) => {
+      if (String(target) === `/proc/${writer.pid}/fd`) {
+        denied = true;
+        throw Object.assign(new Error("denied"), { code });
+      }
+      return readdir(target, options as never);
+    });
+    try {
+      await expect(assertReusableWorktreeSafe(root)).resolves.toBeUndefined();
+      expect(rechecked).toBe(true);
+    } finally {
+      fdSpy.mockRestore();
+      statSpy.mockRestore();
+      writer.stdin.end();
+      await new Promise((resolve) => writer.once("close", resolve));
+    }
+  });
+
+  it.each(["cwd", "cmdline", "fd", "stat-denied"])("rejects foreign-UID positive %s evidence", async (evidence) => {
+    const { root, lock } = await fixture();
+    await fs.writeFile(lock, "");
+    const old = new Date(Date.now() - 660_000);
+    await fs.utimes(lock, old, old);
+    const args = evidence === "cmdline" ? ["--git-dir", path.join(root, ".git"), "hash-object", "--stdin"] : ["hash-object", "--stdin"];
+    const writer = spawn("git", args, { cwd: evidence === "cwd" || evidence === "stat-denied" ? root : os.tmpdir(), stdio: ["pipe", "pipe", "pipe"] });
+    await new Promise<void>((resolve, reject) => { writer.once("spawn", resolve); writer.once("error", reject); });
+    const stat = fs.stat.bind(fs);
+    const statSpy = vi.spyOn(fs, "stat").mockImplementation(async (target, options) => {
+      const result = await stat(target, options as never);
+      if (String(target) === `/proc/${writer.pid}`) return Object.assign(Object.create(Object.getPrototypeOf(result)), result, { uid: (process.getuid?.() ?? 0) + 1 });
+      return result;
+    });
+    if (evidence === "stat-denied") statSpy.mockImplementation(async (target, options) => {
+      if (String(target) === `/proc/${writer.pid}`) throw Object.assign(new Error("denied"), { code: "EACCES" });
+      return stat(target, options as never);
+    });
+    const readdir = fs.readdir.bind(fs);
+    const fdSpy = vi.spyOn(fs, "readdir").mockImplementation(async (target, options) => {
+      if (String(target) === `/proc/${writer.pid}/fd`) {
+        if (evidence === "fd") return ["1"] as never;
+        throw Object.assign(new Error("denied"), { code: "EACCES" });
+      }
+      return readdir(target, options as never);
+    });
+    const readlink = fs.readlink.bind(fs);
+    const linkSpy = vi.spyOn(fs, "readlink").mockImplementation(async (target, options) => {
+      if (evidence === "fd" && String(target) === `/proc/${writer.pid}/fd/1`) return lock as never;
+      return readlink(target, options as never);
+    });
+    try {
+      await expect(assertReusableWorktreeSafe(root)).rejects.toThrow(/live Git writer/);
+      await expect(fs.stat(lock)).resolves.toBeDefined();
+    } finally {
+      linkSpy.mockRestore();
+      fdSpy.mockRestore();
+      statSpy.mockRestore();
       writer.stdin.end();
       await new Promise((resolve) => writer.once("close", resolve));
     }
