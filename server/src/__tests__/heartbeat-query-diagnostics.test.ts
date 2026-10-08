@@ -517,7 +517,7 @@ describe("heartbeat query diagnostics collector", () => {
     }
 
     expect(ownership).toContain(
-      "sql`coalesce(${heartbeatRuns.nativeIssueId}::text, ${heartbeatRuns.contextSnapshot}->>'issueId') = ${issueId}`",
+      "conversationOwnershipIssuePredicate(issueId)",
     );
     expect(ownership).toContain(
       'inArray(heartbeatRuns.status, ["failed", "timed_out", "interrupted", "cancelled"])',

@@ -1,5 +1,24 @@
 # SPA-11264 gates
 
+## Indexed correction continuation 2026-10-08 16:01 manager direction
+
+Index-only closure NOT authorized. Implement independent indexed ownership reads now; trace safe upstream bound separately. No result cache, candidate truncation, new migration, activation or restart.
+
+- Exact text semantics, identities/order, adapter/process/lease evidence and transaction freshness.
+  CHECK: timeout 900 pnpm exec vitest run server/src/__tests__/conversation-ownership-query.test.ts
+  EXPECT: all tests pass against disposable PostgreSQL; actual ORM SQL captured without production bind values; full query plan uses issue indexes on representative fixture.
+  NEGATIVE: timeout 1800 bash scripts/spa-11264-ownership-negative-control.sh
+  EXPECT: isolated baseline/restored pass; removing native/context precedence rejected with nonzero test exit; workspace bytes and dependency links unchanged.
+  RESULT: parent rerun 2026-10-08 16:40Z exit 0, Tests 5 passed (5). Actual ORM SQL differential compares IDs and order including precedence, positive legacy strings, canonical/uppercase/invalid/newline input, JSON null/number/boolean/object/array, adapter events, PID/group/lease and snapshot freshness. Fixture EXPLAIN ANALYZE uses context index without heartbeat_runs Seq Scan. Native-index-specific assertion remains unproven. Parent negative 16:41Z exit0: baseline 5 passed exit0; mutation 2 failed/3 passed exit1 (extra native-owned row); restored 5 passed exit0; ISOLATED_CONTROLS_PASS workspace-links-unchanged. No live DB used.
+- Type safety and regression protection.
+  CHECK: timeout 900 pnpm exec tsc --noEmit -p server/tsconfig.json
+  EXPECT: exit 0 without diagnostics.
+  CHECK: timeout 900 pnpm exec vitest run server/src/__tests__/heartbeat-query-diagnostics.test.ts server/src/__tests__/heartbeat-lease-not-released-retry.test.ts
+  EXPECT: selected tests pass.
+  RESULT: parent tsc exit0 without output 16:41Z; combined ownership+diagnostics+lease retry suites 16:39Z exit0, Test Files 3 passed (3), Tests 28 passed (28). git diff --check exit0. No lint script supplied in root package.json. Test-first assertion red observed by implementer before rewrite; earlier fixture/import/bind setup failures superseded. Parent newline concern was refuted by passing regression without source alteration.
+- Upstream bound, wakeup/cost scan measured disposition and deployed runtime oracle remain UNPROVEN. Candidate fixture timing cannot satisfy deployed acceptance.
+
+
 ## Diagnostic prerequisite, manager clarification 2026-10-08 06:29Z
 
 Independent ownership decisions remain unchanged. Current exact attribution is unproven; implement the authorized narrow fixed-tag diagnostics, not speculative caching. Diagnostic review is not full-card acceptance. No activation is authorized by this clarification.

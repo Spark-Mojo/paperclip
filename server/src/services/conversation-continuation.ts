@@ -93,6 +93,14 @@ function processMayBeAlive(pid: number): boolean {
   }
 }
 
+const NATIVE_ISSUE_ID_ANCHOR = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+
+function conversationOwnershipIssuePredicate(issueId: string) {
+  const contextArm = sql`${heartbeatRuns.nativeIssueId} is null and ${heartbeatRuns.contextSnapshot}->>'issueId' = ${issueId}`;
+  if (!NATIVE_ISSUE_ID_ANCHOR.test(issueId)) return sql`(${contextArm})`;
+  return sql`(${heartbeatRuns.nativeIssueId} = ${issueId}::uuid or ${contextArm})`;
+}
+
 /** A terminal conversation row does not prove that its execution authority ended.
  * Other adapters keep their existing bootstrap and ownership protocols.
  */
@@ -108,7 +116,7 @@ export async function getConversationOwnershipBlocker(db: Db, companyId: string,
       .where(and(
         eq(heartbeatRuns.companyId, companyId), eq(heartbeatRuns.runtimeMode, "legacy"),
         conversationRunPredicate(),
-        sql`coalesce(${heartbeatRuns.nativeIssueId}::text, ${heartbeatRuns.contextSnapshot}->>'issueId') = ${issueId}`,
+        conversationOwnershipIssuePredicate(issueId),
         inArray(heartbeatRuns.status, ["failed", "timed_out", "interrupted", "cancelled"]),
         or(isNotNull(heartbeatRuns.processPid), isNotNull(heartbeatRuns.processGroupId), activeLease),
       )).orderBy(desc(heartbeatRuns.createdAt), desc(heartbeatRuns.id)));
