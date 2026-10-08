@@ -177,7 +177,7 @@ describeEmbeddedPostgres("terminal environment leases (SPA-9423)", () => {
     expect(terminalLease?.status).toBe("released");
   });
 
-  it("rolls back terminal run state when durable lease release fails", async () => {
+  it.each(["lease-release", "shutdown"] as const)("rolls back terminal run state when durable lease release fails via %s", async (entrypoint) => {
     const { companyId, agentId } = await seedCompanyAndAgent();
     const runId = await seedRun({ companyId, agentId, status: "running" });
     const { lease } = await environmentRuntimeService(db).acquireRunLease({
@@ -200,7 +200,11 @@ describeEmbeddedPostgres("terminal environment leases (SPA-9423)", () => {
       BEFORE UPDATE ON environment_leases FOR EACH ROW
       EXECUTE FUNCTION spa9351_reject_lease_release()`));
     try {
-      const failure = await heartbeatService(db).terminalizeRunOnLeaseRelease(originalRun!).then(
+      const heartbeat = heartbeatService(db);
+      const terminalization = entrypoint === "lease-release"
+        ? heartbeat.terminalizeRunOnLeaseRelease(originalRun!)
+        : heartbeat.drainRunningRunsForShutdown("SIGTERM", new Date(), [runId]);
+      const failure = await terminalization.then(
         () => null,
         (error: unknown) => error,
       );
@@ -217,6 +221,34 @@ describeEmbeddedPostgres("terminal environment leases (SPA-9423)", () => {
       await db.execute(sql.raw("DROP FUNCTION spa9351_reject_lease_release()"));
     }
   });
+
+  it.each(["succeeded", "failed", "cancelled", "interrupted", "timed_out"])(
+    "reclaims a %s owner within one sweep and is idempotent",
+    async (status) => {
+      const { companyId, agentId } = await seedCompanyAndAgent();
+      const runId = await seedRun({ companyId, agentId, status });
+      const { lease } = await environmentRuntimeService(db).acquireRunLease({
+        companyId,
+        environment: await seedEnvironment({ companyId, driver: "local" }),
+        issueId: null,
+        heartbeatRunId: runId,
+        persistedExecutionWorkspace: null,
+      });
+      const heartbeat = heartbeatService(db);
+      const first = await heartbeat.reclaimTerminalEnvironmentLeases({ batchSize: RECLAIM_BATCH });
+      expect(first.releasedLeaseIds).toEqual([lease.id]);
+      expect(first.driverFailures).toEqual([]);
+      const [released] = await db.select().from(environmentLeases).where(eq(environmentLeases.id, lease.id));
+      const expectedLeaseStatus = status === "failed" || status === "timed_out"
+        ? "failed"
+        : status === "cancelled" ? "expired" : "released";
+      expect(released?.status).toBe(expectedLeaseStatus);
+      expect(released?.releasedAt).toBeInstanceOf(Date);
+      const second = await heartbeat.reclaimTerminalEnvironmentLeases({ batchSize: RECLAIM_BATCH });
+      expect(second.reclaimed).toBe(0);
+      expect(second.releasedLeaseIds).toEqual([]);
+    },
+  );
 
   it("LEASE-GATES: terminal-release", async () => {
     const { companyId, agentId } = await seedCompanyAndAgent();

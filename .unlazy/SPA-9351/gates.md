@@ -579,3 +579,16 @@ Observed exit 0. `git diff --check` exit 0.
 
 Scope: two heartbeat status setters now wrap legacy nested terminalization or normal status write and local ephemeral lease release in one outer transaction. Local driver has no external cleanup; its release implementation only writes the lease row. Company, owner, active status, ephemeral policy and native-ownership guards remain required.
 Still unproven: direct terminal writers outside these setters, nonlocal provider cleanup atomicity/retry, per-status atomicity coverage, full combined regression and final-head independent review. This is partial progress, not acceptance or merge clearance.
+
+## 2026-10-08 terminal coverage continuation
+
+CHECK: `systemd-run --user --scope -q -p TasksMax=512 -- timeout 240 pnpm -C server exec vitest run src/services/terminal-environment-leases.test.ts`
+EXPECT: `Tests  12 passed (12)`
+Observed exit 0 at 14:42 UTC: 12 passed. Five independent status cases cover succeeded, failed, cancelled, interrupted and timed_out; each requires one sweep, releasedAt, no driver failure, and no second-sweep release. These prove sweep behavior, NOT per-status transaction atomicity.
+The first run exited 1 (3 failed, 9 passed): the new test incorrectly expected every outcome to use the literal released status. Existing leaseReleaseStatusForRunStatus maps failed/timed_out to failed and cancelled to expired; assertions now require those exact terminal values and releasedAt rather than relaxing to not-active.
+NEGATIVE: the same test command exercises the isolated PostgreSQL rejection trigger through both lease-release terminalization and graceful shutdown. Both paths must reject with SPA9351_LEASE_RELEASE_REJECTED and preserve the original run and active lease. Focused `-t 'rolls back'` exit 0: 2 passed, 5 skipped before adding the sweep cases. No new production change or new mutation control claimed.
+CHECK: `systemd-run --user --scope -q -p TasksMax=512 -- timeout 240 pnpm -C server exec tsc --noEmit`
+EXPECT: exit 0 without diagnostics.
+Observed exit 0; git diff --check exit 0. No server lint script found.
+Remaining direct-writer examples: heartbeat.ts:17918 chat-control stop, :18035 admission cancellation, :28100 scheduled-retry cancellation, :28236 and :28328 retry admission cancellation. These update heartbeatRuns directly, not through the two atomic setters. Inventory is not exhaustive.
+Ownership risk remains unproven: releaseTerminalLocalLeases checks native ownership but not legacy recovery proof; terminalizeLegacyExecution can create a reconciliation action in the same transaction. Before expanding release coverage, test whether any local process can still own execution at that boundary and preserve its required stop proof. Advisor identified this as the next safety gate. External provider cleanup remains outside this run's changes. Full-PR independent review is still pending; no merge/install/live acceptance claim.
