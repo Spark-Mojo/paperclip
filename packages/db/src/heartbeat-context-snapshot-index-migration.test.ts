@@ -28,6 +28,13 @@ d("heartbeat context_snapshot expression index migration", () => {
     expect(names).toContain("heartbeat_runs_company_ctx_task_created_idx");
     expect(names).toContain("heartbeat_runs_company_ctx_taskkey_created_idx");
     expect(names).toContain("agent_wakeup_requests_company_payload_issue_idx");
+    expect(names).toContain("heartbeat_runs_company_missing_terminal_liveness_idx");
+
+    await sql.unsafe("SET enable_seqscan = off");
+    const missingPlan = await sql.unsafe(
+      "EXPLAIN SELECT id FROM heartbeat_runs WHERE company_id = '00000000-0000-0000-0000-000000000001' AND liveness_state IS NULL AND status NOT IN ('queued', 'running') LIMIT 20",
+    );
+    expect(missingPlan.map((r) => Object.values(r)[0]).join("\n")).toContain("heartbeat_runs_company_missing_terminal_liveness_idx");
 
     await sql.unsafe("SET enable_seqscan = off");
     const plan = await sql.unsafe(

@@ -218,6 +218,68 @@ describeEmbeddedPostgres("activity service", () => {
     expect(runs[0]).not.toHaveProperty("contextSnapshot");
   });
 
+  it("coalesces repeated legacy backfill scans and picks up new terminal runs", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const issueId = randomUUID();
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "CodexCoder",
+      role: "engineer",
+      status: "idle",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Read ledger",
+      description: "Read repeatedly",
+      status: "in_progress",
+      priority: "medium",
+    });
+    const queries: string[] = [];
+    const observedDb = new Proxy(db, {
+      get(target, property, receiver) {
+        if (property === "select") {
+          return (...args: Parameters<typeof db.select>) => {
+            const query = db.select(...args);
+            const originalFrom = query.from.bind(query);
+            query.from = ((table: Parameters<typeof query.from>[0]) => {
+              if (table === heartbeatRuns) queries.push("heartbeatRuns");
+              return originalFrom(table);
+            }) as typeof query.from;
+            return query;
+          };
+        }
+        return Reflect.get(target, property, receiver);
+      },
+    });
+    const service = activityService(observedDb);
+    await Promise.all(Array.from({ length: 5 }, () => service.runsForIssue(companyId, issueId)));
+    expect(queries).toHaveLength(5);
+
+    const runId = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: runId,
+      companyId,
+      agentId,
+      status: "succeeded",
+      contextSnapshot: { issueId },
+      livenessState: null,
+    });
+    await waitForIssueRun(service, companyId, issueId, (run) => run.runId === runId && run.livenessState !== null);
+  });
+
   it("backfills missing liveness for completed issue runs before returning the ledger", async () => {
     const companyId = randomUUID();
     const agentId = randomUUID();
