@@ -584,6 +584,13 @@ function buildPendingState(input: {
     currentStageId: input.stage.id,
     currentStageIndex: input.stageIndex,
     currentStageType: input.stage.type,
+    stageEnteredAt: input.previous?.status === PENDING_STATUS &&
+      input.previous.currentStageId === input.stage.id &&
+      principalsEqual(input.previous.currentParticipant, input.participant) &&
+      input.previous.lastDecisionOutcome !== "changes_requested" &&
+      input.previous.stageEnteredAt
+      ? input.previous.stageEnteredAt
+      : new Date().toISOString(),
     currentParticipant: input.participant,
     returnAssignee: input.returnAssignee,
     reviewRequest: input.reviewRequest ?? null,
