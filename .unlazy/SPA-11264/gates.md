@@ -249,3 +249,18 @@ INDEPENDENT VERIFICATION (this run, bigbox, read-only):
 6. Leading indicators (NOT the oracle; Ty owns measurement): pg_stat_activity 10 samples @3s — over-1s heartbeat queries 6,4,0,0,0,1,0,1,0,1 vs incident's sustained 9-11; issue GET 1.92/1.67/1.61s (08:0x pre-activation 2.15/2.17/1.77; baseline 9.4-10.6). new missing-terminal index idx_scan=0 (either query shape not yet hit or planner prefers other index — attribution is Ty's).
 
 HANDOFF: card reassigned to Ty (5f006ee1-0723-4512-bbed-ac0203f746af) as the measurement wake. Remaining UNPROVEN: hot-shape attribution, cap/de-duplicate or explicit evidence-based index-only acceptance, wakeup/cost plan evidence, full-query semantics, comparable-load matching query <100ms, 1-2 matching active backends, before/after GET with recorded conditions.
+
+## Dex merge receipt — PR #161 correction (2026-10-08 ~18:16Z, this run)
+
+PRECONDITIONS independently re-derived live before the call (advisor consulted first; its conditions all satisfied):
+- PR #161: state=open, merged=false, mergeable=true, mergeState=clean, head=ee80df278e40995b26a79b27d88afb0b68e6ff8d == verified head Ty handed off (pr-read.sh head: baseRefOid=69f8a98c5927274e6a46edab1ae2ab234a79a09d, baseRefName=rebuild/v2026.916.0-survivors = fork default branch, read live).
+- Fork gates: allow_auto_merge=false; rulesets=0; branch rules=0; classic branch protection on default = 404 Branch not protected; commit statuses on head AND base = count 0; check-runs on head AND base = total_count 0 (full inventory, .check_runs[] — the first --paginate jq read "2" was a page-object artifact, corrected this run); reviews=[]; review threads=0. No head-only reds; no base-reproduction burden.
+- Independent review PASS: NO-CHECK transport comment 6065992077 (author JamesSparkMojo transport of verifier verdict), verdict=pass, "prerequisite merge readiness only; full-incident acceptance remains FAIL/unproven", bound to exact head ee80df27.
+- Local tree clean at ee80df27; ledger committed at that head before merge.
+
+MERGE: gh api -X PUT repos/Spark-Mojo/paperclip/pulls/161/merge -f sha=ee80df278e40995b26a79b27d88afb0b68e6ff8d -f merge_method=merge -> {"merged":true,"sha":"818d2fb85f874c9433363b4ee02fb25b6f9acd3c"} at 2026-10-08T18:16:19Z. Read-back: PR state=closed, merged=true, merge_commit_sha=818d2fb8. Containment: compare ee80df27...818d2fb8 = behind_by=0 status=ahead; fork default tip now 818d2fb8. Never gh pr merge, never --admin.
+
+ROUTING (activation authority gap for THIS correction — SPA-11317 receipt is precedent, not authority; Steve 16:59Z):
+- New child card filed to local-board (todo) authorizing install of merge 818d2fb8 with a named operator; human_only ask_user_questions interaction attached (SPA-11317 pattern).
+- SPA-11264 PATCHed blocked on that child, unblockDescriptor owner=Dex + named action. After authorized activation + install/health receipts, card returns to Ty for the measurement wake.
+- No install, no repin, no restart executed by this run. The monitor's 17:42Z saturation data (11 backends on the full-column ownership shape, GET 26.9s) is context for urgency, not activation authority.
