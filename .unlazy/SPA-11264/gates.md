@@ -264,3 +264,16 @@ ROUTING (activation authority gap for THIS correction — SPA-11317 receipt is p
 - New child card filed to local-board (todo) authorizing install of merge 818d2fb8 with a named operator; human_only ask_user_questions interaction attached (SPA-11317 pattern).
 - SPA-11264 PATCHed blocked on that child, unblockDescriptor owner=Dex + named action. After authorized activation + install/health receipts, card returns to Ty for the measurement wake.
 - No install, no repin, no restart executed by this run. The monitor's 17:42Z saturation data (11 backends on the full-column ownership shape, GET 26.9s) is context for urgency, not activation authority.
+
+## Dex activation receipts — install 818d2fb8 (PR #161 correction), 2026-10-08 ~19:04Z (resume run, wake issue_children_completed)
+
+AUTHORITY: SPA-11382 (child) done — James approved in the attended monitor session ("Yes /plow-ahead"); operator executed managed install + restart, 10 orphaned runs cancelled, leases released. This run re-derived every receipt independently before handoff; the child summary was never trusted as evidence.
+
+INDEPENDENT VERIFICATION (this run, bigbox, read-only):
+1. install.json: ref/sha = 818d2fb85f874c9433363b4ee02fb25b6f9acd3c (the PR #161 merge commit = fork default tip), installedAt = 2026-10-08T18:51:36.992Z, channel=pinned. current -> installs/git/818d2fb85f87 (readlink -f confirmed).
+2. paperclip.service: MainPID=561736, ExecMainStartTimestamp/ActiveEnterTimestamp = 2026-10-08 18:57:56 UTC — strictly later than installedAt. Running argv executes ~/.paperclip/cli/current payload (818d2fb85f87).
+3. /api/health on API port 3100: installedCommit = 818d2fb85f874c9433363b4ee02fb25b6f9acd3c (contains the merge BY IDENTITY — it IS the merge), commit matches, serverInfo.processStartedAt = 2026-10-08T18:58:02.590Z — strictly later than installedAt. All SPA-9473 clause-5 health clauses PASS on this build's real fields.
+4. Pre-handoff context sample (NOT the oracle; Ty owns measurement under comparable load), 19:04Z, three sequential authenticated GET /api/issues/SPA-11264 on :3100, ambient fleet load, no synthetic concurrency: 0.312988s / 0.157760s / 0.135275s (vs 26.9s board measurement at 17:42Z pre-activation, 2.36-2.86s at 15:47Z post-158/pre-161). DB pg_stat_activity counts NOT re-read this run (no DB credentials in run env; exact-query timing/backends are Ty's oracle with authenticated access).
+5. Fix payload lineage: 818d2fb8 carries PR #161 (indexed ownership predicates at verified head ee80df27, contained behind_by=0 per 18:16Z merge receipt) on top of 69f8a98c (PR #158 partial liveness index, verified live 15:43Z). No new migration in #161; DB index state unchanged from 69f8a98c.
+
+HANDOFF: card reassigned to Ty (5f006ee1-0723-4512-bbed-ac0203f746af) as the measurement wake (Steve direction 836604ab item 4). Remaining UNPROVEN for incident closure: current hot-shape attribution under live load with the fix active; upstream cap/de-duplicate at a proven redundant boundary OR explicit board amendment; measured wakeup/cost scan disposition; comparable-load exact-query <100ms, 1-2 matching active backends, before/after issue-GET with conditions recorded. Release state sign-off: merged (818d2fb8) -> installed -> activated -> receipts recorded.
