@@ -192,3 +192,17 @@ ROUTING (authority gap, not invented around):
 GIT HYGIENE (D138):
 - Pre-fix: ahead-of-remote=1 (later 3) — origin resolves to JamesSparkMojo/paperclip (shared clone, 54 worktrees; remote config NOT touched per fleet law). HEAD IS fully contained in refs/remotes/sparkmojo/* (ahead count 0 vs sparkmojo/rebuild/v2026.916.0-survivors).
 - Fix: pushed the card branch (with the ledger addendum commit) to the EXISTING configured remotes — no set-url, no new remote. Post-fix predicate re-run recorded below.
+
+## Dex activation receipts (2026-10-08, resume run; direction eba4be42 item 4)
+
+DECISION (interaction d5d9c6fa, answered 2026-10-08T15:29:55Z by local-board via James's monitor session, standing approval "Yes we can go on 11317"): opt-managed-install; operator = the monitor session; scope widened past my recommendation to fork tip 69f8a98c5927274e6a46edab1ae2ab234a79a09d (carries PR #158 merge 70500bed + #143 + #159). Child SPA-11317 done 15:30:11Z.
+
+INDEPENDENT VERIFICATION (this run, bigbox, read-only):
+1. install.json: ref/sha = 69f8a98c5927274e6a46edab1ae2ab234a79a09d, installedAt = 2026-10-08T15:24:22.262Z, channel=pinned. current -> installs/git/69f8a98c5927 (readlink -f confirmed).
+2. paperclip.service: MainPID=3262997, ActiveEnterTimestamp=2026-10-08 15:28:59 UTC. Running process argv = /usr/bin/node ~/.paperclip/cli/current/node_modules/paperclipai/dist/index.js run --instance default (payload identity matches current symlink).
+3. /api/health on API port 3100 (not the UI :3000 I probed pre-merge — that gap is why I wrongly reported the receipt fields missing): installedCommit=69f8a98c..., commit=69f8a98c..., serverInfo.processStartedAt=2026-10-08T15:29:06.303Z. Clause checks: (a) installedCommit contains merge 70500bed — GitHub compare 70500bed...69f8a98c = ahead_by=11, behind_by=0 → CONTAINED; (b) processStartedAt (15:29:06Z) strictly later than installedAt (15:24:22Z) → PASS. 69f8a98c is the live default-branch tip of Spark-Mojo/paperclip.
+4. Fix payload present: installs/git/69f8a98c5927/node_modules/@paperclipai/server/dist/services/heartbeat-query-diagnostics.js exists; 9283_missing_terminal_run_liveness_index.sql + journal entry idx 9283 in @paperclipai/db/dist/migrations; BOTH ABSENT from old payload 117aed158537.
+5. DB applied: live DB paperclip_spa_cutover_20260906 (postgres 18.6, 127.0.0.1:5433) has index heartbeat_runs_company_missing_terminal_liveness_idx ON heartbeat_runs (company_id) WHERE liveness_state IS NULL AND status <> ALL('{queued,running}') — the exact PR #158 partial index.
+6. Leading indicators (NOT the oracle; Ty owns measurement): pg_stat_activity 10 samples @3s — over-1s heartbeat queries 6,4,0,0,0,1,0,1,0,1 vs incident's sustained 9-11; issue GET 1.92/1.67/1.61s (08:0x pre-activation 2.15/2.17/1.77; baseline 9.4-10.6). new missing-terminal index idx_scan=0 (either query shape not yet hit or planner prefers other index — attribution is Ty's).
+
+HANDOFF: card reassigned to Ty (5f006ee1-0723-4512-bbed-ac0203f746af) as the measurement wake. Remaining UNPROVEN: hot-shape attribution, cap/de-duplicate or explicit evidence-based index-only acceptance, wakeup/cost plan evidence, full-query semantics, comparable-load matching query <100ms, 1-2 matching active backends, before/after GET with recorded conditions.
