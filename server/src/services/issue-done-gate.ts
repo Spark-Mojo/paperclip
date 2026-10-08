@@ -300,7 +300,7 @@ export function issueDoneGateService(db: Db, opts: IssueDoneGateServiceOptions =
         isNull(issueComments.deletedAt),
       ))
       .orderBy(desc(issueComments.createdAt))
-.limit(commentLimit + 1);
+      .limit(commentLimit + 1);
     if (scanBudget && commentRows.length > commentLimit) {
       scanBudget.onTruncated("comments", commentLimit);
     }
