@@ -1,5 +1,48 @@
 # SPA-11264 gates
 
+## PR #161 correction-only prerequisite, 2026-10-08 16:59 manager contract
+
+**Prerequisite acceptance contract for PR #161:**
+1. Review the entire diff against its actual base at the exact final head, including ownership-query implementation, all tests, control scripts, diagnostics-test change and ledger. Preserve existing liveness fixes and SPA-10699 migration coordination; no new migration is authorized.
+2. Preserve original text-match semantics and native/context precedence for null, canonical, noncanonical, invalid and legacy inputs, including JSON edge cases. Prove identical result identities and ordering, adapter/process/group/lease evidence, and fresh decisions across concurrent ownership changes and transaction snapshots. No result cache across requests/transactions, ownership-hiding truncation or artificial correctness-breaking cap.
+3. Capture actual ORM-emitted full SQL safely in disposable fixtures. Demonstrate index-bounded access for BOTH native and context lookup branches using representative selective fixtures, with unchanged full predicates/projection/order. The currently unproven native-index assertion must be resolved before prerequisite PASS; context-only plan evidence is insufficient. Do not publish live bind values, identifiers, payloads or secrets. Fixture timings are not deployed performance acceptance.
+4. Retain executable whole-diff regression/type checks and isolated negative controls with baseline, intended-failure and restored receipts. Prove the control leaves workspace bytes and dependency links unchanged. Fix any content findings; do not relabel them deferred merely to get PASS.
+
+Required verdict scope: **prerequisite merge readiness only; full-incident acceptance remains FAIL/unproven**. Original requirements below retained verbatim and deferred from this prerequisite. No index-only closure permission. Upstream bound or board amendment, measured wakeup/cost disposition and deployed comparable-load oracle remain UNPROVEN. Activation authority/operator for this correction remains unestablished; previous activation grants do not authorize another install/restart. Dex coordinates exact-head merge only after independent PASS and fork gates; authorized activation then returns still-open card to Ty with containment/process-after-install receipts.
+
+### Final-head candidate checks (parent re-derived 2026-10-08 17:45–17:54Z)
+
+- CHECK: timeout 900 pnpm exec vitest run server/src/__tests__/conversation-ownership-query.test.ts server/src/__tests__/heartbeat-query-diagnostics.test.ts server/src/__tests__/heartbeat-lease-not-released-retry.test.ts
+  EXPECT: Test Files 3 passed (3); Tests 31 passed (31)
+  RESULT: exit 0, exact EXPECT matched. Earlier invocation misspelled lease-retry filename and ran only 2 suites/28 tests; not counted as whole-diff proof. Correct command above rerun successfully.
+  NEGATIVE: timeout 1800 bash scripts/spa-11264-ownership-negative-control.sh
+  EXPECT: each targeted mutation exit 1, baseline/restored exit 0 with 8 executed tests; ISOLATED_CONTROLS_PASS workspace-links-unchanged
+  RESULT: parent exit 0; baseline exit=0 executed=8; native-equality-non-sargable exit=1 executed=8 (named native plan assertion failed); context-expression-non-sargable exit=1 executed=8 (named context plan assertion failed); dropped-native-null-guard exit=1 executed=8 (named semantic differential failed); restored exit=0 executed=8. WORKSPACE_SHA256=7120289dbc64e6b8ee768333a8a82923370ccfbad21883158b84fdd75c0e6218; ISOLATED_CONTROLS_PASS workspace-links-unchanged. Vitest JSON assertion status proves intended rejection, not name appearance or aggregate failure alone. Context concat mutation may also break oracle parsing; its named full-plan assertion independently rejects loss of index binding.
+- CHECK: timeout 900 pnpm exec tsc --noEmit -p server/tsconfig.json
+  EXPECT: exit 0 without diagnostics
+  RESULT: parent exit 0 without output. Root package.json contains no lint script; git diff --check exit 0.
+
+Both actual ORM captures are EXPLAIN ANALYZE JSON planned without planner coercion over 1200 clutter rows (same-company terminal/nonterminal and foreign-company terminal), matching rows and precedence decoy. Executed native/context index nodes each have issue-specific and company Index Cond plus positive row yield; heartbeat_runs identified by Relation Name, no executed sequential scan; exact fixture IDs/order equal original coalesce oracle. Existing semantic and transaction snapshot tests retained. No production or migration edits in this continuation; only tests and isolated control hardened. Old native-plan UNPROVEN statements below are superseded by these receipts, not erased. Fixture proof is not runtime acceptance.
+
+## Indexed correction continuation 2026-10-08 16:01 manager direction
+
+Index-only closure NOT authorized. Implement independent indexed ownership reads now; trace safe upstream bound separately. No result cache, candidate truncation, new migration, activation or restart.
+
+- Exact text semantics, identities/order, adapter/process/lease evidence and transaction freshness.
+  CHECK: timeout 900 pnpm exec vitest run server/src/__tests__/conversation-ownership-query.test.ts
+  EXPECT: all tests pass against disposable PostgreSQL; actual ORM SQL captured without production bind values; full query plan uses issue indexes on representative fixture.
+  NEGATIVE: timeout 1800 bash scripts/spa-11264-ownership-negative-control.sh
+  EXPECT: isolated baseline/restored pass; removing native/context precedence rejected with nonzero test exit; workspace bytes and dependency links unchanged.
+  RESULT: parent rerun 2026-10-08 16:40Z exit 0, Tests 5 passed (5). Actual ORM SQL differential compares IDs and order including precedence, positive legacy strings, canonical/uppercase/invalid/newline input, JSON null/number/boolean/object/array, adapter events, PID/group/lease and snapshot freshness. Fixture EXPLAIN ANALYZE uses context index without heartbeat_runs Seq Scan. Native-index-specific assertion remains unproven. Parent negative 16:41Z exit0: baseline 5 passed exit0; mutation 2 failed/3 passed exit1 (extra native-owned row); restored 5 passed exit0; ISOLATED_CONTROLS_PASS workspace-links-unchanged. No live DB used.
+- Type safety and regression protection.
+  CHECK: timeout 900 pnpm exec tsc --noEmit -p server/tsconfig.json
+  EXPECT: exit 0 without diagnostics.
+  CHECK: timeout 900 pnpm exec vitest run server/src/__tests__/heartbeat-query-diagnostics.test.ts server/src/__tests__/heartbeat-lease-not-released-retry.test.ts
+  EXPECT: selected tests pass.
+  RESULT: parent tsc exit0 without output 16:41Z; combined ownership+diagnostics+lease retry suites 16:39Z exit0, Test Files 3 passed (3), Tests 28 passed (28). git diff --check exit0. No lint script supplied in root package.json. Test-first assertion red observed by implementer before rewrite; earlier fixture/import/bind setup failures superseded. Parent newline concern was refuted by passing regression without source alteration.
+- Upstream bound, wakeup/cost scan measured disposition and deployed runtime oracle remain UNPROVEN. Candidate fixture timing cannot satisfy deployed acceptance.
+
+
 ## Diagnostic prerequisite, manager clarification 2026-10-08 06:29Z
 
 Independent ownership decisions remain unchanged. Current exact attribution is unproven; implement the authorized narrow fixed-tag diagnostics, not speculative caching. Diagnostic review is not full-card acceptance. No activation is authorized by this clarification.
@@ -168,3 +211,41 @@ Separately, the disks are saturated by CI test jobs, not by the DB (sdb 100% bus
 
 Current attribution, cap/de-duplicate or explicit evidence-based index-only acceptance, wakeup/cost plan evidence, full-query semantics, comparable-load query below 100 ms, 1–2 matching active backends and before/after GET remain UNPROVEN. No merge or incident-resolution claim.
 
+
+## Dex release-state coordination receipts (2026-10-08, run 28a68dc5)
+
+MERGE (executed by Dex, SHA-bound fork hand-merge per James 2026-10-01 exception):
+- Preconditions independently re-derived this run: PR #158 state=open, merged=false, mergeable=true at head 5fb6462237c8f2f25bfbf0b102df0c5f585c009d (pr-read.sh head, atomic H/B pin: base 117aed1585374e487fad83f9bd529bc33afe874e = fork default rebuild/v2026.916.0-survivors, read live via gh repo view); check-runs total_count=0 on BOTH head and base (full paginated inventory, nothing red anywhere, no head-only reds); rulesets length=0; allow_auto_merge=false; NO-CHECK transport comment 6055397049 present, author JamesSparkMojo, verdict=pass (prerequisite merge readiness only), naming the exact verified head; review threads: none.
+- Merge call: `gh api -X PUT repos/Spark-Mojo/paperclip/pulls/158/merge -f sha=5fb6462237c8f2f25bfbf0b102df0c5f585c009d -f merge_method=merge` -> 2026-10-08T07:58:18Z, merge commit 70500bed8d8b60393912256589c1940fdb472242.
+- Post-merge proof: PR now state=closed merged=true merge_commit_sha=70500bed...; default-branch tip == 70500bed (compare identical, ahead_by=0/behind_by=0); verified head 5fb6462 is an ancestor of the merge (compare ahead=1/behind=0 from head to merge).
+
+ACTIVATION STATE (read-only fact-finding, bigbox):
+- install.json: channel=pinned, ref/sha=117aed1585374e487fad83f9bd529bc33afe874e, installedAt=2026-10-08T00:34:58.324Z. installedCommit does NOT contain merge 70500bed (GitHub compare: behind_by=4, ahead_by=0).
+- paperclip.service: MainPID=3005514, processStartedAt=2026-10-08T00:43:53Z (strictly later than installedAt, but see below — receipt path is deficient).
+- LAUNCH-PATH PROOF: unit ExecStart names the global npm copy (/usr/lib/node_modules/paperclipai), but the RUNNING process argv is `/usr/bin/node /home/jamesilsley/.paperclip/cli/current/node_modules/paperclipai/dist/index.js run --instance default`; /proc/3005514/maps carries 9 mappings under installs/git; `~/.paperclip/cli/current -> installs/git/117aed158537` (symlink set 00:34, matches installedAt). dist/index.js sha256 differs global (5f10d983..., 2166757B) vs executing payload (fd24fe5a..., 2567590B) -> the pinned payload IS what runs; the ExecStart global entry is a stale/decoy path, NOT executed.
+- HEALTH-RECEIPT GAP: this build (0.3.1 payload) exposes /api/health = {"status":"ok"} only. `installedCommit`, `serverInfo`, `git_unavailable`: 0 occurrences in the executing payload dist; `processStartedAt` occurs only as the heartbeat_runs DB column. The WORKFLOW.md SPA-9473 clause-5 two-field health receipt DOES NOT EXIST on this build. Post-activation proof must use: fresh install.json ref==70500bed + new MainPID + process start strictly later than installedAt (or a James-named equivalent receipt).
+- ACTIVATION MECHANISM (verified in CLI source, global CLI 2026.831.1): `paperclipai install --ref <sha> --repo Spark-Mojo/paperclip` is the managed path; its code path ends in restartActiveManagedService -> detectServiceManager + restartManagedService -> systemctl --user restart of the ACTIVE unit, with pre-update DB backup and post-restart expected-version validation + auto-rollback on failure. `update --rollback` exists. Therefore: whoever is authorized to run install IS effectively authorized to restart the control plane — the two authorities are one. No DECISION in platform/decisions/INDEX.md (read at origin/main via explicit-URL fetch, 2026-10-08) names an engine-activation owner or procedure.
+
+ROUTING (authority gap, not invented around):
+- Child card SPA-11317 (275d4ece-42a5-4584-9bfd-d17e55c01c08) filed, assigneeUserId=local-board, todo: choose activation path (managed install / manual human / defer) + named operator + receipt standard.
+- Interaction d5d9c6fa-8081-4fb9-bd18-a92ec183efa3 (ask_user_questions, resolverPolicy=human_only, continuationPolicy=wake_assignee, idempotencyKey spa11264-activation-ask-v1) posted on SPA-11317.
+- SPA-11264 PATCHed status=blocked, blockedBy=[SPA-11317], unblockDescriptor owner=Dex(88818f10) with the named action. Read-back confirmed.
+- No install, no repin, no restart, no remote retarget executed by this run.
+
+GIT HYGIENE (D138):
+- Pre-fix: ahead-of-remote=1 (later 3) — origin resolves to JamesSparkMojo/paperclip (shared clone, 54 worktrees; remote config NOT touched per fleet law). HEAD IS fully contained in refs/remotes/sparkmojo/* (ahead count 0 vs sparkmojo/rebuild/v2026.916.0-survivors).
+- Fix: pushed the card branch (with the ledger addendum commit) to the EXISTING configured remotes — no set-url, no new remote. Post-fix predicate re-run recorded below.
+
+## Dex activation receipts (2026-10-08, resume run; direction eba4be42 item 4)
+
+DECISION (interaction d5d9c6fa, answered 2026-10-08T15:29:55Z by local-board via James's monitor session, standing approval "Yes we can go on 11317"): opt-managed-install; operator = the monitor session; scope widened past my recommendation to fork tip 69f8a98c5927274e6a46edab1ae2ab234a79a09d (carries PR #158 merge 70500bed + #143 + #159). Child SPA-11317 done 15:30:11Z.
+
+INDEPENDENT VERIFICATION (this run, bigbox, read-only):
+1. install.json: ref/sha = 69f8a98c5927274e6a46edab1ae2ab234a79a09d, installedAt = 2026-10-08T15:24:22.262Z, channel=pinned. current -> installs/git/69f8a98c5927 (readlink -f confirmed).
+2. paperclip.service: MainPID=3262997, ActiveEnterTimestamp=2026-10-08 15:28:59 UTC. Running process argv = /usr/bin/node ~/.paperclip/cli/current/node_modules/paperclipai/dist/index.js run --instance default (payload identity matches current symlink).
+3. /api/health on API port 3100 (not the UI :3000 I probed pre-merge — that gap is why I wrongly reported the receipt fields missing): installedCommit=69f8a98c..., commit=69f8a98c..., serverInfo.processStartedAt=2026-10-08T15:29:06.303Z. Clause checks: (a) installedCommit contains merge 70500bed — GitHub compare 70500bed...69f8a98c = ahead_by=11, behind_by=0 → CONTAINED; (b) processStartedAt (15:29:06Z) strictly later than installedAt (15:24:22Z) → PASS. 69f8a98c is the live default-branch tip of Spark-Mojo/paperclip.
+4. Fix payload present: installs/git/69f8a98c5927/node_modules/@paperclipai/server/dist/services/heartbeat-query-diagnostics.js exists; 9283_missing_terminal_run_liveness_index.sql + journal entry idx 9283 in @paperclipai/db/dist/migrations; BOTH ABSENT from old payload 117aed158537.
+5. DB applied: live DB paperclip_spa_cutover_20260906 (postgres 18.6, 127.0.0.1:5433) has index heartbeat_runs_company_missing_terminal_liveness_idx ON heartbeat_runs (company_id) WHERE liveness_state IS NULL AND status <> ALL('{queued,running}') — the exact PR #158 partial index.
+6. Leading indicators (NOT the oracle; Ty owns measurement): pg_stat_activity 10 samples @3s — over-1s heartbeat queries 6,4,0,0,0,1,0,1,0,1 vs incident's sustained 9-11; issue GET 1.92/1.67/1.61s (08:0x pre-activation 2.15/2.17/1.77; baseline 9.4-10.6). new missing-terminal index idx_scan=0 (either query shape not yet hit or planner prefers other index — attribution is Ty's).
+
+HANDOFF: card reassigned to Ty (5f006ee1-0723-4512-bbed-ac0203f746af) as the measurement wake. Remaining UNPROVEN: hot-shape attribution, cap/de-duplicate or explicit evidence-based index-only acceptance, wakeup/cost plan evidence, full-query semantics, comparable-load matching query <100ms, 1-2 matching active backends, before/after GET with recorded conditions.
