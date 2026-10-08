@@ -1,5 +1,31 @@
 # SPA-9434 gates
 
+## 2026-10-08 CI diagnosis and correction
+
+Pinned PR read: H=5ace7e13bfe1b27a97c06acfcd25620297616899, B=b7a3a892d8add53f1b2e6166fdce6f7d0d6756f4. Ancestor A=a7758a4a6d32a6b879e2831a0644d2e4e3178224 (`git merge-base --is-ancestor A B` exit 0). Head run 37171692766 compared with ancestor run 37102675212 using `gh run view RUN -R Spark-Mojo/paperclip --log-failed`. Paginated B check inventory returned total_count=86, 86 entries, no ci jobs: ancestor comparison is necessary, not an exact-base CI claim.
+
+- policy: same three git-push scanner lines in both runs.
+- serialized 5/9: same openapi-routes mounted-route coverage failure.
+- serialized 6/9 and 7/9: same issue-watchdogs and permissions-upgrade root-task project-required 422 failures.
+- server 11/12: same plugin-orchestration project-required 422 failure.
+- server 12/12: same status-cards authoring test, line 406, expected 201 received 422. This is NOT the head-only regression.
+- workspaces-b: both runs have write EPIPE (errno -32) after tests; no allocator assertion implicated.
+- verify and e2e: downstream policy-result failure. Head e2e shards all succeeded; aggregate exits on POLICY_RESULT=failure.
+- vendor review: fork exception, not a code regression.
+- serialized 1/9: actual head-only failure. The missing-project-id recovery test receives setup_failed instead of workspace_validation_failed. New selected-workspace validation runs against an empty candidate set before the existing missing-project validator. Guard selection validation with workspaceProjectId to preserve the typed rejection. Missing selected workspaces on a real project remain fail-closed.
+
+Ancestor-to-base diff is empty for pr.yml, status-cards test/route, openapi-routes test, permissions-upgrade test, issue-watchdogs test and plugin-orchestration test. Full causal non-touch evidence for every base-red exemption remains to be reviewed; this comparison alone is NOT merge authorization.
+
+Gate 4: Preserve typed missing-project rejection before adapter launch.
+  CHECK: timeout 240 pnpm exec vitest run server/src/__tests__/heartbeat-process-recovery.test.ts -t 'blocks a git-sensitive local adapter before launch when a project-workspace-linked issue is missing its project id'
+  EXPECT: Tests  1 passed
+  RESULT: exit 0, 1 passed / 323 skipped; WorkspaceValidationFailure reason=missing_project_id; adapter never called.
+  NEGATIVE: run the identical CHECK with only workspaceProjectId guard removed.
+  RESULT: exit 1, expected workspace_validation_failed, received setup_failed. Guard restored afterward.
+
+The regression test now uses existing runtimeEnv:{} seam. Before that change, local worktree scheduling suppression kept the fixture queued (two failed attempts, not behavioral evidence). No assertion was weakened. Allocator suite CHECK above: exit 0, 174 passed. `timeout 120 pnpm --filter @paperclipai/server exec tsc --noEmit`: exit 0. CI rerun and fresh independent final-head verification remain required; no rollout performed.
+
+
 Gate 1: A selected registered project workspace is the only repository materialized; invalid selection refuses allocation.
   CHECK: timeout 180 pnpm exec vitest run server/src/__tests__/heartbeat-workspace-session.test.ts
   EXPECT: Test Files  1 passed
