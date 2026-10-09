@@ -760,3 +760,39 @@ Observed exit 0. `git diff --check` exit 0.
 
 Production code is unchanged by this gate — it adds no call site, only the
 regression that locks the identity predicate.
+
+## 2026-10-09 base moved again — PR #138 is DIRTY, migration number collides
+
+Discovered while pinning the head for the independent review, not by waiting for
+a CI signal. The live engine line moved 74 commits since this branch was cut.
+
+```
+PR #138 headRefOid                96ea6ce03ab6c2f4f16e4160f7a864b2455eeae8
+pinned baseRefOid (stale)         916919bb7cbdbdfddaac59e31bf6b2e94bcf637c
+live base 818d2fb85f874c9433363b4ee02fb25b6f9acd3c   (74 commits ahead)
+gh api .../pulls/138              mergeable=false  mergeable_state=dirty
+git rev-list --count HEAD..<base>  74   (we are behind)
+```
+
+CHECK: `node .github/scripts/check-pr-migration-order.mjs 818d2fb85f874c9433363b4ee02fb25b6f9acd3c 96ea6ce03ab6c2f4f16e4160f7a864b2455eeae8`
+EXPECT: exit 0.
+Observed **exit 1**:
+`::error title=Migration numbers must follow the target branch::The target branch already contains migrations through packages/db/src/migrations/9283_missing_terminal_run_liveness_index.sql. ... Update from the target branch, then renumber this PR's migrations starting at 9284`
+
+The base took `9283` with its own `9283_missing_terminal_run_liveness_index.sql`
+while this branch holds `9283_stranded_rewake_idempotency.sql`. Migration
+numbers are append-only, so a number already present on the target cannot be
+reused. This is the same defect class that made this PR DIRTY once before
+(0283 vs 9282); it recurs because the base keeps absorbing migrations.
+
+`git merge-tree --write-tree HEAD 818d2fb85f` confirms one conflict, in the same
+file the repo gate names: `packages/db/src/migrations/meta/_journal.json`
+(binary to git's merge driver). Every source file auto-merges, including
+`heartbeat.ts`, `recovery/service.ts`, `index.ts` and the lease suite — so the
+restamp is a bounded operation, not a redesign.
+
+Consequence for sequencing: PR #138 CANNOT merge at this head, so a verifier
+PASS would buy nothing (a card's acceptance is post-merge live recovery). The
+restamp to 9284 is therefore the next action, ahead of the independent review.
+Recorded here rather than in prose on the card so the verifier reads it with
+the gates.
