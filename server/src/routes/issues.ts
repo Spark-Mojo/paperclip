@@ -1055,6 +1055,23 @@ function hasExecutionParticipant(value: unknown) {
   return false;
 }
 
+/**
+ * SPA-9806: a board actor whose identity was never established by a credential.
+ *
+ * On a `local_trusted` deployment `actorMiddleware` pre-types every request as
+ * `{ type: "board", source: "local_implicit" }`; a request carrying an
+ * unresolvable credential instead fails with 401 in the auth layer and never
+ * reaches a handler. So `source === "local_implicit"` is exactly "board actor,
+ * no credential", while a genuine human session is `source === "session"` and
+ * an API caller is `source === "board_key"`. This deliberately keys on the
+ * RESOLVED actor and never on whether an Authorization header was present: a
+ * header check also matches a real cookie-authenticated board UI session and
+ * would refuse the human's own writes.
+ */
+function isImplicitBoardActor(actor: { type?: string; source?: string } | null | undefined) {
+  return actor?.type === "board" && actor?.source === "local_implicit";
+}
+
 function hasScheduledMonitor(input: {
   existingMonitorNextCheckAt?: Date | null;
   patchMonitorNextCheckAt?: unknown;
@@ -9421,6 +9438,7 @@ export function issueRoutes(
                 userId: actor.actorType === "user" ? actor.actorId : null,
               },
               allowBoardOverride: req.actor.type === "board",
+              implicitBoardActor: isImplicitBoardActor(req.actor),
               commentBody: resolutionNote ?? null,
             });
             Object.assign(updateFields, transition.patch);
@@ -13251,6 +13269,7 @@ export function issueRoutes(
           userId: actor.actorType === "user" ? actor.actorId : null,
         },
         allowBoardOverride: req.actor.type === "board",
+        implicitBoardActor: isImplicitBoardActor(req.actor),
         commentBody,
         reviewRequest: reviewRequest === undefined ? undefined : reviewRequest,
         monitorExplicitlyUpdated:

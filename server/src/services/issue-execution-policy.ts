@@ -50,6 +50,7 @@ type TransitionInput = {
   requestedAssigneePatch: RequestedAssigneePatch;
   actor: ActorLike;
   allowBoardOverride?: boolean;
+  implicitBoardActor?: boolean;
   commentBody?: string | null;
   reviewRequest?: IssueExecutionState["reviewRequest"] | null;
   monitorExplicitlyUpdated?: boolean;
@@ -933,6 +934,22 @@ function applyIssueExecutionStageTransition(input: TransitionInput): TransitionR
       !principalsEqual(existingState?.currentParticipant ?? null, currentParticipant);
 
     if (input.allowBoardOverride && attemptedStageAdvance) {
+      // SPA-9806: an *anonymous* board actor must not dissolve a live stage.
+      // `allowBoardOverride` is granted to any board actor, and on a
+      // local_trusted deployment a request that carries no resolvable
+      // credential is still typed as board with source "local_implicit" --
+      // which is exactly how a caller's missing Authorization header silently
+      // nulled SPA-9404's executionState. A credential that resolves to a real
+      // principal (source "session" or "board_key") keeps the override; an
+      // anonymous one is refused so the stage survives to be repaired
+      // deliberately. This is actor-side only: the participant-exclusion
+      // fallback further down repairs the damage for every actor.
+      if (input.implicitBoardActor) {
+        throw unprocessable(
+          "An authenticated board actor is required to advance or dissolve an active execution stage",
+          { code: "implicit_board_stage_override" },
+        );
+      }
       if (requestedStatus !== undefined && requestedStatus !== "in_review") {
         patch.executionState = null;
         return { patch };
@@ -1020,6 +1037,27 @@ function applyIssueExecutionStageTransition(input: TransitionInput): TransitionR
         : explicitAssignee,
     exclude: returnAssignee,
   });
+  // SPA-9806: `returnAssignee` falls back to the CURRENT assignee whenever
+  // executionState is missing, so on a single-participant stage whose only
+  // participant is also the assignee, the exclusion empties the set and the
+  // transition 422s -- for a stage that does have a valid participant. That is
+  // what stranded SPA-9404 after its stage was dissolved: no write could
+  // re-seed it.
+  //
+  // Scoped to re-pending a stage, and deliberately NOT applied on the done
+  // path. On `requestedStatus === "done"` an emptied participant set is the
+  // existing self-review auto-skip signal (canAutoSkipPendingStage): a card
+  // whose only reviewer is its own assignee must skip that stage rather than
+  // have itself review its own work. Widening the selector there would
+  // silently disable that guard. On the recovery path returnAssignee is not a
+  // recorded value at all but a guess from the live assignee, so treating it as
+  // a veto carries no review-integrity meaning.
+  if (!participant && !existingState && requestedStatus === "in_review") {
+    participant = selectStageParticipant(pendingStage, {
+      preferred: explicitAssignee,
+      exclude: null,
+    });
+  }
   while (!participant && canAutoSkipPendingStage({ stage: pendingStage, returnAssignee, requestedStatus })) {
     skippedStageIds.push(pendingStage.id);
     pendingStage = nextPendingStage(

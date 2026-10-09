@@ -2343,4 +2343,193 @@ describe("review round circuit breaker", () => {
   });
 });
 
+// SPA-9806: a headerless PATCH silently dissolved a live review stage, and the
+// resulting "No eligible review participant" 422 left no supported write path.
+describe("SPA-9806 anonymous-dissolve guard and participant-exclusion fallback", () => {
+  const soleParticipantPolicy = makePolicy([
+    { type: "review", participants: [{ type: "agent", agentId: qaAgentId }] },
+  ]);
+  const soleStageId = soleParticipantPolicy.stages[0].id;
+
+  function liveReviewIssue(): IssueLike {
+    return {
+      status: "in_review",
+      assigneeAgentId: qaAgentId,
+      assigneeUserId: null,
+      executionPolicy: soleParticipantPolicy,
+      executionState: {
+        status: "pending",
+        currentStageId: soleStageId,
+        currentStageIndex: 0,
+        currentStageType: "review",
+        currentParticipant: { type: "agent", agentId: qaAgentId },
+        returnAssignee: { type: "agent", agentId: coderAgentId },
+        completedStageIds: [],
+        lastDecisionId: null,
+        lastDecisionOutcome: null,
+      },
+    } as unknown as IssueLike;
+  }
+
+  it("REFUSES an anonymous (local_implicit) board actor dissolving a live stage", () => {
+    expect(() =>
+      applyIssueExecutionPolicyTransition({
+        issue: liveReviewIssue(),
+        policy: soleParticipantPolicy,
+        requestedStatus: "in_progress",
+        requestedAssigneePatch: {},
+        actor: { userId: boardUserId },
+        allowBoardOverride: true,
+        implicitBoardActor: true,
+      }),
+    ).toThrow(/authenticated board actor is required/i);
+  });
+
+  it("POSITIVE CONTROL: an authenticated board session keeps the override", () => {
+    // The guard must be narrow. If it refused every board actor it would block
+    // the human's own board UI, so a real credential still dissolves as before.
+    const result = applyIssueExecutionPolicyTransition({
+      issue: liveReviewIssue(),
+      policy: soleParticipantPolicy,
+      requestedStatus: "in_progress",
+      requestedAssigneePatch: {},
+      actor: { userId: boardUserId },
+      allowBoardOverride: true,
+      implicitBoardActor: false,
+    });
+
+    expect(result.patch).toEqual({ executionState: null });
+  });
+
+  it("REFUSES an anonymous assignee-only override that would dissolve the stage", () => {
+    expect(() =>
+      applyIssueExecutionPolicyTransition({
+        issue: liveReviewIssue(),
+        policy: soleParticipantPolicy,
+        requestedAssigneePatch: { assigneeAgentId: ctoAgentId },
+        actor: { userId: boardUserId },
+        allowBoardOverride: true,
+        implicitBoardActor: true,
+      }),
+    ).toThrow(/authenticated board actor is required/i);
+  });
+
+  it("NEGATIVE CONTROL: the recovery fallback selects real stage membership, not the excluded guess", () => {
+    // If the fallback simply dropped the exclusion and took the first
+    // participant, it could hand a stage to somebody who is not on it. With a
+    // non-participant assignee the participant returned must still be the
+    // stage's genuine member, and never the excluded principal.
+    const result = applyIssueExecutionPolicyTransition({
+      issue: {
+        status: "in_review",
+        assigneeAgentId: ctoAgentId,
+        assigneeUserId: null,
+        executionPolicy: soleParticipantPolicy,
+        executionState: null,
+      } as unknown as IssueLike,
+      policy: soleParticipantPolicy,
+      requestedStatus: "in_review",
+      requestedAssigneePatch: { assigneeAgentId: ctoAgentId },
+      actor: { userId: boardUserId },
+      allowBoardOverride: true,
+      implicitBoardActor: false,
+    });
+
+    expect(result.patch.executionState).toMatchObject({
+      currentParticipant: { type: "agent", agentId: qaAgentId },
+    });
+    expect(result.patch.executionState).not.toMatchObject({
+      currentParticipant: { agentId: ctoAgentId },
+    });
+  });
+
+  it("NEGATIVE CONTROL: the self-review auto-skip on done is NOT disabled", () => {
+    // The exact hazard the scoped fallback avoids: a single-reviewer card whose
+    // reviewer is its own assignee must SKIP that stage on done, never be handed
+    // to itself as a reviewer.
+    const policy = makePolicy([
+      { type: "review", participants: [{ type: "agent", agentId: qaAgentId }] },
+    ]);
+
+    const result = applyIssueExecutionPolicyTransition({
+      issue: {
+        status: "in_progress",
+        assigneeAgentId: qaAgentId,
+        assigneeUserId: null,
+        executionPolicy: policy,
+        executionState: null,
+      } as unknown as IssueLike,
+      policy,
+      requestedStatus: "done",
+      requestedAssigneePatch: {},
+      actor: { agentId: qaAgentId },
+    });
+
+    expect(result.patch.executionState).toMatchObject({
+      status: "completed",
+      currentParticipant: null,
+      completedStageIds: [policy.stages[0].id],
+    });
+  });
+
+  it("rebuilds a null executionState when the sole participant is also the assignee", () => {
+    // The SPA-9404 recovery shape: state dissolved, so returnAssignee falls back
+    // to the current assignee, who is the stage's only participant. The old
+    // exclusion-to-zero produced an unprocessable 422 here.
+    const result = applyIssueExecutionPolicyTransition({
+      issue: {
+        status: "backlog",
+        assigneeAgentId: qaAgentId,
+        assigneeUserId: null,
+        executionPolicy: soleParticipantPolicy,
+        executionState: null,
+      } as unknown as IssueLike,
+      policy: soleParticipantPolicy,
+      requestedStatus: "in_review",
+      requestedAssigneePatch: {},
+      actor: { agentId: qaAgentId },
+    });
+
+    expect(result.patch.executionState).toMatchObject({
+      status: "pending",
+      currentStageId: soleStageId,
+      currentParticipant: { type: "agent", agentId: qaAgentId },
+    });
+  });
+
+  it("still prefers a non-excluded participant when one exists", () => {
+    const policy = makePolicy([
+      {
+        type: "review",
+        participants: [
+          { type: "agent", agentId: qaAgentId },
+          { type: "agent", agentId: ctoAgentId },
+        ],
+      },
+    ]);
+    const stageId = policy.stages[0].id;
+
+    const result = applyIssueExecutionPolicyTransition({
+      issue: {
+        status: "backlog",
+        assigneeAgentId: qaAgentId,
+        assigneeUserId: null,
+        executionPolicy: policy,
+        executionState: null,
+      } as unknown as IssueLike,
+      policy,
+      requestedStatus: "in_review",
+      requestedAssigneePatch: {},
+      actor: { agentId: ctoAgentId },
+    });
+
+    // qaAgentId is the excluded return assignee, so the other participant wins.
+    expect(result.patch.executionState).toMatchObject({
+      status: "pending",
+      currentStageId: stageId,
+      currentParticipant: { type: "agent", agentId: ctoAgentId },
+    });
+  });
+});
+
 type IssueLike = Parameters<typeof applyIssueExecutionPolicyTransition>[0]["issue"];

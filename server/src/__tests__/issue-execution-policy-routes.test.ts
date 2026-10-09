@@ -162,7 +162,10 @@ type TestActor =
       type: "board";
       userId: string;
       companyIds: string[];
-      source: "local_implicit";
+      // SPA-9806: "local_implicit" is a board actor with NO resolvable
+      // credential, and it may no longer dissolve a live execution stage.
+      // A genuine human board session is "session" (cookie) or "board_key".
+      source: "local_implicit" | "session" | "board_key";
       isInstanceAdmin: boolean;
     }
   | {
@@ -171,6 +174,26 @@ type TestActor =
       companyId: string;
       runId: string | null;
     };
+
+/**
+ * SPA-9806: a real human board session (cookie or API key), as opposed to the
+ * default fixture's credential-less "local_implicit" actor. Tests that assert
+ * board override behaviour must use this one -- an anonymous actor may no
+ * longer dissolve a live execution stage.
+ */
+function boardUserActor(): TestActor {
+  return {
+    type: "board",
+    userId: "local-board",
+    companyIds: ["company-1"],
+    source: "session",
+    // An authenticated session actor is NOT auto-allowed the way the
+    // local_implicit one is (authorization.ts `allow_local_board` keys on
+    // source === "local_implicit"), so it needs real elevation. These tests
+    // assert what an instance admin's board UI may do to a live stage.
+    isInstanceAdmin: true,
+  };
+}
 
 async function createApp(actor?: TestActor) {
   const [{ errorHandler }, { issueRoutes }] = await Promise.all([
@@ -251,7 +274,13 @@ describe("issue execution policy routes", () => {
     });
     mockAccessService.canUser.mockResolvedValue(false);
     mockAccessService.decide.mockImplementation(async (input: { actor?: { type?: string; source?: string }; action?: string }) => {
-      const allowed = input.actor?.type === "board" && input.actor.source === "local_implicit"
+      // SPA-9806: a board actor is authorised either as the credential-less
+      // local_implicit actor or as an authenticated instance-admin session/key.
+      // Both may act on a live stage in these tests; the anonymous one is
+      // separately constrained by the dissolve guard under test.
+      const allowed = input.actor?.type === "board"
+        && (input.actor.source === "local_implicit"
+          || (input.actor as { isInstanceAdmin?: boolean }).isInstanceAdmin === true)
         ? true
         : input.actor?.type === "agent" && [
             "company_scope:read",
@@ -855,7 +884,7 @@ describe("issue execution policy routes", () => {
       updatedAt: new Date(),
     }));
 
-    const res = await request(await createApp())
+    const res = await request(await createApp(boardUserActor()))
       .patch("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
       .send({ status: "cancelled" });
 
@@ -914,7 +943,7 @@ describe("issue execution policy routes", () => {
       updatedAt: new Date(),
     }));
 
-    const res = await request(await createApp())
+    const res = await request(await createApp(boardUserActor()))
       .patch("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
       .send({ status: "cancelled" });
 
@@ -980,7 +1009,7 @@ describe("issue execution policy routes", () => {
       updatedAt: new Date(),
     }));
 
-    const res = await request(await createApp())
+    const res = await request(await createApp(boardUserActor()))
       .patch("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
       .send({ assigneeAgentId: "55555555-5555-4555-8555-555555555555" });
 
@@ -1038,7 +1067,7 @@ describe("issue execution policy routes", () => {
       updatedAt: new Date(),
     }));
 
-    const res = await request(await createApp())
+    const res = await request(await createApp(boardUserActor()))
       .patch("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
       .send({ assigneeAgentId: "55555555-5555-4555-8555-555555555555" });
 
