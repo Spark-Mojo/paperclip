@@ -827,3 +827,77 @@ CHECK: server `tsc --noEmit` exit 0; `packages/db` `tsc --noEmit` exit 0;
 Total this run: 307 tests across 14 files, all green on the restamped head.
 Not yet done: push of the restamp branch, PR head move, and the independent
 whole-PR review. No merge, install, live DB write or acceptance wake.
+
+## 2026-10-09 independent review attempt 3 — BLOCKED (access), with a NEW root cause
+
+Third verify attempt on this PR, first on a mergeable head. The verdict is
+`BLOCKED (access: … DIFF-TOO-LARGE …)`, no sign-off posted, no requirement
+judged. This run does not treat it as a pass and does not retry it unchanged.
+
+```
+VERDICT: BLOCKED (access: paged diff preflight refused — DIFF-TOO-LARGE at
+         119043 tokens vs budget 119043; no pages emitted)
+pr-read.sh head 138 -> headRefOid=b29a05728f64914a151643bdcdf6ddacd4a83a3b
+                      baseRefOid=818d2fb85f874c9433363b4ee02fb25b6f9acd3c  (matches)
+check-runs [] statuses [] state pending (no marker claimed, none classified)
+```
+
+**The DIFF-TOO-LARGE cause is NOT the generated snapshot, which is what the
+previous two blocks assumed. Measured on this head:**
+
+```
+full unified-3 diff bytes                      382916   (~127638 tokens)
+  of which 9284_snapshot.json path               254   (binary delta, NOT 1.4 MB)
+  source + test paths                          307967   (~102655 tokens, 80%)
+  .unlazy ledgers                               74432   (~24810 tokens, 19%)
+manifest paths                                     24
+pr-read.sh measured preflight                  310256 tokens vs budget 119043
+```
+
+Because the restamped snapshot was already present on the base line, git records
+it as a 254-byte binary delta. The comparator exemption was never the binding
+constraint at this head: the behavioural change alone models to ~308722 tokens
+against a 119043 budget, i.e. ~2.6x over. Any fix that only exempts the snapshot
+leaves this PR unreadable. This corrects the assumption recorded in the two
+earlier blocked attempts.
+
+**Two independent access defects, both outside this card's authority to fix.**
+
+1. **The budget is harness-injected and unreachable from a builder.** My own
+   session env carries `SM_VERIFY_DIFF_BUDGET=119043`, while `pr-read.sh:483`
+   defaults to 60000 — so the harness injects it, and the verifier subagent runs
+   in its own process, so a builder-side export cannot raise it. This is the
+   same finding already recorded on the open friction card
+   (`5a6db7a1-5f57-4c92-93ca-4c6ef9427194`, sparkmojo-internal#1102): a ~100k-token
+   diff is unjudgeable and the lever lives wherever `119043` is injected. This
+   PR needs ~310k. Raising the ceiling, or splitting the PR, is that card's and
+   its owner's call, not this card's.
+
+2. **The governed comparator is hardcoded to 9283 and now FAILS on this PR.**
+   `pr-read.sh:507-512` reads `9282_snapshot.json` / `9283_snapshot.json` and
+   asserts journal tail `idx == 9282 and idx == 9283`. The live run at this head:
+
+   ```
+   fatal: path 'packages/db/src/migrations/meta/9283_snapshot.json' does not
+          exist in 'b29a05728f64914a151643bdcdf6ddacd4a83a3b'
+   pr-read: file-diff: 9283 snapshot missing
+   ```
+
+   So the restamp that made the PR mergeable simultaneously broke the only
+   bounded whole-object read the verifier has for the migration. This is a real
+   coupling that no earlier note recorded: a card that renumbers its migration
+   must also have the comparator parameterized, or verification is impossible by
+   construction. The builder cannot fix this — a card must not author the fix to
+   the gate that gates its own work, and both the comparator and `verify.md`
+   are governed fleet files.
+
+   The builder's own whole-object comparator (`node /tmp/snapcmp.mjs`, gate
+   above) covers the same ground and passes with its negative, but it is author
+   evidence and is not a substitute for an independent read.
+
+**Not done:** no retry on an unchanged head, no budget export, no edit to
+`pr-read.sh` or `verify.md`, no self-approval. PR #138 stays OPEN and
+`mergeable=true / mergeable_state=clean` on the restamped head, which is a real
+advance over the DIRTY state it was in at the start of this run. Merge, install
+and the live acceptance observation on SPA-8692 / SPA-9280 remain untouched and
+are not claimed.
