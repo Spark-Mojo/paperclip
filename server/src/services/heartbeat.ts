@@ -17940,6 +17940,15 @@ export function heartbeatService(
                       ),
                     )
                     .returning();
+                  // SPA-9351: this admission cancel writes the run row
+                  // directly instead of through setRunStatus, so it must
+                  // release the run's local ephemeral lease itself. The lease
+                  // is acquired before dispatch (environment-runtime.ts:1103),
+                  // so without this the lease stays active and the card
+                  // strands behind `execution_owner_active`.
+                  if (cancelled) {
+                    await releaseTerminalLocalLeases(tx, cancelled);
+                  }
                   if (!cancelled) return { kind: "stale" as const, run: null };
                   await tx
                     .update(agentWakeupRequests)
@@ -18047,6 +18056,11 @@ export function heartbeatService(
                     ),
                   )
                   .returning();
+                // SPA-9351: direct admission cancel — release the local
+                // ephemeral lease in the same transaction as the run write.
+                if (cancelled) {
+                  await releaseTerminalLocalLeases(tx, cancelled);
+                }
                 await tx
                   .update(agentWakeupRequests)
                   .set({
@@ -28118,6 +28132,11 @@ export function heartbeatService(
 
             if (!cancelled) return false;
 
+            // SPA-9351: direct admission cancel — release the local ephemeral
+            // lease in the same transaction as the run write, so a retry that
+            // never became due cannot leave an active lease behind.
+            await releaseTerminalLocalLeases(tx, cancelled);
+
             if (scheduledRun.wakeupRequestId) {
               await tx
                 .update(agentWakeupRequests)
@@ -28251,6 +28270,11 @@ export function heartbeatService(
               .returning();
             if (cancelled.length > 0) {
               cancelledRunsToEmit.push(cancelled[0]);
+              // SPA-9351: direct admission cancel — release the local ephemeral
+              // lease in the same transaction as the run write. A queued holder
+              // holds an acquired lease, and leaving it active strands the card
+              // behind `execution_owner_active`.
+              await releaseTerminalLocalLeases(tx, cancelled[0]);
               if (activeExecutionRun.wakeupRequestId) {
                 await tx
                   .update(agentWakeupRequests)
@@ -28343,6 +28367,9 @@ export function heartbeatService(
                   .returning();
                 if (staleCancelled.length > 0) {
                   cancelledRunsToEmit.push(staleCancelled[0]);
+                  // SPA-9351: direct admission cancel — release the local
+                  // ephemeral lease in the same transaction as the run write.
+                  await releaseTerminalLocalLeases(tx, staleCancelled[0]);
                   if (legacyRun.wakeupRequestId) {
                     await tx
                       .update(agentWakeupRequests)

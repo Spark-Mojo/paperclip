@@ -7,12 +7,17 @@ import type { Environment } from "@paperclipai/shared";
 import {
   activityLog,
   agents,
+  agentRuntimeState,
+  agentTaskSessions,
+  agentWakeupRequests,
   companies,
+  companySkills,
   createDb,
   environmentLeases,
   environments,
   heartbeatRunEvents,
   heartbeatRuns,
+  issues,
 } from "@paperclipai/db";
 import {
   getEmbeddedPostgresTestSupport,
@@ -36,6 +41,32 @@ if (!embeddedPostgresSupport.supported) {
 
 const RECLAIM_BATCH = 25;
 
+// SPA-9351: the direct-terminal-writer cases below call heartbeat.wakeup,
+// which dispatches post-commit and keeps writing rows after the test body
+// returns. Teardown must drain those dispatches BEFORE deleting fixture rows,
+// and must delete children (agent_task_sessions) before the runs they
+// reference. The same discipline the deferred-wake suite adopted for the
+// `delete from heartbeat_runs` vs async `UPDATE issues` race.
+const trackedHeartbeatServices: Array<{ drainActiveRunExecutions: () => Promise<void> }> = [];
+
+function trackHeartbeatService<T extends { drainActiveRunExecutions: () => Promise<void> }>(
+  service: T,
+): T {
+  trackedHeartbeatServices.push(service);
+  return service;
+}
+
+async function drainTrackedHeartbeatServices(): Promise<void> {
+  // Repeat: a settling run can dispatch a follow-up for the same agent,
+  // registering further work on the same instance before it goes idle.
+  for (let pass = 0; pass < 5; pass += 1) {
+    await Promise.all(
+      trackedHeartbeatServices.map((service) => service.drainActiveRunExecutions()),
+    );
+  }
+  trackedHeartbeatServices.length = 0;
+}
+
 describeEmbeddedPostgres("terminal environment leases (SPA-9423)", () => {
   let cleanupDb: (() => Promise<void>) | null = null;
   let db!: ReturnType<typeof createDb>;
@@ -47,14 +78,20 @@ describeEmbeddedPostgres("terminal environment leases (SPA-9423)", () => {
   }, 30_000);
 
   afterEach(async () => {
+    await drainTrackedHeartbeatServices();
     await db.delete(activityLog);
+    await db.delete(companySkills);
+    await db.delete(agentTaskSessions);
     await db.delete(environmentLeases);
     await db.delete(heartbeatRunEvents);
     await db.delete(heartbeatRuns);
+    await db.delete(agentWakeupRequests);
+    await db.delete(issues);
+    await db.delete(agentRuntimeState);
     await db.delete(agents);
     await db.delete(environments);
     await db.delete(companies);
-  });
+  }, 120_000);
 
   afterAll(async () => {
     await cleanupDb?.();
@@ -70,6 +107,9 @@ describeEmbeddedPostgres("terminal environment leases (SPA-9423)", () => {
       issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
       requireBoardApprovalForNewAgents: false,
       status: "active",
+      // heartbeat.wakeup() needs a responsible user to dispatch a run. The
+      // seed below is used by the direct-terminal-writer cases.
+      defaultResponsibleUserId: "responsible-user",
       createdAt: now,
       updatedAt: now,
     });
@@ -140,6 +180,81 @@ describeEmbeddedPostgres("terminal environment leases (SPA-9423)", () => {
       createdAt: row.createdAt,
       updatedAt: row.updatedAt,
     } as Environment;
+  }
+
+  /**
+   * A queued run holding an issue's execution lock, with a second agent as the
+   * new assignee. Mirrors the seeded cross-agent reassignment fixture in
+   * `__tests__/heartbeat-lock-release-on-reassignment.test.ts`, which is the
+   * production shape of the direct terminal writer at heartbeat.ts:28236.
+   */
+  async function seedReassignmentHolder(input: {
+    companyId: string;
+    agentId: string;
+    holderStatus: "queued" | "running";
+  }) {
+    const reviewerAgentId = randomUUID();
+    const issueId = randomUUID();
+    const holderRunId = randomUUID();
+    const wakeupRequestId = randomUUID();
+    const issuePrefix = `T${input.companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+    const now = new Date();
+
+    await db.insert(agents).values({
+      id: reviewerAgentId,
+      companyId: input.companyId,
+      name: `Lease Reviewer ${reviewerAgentId.slice(0, 8)}`,
+      role: "engineer",
+      status: "idle",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+      createdAt: now,
+      updatedAt: now,
+    });
+    await db.insert(agentWakeupRequests).values({
+      id: wakeupRequestId,
+      companyId: input.companyId,
+      agentId: input.agentId,
+      source: "assignment",
+      status: "queued",
+      createdAt: now,
+      updatedAt: now,
+    });
+    await db.insert(heartbeatRuns).values({
+      id: holderRunId,
+      companyId: input.companyId,
+      agentId: input.agentId,
+      invocationSource: "assignment",
+      triggerDetail: "system",
+      status: input.holderStatus,
+      wakeupRequestId,
+      contextSnapshot: {
+        issueId,
+        taskId: issueId,
+        wakeReason: "issue_assigned",
+      },
+      createdAt: now,
+      updatedAt: now,
+    });
+    await db.insert(issues).values({
+      id: issueId,
+      companyId: input.companyId,
+      title: "Cross-agent reassignment with a held lease",
+      status: "in_review",
+      priority: "medium",
+      assigneeAgentId: reviewerAgentId,
+      executionRunId: holderRunId,
+      executionAgentNameKey: "lease-subject-agent",
+      executionLockedAt: now,
+      issueNumber: 1,
+      identifier: `${issuePrefix}-1`,
+      createdAt: now,
+      updatedAt: now,
+    });
+
+    return { reviewerAgentId, issueId, holderRunId, wakeupRequestId };
   }
 
   async function seedRun(input: { companyId: string; agentId: string; status: string; id?: string }) {
@@ -955,5 +1070,133 @@ describeEmbeddedPostgres("terminal environment leases (SPA-9423)", () => {
       .from(environmentLeases)
       .where(eq(environmentLeases.id, d5Lease.lease.id));
     expect(d5After[0]?.status).toBe("active");
+  });
+
+  // SPA-9351 direct terminal writers. The two atomic setters
+  // (setRunStatus / setRunStatusFromLive) enclose the lease release in the
+  // run's transaction, but the admission path cancels `queued` and
+  // `scheduled_retry` holders through bare `tx.update(heartbeatRuns)` calls at
+  // heartbeat.ts:17918, :18035, :28100, :28236 and :28328. A lease is acquired
+  // before dispatch (environment-runtime.ts:1103 -> environments.ts:1596), so a
+  // cancelled-by-those-paths run leaves its active lease behind and the card
+  // strands with `execution_owner_active` — the shape the 2026-10-07 monitor
+  // found on 118 leases. This gate pins the real admission cancellation, not a
+  // synthetic status write, so a test that only re-implements the UPDATE shape
+  // cannot pass for it.
+  it("releases the lease of a queued holder cancelled on reassignment", async () => {
+    const { companyId, agentId } = await seedCompanyAndAgent();
+    const scenario = await seedReassignmentHolder({ companyId, agentId, holderStatus: "queued" });
+    const { lease } = await environmentRuntimeService(db).acquireRunLease({
+      companyId,
+      environment: await seedEnvironment({ companyId, driver: "local" }),
+      issueId: scenario.issueId,
+      heartbeatRunId: scenario.holderRunId,
+      persistedExecutionWorkspace: null,
+    });
+
+    await trackHeartbeatService(heartbeatService(db)).wakeup(scenario.reviewerAgentId, {
+      source: "automation",
+      triggerDetail: "system",
+      reason: "issue_assigned",
+      payload: { issueId: scenario.issueId },
+      contextSnapshot: {
+        issueId: scenario.issueId,
+        taskId: scenario.issueId,
+        wakeReason: "issue_assigned",
+      },
+      requestedByActorType: "user",
+      requestedByActorId: "local-board",
+    });
+
+    const [holder] = await db
+      .select({ status: heartbeatRuns.status, errorCode: heartbeatRuns.errorCode })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, scenario.holderRunId));
+    expect(holder?.errorCode).toBe("lock_released_on_reassignment");
+    expect(holder?.status).toBe("cancelled");
+
+    const [after] = await db
+      .select({ status: environmentLeases.status, releasedAt: environmentLeases.releasedAt })
+      .from(environmentLeases)
+      .where(eq(environmentLeases.id, lease.id));
+    expect(after?.status).not.toBe("active");
+    expect(after?.releasedAt).toBeInstanceOf(Date);
+  });
+
+  it("releases the lease of a scheduled_retry run cancelled before it became due", async () => {
+    const { companyId, agentId } = await seedCompanyAndAgent();
+    // cancelStaleScheduledRetry (heartbeat.ts:28100) cancels a
+    // scheduled_retry holder whose issue was cancelled before the retry became
+    // due. It writes the run row directly rather than through setRunStatus, so
+    // its lease is exactly the shape that strands. Drive it through the public
+    // admission path: a wakeup for an issue already in `cancelled`.
+    const cancelledIssueId = randomUUID();
+    const issuePrefix = `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+    const staleRunId = await seedRun({
+      companyId,
+      agentId,
+      status: "scheduled_retry",
+    });
+    const now = new Date();
+    // The admission path finds a legacy holder by context scan
+    // (heartbeat.ts:28291, `contextSnapshot ->> 'issueId'`), so the run has to
+    // name the issue or cancelStaleScheduledRetry never sees it.
+    await db
+      .update(heartbeatRuns)
+      .set({
+        contextSnapshot: {
+          issueId: cancelledIssueId,
+          taskId: cancelledIssueId,
+          wakeReason: "transient_failure_retry",
+        },
+        updatedAt: now,
+      })
+      .where(eq(heartbeatRuns.id, staleRunId));
+    await db.insert(issues).values({
+      id: cancelledIssueId,
+      companyId,
+      title: "Cancelled before the retry became due",
+      status: "cancelled",
+      priority: "medium",
+      issueNumber: 1,
+      identifier: `${issuePrefix}-1`,
+      createdAt: now,
+      updatedAt: now,
+    });
+    const { lease } = await environmentRuntimeService(db).acquireRunLease({
+      companyId,
+      environment: await seedEnvironment({ companyId, driver: "local" }),
+      issueId: cancelledIssueId,
+      heartbeatRunId: staleRunId,
+      persistedExecutionWorkspace: null,
+    });
+
+    await trackHeartbeatService(heartbeatService(db)).wakeup(agentId, {
+      source: "automation",
+      triggerDetail: "system",
+      reason: "issue_assigned",
+      payload: { issueId: cancelledIssueId },
+      contextSnapshot: {
+        issueId: cancelledIssueId,
+        taskId: cancelledIssueId,
+        wakeReason: "issue_assigned",
+      },
+      requestedByActorType: "user",
+      requestedByActorId: "local-board",
+    });
+
+    const [stale] = await db
+      .select({ status: heartbeatRuns.status, errorCode: heartbeatRuns.errorCode })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, staleRunId));
+    expect(stale?.status).toBe("cancelled");
+    expect(stale?.errorCode).toBe("issue_cancelled");
+
+    const [after] = await db
+      .select({ status: environmentLeases.status, releasedAt: environmentLeases.releasedAt })
+      .from(environmentLeases)
+      .where(eq(environmentLeases.id, lease.id));
+    expect(after?.status).not.toBe("active");
+    expect(after?.releasedAt).toBeInstanceOf(Date);
   });
 });

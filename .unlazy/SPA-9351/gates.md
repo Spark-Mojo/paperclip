@@ -604,3 +604,67 @@ EXPECT: exit 0 without diagnostics.
 Observed exit 0; git diff --check exit 0. No server lint script found.
 Remaining direct-writer examples: heartbeat.ts:17918 chat-control stop, :18035 admission cancellation, :28100 scheduled-retry cancellation, :28236 and :28328 retry admission cancellation. These update heartbeatRuns directly, not through the two atomic setters. Inventory is not exhaustive.
 Ownership risk remains unproven: releaseTerminalLocalLeases checks native ownership but not legacy recovery proof; terminalizeLegacyExecution can create a reconciliation action in the same transaction. Before expanding release coverage, test whether any local process can still own execution at that boundary and preserve its required stop proof. Advisor identified this as the next safety gate. External provider cleanup remains outside this run's changes. Full-PR independent review is still pending; no merge/install/live acceptance claim.
+
+## 2026-10-09 direct terminal writers (queued / scheduled_retry admission cancels)
+
+The two atomic setters cover the run-finalization paths, but the admission path
+cancels holders through bare `tx.update(heartbeatRuns)` at heartbeat.ts:17918,
+:18035, :28100, :28236 and :28328. A lease is acquired BEFORE dispatch
+(environment-runtime.ts:1103 -> environments.ts:1596), so a holder cancelled by
+those five writes leaves its active local-ephemeral lease behind — exactly the
+`execution_owner_active` strand the 2026-10-07 monitor found on 118 leases.
+All five run inside an existing `db.transaction`, so each can release in the same
+transaction without a new transaction boundary.
+
+CHECK: `systemd-run --user --scope -q -p TasksMax=512 -- timeout 700 pnpm -C server exec vitest run src/services/terminal-environment-leases.test.ts --disable-console-intercept --reporter=dot`
+EXPECT: `Tests  18 passed (18)`
+Observed exit 0 at 05:56 UTC, 18 passed (16 prior + 2 new).
+The two new cases drive the REAL admission path (`heartbeat.wakeup` with an
+`issue_assigned` reason), not a synthetic status write, so a test that merely
+re-implements the UPDATE shape cannot pass for them. They assert the run reached
+`cancelled` with its production errorCode (`lock_released_on_reassignment`,
+`issue_cancelled`) AND that its lease left `active` with a `releasedAt`.
+
+NEGATIVE (before fix, no production change): the same command.
+Observed exit 1, 2 failed / 16 passed, both
+`AssertionError: expected 'active' not to be 'active'` — the stranded lease,
+not a fixture error. Three teardown defects surfaced first and were fixed
+before the control was accepted as clean, since a control that fails for the
+wrong reason is not a control: missing `defaultResponsibleUserId` (wakeup
+dispatch refused), `agent_task_sessions` / `agent_runtime_state` /
+`company_skills` FK ordering in afterEach, and the drain-before-delete
+discipline adopted from `deferred-wake-backstop.test.ts` (afterEach raised to
+120s because a settling run re-dispatches).
+
+NEGATIVE (mutation, after fix): delete ONLY the five
+`releaseTerminalLocalLeases(tx, ...)` call sites, leaving the tests and all
+other code untouched.
+Observed exit 1, 2 failed / 16 passed, same two assertions. Restored byte-exact
+from a pre-mutation copy; re-run returned exit 0, 18 passed. This is the
+control that proves the tests read the production behaviour rather than
+passing for an unrelated reason.
+
+CHECK: `systemd-run --user --scope -q -p TasksMax=512 -- timeout 400 pnpm -C server exec tsc --noEmit`
+EXPECT: exit 0 without diagnostics.
+Observed exit 0. `git diff --check` exit 0. No server lint script found.
+
+NEGATIVE (typecheck): the first wiring cast `tx as unknown as Db`, which the
+helper's parameter type rejects — 5x TS2739 at heartbeat.ts:17951, :18066,
+:28144, :28284, :28382. Passing `tx` directly (already the transaction type)
+cleared them. Recorded because it is the reason a typecheck control exists here.
+
+REGRESSION: the admission paths have dedicated suites, all foreground this run:
+- `heartbeat-lock-release-on-reassignment.test.ts` + `issue-queued-comments-routes.test.ts`
+  exit 0, 50 passed (2 files) — the two writer shapes this change touches.
+- `deferred-wake-backstop.test.ts` + `terminal-environment-leases.test.ts` +
+  `heartbeat-deferred-promote-on-reassignment.test.ts` exit 0, 80 passed (3 files).
+- `heartbeat-retry-scheduling.test.ts` + `src/services/recovery/**` exit 0,
+  212 passed (9 files) — covers cancelStaleScheduledRetry's retry accounting.
+Total 342 tests / 14 files, all green after the change.
+
+Scope of this run: the five direct writers only. Safety guards in
+`releaseTerminalLocalLeases` (terminal status, native-ownership-held, company,
+owner, `active`, `ephemeral`, `local`) apply unchanged at every call site, so a
+non-local or retained lease is still never released here. Nonlocal provider
+cleanup atomicity and full-PR independent review remain incomplete; no merge,
+install, live DB write or acceptance wake was performed.
