@@ -1,6 +1,7 @@
 import type { Db } from "@paperclipai/db";
 import {
   createAdmissionTransactionScope as buildAdmissionTransactionScope,
+  createDeferredWakeQueueDrainAdapter,
   createPostgresWakeQueueAdapter,
   createWakeAdmissionReader,
   createWakeAdmissionWriter,
@@ -36,6 +37,11 @@ export type {
   TransactionScope,
 } from "./application/ports.js";
 export type { AdmitWakeBehindIssueExecutionInput, AdmitWakeBehindIssueExecutionResult, ReleaseIssueExecutionInput } from "./application/use-cases.js";
+export type {
+  DeferredWakeQueueDrainInput,
+  DeferredWakeQueueDrainOutcome,
+  DeferredWakeQueueDrainWriter,
+} from "./application/ports.js";
 export {
   QueuedCommentMutationError,
   QueuedCommentMutationForbiddenError,
@@ -87,14 +93,16 @@ export type WakeQueueDeps = {
  * before it calls `admitWakeBehindIssueExecution`.
  */
 export function createWakeQueue(db: Db, deps: WakeQueueDeps) {
-  const issueLock = createPostgresWakeQueueAdapter(db, {
+  const adapterDeps = {
     resolveResponsibleUserId: deps.resolveResponsibleUserId,
     getRoutineEnv: deps.getRoutineEnv,
     resolveSessionBeforeForWakeup: deps.resolveSessionBeforeForWakeup,
-  });
+  };
+  const issueLock = createPostgresWakeQueueAdapter(db, adapterDeps);
 
   return {
     releaseIssueExecution: createReleaseIssueExecution({ issueLock, recovery: deps.recovery }),
+    drainDeferredWakeQueue: createDeferredWakeQueueDrainAdapter(db, adapterDeps).drainDeferredWakeQueue,
     admitWakeBehindIssueExecution: createAdmitWakeBehindIssueExecution({
       reader: createWakeAdmissionReader(),
       writer: createWakeAdmissionWriter(),

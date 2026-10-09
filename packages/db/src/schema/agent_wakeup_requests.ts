@@ -89,6 +89,16 @@ export const agentWakeupRequests = pgTable(
       uniqueIndex("agent_wakeup_requests_handoff_bounded_escalation_uq")
         .on(table.companyId, table.idempotencyKey)
         .where(sql`${table.idempotencyKey} LIKE 'handoff_bounded_continuation_escalation:%'`),
+    exhaustedRetryRewakeIdempotencyUq: uniqueIndex(
+      "agent_wakeup_requests_exhausted_retry_rewake_idempotency_uq",
+    )
+      .on(table.companyId, table.idempotencyKey)
+      .where(sql`${table.idempotencyKey} LIKE 'exhausted_retry_rewake:%'`),
+    orphanedRetryRewakeIdempotencyUq: uniqueIndex(
+      "agent_wakeup_requests_orphaned_retry_rewake_idempotency_uq",
+    )
+      .on(table.companyId, table.idempotencyKey)
+      .where(sql`${table.idempotencyKey} LIKE 'orphaned_retry_rewake:%'`),
     companyPayloadIssueIdx: index("agent_wakeup_requests_company_payload_issue_idx").on(
       table.companyId,
       sql`(${table.payload} ->> 'issueId')`,
