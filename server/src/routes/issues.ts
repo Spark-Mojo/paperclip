@@ -12952,7 +12952,17 @@ export function issueRoutes(
           res,
           existing,
           "issue_write_terminal_recomplete",
-          {},
+          // SPA-10721 (GitHub #1288): a write can commit server-side while its
+          // response is lost (client sees HTTP 000). Without a read-back the
+          // caller cannot tell "applied, response dropped" from "refused", and
+          // retries burn on the ambiguity. Carry the persisted outcome in the
+          // response so a single retry resolves it: the requested terminal
+          // status is already the stored state (`terminalStatusAlreadySet`),
+          // and `currentStatus` is the state the caller should observe. The
+          // name is scoped to the *status* on purpose — a PATCH that also
+          // carried a comment was refused wholesale, so the comment did not
+          // land and a blanket `alreadyApplied` would be a lie.
+          { terminalStatusAlreadySet: true, currentStatus: existing.status },
           { terminalStatus },
         );
         return;
