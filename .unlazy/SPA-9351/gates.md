@@ -731,3 +731,32 @@ cases (both `lease-release` and `shutdown` entrypoints).
 
 Consequence: no new production code is warranted from this review. The three
 answers are recorded here so a later reader does not re-derive them.
+
+## 2026-10-09 run-identity binding gate
+
+The advisor's highest-value question was lease identity: can the admission
+release free a DIFFERENT run's live lease? The prose answer is the
+`heartbeat_run_id` predicate in the WHERE clause. That prose is now a gate.
+
+CHECK: `systemd-run --user --scope -q -p TasksMax=512 -- timeout 700 pnpm -C server exec vitest run src/services/terminal-environment-leases.test.ts --disable-console-intercept --reporter=dot`
+EXPECT: `Tests  19 passed (19)`
+Observed exit 0 at 06:2x UTC, 19 passed (18 prior + 1 identity case).
+The case holds two active local-ephemeral leases on the SAME company and agent,
+cancels one run through the real admission path, and requires the sibling's
+lease to still read `active` with a null `releasedAt`.
+
+NEGATIVE (mutation): remove ONLY the
+`eq(environmentLeases.heartbeatRunId, run.id)` predicate from
+releaseTerminalLocalLeases, leaving company/status/policy/provider intact.
+Observed exit 1, 1 failed / 18 passed:
+`AssertionError: expected 'released' to be 'active'` — the cancel freed the
+SIBLING run's live lease. That is precisely the second stranding class the
+identity binding exists to prevent, so the gate is load-bearing rather than
+decorative. Restored byte-exact; re-verified exit 0, 19 passed.
+
+CHECK: `systemd-run --user --scope -q -p TasksMax=512 -- timeout 400 pnpm -C server exec tsc --noEmit`
+EXPECT: exit 0 without diagnostics.
+Observed exit 0. `git diff --check` exit 0.
+
+Production code is unchanged by this gate — it adds no call site, only the
+regression that locks the identity predicate.

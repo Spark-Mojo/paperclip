@@ -1199,4 +1199,64 @@ describeEmbeddedPostgres("terminal environment leases (SPA-9423)", () => {
     expect(after?.status).not.toBe("active");
     expect(after?.releasedAt).toBeInstanceOf(Date);
   });
+
+  // SPA-9351 identity binding. The admission release pins
+  // `heartbeat_run_id = run.id`, so a cancel must never free a DIFFERENT run's
+  // live lease on the same agent. If the WHERE ever loosened to agent/company
+  // scope, a newer queued run that acquired its own lease would have it
+  // released by an older run's cancellation — a second stranding class traded
+  // for the first. This case holds two leases on one company and requires that
+  // cancelling one holder leaves the other's untouched.
+  it("releases only the cancelled run's lease and never a sibling run's", async () => {
+    const { companyId, agentId } = await seedCompanyAndAgent();
+    const environment = await seedEnvironment({ companyId, driver: "local" });
+    const runtime = environmentRuntimeService(db);
+    const scenario = await seedReassignmentHolder({ companyId, agentId, holderStatus: "queued" });
+
+    const cancelledRunLease = await runtime.acquireRunLease({
+      companyId,
+      environment,
+      issueId: scenario.issueId,
+      heartbeatRunId: scenario.holderRunId,
+      persistedExecutionWorkspace: null,
+    });
+    // A second, unrelated run on the SAME company and agent. It holds a lease
+    // the cancel must not touch.
+    const siblingRunId = await seedRun({ companyId, agentId, status: "queued" });
+    const siblingLease = await runtime.acquireRunLease({
+      companyId,
+      environment,
+      issueId: null,
+      heartbeatRunId: siblingRunId,
+      persistedExecutionWorkspace: null,
+    });
+
+    await trackHeartbeatService(heartbeatService(db)).wakeup(scenario.reviewerAgentId, {
+      source: "automation",
+      triggerDetail: "system",
+      reason: "issue_assigned",
+      payload: { issueId: scenario.issueId },
+      contextSnapshot: {
+        issueId: scenario.issueId,
+        taskId: scenario.issueId,
+        wakeReason: "issue_assigned",
+      },
+      requestedByActorType: "user",
+      requestedByActorId: "local-board",
+    });
+
+    const [released] = await db
+      .select({ status: environmentLeases.status, releasedAt: environmentLeases.releasedAt })
+      .from(environmentLeases)
+      .where(eq(environmentLeases.id, cancelledRunLease.lease.id));
+    expect(released?.status).not.toBe("active");
+    expect(released?.releasedAt).toBeInstanceOf(Date);
+
+    const [sibling] = await db
+      .select({ status: environmentLeases.status, releasedAt: environmentLeases.releasedAt })
+      .from(environmentLeases)
+      .where(eq(environmentLeases.id, siblingLease.lease.id));
+    expect(sibling?.status).toBe("active");
+    expect(sibling?.releasedAt).toBeNull();
+  });
 });
