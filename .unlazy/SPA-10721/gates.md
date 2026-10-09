@@ -68,3 +68,27 @@ GATE: g3-typecheck | deliverable: d1-readback-copy,d2-readback-details
 - **Negative control (scoped, no lie):** a `PATCH {status:"done", comment:"..."}` on a `done` card
   still `409`s with no side effects; it reports `terminalStatusAlreadySet` but **not** a blanket
   `alreadyApplied`, because the comment did not land.
+
+## PR + evidence trail
+
+- Branch `ty/SPA-10721-ambiguous-write` -> PR [#162](https://github.com/Spark-Mojo/paperclip/pull/162) against fork default `rebuild/v2026.916.0-survivors`.
+- Deliverable commit: `cbbeb3f01372512b9c2d361eef5b9e3c7c3a82d2`.
+
+EVIDENCE: d1-readback-copy | commit: cbbeb3f01 | gates: g1 PASS, g3 PASS | critic: <pending> | at: 2026-10-09T16:5xZ
+EVIDENCE: d2-readback-details | commit: cbbeb3f01 | gates: g2 PASS, g3 PASS | critic: <pending> | at: 2026-10-09T16:5xZ
+EVIDENCE: d3-readback-oracle | commit: cbbeb3f01 | gates: g1 PASS, g2 PASS | critic: <pending> | at: 2026-10-09T16:5xZ
+
+## Root-cause note — `GET /api/issues/:id` vs sibling routes (NOT fixed here)
+
+`#1288` also observed `GET /api/issues/{id}` failing `000` while `/comments`, `/activity`,
+`/health`, and the company list served `200` in the same minute. Not reproduced in this run; the
+live board is healthy and the intermittency is not on-demand reproducible. Reading:
+- A route-selective `000` is not a server-wide socket reset (that would fail every route). The two
+  observed classes are distinct: (a) the **absent listener** (SPA-10725 / PR #160) — a `close()`d
+  listener with surviving ESTABLISHED sockets, which fails *every* route; (b) the **single-route**
+  `000` here, which is consistent with a request that was in flight across a process restart/shutdown
+  (the 10-04 15:00:16 restart, `launchd-err.log` ENOSPC at 14:58) and whose response was lost, while
+  fresh sibling requests landed on the rebound listener.
+- The durable fix for the *caller-facing* ambiguity is this card's read-back (applied-vs-refused is no
+  longer inferred from a `000`). The socket/startup root cause is SPA-10725's lane; a second code fix
+  here would overlap it. Recorded, not half-fixed.
