@@ -760,3 +760,70 @@ Observed exit 0. `git diff --check` exit 0.
 
 Production code is unchanged by this gate — it adds no call site, only the
 regression that locks the identity predicate.
+
+## 2026-10-09 restamp onto the live base (9283 -> 9284)
+
+Carried out on a separate worktree `/srv/bulk/worktrees/spa9351-restamp`
+(branch `ty/spa9351-restamp`) cut at the live base
+`818d2fb85f874c9433363b4ee02fb25b6f9acd3c`, so the PR branch and its head were
+never checked out, switched or rebased in place.
+
+The 24-file change was reapplied with `git apply --3way --index`. Every source
+file applied cleanly — `heartbeat.ts`, `recovery/service.ts`, `index.ts`, the
+wake-queue module and the lease suite — and exactly one file needed manual
+resolution: `packages/db/src/migrations/meta/_journal.json`, the same file the
+repo gate names. The stray empty `.unlazt` file a shell typo created was
+removed, and the migration test's path reference was updated to the new name.
+
+Restamp, per the gate's instruction to keep SQL filename, meta snapshot and
+journal entry aligned:
+- `9283_stranded_rewake_idempotency.sql` -> `9284_stranded_rewake_idempotency.sql`
+- `meta/9283_snapshot.json` -> `meta/9284_snapshot.json`
+- `_journal.json` taken from the LIVE BASE verbatim and our entry APPENDED:
+  284 entries, tail `(9282 cascade_fk, 9283 missing_terminal_liveness,
+  9284 stranded_rewake)`, zero duplicate `idx`. Taking base's journal wholesale
+  inherits its 9283 entry and its duplicate-idx fix rather than resurrecting
+  the duplicate this branch once carried.
+- The snapshot keeps `prevId = 70d41d4f-…`, which is base's real
+  `9282_snapshot.json` id — base's actual snapshot tail, since base's 9283 has
+  no snapshot. A bare rename would have broken lineage here.
+
+CHECK: `node .github/scripts/check-pr-migration-order.mjs 818d2fb85f874c9433363b4ee02fb25b6f9acd3c <restamp-head>`
+EXPECT: exit 0, `All new migrations follow …/9283_missing_terminal_run_liveness_index.sql.`
+Observed exit 0. NEGATIVE (the pre-restamp head `96ea6ce03a` against the same
+base) exits 1 with the `::error` above — both directions measured on this run.
+
+CHECK: `cd packages/db && pnpm run check:migrations`
+EXPECT: `Migration safety check passed`.
+Observed exit 0: `20 historical finding(s) covered by baseline (1 stale
+baseline id(s) ignored)`. The first attempt used a non-existent script path
+(`.github/scripts/check-migration-safety.mjs`, MODULE_NOT_FOUND, exit 1); the
+real entry point is the `check:migrations` package script, which is what ran.
+
+CHECK: snapshot lineage comparator (whole-object, `node /tmp/snapcmp.mjs`)
+EXPECT: `SNAPSHOT-DELTA: verified against 9282 (2 asserted indexes, 0 unenumerated changes)`
+Observed exit 0 with `LINEAGE: 9284.prevId == 9282.id == 70d41d4f-…`, adds
+exactly `…_exhausted_retry_rewake_idempotency_uq` and
+`…_orphaned_retry_rewake_idempotency_uq`, and zero other table differs.
+NEGATIVE: a scratch copy with ONE asserted index deleted, re-run in an isolated
+tree, exits 1 (`AssertionError … exactly the two asserted partial indexes are
+added`). Every unenumerated delta fails. First comparator draft asserted a
+top-level `indexes` key that does not exist in these snapshots and reported
+`0 added`; it was corrected to walk `tables.<name>.indexes` rather than
+weakened to make it pass.
+
+CHECK: `pnpm -C server exec vitest run src/services/terminal-environment-leases.test.ts`
+EXPECT: `Tests  19 passed (19)`. Observed exit 0, 19 passed.
+CHECK: recovery + admission regression set (`deferred-wake-backstop`,
+`heartbeat-lock-release-on-reassignment`, `heartbeat-deferred-promote-on-reassignment`,
+`issue-queued-comments-routes`, `src/services/recovery/**`)
+EXPECT: all green. Observed exit 0, 281 passed (12 files).
+CHECK: `pnpm -C packages/db exec vitest run src/stranded-rewake-idempotency-migration.test.ts`
+EXPECT: green. Observed exit 0, 7 passed — this suite reads the migration file
+by name, so it would have failed had the restamp missed a reference.
+CHECK: server `tsc --noEmit` exit 0; `packages/db` `tsc --noEmit` exit 0;
+`git diff --check` exit 0.
+
+Total this run: 307 tests across 14 files, all green on the restamped head.
+Not yet done: push of the restamp branch, PR head move, and the independent
+whole-PR review. No merge, install, live DB write or acceptance wake.
