@@ -668,3 +668,66 @@ owner, `active`, `ephemeral`, `local`) apply unchanged at every call site, so a
 non-local or retained lease is still never released here. Nonlocal provider
 cleanup atomicity and full-PR independent review remain incomplete; no merge,
 install, live DB write or acceptance wake was performed.
+
+## 2026-10-09 advisor review of the admission-path release (three questions answered from code)
+
+The advisor asked three things this change could plausibly get wrong. Each is
+answered by reading the code, not by asserting intent.
+
+**1. Lease identity — can the cancel free a DIFFERENT run's live lease?**
+No, and the reason is the WHERE clause, not the guard list.
+`releaseTerminalLocalLeases` (heartbeat.ts:13159-13176) pins:
+
+```sql
+where heartbeat_run_id = <run.id>
+  and company_id       = <run.companyId>
+  and status           = 'active'
+  and lease_policy     = 'ephemeral'
+  and provider         = 'local'
+```
+
+`heartbeat_run_id` is the identity binding: a lease is only ever released by a
+write naming the run that owns it (`environments.ts:1429` sets
+`heartbeatRunId` at acquire). A newer run that acquired its own lease is a
+different `heartbeat_run_id` and is unreachable by this statement. The advisor's
+"second stranding class" does not exist here.
+
+**2. Use-after-release — can the orchestrator already hold this lease and be
+about to boot a process when the cancel fires?**
+No, and the proof is the ordering of the whole lifecycle:
+
+- A lease is acquired inside `executeRun` (heartbeat.ts:22842, the only
+  `envOrchestrator.acquireForRun` call site).
+- `executeRun` is reached only from the claim paths at heartbeat.ts:15433,
+  :19281, :20525 and :20596, and every one of those acts on a run already
+  claimed out of `queued` — `claimQueuedRun` (heartbeat.ts:17668) writes
+  `status: "running"` at :18108 BEFORE the run is returned for execution.
+- Therefore a run can hold an acquired lease only while it is `running`. Each
+  of the five cancel sites is pinned to a non-running status, so none can
+  match a lease-holding run:
+  - :17918 `eq(status, "queued")`
+  - :18035 `eq(status, "queued")`
+  - :28100 `eq(status, "scheduled_retry")`
+  - :28236 `eq(status, activeExecutionRun.status)` under the enclosing guard
+    `activeExecutionRun.status !== "running"`
+  - :28328 `eq(status, legacyRun.status)` under the enclosing guard
+    `legacyRun.status !== "running"`
+
+So the cancel and the acquire cannot overlap on one run: either the run never
+reached `running` (no lease exists, the release matches zero rows — harmless),
+or it reached `running` and none of these predicates matches. The stranded
+lease these cases DO exhibit comes from the historical shape where a lease was
+acquired and the run then terminalized — the opposite order — which is exactly
+what the sweep and the atomic setters already handle.
+
+**3. Is a release failure retryable, or does it wedge the cancel?**
+The release runs inside the same transaction as the cancel, so a throw rolls
+both back together: the run stays `queued`/`scheduled_retry` and the cancel is
+retried on the next admission attempt. There is no partial state in which the
+run is cancelled and its lease is not released — which is the property this
+whole change exists to establish. The rollback direction is already proven by
+the existing `rolls back terminal run state when durable lease release fails`
+cases (both `lease-release` and `shutdown` entrypoints).
+
+Consequence: no new production code is warranted from this review. The three
+answers are recorded here so a later reader does not re-derive them.
