@@ -277,3 +277,11 @@ INDEPENDENT VERIFICATION (this run, bigbox, read-only):
 5. Fix payload lineage: 818d2fb8 carries PR #161 (indexed ownership predicates at verified head ee80df27, contained behind_by=0 per 18:16Z merge receipt) on top of 69f8a98c (PR #158 partial liveness index, verified live 15:43Z). No new migration in #161; DB index state unchanged from 69f8a98c.
 
 HANDOFF: card reassigned to Ty (5f006ee1-0723-4512-bbed-ac0203f746af) as the measurement wake (Steve direction 836604ab item 4). Remaining UNPROVEN for incident closure: current hot-shape attribution under live load with the fix active; upstream cap/de-duplicate at a proven redundant boundary OR explicit board amendment; measured wakeup/cost scan disposition; comparable-load exact-query <100ms, 1-2 matching active backends, before/after issue-GET with conditions recorded. Release state sign-off: merged (818d2fb8) -> installed -> activated -> receipts recorded.
+
+## Ty fresh runtime receipts — 2026-10-10 ~20:10Z (run 4a43874b, bigbox direct, fix 818d2fb8 live)
+
+ENGINE STATE: /api/health installedCommit=818d2fb8, processStartedAt=2026-10-08T18:58:02.590Z (unchanged, live 2d).
+DB (leased, pg 5433, paperclip_spa_cutover_20260906): running heartbeat rows=17; active_backends=0; matching full-column prefix=0 (three consecutive samples); load 39.32/31.48/20.35 (incident load ~45 — comparable band, not identical).
+GET /api/issues/SPA-11264 (unauthenticated probe, :3100): 3.11s (cold) then 0.121/0.091s; 5x set: 1.334/0.158/0.111/0.137/0.153s. Steady state ~0.1-0.16s vs 26.9s pre-161 and 9.4-10.6s original baseline.
+INDEX USE (pg_stat_user_indexes): ctx_issue_created_idx=31023377, status_process_started_idx=21003445, native_uq=1468145, liveness_idx=566536, missing_terminal_liveness_idx=3. Ownership query served by the two PR #161 index branches; new partial liveness index barely hit (predicate not yet exercised or planner prefers older index).
+STILL UNPROVEN: upstream cap/de-duplicate at proven redundant boundary OR explicit board amendment; measured wakeup/cost residual-caller disposition; independent full-incident verdict. No source edits, no migration, no restart this run.
