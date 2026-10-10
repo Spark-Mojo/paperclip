@@ -1997,6 +1997,22 @@ async function assertExecutionTaskParent(db: Db, companyId: string, parentId?: s
   if (parent?.conversationAgentId) throw unprocessable("Conversations cannot have new subtasks; create a task in a project instead");
 }
 
+async function assertAcyclicIssueParent(db: Db, companyId: string, issueId: string, parentId: string | null | undefined) {
+  if (!parentId) return;
+  if (parentId === issueId) throw unprocessable("An issue cannot be its own parent");
+  const rows = await db.execute(sql`
+    WITH RECURSIVE ancestors(id, parent_id, path) AS (
+      SELECT id, parent_id, ARRAY[id] FROM issues WHERE id = ${parentId} AND company_id = ${companyId}
+      UNION ALL
+      SELECT parent.id, parent.parent_id, ancestors.path || parent.id
+      FROM issues parent JOIN ancestors ON parent.id = ancestors.parent_id
+      WHERE parent.company_id = ${companyId} AND NOT parent.id = ANY(ancestors.path)
+    )
+    SELECT id FROM ancestors WHERE id = ${issueId} OR parent_id = ANY(path) LIMIT 1
+  `);
+  if (Array.from(rows).length > 0) throw unprocessable("An issue cannot be moved into its own subtree or a cyclic parent tree");
+}
+
 type DbTransaction = Parameters<Parameters<Db["transaction"]>[0]>[0];
 type IssueCreateInput = Omit<typeof issues.$inferInsert, "companyId"> & {
   initialPlan?: string | null;
@@ -9809,6 +9825,10 @@ export function issueService(db: Db) {
         throw unprocessable("in_progress issues require an assignee");
       }
       const persist = async (tx: DbTransaction) => {
+        if (issueData.parentId) {
+          await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${`issue-parent:${companyId}`}, 0))`);
+          if (issueData.id) await assertAcyclicIssueParent(tx as unknown as Db, companyId, issueData.id, issueData.parentId);
+        }
         await assertExecutionTaskParent(tx as unknown as Db, companyId, issueData.parentId);
         if (issueData.conversationAgentId && issueData.conversationUserId) {
           const identity = `conversation:${companyId}:${issueData.conversationAgentId}:${issueData.conversationUserId}`;
@@ -10974,6 +10994,10 @@ export function issueService(db: Db) {
       }
 
       const runUpdate = async (tx: any) => {
+        if (issueData.parentId) {
+          await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${`issue-parent:${existing.companyId}`}, 0))`);
+          await assertAcyclicIssueParent(tx, existing.companyId, id, issueData.parentId);
+        }
         // The receipt baseline must be read under the same row lock as the
         // write. Otherwise a concurrent update can be mistaken for a change
         // made by this request.
