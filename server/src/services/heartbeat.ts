@@ -402,7 +402,7 @@ import {
 import { createToolGatewayService } from "./tool-gateway.js";
 import { toolAccessService } from "./tool-access.js";
 import { visibleIssueCondition } from "./issue-visibility.js";
-import { ISSUE_BLOCKERS_RESOLVED_WAKE_REASON } from "./issue-dependency-wakeups.js";
+import { ISSUE_BLOCKERS_RESOLVED_WAKE_REASON, buildIssueBlockersResolvedWakeStateKey } from "./issue-dependency-wakeups.js";
 import {
   buildIssueMonitorClearedPatch,
   buildIssueMonitorTriggeredPatch,
@@ -20426,6 +20426,36 @@ export function heartbeatService(
       .then((rows) => Boolean(rows[0]));
   }
 
+  async function autoUnblockReadyDependents(blockerIssueId: string) {
+    const enabled = resolveIdleTodoPullCanary(runtimeEnv.PAPERCLIP_AUTO_UNBLOCK_READY_DEPENDENTS).enabled && resolveIdleTodoPullGate().enabled;
+    const result = { enabled, checked: 0, unblocked: 0, notReadySkipped: 0, deferredOrFailed: 0, issueIds: [] as string[] };
+    if (!enabled || (await getSchedulingSuppression()).suppressed) return result;
+    const candidates = await issuesSvc.listBlockedDependentsReadyForAutoUnblock(blockerIssueId);
+    result.checked = candidates.length;
+    for (const candidate of candidates) {
+      const transitioned = await issuesSvc.autoUnblockReadyDependent(candidate);
+      if (!transitioned?.agentId) {
+        result.notReadySkipped += 1;
+        continue;
+      }
+      result.unblocked += 1;
+      result.issueIds.push(candidate.id);
+      try {
+        await enqueueWakeup(transitioned.agentId, {
+          source: "automation", triggerDetail: "system", reason: ISSUE_BLOCKERS_RESOLVED_WAKE_REASON,
+          payload: { issueId: candidate.id, resolvedBlockerIssueId: blockerIssueId, blockerIssueIds: transitioned.blockerIssueIds },
+          idempotencyKey: buildIssueBlockersResolvedWakeStateKey({ dependentIssueId: candidate.id, blockerIssueIds: transitioned.blockerIssueIds, blockedTransitionAt: transitioned.blockedTransitionAt }),
+          requestedByActorType: "system",
+          contextSnapshot: { issueId: candidate.id, taskId: candidate.id, wakeReason: ISSUE_BLOCKERS_RESOLVED_WAKE_REASON },
+        });
+      } catch (err) {
+        result.deferredOrFailed += 1;
+        logger.warn({ err, issueId: candidate.id }, "failed to wake auto-unblocked dependent");
+      }
+    }
+    return result;
+  }
+
   async function sweepStaleIssueLocks() {
     return recovery.sweepStaleIssueLocks();
   }
@@ -30743,6 +30773,7 @@ export function heartbeatService(
 
     reconcileStrandedAssignedIssues,
     pullIdleAgentTodoIssues,
+    autoUnblockReadyDependents,
     recoverPendingSessionGoalActions,
     recoverActiveSessionGoals,
 

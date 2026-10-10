@@ -293,6 +293,28 @@ describeEmbeddedPostgres("question response delivery", () => {
     };
   }
 
+  it("user-assigned creator wake delivers an answered question to its author without assignment mutation", async () => {
+    const seeded = await seed();
+    await db.update(issues).set({ assigneeAgentId: null, assigneeUserId: "board-user" }).where(eq(issues.id, seeded.issueId));
+    const fallbackRunId = randomUUID();
+    const wakeup = vi.fn(async () => db.insert(heartbeatRuns).values({
+      id: fallbackRunId, companyId: seeded.companyId, agentId: seeded.agentId,
+      invocationSource: "automation", status: "queued", runtimeMode: "legacy",
+      driverKind: "codex", contextSnapshot: { issueId: seeded.issueId },
+    }).returning().then((rows) => rows[0]!));
+    const service = questionResponseDeliveryService(db, { heartbeat: { wakeup } as never });
+    const first = await service.deliver(seeded.interaction.id);
+    const second = await service.deliver(seeded.interaction.id);
+    expect(first).toMatchObject({ status: "fallback_queued", duplicate: false });
+    expect(second).toMatchObject({ duplicate: true });
+    expect(wakeup).toHaveBeenCalledTimes(1);
+    expect(wakeup).toHaveBeenCalledWith(seeded.agentId, expect.objectContaining({
+      payload: expect.objectContaining({ issueId: seeded.issueId, interactionId: seeded.interaction.id }),
+    }));
+    const [issue] = await db.select().from(issues).where(eq(issues.id, seeded.issueId));
+    expect(issue).toMatchObject({ assigneeAgentId: null, assigneeUserId: "board-user" });
+  });
+
   it("persists the receipt atomically and steers exactly once into a running successor", async () => {
     const seeded = await seed({ successorStatus: "running" });
     const newerRunId = randomUUID();

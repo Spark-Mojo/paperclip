@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { spawn } from "node:child_process";
-import { and, eq } from "drizzle-orm";
+import { and, eq, inArray } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   activityLog,
@@ -1507,6 +1507,528 @@ describeEmbeddedPostgres("heartbeat resolved dependency wake reconciliation", ()
         .from(agentWakeupRequests)
         .where(eq(agentWakeupRequests.companyId, companyId));
       expect(wakes).toHaveLength(0);
+    });
+  });
+
+  // SPA-10513, slice 3. Closing the LAST blocker of a blocked dependent must
+  // hand that dependent back to the queue: the card moves blocked -> todo and
+  // its assignee is woken exactly once. The wake alone was not enough — a
+  // dependent left in `blocked` with every blocker done is invisible to the
+  // idle-pull sweep (which only reads `todo`), so the card silently never
+  // drains. The transition must be narrow: an open blocker, an unfinished
+  // workspace finalize obligation, a backlog park, a conversation container, a
+  // terminal card, and a non-agent assignee all keep their current status.
+  describe("last blocker auto-unblock (SPA-10513)", () => {
+    const CANARY_ENV_VAR = "PAPERCLIP_AUTO_UNBLOCK_READY_DEPENDENTS";
+
+    async function seedAutoUnblockFixture(opts: {
+      workspaceState?: "none" | "not_finalized";
+      dependentStatus?: string;
+      dependentAssignee?: "agent" | null;
+    } = {}) {
+      const workspaceState = opts.workspaceState ?? "none";
+      const companyId = randomUUID();
+      const agentId = randomUUID();
+      const ownerUserId = randomUUID();
+      const blockedIssueId = randomUUID();
+      const blockerIssueId = randomUUID();
+      const projectId = randomUUID();
+      const projectWorkspaceId = randomUUID();
+      const executionWorkspaceId = randomUUID();
+      const issuePrefix = `U${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+
+      await db.insert(companies).values({
+        id: companyId,
+        name: "Paperclip",
+        issuePrefix,
+        requireBoardApprovalForNewAgents: false,
+      });
+      await db.insert(companyMemberships).values({
+        companyId,
+        principalType: "user",
+        principalId: ownerUserId,
+        membershipRole: "owner",
+        status: "active",
+      });
+      await db.insert(agents).values({
+        id: agentId,
+        companyId,
+        name: "Priya",
+        role: "engineer",
+        status: "idle",
+        adapterType: "test_adapter",
+        adapterConfig: {},
+        runtimeConfig: { heartbeat: { wakeOnDemand: true, maxConcurrentRuns: 1 } },
+        permissions: {},
+      });
+
+      if (workspaceState !== "none") {
+        await db.insert(projects).values({
+          id: projectId,
+          companyId,
+          name: "Synthetic auto-unblock project",
+          status: "in_progress",
+        });
+        await db.insert(projectWorkspaces).values({
+          id: projectWorkspaceId,
+          companyId,
+          projectId,
+          name: "Synthetic workspace",
+          sourceType: "git_worktree",
+        });
+        await db.insert(executionWorkspaces).values({
+          id: executionWorkspaceId,
+          companyId,
+          projectId,
+          projectWorkspaceId,
+          mode: "isolated_workspace",
+          strategyType: "git_worktree",
+          name: "Synthetic execution workspace",
+          providerType: "git_worktree",
+        });
+      }
+
+      await db.insert(issues).values([
+        {
+          id: blockedIssueId,
+          companyId,
+          projectId: workspaceState === "none" ? null : projectId,
+          title: "Synthetic blocked dependent",
+          status: opts.dependentStatus ?? "blocked",
+          priority: "medium",
+          unblockDescriptor: { owner: { agentId }, action: "Wait for the blocker" },
+          assigneeAgentId: opts.dependentAssignee === null ? null : agentId,
+          issueNumber: 1,
+          identifier: `${issuePrefix}-1`,
+        },
+        {
+          id: blockerIssueId,
+          companyId,
+          projectId: workspaceState === "none" ? null : projectId,
+          title: "Synthetic completed blocker",
+          status: "done",
+          priority: "medium",
+          executionWorkspaceId: workspaceState === "none" ? null : executionWorkspaceId,
+          issueNumber: 2,
+          identifier: `${issuePrefix}-2`,
+        },
+      ]);
+      await db.insert(issueRelations).values({
+        companyId,
+        issueId: blockerIssueId,
+        relatedIssueId: blockedIssueId,
+        type: "blocks",
+      });
+
+      if (workspaceState === "not_finalized") {
+        await db.insert(workspaceOperations).values({
+          companyId,
+          executionWorkspaceId,
+          issueId: blockerIssueId,
+          phase: "adapter_execute",
+          status: "succeeded",
+          startedAt: new Date(Date.now() - 60_000),
+        });
+      }
+
+      return {
+        companyId,
+        agentId,
+        ownerUserId,
+        blockedIssueId,
+        blockerIssueId,
+        executionWorkspaceId,
+        issuePrefix,
+      };
+    }
+
+    function autoUnblockHeartbeat() {
+      return heartbeatService(db, { runtimeEnv: { [CANARY_ENV_VAR]: "true", PAPERCLIP_IDLE_TODO_PULL: "true" } });
+    }
+
+    async function dependentStatusById(issueIds: string[]) {
+      const rows = await db
+        .select({ id: issues.id, status: issues.status })
+        .from(issues)
+        .where(inArray(issues.id, issueIds));
+      return new Map(rows.map((row) => [row.id, row.status]));
+    }
+
+    it("last blocker auto-unblock moves a blocked dependent to todo and wakes it once", async () => {
+      const { companyId, agentId, blockedIssueId, blockerIssueId } =
+        await seedAutoUnblockFixture();
+
+      const result = await autoUnblockHeartbeat().autoUnblockReadyDependents(blockerIssueId);
+
+      expect(result.enabled).toBe(true);
+      expect(result.unblocked).toBe(1);
+      expect(result.issueIds).toEqual([blockedIssueId]);
+      expect(result.deferredOrFailed).toBe(0);
+
+      const flipped = await db
+        .select({ status: issues.status, blockedTransitionAt: issues.blockedTransitionAt, unblockDescriptor: issues.unblockDescriptor })
+        .from(issues)
+        .where(eq(issues.id, blockedIssueId))
+        .then((rows) => rows[0] ?? null);
+      expect(flipped?.status).toBe("todo");
+      // Leaving `blocked` clears the blocked-cycle stamp, which is the epoch the
+      // wake idempotency key binds to.
+      expect(flipped?.blockedTransitionAt).toBeNull();
+      expect(flipped?.unblockDescriptor).toBeNull();
+
+      const wakes = await db
+        .select({
+          reason: agentWakeupRequests.reason,
+          idempotencyKey: agentWakeupRequests.idempotencyKey,
+          payload: agentWakeupRequests.payload,
+        })
+        .from(agentWakeupRequests)
+        .where(
+          and(
+            eq(agentWakeupRequests.companyId, companyId),
+            eq(agentWakeupRequests.agentId, agentId),
+          ),
+        );
+      expect(wakes).toHaveLength(1);
+      expect(wakes[0]?.reason).toBe("issue_blockers_resolved");
+      expect(wakes[0]?.idempotencyKey).toBe(
+        buildIssueBlockersResolvedWakeStateKey({
+          dependentIssueId: blockedIssueId,
+          blockerIssueIds: [blockerIssueId],
+        }),
+      );
+      expect(wakes[0]?.payload).toMatchObject({
+        issueId: blockedIssueId,
+        resolvedBlockerIssueId: blockerIssueId,
+      });
+
+      // A second sweep over the same final blocker state is a no-op: the card is
+      // already `todo`, so there is nothing to transition and the level-keyed
+      // wake already covers this ready state.
+      const repeat = await autoUnblockHeartbeat().autoUnblockReadyDependents(blockerIssueId);
+      expect(repeat.unblocked).toBe(0);
+      expect(repeat.issueIds).toEqual([]);
+
+      const wakesAfterRepeat = await db
+        .select({ id: agentWakeupRequests.id })
+        .from(agentWakeupRequests)
+        .where(eq(agentWakeupRequests.companyId, companyId));
+      expect(wakesAfterRepeat).toHaveLength(1);
+
+      const statusAfterRepeat = await db
+        .select({ status: issues.status })
+        .from(issues)
+        .where(eq(issues.id, blockedIssueId))
+        .then((rows) => rows[0] ?? null);
+      expect(statusAfterRepeat?.status).toBe("todo");
+    });
+
+    it("last blocker auto-unblock leaves open blockers, backlog parks, terminal, conversation and non-agent dependents unchanged", async () => {
+      const {
+        companyId,
+        agentId,
+        ownerUserId,
+        blockedIssueId,
+        blockerIssueId,
+        issuePrefix,
+      } = await seedAutoUnblockFixture();
+      const eligibleId = randomUUID();
+      const openBlockerDependentId = randomUUID();
+      const cancelledBlockerDependentId = randomUUID();
+      const cancelledBlockerId = randomUUID();
+      const backlogParkDependentId = randomUUID();
+      const terminalDependentId = randomUUID();
+      const conversationDependentId = randomUUID();
+      const userOwnedDependentId = randomUUID();
+      const unassignedDependentId = randomUUID();
+      const openBlockerId = randomUUID();
+      const conversationBlockerId = randomUUID();
+
+      await db.insert(issues).values([
+        {
+          id: eligibleId,
+          companyId,
+          title: "Another blocked dependent on the same done blocker",
+          status: "blocked",
+          priority: "medium",
+          assigneeAgentId: agentId,
+          issueNumber: 3,
+          identifier: `${issuePrefix}-3`,
+        },
+        {
+          id: openBlockerDependentId,
+          companyId,
+          title: "Dependent with one blocker still open",
+          status: "blocked",
+          priority: "medium",
+          assigneeAgentId: agentId,
+          issueNumber: 4,
+          identifier: `${issuePrefix}-4`,
+        },
+        {
+          id: openBlockerId,
+          companyId,
+          title: "Still-open blocker",
+          status: "in_progress",
+          priority: "medium",
+          issueNumber: 5,
+          identifier: `${issuePrefix}-5`,
+        },
+        {
+          id: cancelledBlockerDependentId,
+          companyId,
+          title: "Dependent with a cancelled blocker",
+          status: "blocked",
+          priority: "medium",
+          assigneeAgentId: agentId,
+          issueNumber: 12,
+          identifier: `${issuePrefix}-12`,
+        },
+        {
+          id: cancelledBlockerId,
+          companyId,
+          title: "Cancelled blocker",
+          status: "cancelled",
+          priority: "medium",
+          issueNumber: 13,
+          identifier: `${issuePrefix}-13`,
+        },
+        {
+          id: backlogParkDependentId,
+          companyId,
+          title: "Dependent parked in backlog",
+          status: "backlog",
+          priority: "medium",
+          assigneeAgentId: agentId,
+          issueNumber: 6,
+          identifier: `${issuePrefix}-6`,
+        },
+        {
+          id: terminalDependentId,
+          companyId,
+          title: "Terminal dependent on a done blocker",
+          status: "done",
+          priority: "medium",
+          assigneeAgentId: agentId,
+          issueNumber: 7,
+          identifier: `${issuePrefix}-7`,
+        },
+        {
+          id: conversationDependentId,
+          companyId,
+          title: "Conversation container blocked by the done blocker",
+          status: "blocked",
+          priority: "medium",
+          assigneeAgentId: agentId,
+          conversationAgentId: agentId,
+          conversationUserId: ownerUserId,
+          conversationState: "waiting",
+          issueNumber: 8,
+          identifier: `${issuePrefix}-8`,
+        },
+        {
+          id: userOwnedDependentId,
+          companyId,
+          title: "Human-owned dependent",
+          status: "blocked",
+          priority: "medium",
+          assigneeUserId: ownerUserId,
+          issueNumber: 9,
+          identifier: `${issuePrefix}-9`,
+        },
+        {
+          id: unassignedDependentId,
+          companyId,
+          title: "Unassigned dependent",
+          status: "blocked",
+          priority: "medium",
+          issueNumber: 10,
+          identifier: `${issuePrefix}-10`,
+        },
+        {
+          id: conversationBlockerId,
+          companyId,
+          title: "Second completed blocker for the conversation container",
+          status: "done",
+          priority: "medium",
+          issueNumber: 11,
+          identifier: `${issuePrefix}-11`,
+        },
+      ]);
+      await db.insert(issueRelations).values([
+        {
+          companyId,
+          issueId: blockerIssueId,
+          relatedIssueId: eligibleId,
+          type: "blocks",
+        },
+        {
+          companyId,
+          issueId: openBlockerId,
+          relatedIssueId: openBlockerDependentId,
+          type: "blocks",
+        },
+        {
+          companyId,
+          issueId: blockerIssueId,
+          relatedIssueId: cancelledBlockerDependentId,
+          type: "blocks",
+        },
+        {
+          companyId,
+          issueId: cancelledBlockerId,
+          relatedIssueId: cancelledBlockerDependentId,
+          type: "blocks",
+        },
+        {
+          companyId,
+          issueId: blockerIssueId,
+          relatedIssueId: backlogParkDependentId,
+          type: "blocks",
+        },
+        {
+          companyId,
+          issueId: blockerIssueId,
+          relatedIssueId: terminalDependentId,
+          type: "blocks",
+        },
+        {
+          companyId,
+          issueId: blockerIssueId,
+          relatedIssueId: conversationDependentId,
+          type: "blocks",
+        },
+        {
+          companyId,
+          issueId: blockerIssueId,
+          relatedIssueId: userOwnedDependentId,
+          type: "blocks",
+        },
+        {
+          companyId,
+          issueId: blockerIssueId,
+          relatedIssueId: unassignedDependentId,
+          type: "blocks",
+        },
+        {
+          companyId,
+          issueId: conversationBlockerId,
+          relatedIssueId: conversationDependentId,
+          type: "blocks",
+        },
+      ]);
+
+      const result = await autoUnblockHeartbeat().autoUnblockReadyDependents(blockerIssueId);
+
+      expect(result.unblocked).toBe(2);
+      expect(result.issueIds.sort()).toEqual([blockedIssueId, eligibleId].sort());
+
+      const statuses = await dependentStatusById([
+        blockedIssueId,
+        eligibleId,
+        openBlockerDependentId,
+        cancelledBlockerDependentId,
+        backlogParkDependentId,
+        terminalDependentId,
+        conversationDependentId,
+        userOwnedDependentId,
+        unassignedDependentId,
+      ]);
+      expect(["todo", "in_progress"]).toContain(statuses.get(blockedIssueId));
+      expect(["todo", "in_progress"]).toContain(statuses.get(eligibleId));
+      // An open blocker still owns its dependent.
+      expect(statuses.get(openBlockerDependentId)).toBe("blocked");
+      expect(statuses.get(cancelledBlockerDependentId)).toBe("blocked");
+      // A backlog park is a human parking surface, never auto-released.
+      expect(statuses.get(backlogParkDependentId)).toBe("backlog");
+      // A terminal card is never reopened by a dependency edge.
+      expect(statuses.get(terminalDependentId)).toBe("done");
+      // A conversation container's turn lifecycle is authoritative.
+      expect(statuses.get(conversationDependentId)).toBe("blocked");
+      // Human-owned and unassigned cards have no agent to hand work back to.
+      expect(statuses.get(userOwnedDependentId)).toBe("blocked");
+      expect(statuses.get(unassignedDependentId)).toBe("blocked");
+
+      const wakes = await db
+        .select({ payload: agentWakeupRequests.payload })
+        .from(agentWakeupRequests)
+        .where(eq(agentWakeupRequests.companyId, companyId));
+      const wokenIssueIds = wakes.map((wake) =>
+        (wake.payload as { issueId?: unknown } | null)?.issueId,
+      );
+      expect(wokenIssueIds.sort()).toEqual([blockedIssueId, eligibleId].sort());
+    });
+
+    it("last blocker auto-unblock waits for workspace finalize before flipping status", async () => {
+      const { companyId, agentId, blockedIssueId, blockerIssueId, executionWorkspaceId } =
+        await seedAutoUnblockFixture({ workspaceState: "not_finalized" });
+
+      const beforeFinalize = await autoUnblockHeartbeat().autoUnblockReadyDependents(
+        blockerIssueId,
+      );
+
+      expect(beforeFinalize.unblocked).toBe(0);
+      expect(beforeFinalize.checked).toBe(0);
+
+      const beforeStatuses = await dependentStatusById([blockedIssueId]);
+      expect(beforeStatuses.get(blockedIssueId)).toBe("blocked");
+      expect(
+        await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, companyId)),
+      ).toHaveLength(0);
+
+      await db.insert(workspaceOperations).values({
+        companyId,
+        executionWorkspaceId,
+        issueId: blockerIssueId,
+        phase: "workspace_finalize",
+        status: "succeeded",
+        startedAt: new Date(),
+      });
+
+      const afterFinalize = await autoUnblockHeartbeat().autoUnblockReadyDependents(
+        blockerIssueId,
+      );
+
+      expect(afterFinalize.unblocked).toBe(1);
+      expect(afterFinalize.issueIds).toEqual([blockedIssueId]);
+
+      const afterStatuses = await dependentStatusById([blockedIssueId]);
+      expect(afterStatuses.get(blockedIssueId)).toBe("todo");
+
+      const wakes = await db
+        .select({ reason: agentWakeupRequests.reason })
+        .from(agentWakeupRequests)
+        .where(eq(agentWakeupRequests.agentId, agentId));
+      expect(wakes).toHaveLength(1);
+      expect(wakes[0]?.reason).toBe("issue_blockers_resolved");
+    });
+
+    it("last blocker auto-unblock refuses to transition without the idle todo recovery gate", async () => {
+      const { companyId, blockedIssueId, blockerIssueId } = await seedAutoUnblockFixture();
+      const result = await heartbeatService(db, {
+        runtimeEnv: { [CANARY_ENV_VAR]: "true" },
+      }).autoUnblockReadyDependents(blockerIssueId);
+
+      expect(result.enabled).toBe(false);
+      expect((await dependentStatusById([blockedIssueId])).get(blockedIssueId)).toBe("blocked");
+      expect(await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, companyId))).toHaveLength(0);
+    });
+
+    it("last blocker auto-unblock is default-off and reversible when the canary env is unset", async () => {
+      const { companyId, blockedIssueId, blockerIssueId } = await seedAutoUnblockFixture();
+
+      const result = await heartbeatService(db).autoUnblockReadyDependents(blockerIssueId);
+
+      expect(result.enabled).toBe(false);
+      expect(result.unblocked).toBe(0);
+      expect(result.checked).toBe(0);
+      expect(result.issueIds).toEqual([]);
+
+      const statuses = await dependentStatusById([blockedIssueId]);
+      expect(statuses.get(blockedIssueId)).toBe("blocked");
+      expect(
+        await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, companyId)),
+      ).toHaveLength(0);
     });
   });
 
