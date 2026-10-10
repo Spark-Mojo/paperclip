@@ -6612,19 +6612,6 @@ async function countBlockedInboxIssues(
   }, 0);
 }
 
-// SPA-10429 / SPA-10357 ownership-transfer CAS. The caller must supply the
-// row's current value for each field it is changing; a stale value (the
-// caller observed a value that has since been overwritten) returns 409 and
-// leaves the row untouched. The check is intended to run AFTER the row has
-// been re-read under the service's `for("update")` lock, so the comparison is
-// against the locked snapshot, not against a read the caller may have made
-// earlier.
-//
-// When the caller DOES NOT supply the corresponding expected* but IS
-// changing the target field, the helper rejects as `cas_missing` — the
-// SPA-10357 silent-write class is closed only when expected is mandatory for
-// status / assignee changes. Title-only and description-only edits are
-// unaffected.
 export type IssueWriteOwnershipCASExpectations = {
   expectedStatus?: string | null;
   expectedAssigneeUserId?: string | null;
@@ -10767,28 +10754,11 @@ export function issueService(db: Db) {
         expectedAssigneeUserId,
         expectedAssigneeAgentId,
       };
-      const writeOwnershipCASChanges: IssueWriteOwnershipCASChanges = {
-        statusChanged: issueData.status !== undefined && issueData.status !== existing.status,
-        assigneeUserIdChanged:
-          issueData.assigneeUserId !== undefined &&
-          issueData.assigneeUserId !== existing.assigneeUserId,
-        assigneeAgentIdChanged:
-          issueData.assigneeAgentId !== undefined &&
-          issueData.assigneeAgentId !== existing.assigneeAgentId,
-      };
+
       const hasAnyCASExpectation =
-        Object.prototype.hasOwnProperty.call(
-          writeOwnershipCASExpectations,
-          "expectedStatus",
-        ) ||
-        Object.prototype.hasOwnProperty.call(
-          writeOwnershipCASExpectations,
-          "expectedAssigneeUserId",
-        ) ||
-        Object.prototype.hasOwnProperty.call(
-          writeOwnershipCASExpectations,
-          "expectedAssigneeAgentId",
-        );
+        expectedStatus !== undefined ||
+        expectedAssigneeUserId !== undefined ||
+        expectedAssigneeAgentId !== undefined;
       if (
         issueData.assigneeAgentId !== undefined &&
         issueData.assigneeAgentId !== existing.assigneeAgentId
@@ -11096,15 +11066,34 @@ export function issueService(db: Db) {
           .for("update")
           .then((rows: Array<typeof issues.$inferSelect>) => rows[0] ?? null);
         if (!receiptExisting) return null;
-        // SPA-10357 / SPA-10429 ownership-transfer CAS. The locked snapshot
-        // is the only comparison surface; the caller's earlier read is not.
-        // Fires whenever the caller is changing status, assigneeUserId, or
-        // assigneeAgentId — supplying expected* is mandatory.
-        assertIssueWriteOwnershipCAS(
-          receiptExisting,
-          hasAnyCASExpectation ? writeOwnershipCASExpectations : {},
-          writeOwnershipCASChanges,
-        );
+        if (hasAnyCASExpectation) {
+          // SPA-10859 boundary (Dex option (a)): the service validates the
+          // expectations the caller actually supplied against the locked
+          // snapshot. It does NOT synthesize a requirement for a field the
+          // caller left out — the board-actor mandatory set
+          // (ownership-transmit fields only) is enforced at the route, where
+          // the actor class is known. Gating each `*Changed` flag on its
+          // expectation being present keeps status CAS opt-in here, so a
+          // board write that carries expectedAssignee* but not
+          // expectedStatus is not silently re-promoted to mandatory status
+          // (which would re-break the in-repo board UI), and in-tree
+          // service callers that never set these fields pass through intact.
+          const lockedChanges: IssueWriteOwnershipCASChanges = {
+            statusChanged:
+              expectedStatus !== undefined && issueData.status !== undefined,
+            assigneeUserIdChanged:
+              expectedAssigneeUserId !== undefined &&
+              issueData.assigneeUserId !== undefined,
+            assigneeAgentIdChanged:
+              expectedAssigneeAgentId !== undefined &&
+              issueData.assigneeAgentId !== undefined,
+          };
+          assertIssueWriteOwnershipCAS(
+            receiptExisting,
+            writeOwnershipCASExpectations,
+            lockedChanges,
+          );
+        }
         if (actorAgentId && patch.status === "done") {
           const [review] = await tx.select({ id: toolActionRequests.id }).from(toolActionRequests).where(and(eq(toolActionRequests.companyId, existing.companyId), eq(toolActionRequests.issueId, id), inArray(toolActionRequests.status, ["pending", "approved", "executing"]))).limit(1);
           if (review) throw conflict("This task is waiting for a connection review. Finish unrelated work, then yield in_review without retrying the governed call.", { code: "tool_review_pending", actionRequestId: review.id });

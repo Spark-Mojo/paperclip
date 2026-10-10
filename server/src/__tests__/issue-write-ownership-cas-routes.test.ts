@@ -3,10 +3,25 @@
 // The board-actor silent-write class was: a PATCH that moved an issue away
 // from `local-board` and into `backlog` succeeded even though the actor had
 // no visible signal of the row's prior state. The CAS invariant makes that
-// class unrepresentable: when a caller modifies status, assigneeUserId, or
-// assigneeAgentId, it must supply a caller-observed expected value that the
-// service compares against the locked row. Mismatch returns 409 and the row
-// is untouched. Title-only edits keep working without the expected fields.
+// class unrepresentable on the ownership-transmit fields: a board actor that
+// changes assigneeUserId or assigneeAgentId over the HTTP PATCH path must
+// supply a caller-observed expected value that the service compares against
+// the locked row. Mismatch returns 409 and the row is untouched.
+//
+// BOUNDARY (SPA-10859): mandatory enforcement covers the OWNERSHIP fields
+// only; status CAS is provided but opt-in. Under `deploymentMode:
+// local_trusted` the board UI and the offending monitor sweep are the same
+// actor class (type=board, source=local_implicit), so a mandatory
+// expectedStatus would 409 every human status change in the in-repo board UI
+// without separating the sweep. The observed damage — eight DEPLOY-GATE cards
+// moved OFF local-board — is ownership departure, which is what is gated.
+//
+// SCOPE (SPA-10357 §5 wording): the control is on the issue PATCH write
+// path — the HTTP board-actor route. Internal service callers (interaction
+// accept, connection-intent delivery, execution-workspaces, email-channels,
+// native-runtime tests) re-read the locked row themselves and run under the
+// issue's own state-machine guards; they do not supply expected* and the
+// service-layer CAS helper is a no-op for them.
 //
 // These tests exercise the real `issueRoutes` against an embedded Postgres
 // database, so the validator schema, the route handler, the service's
@@ -22,6 +37,7 @@ import { eq } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import {
   activityLog,
+  agentWakeupRequests,
   agents,
   companies,
   companyMemberships,
@@ -62,6 +78,9 @@ describeEmbeddedPostgres("SPA-10357 / SPA-10429 ownership-transfer CAS", () => {
     await db.delete(issueRelations);
     await db.delete(activityLog);
     await db.delete(issues);
+    // The CAS writes can enqueue agent wakeup requests (same as any board
+    // reassignment); they reference the agent row, so clear them first.
+    await db.delete(agentWakeupRequests);
     await db.delete(agents);
     await db.delete(companyMemberships);
     await db.delete(companies);
@@ -212,9 +231,16 @@ describeEmbeddedPostgres("SPA-10357 / SPA-10429 ownership-transfer CAS", () => {
     expect(row).toEqual({ status: "todo", assigneeUserId: "local-board" });
   });
 
-  // --- the service-side mandatory check (CAS missing) --------------------
+  // --- the board-actor mandatory check (CAS missing on ownership fields) --
 
-  it("negative: PATCH that changes status without expectedStatus is rejected by the service with 409 cas-missing", async () => {
+  it("boundary: status CAS is OPT-IN — a status-only board PATCH without expected succeeds", async () => {
+    // SPA-10859 boundary decision. Under local_trusted the board UI and the
+    // offending sweep are the same actor class (type=board, local_implicit),
+    // so a mandatory expectedStatus cannot separate them; it would 409 every
+    // human status change in the in-repo board UI. Mandatory enforcement
+    // therefore covers the ownership-transmit fields only. This test pins
+    // that status stays opt-in: `todo -> backlog` is accepted with no
+    // expected fields, and the row actually moves.
     const { companyId } = await seedCompanyAndAgent();
     const issueId = await seedIssue({
       companyId,
@@ -226,16 +252,91 @@ describeEmbeddedPostgres("SPA-10357 / SPA-10429 ownership-transfer CAS", () => {
       .patch(`/api/issues/${issueId}`)
       .send({ status: "backlog" });
 
-    expect(res.status, JSON.stringify(res.body)).toBe(409);
-    expect(JSON.stringify(res.body)).toMatch(/issue_write_ownership_cas_missing/);
-    expect(JSON.stringify(res.body)).toMatch(/expectedStatus/);
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(JSON.stringify(res.body)).not.toMatch(/issue_write_ownership_cas_/);
 
     const row = await db
       .select({ status: issues.status })
       .from(issues)
       .where(eq(issues.id, issueId))
       .then((r) => r[0]);
-    expect(row?.status).toBe("todo");
+    expect(row?.status).toBe("backlog");
+  });
+
+  it("negative: the SPA-10357 sweep shape (status + assignee off local-board) without expected is rejected 409 cas-missing", async () => {
+    // The literal 2026-09-28 shape: one PATCH moves status AND the assignee
+    // off local-board. The ownership-transmit fields are mandatory for a
+    // board actor, so the missing expectedAssignee* fields reject the write
+    // before any mutation even though the status change alone would pass.
+    const { companyId, agentId } = await seedCompanyAndAgent();
+    const issueId = await seedIssue({
+      companyId,
+      status: "todo",
+      assigneeUserId: "local-board",
+    });
+
+    const res = await request(createApp(boardActor(companyId)))
+      .patch(`/api/issues/${issueId}`)
+      .send({ status: "backlog", assigneeUserId: null, assigneeAgentId: agentId });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(409);
+    expect(JSON.stringify(res.body)).toMatch(/issue_write_ownership_cas_missing/);
+    expect(JSON.stringify(res.body)).toMatch(/expectedAssigneeUserId|expectedAssigneeAgentId/);
+
+    const row = await db
+      .select({
+        status: issues.status,
+        assigneeUserId: issues.assigneeUserId,
+        assigneeAgentId: issues.assigneeAgentId,
+      })
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((r) => r[0]);
+    expect(row).toEqual({
+      status: "todo",
+      assigneeUserId: "local-board",
+      assigneeAgentId: null,
+    });
+  });
+
+  it("positive: ownership transfer with matching expectedAssignee* and no expectedStatus succeeds", async () => {
+    // Proves the two halves of the boundary at once: the ownership fields are
+    // mandatory (so the transfer must carry expected) and status remains
+    // opt-in (the transfer is accepted without expectedStatus).
+    const { companyId, agentId } = await seedCompanyAndAgent();
+    const issueId = await seedIssue({
+      companyId,
+      status: "todo",
+      assigneeUserId: "local-board",
+    });
+
+    const res = await request(createApp(boardActor(companyId)))
+      .patch(`/api/issues/${issueId}`)
+      .send({
+        status: "backlog",
+        assigneeUserId: null,
+        assigneeAgentId: agentId,
+        expectedAssigneeUserId: "local-board",
+        expectedAssigneeAgentId: null,
+      });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(JSON.stringify(res.body)).not.toMatch(/issue_write_ownership_cas_/);
+
+    const row = await db
+      .select({
+        status: issues.status,
+        assigneeUserId: issues.assigneeUserId,
+        assigneeAgentId: issues.assigneeAgentId,
+      })
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((r) => r[0]);
+    expect(row).toEqual({
+      status: "backlog",
+      assigneeUserId: null,
+      assigneeAgentId: agentId,
+    });
   });
 
   it("negative: PATCH that changes assigneeUserId without expectedAssigneeUserId is rejected by the service with 409 cas-missing", async () => {
@@ -295,9 +396,9 @@ describeEmbeddedPostgres("SPA-10357 / SPA-10429 ownership-transfer CAS", () => {
   it("positive: PATCH succeeds when caller expected matches the live row", async () => {
     // The SPA-10357 named control's done condition includes a positive
     // control: a PATCH that supplies matching expected* must succeed.
-    // We use the `todo → in_review` transition so the service-side
-    // status-transition validation accepts the change.
-    const { companyId } = await seedCompanyAndAgent();
+    // Ownership transfer with matching expectedAssignee* plus an opt-in
+    // expectedStatus proves the full CAS path end to end.
+    const { companyId, agentId } = await seedCompanyAndAgent();
     const issueId = await seedIssue({
       companyId,
       status: "todo",
@@ -308,19 +409,30 @@ describeEmbeddedPostgres("SPA-10357 / SPA-10429 ownership-transfer CAS", () => {
       .patch(`/api/issues/${issueId}`)
       .send({
         status: "in_review",
+        assigneeUserId: null,
+        assigneeAgentId: agentId,
         expectedStatus: "todo",
         expectedAssigneeUserId: "local-board",
+        expectedAssigneeAgentId: null,
       });
 
     expect(res.status, JSON.stringify(res.body)).toBe(200);
     expect(JSON.stringify(res.body)).not.toMatch(/issue_write_ownership_cas_/);
 
     const row = await db
-      .select({ status: issues.status, assigneeUserId: issues.assigneeUserId })
+      .select({
+        status: issues.status,
+        assigneeUserId: issues.assigneeUserId,
+        assigneeAgentId: issues.assigneeAgentId,
+      })
       .from(issues)
       .where(eq(issues.id, issueId))
       .then((r) => r[0]);
-    expect(row).toEqual({ status: "in_review", assigneeUserId: "local-board" });
+    expect(row).toEqual({
+      status: "in_review",
+      assigneeUserId: null,
+      assigneeAgentId: agentId,
+    });
   });
 
   it("positive: TOCTOU — caller expected matches the locked snapshot even when pre-lock differs", async () => {
@@ -420,5 +532,100 @@ describeEmbeddedPostgres("SPA-10357 / SPA-10429 ownership-transfer CAS", () => {
         }),
       }),
     );
+  });
+
+  it("boundary: a status re-stamp plus a title edit without expected succeeds", async () => {
+    // The board UI commonly sends status alongside a title/property edit.
+    // Status is opt-in, so this must not 409.
+    const { companyId } = await seedCompanyAndAgent();
+    const issueId = await seedIssue({
+      companyId,
+      status: "todo",
+      assigneeUserId: "local-board",
+    });
+
+    const res = await request(createApp(boardActor(companyId)))
+      .patch(`/api/issues/${issueId}`)
+      .send({ status: "todo", title: "Renamed in place" });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(JSON.stringify(res.body)).not.toMatch(/issue_write_ownership_cas_/);
+    const row = await db
+      .select({ title: issues.title, status: issues.status })
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((r) => r[0]);
+    expect(row?.title).toBe("Renamed in place");
+    expect(row?.status).toBe("todo");
+  });
+
+  it("boundary (transfer-only trigger): the board UI composer shape — unchanged assignee values, no expected — succeeds", async () => {
+    // The in-repo board UI's comment flow re-sends the issue's CURRENT
+    // assigneeUserId/assigneeAgentId on every post (ui/src/pages/
+    // IssueDetail.tsx composer). Under the transfer-only trigger an
+    // unchanged value is not an ownership departure, so this must not 409.
+    const { companyId, agentId } = await seedCompanyAndAgent();
+    const issueId = await seedIssue({
+      companyId,
+      status: "todo",
+      assigneeUserId: "board-user",
+    });
+
+    const res = await request(createApp(boardActor(companyId)))
+      .patch(`/api/issues/${issueId}`)
+      .send({ assigneeUserId: "board-user", assigneeAgentId: null });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(JSON.stringify(res.body)).not.toMatch(/issue_write_ownership_cas_/);
+    const row = await db
+      .select({
+        assigneeUserId: issues.assigneeUserId,
+        assigneeAgentId: issues.assigneeAgentId,
+      })
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((r) => r[0]);
+    expect(row).toEqual({ assigneeUserId: "board-user", assigneeAgentId: null });
+  });
+
+  it("boundary (transfer-only trigger): same-value write from the OTHER owner — agent re-stamp, no expected — succeeds", async () => {
+    // Symmetric composer shape: the issue already sits on an agent and the
+    // caller re-sends that same agent. No departure, no gate.
+    const { companyId, agentId } = await seedCompanyAndAgent();
+    const issueId = await seedIssue({
+      companyId,
+      status: "todo",
+      assigneeUserId: null,
+      assigneeAgentId: agentId,
+    });
+
+    const res = await request(createApp(boardActor(companyId)))
+      .patch(`/api/issues/${issueId}`)
+      .send({ comment: "a reply", assigneeUserId: null, assigneeAgentId: agentId });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(JSON.stringify(res.body)).not.toMatch(/issue_write_ownership_cas_/);
+  });
+
+  it("negative: supplied-but-stale expected on an unchanged value still 409s (service CAS on opt-in expectations)", async () => {
+    // A caller that opts into CAS by supplying expected* gets the full
+    // locked-snapshot comparison even when the target value is unchanged —
+    // a stale expectation is a stale observation and must not pass.
+    const { companyId, agentId } = await seedCompanyAndAgent();
+    const issueId = await seedIssue({
+      companyId,
+      status: "todo",
+      assigneeUserId: "board-user",
+    });
+
+    const res = await request(createApp(boardActor(companyId)))
+      .patch(`/api/issues/${issueId}`)
+      .send({
+        assigneeUserId: "board-user",
+        expectedAssigneeUserId: "someone-else",
+      });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(409);
+    expect(JSON.stringify(res.body)).toMatch(/issue_write_ownership_cas_/);
   });
 });

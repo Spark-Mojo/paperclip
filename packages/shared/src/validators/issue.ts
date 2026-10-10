@@ -844,13 +844,15 @@ const issueCommentAttachmentIdsSchema = z
   });
 
 // Caller-supplied compare-and-set expectations for ownership-transfer CAS
-// (SPA-10357 / SPA-10429 / SPA-10859). When a caller writes to status,
-// assigneeUserId, or assigneeAgentId, the matching expected* field MUST be
-// present and MUST equal the row's current value as re-read under the issue
-// write service's existing `for("update")` row lock. Mismatch returns 409
-// and leaves the row untouched. These fields are optional in the schema so
-// callers that don't change those fields (e.g. title-only edits) keep
-// working unchanged.
+// (SPA-10357 / SPA-10429 / SPA-10859). A caller that opts in supplies the
+// row's current value for status, assigneeUserId, or assigneeAgentId; the
+// service compares it against the row re-read under the issue write
+// service's existing `for("update")` row lock. Mismatch returns 409 and
+// leaves the row untouched. The fields are optional in the schema so
+// callers that don't opt in (title-only edits, status-only writes,
+// in-tree service callers) keep working unchanged; the board-actor
+// mandatory set (ownership-transmit fields on a real transfer) is enforced
+// at the PATCH route, where the actor class is known.
 const issueWriteOwnershipCASSchema = z.object({
   expectedStatus: z.enum(ISSUE_STATUSES).optional(),
   expectedAssigneeUserId: z.string().trim().min(1).nullable().optional(),
