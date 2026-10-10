@@ -967,7 +967,15 @@ export function IssueProperties({
   };
   const applyAssignee = (next: { assigneeAgentId: string | null; assigneeUserId: string | null }, track?: () => void) => {
     track?.();
-    onUpdate(next);
+    onUpdate({
+      ...next,
+      // SPA-10357 / SPA-10859 board-actor ownership-transfer CAS: the
+      // properties panel observes the issue from props, so the current
+      // assignee values are the caller-observed expectation. A concurrent
+      // move 409s instead of being silently overwritten.
+      expectedAssigneeAgentId: issue.assigneeAgentId ?? null,
+      expectedAssigneeUserId: issue.assigneeUserId ?? null,
+    });
     closeAssigneePicker();
   };
   /** Apply a selection immediately, or stage it for confirmation while a run is live. */

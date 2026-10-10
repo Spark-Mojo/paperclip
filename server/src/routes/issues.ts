@@ -13614,24 +13614,89 @@ export function issueRoutes(
       } = { value: null };
       const postCommitActivityPublications: ActivityPublication[] = [];
       const postCommitIssueActions: IssuePostCommitAction[] = [];
-      const issueUpdateData = {
+      // SPA-10357 / SPA-10429 ownership-transfer CAS, board-actor mandatory
+      // boundary. The observed harm was an *ownership transfer*: the
+      // 2026-09-28 sweep moved eight DEPLOY-GATE cards off `local-board`
+      // (assigneeUserId -> null, assigneeAgentId -> an agent) with no
+      // caller-observed expected value. Mandatory enforcement therefore
+      // covers the ownership-transmit fields only.
+      //
+      // `status` CAS is provided but OPT-IN: a caller that supplies
+      // `expectedStatus` gets the locked-snapshot comparison, but a
+      // status-only write is not required to supply it. This is deliberate
+      // and load-bearing. Under `deploymentMode: local_trusted` the board
+      // UI (browser, headerless) and the offending monitor sweep are the
+      // SAME actor class — both `type: "board"`, `source: "local_implicit"` —
+      // so a mandatory `expectedStatus` cannot separate the interactive
+      // writer from the sweep; it would 409 every human status change in
+      // the in-repo board UI. The threat is ownership departure, and that is
+      // what is gated here. See SPA-10859 for the no-discriminator probe and
+      // the caller-migration follow-ups.
+      const boardActorRequest = req.actor.type === "board";
+      if (boardActorRequest) {
+        const casRequiredFieldsForBoardActor: Array<{
+          targetKey: "assigneeUserId" | "assigneeAgentId";
+          expectedKey: "expectedAssigneeUserId" | "expectedAssigneeAgentId";
+        }> = [
+          {
+            targetKey: "assigneeUserId",
+            expectedKey: "expectedAssigneeUserId",
+          },
+          {
+            targetKey: "assigneeAgentId",
+            expectedKey: "expectedAssigneeAgentId",
+          },
+        ];
+        for (const { targetKey, expectedKey } of casRequiredFieldsForBoardActor) {
+          if (req.body[targetKey] === undefined) continue;
+          // Transfer-only trigger (SPA-10859): an unchanged value is not an
+          // ownership departure. The board UI's comment/reply flow re-sends
+          // the issue's current assignee values on every post; requiring
+          // expected* on mere presence would 409 every human comment. The
+          // sweep shape — a value that DIFFERS from the row — is what gates.
+          // A supplied-but-wrong expected is still validated by the service
+          // against the locked snapshot, so callers that opt in get full CAS.
+          if (req.body[targetKey] === existing[targetKey as keyof typeof existing]) continue;
+          if (req.body[expectedKey] === undefined) {
+            res.status(409).json({
+              error: `Issue write rejected: board actor did not supply expected value for ${expectedKey}; ownership-transfer CAS is required when changing this field (SPA-10357)`,
+              code: "issue_write_ownership_cas_missing",
+              field: expectedKey,
+            });
+            return;
+          }
+        }
+      }
+      const issueUpdateData: Record<string, unknown> = {
         ...updateFields,
         actorAgentId: actor.agentId ?? null,
         actorUserId: actor.actorType === "user" ? actor.actorId : null,
         // SPA-8957: route-minted override reaches the service only for
         // user/board actors (agents were rejected above).
-        ...(doneOverrideRequested
-          ? {
-            doneGateOverride: {
-              reason: doneOverrideRequested.reason,
-              actorType: actor.actorType,
-              actorId: actor.actorId,
-              agentId: actor.agentId ?? null,
-              runId: actor.runId ?? null,
-            },
-          }
-          : {}),
       };
+      // SPA-10357 / SPA-10429 ownership-transfer CAS expectations. Only
+      // forward keys the caller actually supplied — `undefined` here would
+      // make the service-side `hasOwnProperty` check always return true and
+      // collapse the helper into a no-op cas-missing rejection. Forwarding
+      // a literal `undefined` is therefore a defect, not a no-op.
+      if (req.body.expectedStatus !== undefined) {
+        issueUpdateData.expectedStatus = req.body.expectedStatus;
+      }
+      if (req.body.expectedAssigneeUserId !== undefined) {
+        issueUpdateData.expectedAssigneeUserId = req.body.expectedAssigneeUserId;
+      }
+      if (req.body.expectedAssigneeAgentId !== undefined) {
+        issueUpdateData.expectedAssigneeAgentId = req.body.expectedAssigneeAgentId;
+      }
+      if (doneOverrideRequested) {
+        issueUpdateData.doneGateOverride = {
+          reason: doneOverrideRequested.reason,
+          actorType: actor.actorType,
+          actorId: actor.actorId,
+          agentId: actor.agentId ?? null,
+          runId: actor.runId ?? null,
+        };
+      }
       const shouldCollectCompletionPublication =
         actor.actorType === "user" &&
         existing.status !== "done" &&

@@ -1,4 +1,5 @@
 import type { ActivityEvent } from "@paperclipai/shared";
+import { parseAssigneeValue } from "@/lib/assignees";
 import { useProjectCreatedItems } from "@/hooks/useProjectCreatedItems";
 import { requiresExecutionReconciliation } from "@paperclipai/shared";
 import { TaskChatExpansionState } from "@/components/task-chat/expansion-state";
@@ -596,15 +597,22 @@ export function TaskChatThread(props: TaskChatThreadProps) {
     }) => {
       if (!issueId)
         throw new Error("The task is not available for reassignment.");
+      // SPA-10357 / SPA-10859 board-actor ownership-transfer CAS: a
+      // reassignment is an ownership transfer, so the PATCH must carry the
+      // caller-observed current values. `currentAssigneeValue` is derived
+      // from the loaded issue, which is that observation.
+      const observed = parseAssigneeValue(currentAssigneeValue ?? "");
       await issuesApi.update(issueId, {
         ...reassignment,
+        expectedAssigneeAgentId: observed.assigneeAgentId,
+        expectedAssigneeUserId: observed.assigneeUserId,
         deferWakeForGoal: true,
       });
       await queryClient.invalidateQueries({
         queryKey: queryKeys.issues.detail(issueId),
       });
     },
-    [issueId, queryClient],
+    [issueId, queryClient, currentAssigneeValue],
   );
 
   const queuedMessageQueue =
