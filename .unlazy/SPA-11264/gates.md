@@ -285,3 +285,54 @@ DB (leased, pg 5433, paperclip_spa_cutover_20260906): running heartbeat rows=17;
 GET /api/issues/SPA-11264 (unauthenticated probe, :3100): 3.11s (cold) then 0.121/0.091s; 5x set: 1.334/0.158/0.111/0.137/0.153s. Steady state ~0.1-0.16s vs 26.9s pre-161 and 9.4-10.6s original baseline.
 INDEX USE (pg_stat_user_indexes): ctx_issue_created_idx=31023377, status_process_started_idx=21003445, native_uq=1468145, liveness_idx=566536, missing_terminal_liveness_idx=3. Ownership query served by the two PR #161 index branches; new partial liveness index barely hit (predicate not yet exercised or planner prefers older index).
 STILL UNPROVEN: upstream cap/de-duplicate at proven redundant boundary OR explicit board amendment; measured wakeup/cost residual-caller disposition; independent full-incident verdict. No source edits, no migration, no restart this run.
+
+## Upstream-bound investigation — 2026-10-10 ~20:3xZ (run this heartbeat, manager ruling aa05e2a6 item 1)
+
+CONTEXT: Hot shape (full-column ownership query) is fixed and live (818d2fb8, 0 matching
+backends, GET steady-state ~0.1-0.16s). Remaining Ask 1: cap/de-dupe the caller. Branch
+taken: (2) return concrete no-redundant-trigger tracing for explicit board amendment.
+No cross-transaction ownership cache added (forbidden by 06:29 clarification, retained).
+
+CALLER INVENTORY (source reads this run at fork tip 818d2fb8 = live payload):
+- getConversationOwnershipBlocker defined conversation-continuation.ts:107. Direct callers:
+  execution-blocker.ts:37 (getExecutionBlocker) and execution-recovery-resolution.ts:323
+  (settleUnrecoverableExecutions tx loop, limit 25, skipLocked).
+- getExecutionBlocker fan-out (each a distinct admission decision in its own snapshot):
+  wake-queue postgres.ts:1201 (release tx — gates executor handoff); heartbeat.ts:10737 /
+  10740 (stoppedNativeContinuation / legacyContinuation gates — mutually exclusive branches,
+  one fires per invocation, NOT duplicate); heartbeat.ts:10873 (resumeExecutionWaitComments);
+  heartbeat.ts:10956; heartbeat.ts:19736 (stranded-queue path); heartbeat.ts:27748 / 28643
+  (dispatch admission tx); explicit-native-continuation.ts:133 (admission dry-run gate).
+
+EXISTING BOUNDS (already in the shipped source, not added here):
+- resumeExecutionWaitComments (heartbeat.ts:10940-56): limit 50, per-issue seen Set
+  (10941-45), atomic updatedAt<=30s claim before ownership lookup (10948-53).
+- pendingInterrupts (19697-99): limit 50 + updatedAt<=30s eligibility.
+- strandedQueues (19711-23): limit 50 but NO updatedAt eligibility cutoff — the one
+  unbounded-eligibility site; it drives the agent_wakeup_requests SHAPE, which per this
+  ruling is split out to child card 3528f7e0 and is NOT this card's work.
+- settle loop (execution-recovery-resolution.ts:320-21): limit 25, FOR UPDATE SKIP LOCKED.
+
+CONCURRENCY BOUNDARY: single control-plane process (MainPID); concurrent triggers each
+hold their own transaction snapshot (release tx, dispatch admission tx, settle tx, plain
+reads from issue GET). Sharing one in-flight ownership result across these snapshots can
+suppress newly acquired ownership or cross snapshot isolation — the exact hazard named in
+the 06:27 handoff and accepted in the 06:29 clarification. Per-issue keys differ across
+triggers (N issues x M triggers, not N duplicates of one query); same-issue concurrent
+overlap is unproven from live evidence and coalescing it is a cross-snapshot cache.
+
+CONCLUSION (branch 2): no safe redundant upstream trigger exists to bound/coalesce
+without changing ownership decision semantics. The per-site limits + atomic claims above
+ARE the existing bound; the index fix (5.977ms exact installed query, 0 backends) removed
+the cost that made the concurrency painful. Amendment evidence: ask the board to strike
+Ask 1 (cap/de-dupe) as superseded by the index-bounded correction, with this tracing
+attached. No behavior change proposed, so no result-equivalence proof is owed — the
+amendment strikes the ask, it does not land a new bound.
+
+SPLIT-OUT CHILDREN (ruling item 2, both todo + real owner Ty, parent SPA-11264):
+- 3528f7e0: agent_wakeup_requests residual caller attribution + measured index disposition.
+- a3a37466: cost_events residual caller attribution + measured index disposition.
+This card no longer carries the 78G/71G cumulative scans.
+
+STILL TO RUN THIS HEARTBEAT (ruling item 3): ONE fresh independent incident verdict with
+original Ask verbatim + full ledger + board GET sample (19:30Z) + Oct-10 receipts.
