@@ -61,6 +61,38 @@ import {
  * board override (see `doneOverride` on the PATCH route — agents may never
  * supply it).
  *
+ * SPA-9578 (James ruled `narrow-exception`, 2026-09-30, interaction
+ * 753031a2 on SPA-9578): a card classified as a NON-CODE COORDINATION card may
+ * close while a PR it merely CITES stays open. Live gap: SPA-9575 coordinates a
+ * reviewer verdict on PR #957 and cites that PR as evidence; it has no
+ * `pull_request` work product, yet two `done` PATCHes were refused 409 because
+ * #957 is open. Under SPA-9038 prose links bind exactly like work products, so
+ * a card that is not ABOUT the PR cannot close.
+ *
+ * The classification is deliberately narrow, and narrow in the direction that
+ * protects merge safety:
+ *   - It relaxes ONLY references derived from prose (description/comments). A
+ *     `pull_request` WORK PRODUCT stays fully binding — from any repo — because
+ *     an attached work product is the engine's strongest statement that the PR
+ *     is this card's deliverable. SPA-9038 exists precisely because that signal
+ *     is weak in practice (agents usually link PRs in comments, not work
+ *     products), so a work product is the one signal we still insist on.
+ *   - It relaxes ONLY `state === "open"`. An `unknown` reference (GitHub
+ *     unreachable, credentials missing, resolver absent, or a 404 on both the
+ *     pulls and issues endpoints) stays fail-closed and still refuses. The
+ *     classification is a statement about INTENT ("this card's deliverable is
+ *     a coordination outcome, not a merge"), never a statement that we failed
+ *     to verify something.
+ *   - It may only be supplied by a user/board actor, with a reason, exactly like
+ *     `doneOverride` — an agent PATCH carrying it is 403. An agent whose own PR
+ *     is open therefore cannot classify its way out of the gate; that is the
+ *     SPA-8593/8626/8665/8715/8722 failure class this gate exists to stop.
+ *   - It is never silent: an accepted classification writes an
+ *     `issue.done_gate_coordination_relaxed` activity row naming the actor, the
+ *     reason, and every reference it relaxed.
+ *   - No PR evidence is ever deleted to use it. The cited links stay in the card
+ *     text; only the gate's binding is narrowed for that one transition.
+ *
  * Verdicts are snapshot-bound: the merge state is read through the same
  * resolver seam (and cache convention) as execution-workspace delivery
  * assessment — a short TTL, never a live re-check on refusal. A reviewer who
@@ -70,6 +102,9 @@ import {
  */
 
 export const DONE_GATE_OPEN_PR_REFUSAL = "issue_done_with_unmerged_pull_request";
+
+/** Activity action written when a coordination classification was accepted. */
+export const DONE_GATE_COORDINATION_RELAXED = "issue.done_gate_coordination_relaxed";
 
 /**
  * SPA-9038: PR links parsed out of card prose (description/comments) bind the
@@ -93,13 +128,26 @@ export type DoneGatePullRequestState = {
   state: "merged" | "open" | "closed" | "unknown";
 };
 
+/**
+ * SPA-9578: which binding surface produced a reference. `work_product` is an
+ * attached `pull_request` work product (always binding); `prose` is a link in
+ * the card's description or comments (the only surface a coordination
+ * classification may relax).
+ */
+export type BoundPullRequestSource = "work_product" | "prose";
+
+export type BoundPullRequestReference = {
+  reference: GitHubPullRequestReference;
+  source: BoundPullRequestSource;
+};
+
 export type DoneGateBlockedReason =
   | { kind: "open_pull_requests"; pullRequests: DoneGatePullRequestState[] }
   | { kind: "unknown_pull_request_state"; pullRequests: DoneGatePullRequestState[] }
   | { kind: "unresolved_pull_request_reference"; numbers: number[] };
 
 export type DoneGateDecision =
-  | { outcome: "allow" }
+  | { outcome: "allow"; relaxedPullRequests?: DoneGatePullRequestState[] }
   | { outcome: "refuse"; reason: DoneGateBlockedReason };
 
 export type DoneGateOverrideInput = {
@@ -109,6 +157,15 @@ export type DoneGateOverrideInput = {
   agentId: string | null;
   runId: string | null;
 };
+
+/**
+ * SPA-9578: a user/board assertion that this card is a non-code COORDINATION
+ * card — its deliverable is a coordination outcome (a verdict, a routing
+ * decision, a reviewer answer), not a merge. Requires a reason; never agent
+ * supplied (the PATCH route rejects an agent actor with 403 before this ever
+ * reaches the service, exactly as it does for `doneOverride`).
+ */
+export type DoneGateCoordinationClassificationInput = DoneGateOverrideInput;
 
 export type IssueDoneGateServiceOptions = {
   /**
@@ -181,34 +238,37 @@ export function issueDoneGateService(db: Db, opts: IssueDoneGateServiceOptions =
    *   2. GitHub PR URLs and `owner/repo#N` shorthands parsed from the card's
    *      description and its most recent comments, restricted to Spark-Mojo
    *      repos. Deleted comments never bind.
+   *
+   * SPA-9578: each entry is tagged with where it came from, because only the
+   * prose-derived ones may be relaxed by a coordination classification. An
+   * attached work product is the strongest "this PR IS the deliverable"
+   * statement the engine has and stays binding under every classification.
+   * A reference found through BOTH paths keeps the work-product tag — the
+   * stronger signal wins, and the card must attach a work product rather than
+   * drop one to qualify.
    */
   async function listBoundPullRequests(
     issue: { id: string; companyId: string; description?: string | null },
   ) {
-    const references = new Map<string, GitHubPullRequestReference>();
+    const references = new Map<string, BoundPullRequestReference>();
     const unresolved = new Set<number>();
     const productReferences: GitHubPullRequestReference[] = [];
+    const record = (reference: GitHubPullRequestReference, source: BoundPullRequestSource) => {
+      const key = formatReference(reference).toLowerCase();
+      const existing = references.get(key);
+      if (!existing) references.set(key, { reference, source });
+      else if (source === "work_product") existing.source = "work_product";
+    };
     const addProse = (body: string) => {
-      addExtracted(extractGitHubPullRequestReferences([body]).filter(isSparkMojoRepo));
+      for (const reference of extractGitHubPullRequestReferences([body]).filter(isSparkMojoRepo)) {
+        record(reference, "prose");
+      }
       for (const number of unresolvedPaperclipPullRoutes(body)) {
         const repos = new Set(productReferences.filter((reference) => reference.number === number && isSparkMojoRepo(reference))
           .map((reference) => `${reference.owner}/${reference.repo}`.toLowerCase()));
         if (repos.size !== 1) unresolved.add(number);
       }
     };
-    const addReferences = (values: readonly unknown[]) => {
-      for (const reference of extractGitHubPullRequestReferences(values)) {
-        const key = formatReference(reference).toLowerCase();
-        if (!references.has(key)) references.set(key, reference);
-      }
-    };
-    const addExtracted = (extracted: readonly GitHubPullRequestReference[]) => {
-      for (const reference of extracted) {
-        const key = formatReference(reference).toLowerCase();
-        if (!references.has(key)) references.set(key, reference);
-      }
-    };
-
     const products = await db
       .select({
         url: issueWorkProducts.url,
@@ -234,8 +294,9 @@ export function issueDoneGateService(db: Db, opts: IssueDoneGateServiceOptions =
         product.summary,
         product.metadata ? JSON.stringify(product.metadata) : null,
       ];
-      productReferences.push(...extractGitHubPullRequestReferences(values));
-      addReferences(values);
+      const extracted = extractGitHubPullRequestReferences(values);
+      productReferences.push(...extracted);
+      for (const reference of extracted) record(reference, "work_product");
     }
 
     // SPA-9038: prose bindings — description first, then recent live comments.
@@ -258,8 +319,20 @@ export function issueDoneGateService(db: Db, opts: IssueDoneGateServiceOptions =
     return { references: [...references.values()], unresolved: [...unresolved] };
   }
 
+  /**
+   * SPA-9578: when a user/board actor classified the card as a non-code
+   * coordination card, cited (`prose`-derived) OPEN pull requests no longer
+   * block that one transition. Everything else is unchanged and fail-closed:
+   * `work_product` references block from any repo, and an `unknown` state
+   * blocks regardless of source — the classification asserts intent about what
+   * the card delivers, never that a lookup failed.
+   *
+   * The relaxed references are returned alongside `allow` so the caller can
+   * record them; nothing is dropped silently.
+   */
   async function evaluateDoneGate(
     issue: { id: string; companyId: string; description?: string | null },
+    opts: { coordinationClassification?: boolean } = {},
   ): Promise<DoneGateDecision> {
     const { references, unresolved } = await listBoundPullRequests(issue);
     if (unresolved.length > 0) {
@@ -268,13 +341,38 @@ export function issueDoneGateService(db: Db, opts: IssueDoneGateServiceOptions =
     if (references.length === 0) return { outcome: "allow" };
 
     const states: DoneGatePullRequestState[] = [];
-    for (const reference of references) {
-      states.push({ reference, state: await resolvePullRequestState(issue.companyId, reference) });
+    for (const bound of references) {
+      states.push({
+        reference: bound.reference,
+        state: await resolvePullRequestState(issue.companyId, bound.reference),
+      });
     }
-    // `closed` (refused PR) is a human signal — never blocks the close.
-    const open = states.filter((entry) => entry.state === "open" || entry.state === "unknown");
-    if (open.length === 0) return { outcome: "allow" };
 
+    // A classification relaxes ONLY a prose-derived reference that is
+    // positively OPEN. `unknown` never relaxes — fail-closed on ambiguity is
+    // the one property this gate may not trade away, and the classification
+    // asserts intent about the deliverable, never that a lookup failed.
+    const isRelaxable = (index: number) =>
+      opts.coordinationClassification === true
+      && references[index]!.source === "prose"
+      && states[index]!.state === "open";
+
+    // `closed` (refused PR) is a human signal — never blocks the close.
+    const blocking = states
+      .map((entry, index) => ({ entry, index }))
+      .filter(({ entry }) => entry.state === "open" || entry.state === "unknown");
+    if (blocking.length === 0) return { outcome: "allow" };
+
+    const stillBlocking = blocking.filter(({ index }) => !isRelaxable(index));
+    const relaxed = blocking.filter(({ index }) => isRelaxable(index)).map(({ entry }) => entry);
+
+    if (stillBlocking.length === 0) {
+      return relaxed.length > 0
+        ? { outcome: "allow", relaxedPullRequests: relaxed }
+        : { outcome: "allow" };
+    }
+
+    const open = stillBlocking.map(({ entry }) => entry);
     const unknownOnly = open.every((entry) => entry.state === "unknown");
     return {
       outcome: "refuse",
@@ -334,10 +432,45 @@ export function issueDoneGateService(db: Db, opts: IssueDoneGateServiceOptions =
     });
   }
 
+  /**
+   * SPA-9578: never silent. Records the accepted coordination classification,
+   * the actor who supplied it, and every cited reference it relaxed — so a
+   * later reader can see exactly which PRs were open when this card closed and
+   * why the gate stood down.
+   */
+  async function recordCoordinationClassification(input: {
+    issue: { id: string; companyId: string; identifier: string | null };
+    classification: DoneGateCoordinationClassificationInput;
+    relaxedPullRequests: DoneGatePullRequestState[];
+  }) {
+    await logActivity(db, {
+      companyId: input.issue.companyId,
+      actorType: input.classification.actorType === "agent" ? "agent" : "user",
+      actorId: input.classification.actorId ?? "board",
+      agentId: input.classification.agentId,
+      runId: input.classification.runId,
+      action: DONE_GATE_COORDINATION_RELAXED,
+      entityType: "issue",
+      entityId: input.issue.id,
+      issueId: input.issue.id,
+      details: {
+        identifier: input.issue.identifier,
+        reason: input.classification.reason,
+        gate: DONE_GATE_OPEN_PR_REFUSAL,
+        scope: "prose_cited_pull_requests_only",
+        pullRequests: input.relaxedPullRequests.map((entry) => ({
+          reference: formatReference(entry.reference),
+          state: entry.state,
+        })),
+      },
+    });
+  }
+
   return {
     evaluateDoneGate,
     refusalError,
     recordOverride,
+    recordCoordinationClassification,
     listBoundPullRequests,
   };
 }

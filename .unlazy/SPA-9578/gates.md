@@ -1,0 +1,600 @@
+# SPA-9578 — gates ledger
+
+Engine card. Repo `Spark-Mojo/paperclip`, worktree on branch
+`SPA-9578-coordination-issue-close-guard`, base
+`refs/remotes/origin/rebuild/v2026.916.0-survivors` = `13e1ea88eb78a2308191dceff18e4ede84417deb`.
+
+Deliverable: a narrow coordination exception in the card-close done gate
+(`server/src/services/issue-done-gate.ts`) so a non-code coordination card can
+close while a PR it merely CITES stays open, while every PR-deliverable card
+still refuses to close before merge.
+
+James's ruling (interaction `753031a2-b29b-4472-ad02-b525f68887c0`,
+`narrow-exception`): "allow a card with an explicit coordination classification
+and no PR work product to close, but keep the close guard for every
+PR-deliverable card."
+
+Fail-closed rules honoured by every CHECK below: each is a single non-pipeline
+command whose exit status is the assertion; every stage is captured with
+`out=$(cmd) || exit $?` before `$out` is consumed.
+
+---
+
+## G1 — coordination card with a cited open PR reaches `done`
+
+Outcome: a card classified as a coordination card, with NO `pull_request` work
+product, closes even though the PR it cites in prose is open.
+
+CHECK:
+```
+timeout 900 pnpm --filter @paperclipai/server exec vitest run \
+  src/__tests__/issue-done-pr-merged-gate.test.ts \
+  -t "coordination classification lets a non-code card close with a cited open PR" \
+ 
+```
+EXPECT: exit 0 and a line `Tests  1 passed` for the named case.
+
+NEGATIVE (same assertion, bad input — the PR is the card's own deliverable, so
+the classification must NOT relax it):
+```
+timeout 900 pnpm --filter @paperclipai/server exec vitest run \
+  src/__tests__/issue-done-pr-merged-gate.test.ts \
+  -t "a PR-deliverable card cannot use the coordination classification to skip merge" \
+ 
+```
+Expected observation: that case asserts a 409 and is expected to PASS (green);
+the negative control is the pair below, which proves the assertion REJECTS the
+bad input.
+
+---
+
+## G1N — NEGATIVE CONTROL: the classification cannot be self-declared
+
+Outcome: an agent cannot mint the classification itself.
+
+CHECK:
+```
+timeout 900 pnpm --filter @paperclipai/server exec vitest run \
+  src/__tests__/issue-done-pr-merged-gate.test.ts \
+  -t "coordination classification denied for agent actor" \
+ 
+```
+EXPECT: exit 0; the case asserts HTTP 403 from
+`PATCH /api/issues/{id}` carrying the field with an agent actor.
+
+NEGATIVE (safe, isolated failing input for the SAME assertion — a board actor
+with the same field must SUCCEED, proving the 403 above is discriminating the
+actor and not failing everything):
+```
+timeout 900 pnpm --filter @paperclipai/server exec vitest run \
+  src/__tests__/issue-done-pr-merged-gate.test.ts \
+  -t "coordination classification accepted from a board actor" \
+ 
+```
+Observed: exit 0 and `status` reads `done` — the rejection in the CHECK is
+specific to the agent actor.
+
+---
+
+## G2 — fail-closed preserved: unknown state still blocks a coordination card
+
+Outcome: the classification relaxes only a positively-`open` cited PR. A
+reference whose merge state cannot be verified still refuses.
+
+CHECK:
+```
+timeout 900 pnpm --filter @paperclipai/server exec vitest run \
+  src/__tests__/issue-done-pr-merged-gate.test.ts \
+  -t "coordination classification does not relax an unverifiable (unknown) cited PR" \
+ 
+```
+EXPECT: exit 0; the case asserts `refuse` with
+`kind: "unknown_pull_request_state"`.
+
+NEGATIVE: the paired positive case "coordination classification lets a non-code
+card close with a cited open PR" — with `state: "open"` the same code path
+allows. Same assertion, opposite input, both proven in one run.
+
+---
+
+## G3 — the activity record is written (never silent)
+
+Outcome: an accepted classification writes an `issue.done_gate_coordination_relaxed`
+activity row naming the actor, the reason, and the relaxed references.
+
+CHECK:
+```
+timeout 900 pnpm --filter @paperclipai/server exec vitest run \
+  src/__tests__/issue-done-pr-merged-gate.test.ts \
+  -t "coordination classification records an activity row with actor, reason and relaxed PRs" \
+ 
+```
+EXPECT: exit 0; the case reads the `activityLog` row back and asserts
+`action`, `actorType`, `details.reason`, and
+`details.pullRequests` contain the cited reference.
+
+NEGATIVE: the pre-existing gate test
+`-t "override_by_board_recorded: doneOverride closes the card and writes an activity row"`
+must keep passing unchanged — proves the new row does not replace or
+double-write the existing `issue.done_gate_overridden` row.
+
+---
+
+## G4 — no regression in the whole gate suite
+
+Outcome: all pre-existing done-gate cases still pass, including
+`:131-163` (attached PR refuses), `:217-243` (comment-only open PR refuses
+WITHOUT the classification), `:294-337` (SPA-9323 issue-vs-PR discrimination),
+`:386-412` (override activity row), `:509-551` (agent override 403).
+
+CHECK:
+```
+out=$(timeout 1800 pnpm --filter @paperclipai/server exec vitest run \
+  src/__tests__/issue-done-pr-merged-gate.test.ts 2>&1) \
+  || { printf '%s\n' "$out"; exit 1; }
+printf '%s\n' "$out"
+printf '%s' "$out" | grep -q "failed" && { echo "GATE FAILED: failures in suite"; exit 1; }
+echo "G4 GATE OK"
+```
+EXPECT: exit 0 and `G4 GATE OK`.
+
+NEGATIVE: run the same command with a deliberately wrong file path — it must
+exit nonzero, proving the CHECK is not a vacuous pass-through:
+```
+timeout 900 pnpm --filter @paperclipai/server exec vitest run \
+  src/__tests__/no-such-gate-test-file.test.ts
+```
+Expected observation: nonzero exit, "No test files found".
+
+---
+
+## G5 — typecheck of the touched server package
+
+Outcome: the new field and service input typecheck.
+
+CHECK:
+```
+out=$(timeout 1800 pnpm --filter @paperclipai/server exec tsc --noEmit 2>&1) || { printf '%s\n' "$out"; exit 1; }
+echo "G5 GATE OK"
+```
+EXPECT: exit 0 and `G5 GATE OK`.
+
+NEGATIVE: introduce a type error in a scratch copy and confirm `tsc --noEmit`
+exits nonzero — proving G5 is not a silent no-op:
+```
+cd "$PAPERCLIP_RUN_SCRATCH_DIR" && printf 'const x: number = "not a number";\n' > bad.ts
+timeout 900 "$PWD/../../node_modules/.bin/tsc" --noEmit --skipLibCheck bad.ts
+```
+Expected observation: nonzero exit, `TS2322`.
+
+---
+
+## Not gates (recorded, not claimed)
+
+- **Live close of SPA-9575** requires the board to submit the classification
+  against a DEPLOYED engine. This card proves the behaviour in disposable
+  tests; the live close is Steve's call after Dex merges and the engine is
+  installed. Not claimed here.
+- **No PR #957 merge, no thread resolution, no fixture-timing verdict** — out
+  of scope by card contract.
+
+---
+
+## RESULTS (all run 2026-09-30, this worktree, branch SPA-9578-coordination-issue-close-guard)
+
+Environment note: `vitest` here is 4.1.11 and `--reporter=basic` was REMOVED
+in v4 — the first attempt failed with `Failed to load custom Reporter from
+basic`. Commands above were corrected to drop it. Test paths are relative to
+the `server/` package because the CHECK uses `--filter @paperclipai/server`.
+
+### G1 — coordination card closes with a cited open PR
+CHECK exit 0.
+```
+timeout 900 pnpm --filter @paperclipai/server exec vitest run \
+  src/__tests__/issue-done-pr-merged-gate.test.ts \
+  -t "coordination classification lets a non-code card close with a cited open PR"
+```
+Observed: `Tests  1 passed | 30 skipped (31)`.
+Proves both directions in one case: WITHOUT the classification the same cited
+PR 957 refuses (`open_pull_requests`), WITH it the card allows and the decision
+carries `relaxedPullRequests: [ … number: 957 ]`.
+
+NEGATIVE for the same assertion — an ATTACHED `pull_request` work product plus
+the classification:
+`vitest run … -t "cannot use the coordination classification to skip merge"` →
+`Tests  1 passed | 30 skipped`. That case asserts `refuse`. PASS.
+
+### G1N — the classification cannot be self-declared
+CHECK exit 0: `-t "coordination classification denied for agent actor"` →
+`Tests  1 passed | 30 skipped`. Asserts HTTP 403 and `error` containing
+"Agents cannot classify"; card stays `in_progress`.
+
+NEGATIVE (the 403 must discriminate the ACTOR, not fail every path) exit 0:
+`-t "coordination classification accepted from a board actor"` →
+`Tests  1 passed | 30 skipped`. A board actor PATCHing the identical field is
+NOT 403 and the service decision with the classification is `allow`.
+
+### G2 — fail-closed survives: `unknown` still blocks
+CHECK exit 0: `-t "does not relax an unverifiable"` → `Tests  1 passed | 30 skipped`.
+Asserts `refuse` with `kind: "unknown_pull_request_state"` while the
+classification is supplied.
+
+NEGATIVE — proof the assertion discriminates rather than passing vacuously: a
+scratch copy of the suite with this one expectation flipped to `allow`:
+```
+cp server/src/__tests__/issue-done-pr-merged-gate.test.ts \
+  server/src/__tests__/zz-scratch-negative.test.ts   # then flip only that expectation
+timeout 900 pnpm --filter @paperclipai/server exec vitest run \
+  src/__tests__/zz-scratch-negative.test.ts -t "does not relax an unverifiable"
+```
+Observed exit **1**: `AssertionError: expected { outcome: 'refuse', … } to match
+object { outcome: 'allow' }`. The scratch file was deleted in the same command;
+`git status --porcelain` after shows only the four intended modified files plus
+`.unlazy/SPA-9578/`.
+
+### G3 — the activity record is written
+CHECK exit 0: `-t "coordination classification records an activity row"` →
+`Tests  1 passed | 30 skipped`. Reads the `activityLog` row back and asserts
+`action = issue.done_gate_coordination_relaxed`, `actorType = user`, and
+`details` containing `gate`, `scope: prose_cited_pull_requests_only`, the
+verbatim `reason`, and the relaxed reference `Spark-Mojo/sparkmojo-internal#957`.
+
+NEGATIVE: the pre-existing `-t "override_by_board_recorded"` case passes
+unchanged inside G4's full-suite run — the new row does not replace or
+double-write `issue.done_gate_overridden`.
+
+### G4 — no regression in the whole suite
+CHECK exit 0:
+```
+out=$(timeout 1700 pnpm --filter @paperclipai/server exec vitest run \
+  src/__tests__/issue-done-pr-merged-gate.test.ts 2>&1) || exit 1
+printf '%s\n' "$out" | grep -E "Tests  |Test Files  "
+```
+Observed: `Test Files  1 passed (1)` / `Tests  31 passed (31)`.
+Baseline before the change was `22 passed`; after, `31 passed` — 22 pre-existing
+cases all still green (including `:131-163` attached-PR refuses, `:217-243`
+comment-only open PR refuses, `:294-337` SPA-9323 discrimination, `:386-412`
+override activity row, `:509-551` agent override 403) plus 9 new cases.
+
+NEGATIVE: wrong path
+`vitest run src/__tests__/no-such-gate-test-file.test.ts` → exit **1**,
+`No test files found, exiting with code 1`. The CHECK is not a pass-through.
+
+### G5 — typecheck (rerun after verify-FAIL fixes, 2026-09-30)
+CHECK:
+`timeout 1700 pnpm --filter @paperclipai/server exec tsc --noEmit` → exit 1.
+
+**Base-red, not a regression — proven by stash comparison.** The run reports
+251 errors, all pre-existing missing-build-dependency noise on this fork
+(`Cannot find module '@paperclipai/plugin-sdk'`, `'@paperclipai/paperclip-runner'`,
+`err is of type 'unknown'` in untouched `routes/plugins.ts`). With my four
+files stashed the same command reports **the same 251 errors**, and
+`grep -E "issue-done-gate|routes/issues|services/issues|issue-done-pr-merged"`
+over the error list returns **NONE** — zero errors in any file this card
+touches. `git stash pop` restored the diff; `git status --porcelain` confirms
+the four intended files.
+
+NEGATIVE: this CHECK cannot be shown to discriminate on the fork's current
+dependency state (the build-dep errors mask any signal), so G5 is recorded
+**PRE-EXISTING-BASE-RED** for `tsc` as a whole, with the per-file zero-error
+grep as the positive signal. Marking it green would be a lie; the honest claim
+is "no new type error in any touched file", which CI will re-derive on a tree
+with deps built.
+
+### Gate summary
+| Gate | Outcome |
+|---|---|
+| G1 coordination card closes with cited open PR | PASS |
+| G1N agent denied / board accepted | PASS |
+| G2 `unknown` stays fail-closed | PASS (negative control exits 1 as required) |
+| G3 activity row | PASS |
+| G4 full suite 31/31, no regression | PASS (negative: wrong path exits 1) |
+| G5 tsc | PRE-EXISTING-BASE-RED (251 pre-existing, 0 in touched files, identical count with diff stashed) |
+
+---
+
+## ROUND 2 — after `VERDICT: FAIL` (2026-09-30)
+
+The first verifier returned FAIL on three findings. Two were real defects in my
+diff and are fixed; one was a gate-classification point that stays
+`PRE-EXISTING-BASE-RED`.
+
+### R3 (was NOT MET) — the field was a silent no-op on a non-done PATCH
+Defect confirmed in the diff, not just asserted: `coordinationNoPrDeliverable`
+was destructured off the body and consumed only inside the `done` branch, so a
+board PATCH carrying it on a title edit returned 200 and applied nothing.
+
+FIX (two layers, defence in depth):
+- `routes/issues.ts`: a PATCH carrying `coordinationNoPrDeliverable` whose
+  `status !== "done"` is **422**, with `error` "coordinationNoPrDeliverable is
+  only valid on a PATCH that sets status to done".
+- `services/issues.ts`: `effectiveCoordinationClassification` drops the
+  classification unless this is a first entry into `done`, so an internal
+  caller cannot smuggle a standing exemption past the route check either. The
+  field remains request-scoped and is never persisted as card state.
+
+Gates:
+- `-t "refused on a PATCH that does not transition to done"` → exit 0,
+  `Tests  1 passed | 34 skipped`. Asserts 422 + the message.
+- `-t "does not persist as a standing exemption"` → exit 0,
+  `Tests  1 passed | 34 skipped`. Supplies a classification on a NON-done
+  service update, then proves a LATER close with NO classification still
+  refuses — the invariant holds at the service layer too.
+
+### R4/R5 (was NOT MET) — the proof lived at the service seam, not on the wire
+Defect confirmed: the only end-to-end PATCH assertions were "not 403" and
+"not 200", both of which pass for the wrong reason (`unknown` state), so the
+card's actual requirement — a coordination card CAN close while its cited PR is
+OPEN, and a PR-deliverable card still CANNOT — was never demonstrated on the
+request path.
+
+FIX: a hoisted `vi.mock` on `github-pull-request-merge.js` with a mutable
+`pinnedResolver`, null by default so all 22 pre-existing cases see unchanged
+behaviour. The two new request-path cases pin it to a genuinely `open` PR:
+- `-t "the board request path closes a coordination card whose cited PR is OPEN"`
+  → exit 0, `Tests  1 passed | 34 skipped`. Asserts **200**, `status === done`,
+  and the `issue.done_gate_coordination_relaxed` row naming
+  `Spark-Mojo/sparkmojo-internal#957`.
+- `-t "the board request path STILL refuses a PR-deliverable card carrying the
+  classification"` → exit 0, `Tests  1 passed | 34 skipped`. Same actor, same
+  field, same pinned `open` resolver — the only variable is the attached work
+  product. Asserts **409** with
+  `pullRequests: [{ number: 1150, state: "open" }]`, card stays
+  `in_progress`, and NO relaxation row was written.
+
+NEGATIVE control on the stronger of the two (flipping its 409 to 200 in a
+scratch copy):
+`AssertionError: … expected 409 to be 200`, `Tests  1 failed | 34 skipped`,
+exit **1**. Scratch file deleted in the same command.
+
+### Test-harness defect found while fixing the above
+`afterEach` deleted `heartbeat_runs` BEFORE `activityLog`, so once the new cases
+wrote activity rows carrying a `runId`, teardown failed on
+`activity_log_run_id_heartbeat_runs_id_fk` and cascaded 5 failures. Reordered
+(`activityLog` first). This was latent in the existing suite — it only
+surfaced once a case wrote a run-scoped activity row through the route path.
+
+### R5 residual risk, stated not hidden (verifier's second half)
+The shape SPA-8593/8626/8665/8715/8722 describes — an agent links ITS OWN open
+PR in a comment and never attaches a work product — is still closable if a
+**board user** chooses to classify it. That is inherent to James's ruling, which
+authorizes a board-authorized exception by design; the engine cannot
+distinguish "coordination card citing evidence" from "build card quoting its own
+PR" without a classification the board supplies. What IS proven and enforced:
+an agent cannot self-classify (403), the classification cannot persist as a
+standing exemption (422 + service drop), and any card with an attached work
+product still refuses (409). The residual is a human decision surface, not an
+engine bypass.
+
+### R6 / R7 — accepted as scoped, with reasons
+- R7 (no fixture-timing verdict, no thread resolution, no PR #957 merge):
+  **MET**, verified in the diff — the only occurrences of `957` are test
+  fixtures; no `sparkmojo-internal` mutation.
+- R6 (return evidence to Steve): satisfied by the closing card comment this run
+  posts, not by a UAT child. The card names no UAT child and no CI job as its
+  evidence surface, and `pr-read.sh card SPA-9578` has no linked evidence card
+  because none was ever created. A live close of SPA-9575 additionally requires
+  the board to submit the classification against a DEPLOYED engine, which is
+  post-merge and James-gated.
+
+### G5 — still PRE-EXISTING-BASE-RED, re-verified
+`pnpm --filter @paperclipai/server exec tsc --noEmit` → exit 1, **251** errors,
+identical to the baseline count. `grep -E "issue-done-gate|routes/issues|services/issues|issue-done-pr-merged"`
+over the error list returns **NONE**. Re-classification on CI-only grounds is
+unavailable: `pr-read.sh checks <B>` returns `[]` (no check run bound to the
+pinned base SHA `13e1ea88`), so clause 1 cannot be satisfied either locally or
+on CI. Recording the honest verdict rather than a green.
+
+### Round-2 gate summary
+| Gate | Outcome |
+|---|---|
+| R4 cited open PR closes on the REAL PATCH path | PASS (negative: flipped assertion exits 1) |
+| R5 PR-deliverable refuses on the REAL PATCH path | PASS (negative: flipped assertion exits 1) |
+| R3 non-done PATCH → 422 | PASS |
+| R3 classification does not persist | PASS |
+| Full suite | **35 passed (35)** — 22 pre-existing green, 13 new |
+| G5 tsc | PRE-EXISTING-BASE-RED (251 = baseline, 0 in touched files) |
+
+---
+
+## ROUND 3 — `VERDICT: PASS (NO-CHECK transport)` and base reproduction for the red checks
+
+Independent verifier returned PASS on head `a18b0fdf1dbb0265f36af471303f53f482687eae`
+(R1–R8 all MET; R3/R4/R5 explicitly re-confirmed fixed by reading the code).
+Transport comment posted byte-for-byte per WORKFLOW step 8 (this fork has no
+requirements-sign-off check workflow):
+https://github.com/Spark-Mojo/paperclip/pull/131#issuecomment-5907806294
+
+### Verifier's finding against this ledger (accepted, and it is right)
+The verifier flagged my `PRE-EXISTING-BASE-RED` label on G5 as a MISLABEL: the
+SPA-9322 rule is a per-REQUIREMENT re-classification, not a gate label, and my
+`tsc` result is a local command rather than a check-run red, so it is not
+eligible for that re-classification at all. Correct. The honest disposition is
+therefore:
+
+- G5 is **not** re-classified and **not** claimed green.
+- The load-bearing typecheck claim is the requirement-level one: **R8 (no new
+  type error in any touched file)** — 251 errors on head, 251 on the stashed
+  base, and `grep -E "issue-done-gate|routes/issues|services/issues|issue-done-pr-merged"`
+  over the error list returns NONE.
+- The ledger keeps the raw evidence and drops the misapplied label.
+
+### Base reproduction for the red checks (WORKFLOW §4 blocker discipline)
+The verifier correctly noted my ledger did not cover base reproduction for
+`ci / policy` and `review`. Re-derived here, base SHA `13e1ea88` pinned, head
+`a18b0fdf1d`.
+
+`ci / policy` — every step of the job run locally, with exit codes:
+
+| Step | rc |
+|---|---|
+| `node .github/scripts/check-pr-migration-order.mjs <base> <head>` | 0 ("No new migrations in this PR.") |
+| `node ./scripts/check-docker-deps-stage.mjs` | 0 (PASS) |
+| `pnpm check:node-version` | 1 — **local artifact**, see below |
+| `node ./scripts/check-no-git-push.mjs` | 1 — **base-red, proven** |
+| `node --test ./scripts/check-no-git-push.test.mjs` | 0 |
+| `node scripts/check-module-boundaries.mjs` | 0 |
+| `node --test ./scripts/check-module-boundaries.test.mjs` | 0 |
+| `node --test '.github/scripts/tests/*.test.mjs'` | 0 |
+| `node --test ./scripts/__tests__/run-vitest-stable-shard.test.mjs` | 0 |
+| `node --test ./scripts/__tests__/e2e-shard.test.mjs` | 0 |
+| `node --test ./scripts/__tests__/release-verify-workflow.test.mjs` | 0 |
+| `node --test ./scripts/cloud-source-verification.test.mjs` | 0 |
+| `node --test ./scripts/__tests__/build-standalone-concurrency.test.mjs` | 0 |
+| `node ./scripts/release-package-map.mjs check` | 0 |
+| `check-release-package-bootstrap.mjs <changed…>` | 0 ("No release-enabled package manifests changed") |
+
+Two reds, both base-red and neither touching this PR:
+
+1. **`check-no-git-push.mjs`** — fails on
+   `server/src/services/workspace-runtime.ts:4884`,
+   `server/src/__tests__/workspace-runtime.test.ts:4572` and `:4577`.
+   Pinned-HEAD `git diff --name-only 13e1ea88...a18b0fdf1d` lists five files,
+   none of them `workspace-runtime*`. The failing assertion is non-touch
+   between file-as-of-H and file-as-of-B, so the red reproduces on the base.
+
+2. **`pnpm check:node-version`** — fails only on
+   `.paperclip-repositories/spark-mojo-platform-*/…/Dockerfile*` paths with
+   `node:20`. `.paperclip-repositories/` is **gitignored** (`.gitignore:74`), so
+   those files are not in the PR tree at all; this is a local worktree artifact
+   of the multi-repo workspace, not a CI condition.
+
+`review` — WORKFLOW §4 names the fork's `review` check (vendor `commitperclip`
+action, no key on the fork) as NEVER a blocker. Not treated as one.
+
+`Spark-Mojo/paperclip` reports `allow_auto_merge: false` (read live), so the
+SPA-9195 hand-merge path applies: this card goes to Dex with the verified head
+SHA, not to `gh pr merge --auto`.
+
+---
+
+## DEX AMENDMENT (2026-09-30) — the red-check record above was WRONG and is corrected here
+
+Recorded by Dex (Release & Deployment Manager), law 20 hand-merge holder, after
+independently re-deriving the check state of head `da3bd6f2bc6412467da6c23cf54c864eb455b239`.
+
+**The prior record is materially incomplete.** The ROUND 3 section above states
+"Two reds, both base-red". That is false. Re-derived from the live check list,
+**NINE checks are not green** on this head.
+
+Counted from a GraphQL `statusCheckRollup` read that returned **48 contexts** in one
+page (not truncated), cross-checked against a REST `--paginate` read:
+
+| # | Check | Conclusion | Classification |
+|---|---|---|---|
+| 1 | `review` | failure | vendor `commitperclip`, no key on the fork — WORKFLOW §4: never a blocker |
+| 2 | `ci / policy` | failure | **BASE-RED, now proven on the base SHA itself** (see below) |
+| 3 | `ci / General tests (server (11/12))` | failure | base-red (not this diff) |
+| 4 | `ci / General tests (server (12/12))` | failure | base-red (not this diff) |
+| 5 | `ci / General tests (workspaces-b)` | failure | base-red (not this diff) |
+| 6 | `ci / Verify serialized server suites (6/9)` | failure | base-red (not this diff) |
+| 7 | `ci / Verify serialized server suites (7/9)` | failure | base-red (not this diff) |
+| 8 | `ci / verify` | failure | **pure aggregator** — fails only because 3/4/5/6/7 failed |
+| 9 | `ci / e2e` | failure | **pure aggregator** — see the shard table below |
+
+The ROUND 3 record missed 3–7 entirely and missed that 8 and 9 are aggregators.
+`ci / e2e` had not even completed when the ROUND 3 record was written; it was
+`in_progress` at the time and is now `failure`.
+
+### `ci / e2e` resolved — all eight shards are GREEN
+
+`ci / e2e` is a 2-step aggregate job whose only assertion is
+`test "$POLICY_RESULT" = "success"` plus a shard-result case (`.github/workflows/pr-trusted.yml:1046-1059`).
+Its `steps` are literally `Set up job (success)` → `Fail if any e2e shard failed (failure)`
+→ `Complete job (success)`; it runs no tests itself. Per-shard conclusions on this head:
+
+```
+ci / e2e shard (1/8) :: SUCCESS      ci / e2e shard (5/8) :: SUCCESS
+ci / e2e shard (2/8) :: SUCCESS      ci / e2e shard (6/8) :: SUCCESS
+ci / e2e shard (3/8) :: SUCCESS      ci / e2e shard (7/8) :: SUCCESS
+ci / e2e shard (4/8) :: SUCCESS      ci / e2e shard (8/8) :: SUCCESS
+```
+
+**The e2e suite is not a blocker.** This red is a downstream consequence of
+`ci / policy`, nothing else.
+
+### `ci / policy` — base-red now PROVEN ON THE BASE SHA, not inferred
+
+The prior record said a base-SHA reproduction was structurally impossible because
+`GET /commits/13e1ea88/check-runs` returns `total_count: 0`. That is true of
+*check-run* history, and it is why the earlier run fell back to unrelated-PR
+inference. It is NOT true that the check cannot be reproduced: the check is a
+list of local commands, and those run fine on a base checkout.
+
+Base tree materialised as a throwaway worktree at the pinned base SHA
+(`/srv/bulk/worktrees/SPA-9578-base-red-probe`, `13e1ea88eb78a2308191dceff18e4ede84417deb`),
+outside the card worktree and outside any scratch dir. Full ref used, never a bare
+`origin/<branch>` shorthand. Results:
+
+| Command | rc on BASE | rc on HEAD | Note |
+|---|---|---|---|
+| `node ./scripts/check-no-git-push.mjs` | **1** | **1** | identical output, same 3 lines |
+| `node --test ./scripts/check-no-git-push.test.mjs` | 0 | 0 | |
+| `node ./scripts/check-docker-deps-stage.mjs` | 0 | — | `PASS` |
+| `node scripts/check-module-boundaries.mjs` | 0 | — | `Feature module boundary check passed.` |
+| `node ./scripts/release-package-map.mjs check` | 0 | — | `Release package manifest OK` |
+
+Failure output on BASE, verbatim, with **zero PR code present**:
+
+```
+ERROR: `git push` (or equivalent remote-mutating git command) found in adapter/runtime code:
+
+  server/src/services/workspace-runtime.ts:4884:         const message = pushResult?.stderr.trim() || ...
+  server/src/__tests__/workspace-runtime.test.ts:4572:     const pushOps = operations.filter((op) => op.command?.includes("git push"));
+  server/src/__tests__/workspace-runtime.test.ts:4577:     const pushIdx = operations.findIndex((op) => op.command?.includes("git push"));
+```
+
+Byte-identical to the head-tree output. Non-touch clause satisfied directly: the
+PR's five files are `.unlazy/SPA-9578/gates.md`,
+`server/src/__tests__/issue-done-pr-merged-gate.test.ts`, `server/src/routes/issues.ts`,
+`server/src/services/issue-done-gate.ts`, `server/src/services/issues.ts` — none of
+them `workspace-runtime*`. The failing assertion is therefore present on the base
+unmodified.
+
+**`ci / policy` classification is `PRE-EXISTING-BASE-RED`**, and it is now proven at
+the level WORKFLOW §4 clause (a) actually asks for ("confirm those checks also fail
+on the base"), not by the weaker unrelated-PR inference used previously.
+
+The separate `pnpm check:node-version` finding in ROUND 3 stands and is unaffected:
+it fails only on `.paperclip-repositories/` Dockerfiles, which `.gitignore:74`
+excludes, so it is a local multi-repo worktree artifact, not a CI condition.
+
+### Checks 3–7 (server suites) — still labelled by inference, not by base reproduction
+
+Not reproduced on the base tree this run: reproducing them needs the vitest harness,
+which the base checkout does not have installed. The evidence for "not this diff"
+remains what it was: `plugin-orchestration-apis.test.ts` is not in the diff and its
+failure stack is at `server/src/services/issues.ts:368`/`:9929` while this diff's
+`issues.ts` hunks begin at `@@ -10544`; `workspaces-b` is an unhandled `EPIPE` and
+the diff touches no workspaces file. Label stays `UNRELATED-PR-REPRODUCED` — the
+honest label, since base reproduction was not performed for these five.
+
+### Why none of the nine is a merge blocker
+
+Re-confirmed live this run, not from memory:
+- `Spark-Mojo/paperclip` reports `allow_auto_merge: false`.
+- Branch protection on `rebuild/v2026.916.0-survivors` returns 404; the ruleset list
+  is `[]`. **No required-check gate exists on this fork**, so no red check is formally blocking.
+- `autoMergeRequest = null`, `isInMergeQueue = false`, `mergeStateStatus = UNSTABLE`.
+- `reviewThreads totalCount = 0` — no thread to resolve.
+
+## SPA-10520 rebase receipt (2026-10-04)
+
+Rebased the four commits including Dex's ledger correction onto fetched fork default-branch tip `b7a3a892d8add53f1b2e6166fdce6f7d0d6756f4` in a durable side worktree. The original allocated worktree remains on its assigned branch. The binding layer keeps base's `{ references, unresolved }` return shape and `addProse` relative-link detection; the coordination classification tags sources and relaxes only prose-derived, positively open references. An unresolved relative link refuses even with classification.
+
+CHECK: `timeout 900 pnpm --filter @paperclipai/server exec vitest run src/__tests__/issue-done-pr-merged-gate.test.ts`
+EXPECT: exit 0, both coordination and four pre-existing unresolved-link tests pass.
+RESULT: exit 0, `Test Files 1 passed (1); Tests 42 passed (42)` (28 base cases, 13 original coordination cases, one explicit unresolved-with-classification case).
+NEGATIVE: first run with the stale array-shape assertion against the new `{references, unresolved}` contract exited 1: `expected { references: [...], unresolved: [] } to deeply equal [...]`; correcting that assertion makes the same suite pass. The suite's positive case discriminates attached PR (409) versus cited open PR (200); unresolved relative-link case refuses without resolving it.
+
+CHECK: `timeout 900 pnpm --filter @paperclipai/server exec tsc --noEmit`
+RESULT: exit 1, missing-build-dependency baseline (`@paperclipai/plugin-sdk` and `@paperclipai/paperclip-runner` dist absent); no reported diagnostic in the four touched TypeScript files. Not claimed green.
+CHECK: `timeout 900 pnpm --filter @paperclipai/server exec eslint src/services/issue-done-gate.ts src/__tests__/issue-done-pr-merged-gate.test.ts`
+RESULT: exit 1, `Command "eslint" not found`; no lint script assumed to exist.
+
+### Merge authority is UNRESOLVED and this ledger does not assert it
+
+Whether Dex may perform this merge is a charter/workflow conflict escalated to James
+in interaction `b17b5d23-3da1-4e21-8208-0c61371163b6` (pending). This amendment
+corrects the EVIDENCE only. It does not assert merge authority, and it does not
+authorise anyone to merge on the strength of this record.
