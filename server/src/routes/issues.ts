@@ -2565,6 +2565,7 @@ async function queueResolvedInteractionContinuationWakeup(input: {
     id: string;
     companyId: string;
     assigneeAgentId: string | null;
+    assigneeUserId?: string | null;
     status: string;
   };
   interaction: {
@@ -2572,6 +2573,7 @@ async function queueResolvedInteractionContinuationWakeup(input: {
     kind: string;
     status: string;
     continuationPolicy: string;
+    createdByAgentId?: string | null;
     sourceCommentId?: string | null;
     sourceRunId?: string | null;
     payload?: unknown;
@@ -2584,8 +2586,13 @@ async function queueResolvedInteractionContinuationWakeup(input: {
   newlyResolvedItemIds?: string[];
   idempotencyKey?: string | null;
 }) {
-  if (!input.issue.assigneeAgentId || isClosedIssueStatus(input.issue.status))
-    return;
+  if (isClosedIssueStatus(input.issue.status)) return;
+  let wakeAgentId = input.issue.assigneeAgentId;
+  if (!wakeAgentId && input.issue.assigneeUserId && input.interaction.createdByAgentId) {
+    const creator = await agentService(input.db).getById(input.interaction.createdByAgentId);
+    wakeAgentId = creator?.companyId === input.issue.companyId ? creator.id : null;
+  }
+  if (!wakeAgentId) return;
 
   const reviewPathLost =
     input.issue.status === "in_review" &&
@@ -2600,6 +2607,8 @@ async function queueResolvedInteractionContinuationWakeup(input: {
         return false;
       }));
   const continuationPolicyAllowsWake =
+    (!input.issue.assigneeAgentId && Boolean(input.issue.assigneeUserId) && Boolean(input.interaction.createdByAgentId) &&
+      ["accepted", "rejected", "answered"].includes(input.interaction.status)) ||
     input.interaction.continuationPolicy === "wake_assignee" ||
     (input.interaction.continuationPolicy === "wake_assignee_on_accept" &&
       // Question interactions resolve as `answered`, not `accepted`. An
@@ -2721,7 +2730,7 @@ async function queueResolvedInteractionContinuationWakeup(input: {
       `interaction:${input.interaction.id}:${publication.endpointId}`,
   );
   void input.heartbeat
-    .wakeup(input.issue.assigneeAgentId, {
+    .wakeup(wakeAgentId, {
       source: "automation",
       triggerDetail: "system",
       reason: "issue_commented",
@@ -2780,7 +2789,7 @@ async function queueResolvedInteractionContinuationWakeup(input: {
           err,
           issueId: input.issue.id,
           interactionId: input.interaction.id,
-          agentId: input.issue.assigneeAgentId,
+          agentId: wakeAgentId,
         },
         "failed to wake assignee on issue interaction resolution",
       ),
@@ -14984,6 +14993,7 @@ export function issueRoutes(
         const becameDone =
           existing.status !== "done" && issue.status === "done";
         if (becameDone) {
+          await heartbeat.autoUnblockReadyDependents(issue.id);
           const dependents = await svc.listWakeableBlockedDependents(issue.id);
           for (const dependent of dependents) {
             await addDependencyResolvedWakeup({
@@ -18397,6 +18407,7 @@ export function issueRoutes(
           issueBeforeCommentDecision.status !== "done" &&
           currentIssue.status === "done";
         if (becameDone) {
+          await heartbeat.autoUnblockReadyDependents(currentIssue.id);
           const dependents = await svc.listWakeableBlockedDependents(
             currentIssue.id,
           );
