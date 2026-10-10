@@ -3055,6 +3055,14 @@ describe("SPA-5916 — terminal re-complete guard", () => {
       expect(res.status, JSON.stringify(res.body)).toBe(409);
       expect(res.body.details?.code).toBe("issue_write_terminal_recomplete");
       expect(res.body.details?.boundary).toBe("Terminal status");
+      // SPA-10721 / GitHub #1288: the retry of a PATCH whose response was lost
+      // is exactly a done -> done (or cancelled -> cancelled) re-assertion. The
+      // response must hand the caller the persisted outcome so the ambiguity
+      // between "applied, response dropped" and "refused" is resolved without
+      // a second round trip.
+      expect(res.body.details?.terminalStatusAlreadySet).toBe(true);
+      expect(res.body.details?.currentStatus).toBe(requestedStatus);
+      expect(res.body.error).toContain("already landed");
       expect(res.body.error).toContain(
         existingStatus === "done" ? "already done" : "already cancelled",
       );
@@ -3080,6 +3088,10 @@ describe("SPA-5916 — terminal re-complete guard", () => {
 
     expect(res.status, JSON.stringify(res.body)).toBe(200);
     expect(mockIssueService.update).toHaveBeenCalled();
+    // NEGATIVE CONTROL for SPA-10721: a genuinely new terminal transition must
+    // NOT be mislabeled as an already-applied read-back.
+    expect(res.body.details?.terminalStatusAlreadySet).toBeUndefined();
+    expect(res.body.details?.currentStatus).toBeUndefined();
   });
 
   it("allows non-status PATCH (title) on a done card — terminal guard is status-only", async () => {
@@ -3107,5 +3119,12 @@ describe("SPA-5916 — terminal re-complete guard", () => {
     expect(res.status, JSON.stringify(res.body)).toBe(409);
     expect(mockIssueService.addComment).not.toHaveBeenCalled();
     expect(mockIssueService.update).not.toHaveBeenCalled();
+    // The read-back is scoped to the STATUS: the comment that accompanied this
+    // PATCH did NOT land, so the response must not claim the whole request was
+    // applied. `terminalStatusAlreadySet` is truthful; a blanket `alreadyApplied`
+    // would be a lie here.
+    expect(res.body.details?.terminalStatusAlreadySet).toBe(true);
+    expect(res.body.details?.currentStatus).toBe("done");
+    expect(res.body.details?.alreadyApplied).toBeUndefined();
   });
 });
