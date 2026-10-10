@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
+import { spawn } from "node:child_process";
 import { and, eq } from "drizzle-orm";
-import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   activityLog,
   agents,
@@ -94,6 +95,10 @@ describeEmbeddedPostgres("heartbeat resolved dependency wake reconciliation", ()
     db = createDb(tempDb.connectionString);
   }, 30_000);
 
+  beforeEach(() => {
+    vi.stubEnv("PAPERCLIP_IN_WORKTREE", "false");
+  });
+
   afterEach(async () => {
     // Dependency reconciliation heals missing wakes by enqueuing an
     // on-demand wake, which dispatches a heartbeat run fire-and-forget (see
@@ -105,6 +110,7 @@ describeEmbeddedPostgres("heartbeat resolved dependency wake reconciliation", ()
     // trip the run_events → runs foreign key.
     await heartbeatService(db).drainActiveRunExecutions();
     vi.clearAllMocks();
+    vi.unstubAllEnvs();
     runningProcesses.clear();
     await db.delete(activityLog);
     await db.delete(heartbeatRunEvents);
@@ -471,6 +477,138 @@ describeEmbeddedPostgres("heartbeat resolved dependency wake reconciliation", ()
       entityId: blockedIssueId,
       details: expect.objectContaining({ source: "issue_graph_liveness.backstop" }),
     });
+  });
+
+  it("replays a crash-window todo dependent past 501 earlier dependency candidates exactly once", async () => {
+    const { companyId, blockedIssueId, blockerIssueId } =
+      await seedResolvedDependencyBackstopFixture({ workspaceState: "none" });
+    const earlierIds = Array.from({ length: 501 }, (_, index) =>
+      `00000000-0000-4000-8000-${(index + 1).toString(16).padStart(12, "0")}`);
+    const deferredAgentId = randomUUID();
+    await db.insert(agents).values({
+      id: deferredAgentId, companyId, name: "Deferred agent", role: "engineer",
+      status: "idle", adapterType: "test_adapter", adapterConfig: {},
+      runtimeConfig: { heartbeat: { wakeOnDemand: false } }, permissions: {},
+    });
+    await db.insert(issues).values(earlierIds.map((id, index) => ({
+      id, companyId, title: `Earlier todo ${index}`, status: "todo",
+      priority: "medium", assigneeAgentId: deferredAgentId, issueNumber: index + 4,
+      identifier: `R-EARLIER-${index + 4}`,
+    })));
+    await db.insert(issueRelations).values(earlierIds.map((id) => ({
+      companyId, issueId: blockerIssueId, relatedIssueId: id, type: "blocks" as const,
+    })));
+    const child = spawn(process.execPath, [
+      "--import", "tsx", "--input-type=module", "-e",
+      `import { createDb, issues } from '@paperclipai/db';
+       import { eq } from 'drizzle-orm';
+       const db = createDb(process.env.REPLAY_DATABASE_URL);
+       await db.update(issues).set({ status: 'todo', blockedTransitionAt: new Date() }).where(eq(issues.id, process.env.REPLAY_ISSUE_ID));
+       process.stdout.write('TRANSITION_COMMITTED\\n');
+       setInterval(() => {}, 1000);`,
+    ], {
+      cwd: new URL("../../", import.meta.url).pathname,
+      env: { ...process.env, REPLAY_DATABASE_URL: tempDb!.connectionString, REPLAY_ISSUE_ID: blockedIssueId },
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    const childExit = new Promise<void>((resolve) => child.once("exit", () => resolve()));
+    let errors = "";
+    child.stderr.on("data", (chunk: Buffer) => { errors += chunk.toString(); });
+    const barrier = new Promise<void>((resolve, reject) => {
+      let output = "";
+      child.stdout.on("data", (chunk: Buffer) => {
+        output += chunk.toString();
+        if (output.includes("TRANSITION_COMMITTED\n")) resolve();
+      });
+      child.on("error", reject);
+      child.on("exit", (code) => reject(new Error(`transition process exited before barrier (${code}): ${errors}`)));
+    });
+    const bounded = async <T>(promise: Promise<T>, label: string) => {
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      try {
+        return await Promise.race([
+          promise,
+          new Promise<never>((_, reject) => {
+            timer = setTimeout(() => reject(new Error(`${label} timed out: ${errors}`)), 20_000);
+          }),
+        ]);
+      } finally {
+        clearTimeout(timer);
+      }
+    };
+    try {
+      await bounded(barrier, "transition barrier");
+    } finally {
+      child.kill("SIGKILL");
+      await bounded(childExit, "transition process exit");
+    }
+    expect((await db.select().from(issues).where(eq(issues.id, blockedIssueId)))[0]?.status).toBe("todo");
+    expect(await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, companyId))).toHaveLength(0);
+    expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, companyId))).toHaveLength(0);
+
+    const heartbeat = heartbeatService(db);
+    const firstPass = await heartbeat.reconcileResolvedDependencyWakes();
+    expect(firstPass.checked).toBe(500);
+    expect(firstPass.candidateLimitSkipped).toBeGreaterThan(0);
+    expect(firstPass.issueIds).not.toContain(blockedIssueId);
+    const restartedHeartbeat = heartbeatService(db);
+    const restartedFirstPass = await restartedHeartbeat.reconcileResolvedDependencyWakes();
+    expect(restartedFirstPass.issueIds).not.toContain(blockedIssueId);
+    const passes = await Promise.all([
+      restartedHeartbeat.reconcileResolvedDependencyWakes(),
+      restartedHeartbeat.reconcileResolvedDependencyWakes(),
+    ]);
+    expect(passes.flatMap((pass) => pass.issueIds)).toContain(blockedIssueId);
+    await heartbeatService(db).drainActiveRunExecutions();
+    const wakes = await db.select().from(agentWakeupRequests)
+      .where(and(eq(agentWakeupRequests.companyId, companyId), eq(agentWakeupRequests.reason, "issue_blockers_resolved")));
+    expect(wakes.filter((wake) => (wake.payload as { issueId?: string }).issueId === blockedIssueId)).toHaveLength(1);
+    expect(wakes[0]?.runId).not.toBeNull();
+    const runs = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, companyId));
+    expect(runs.filter((run) => run.wakeupRequestId === wakes[0]?.id)).toHaveLength(1);
+    expect(runs.filter((run) => (run.contextSnapshot as { wakeReason?: string })?.wakeReason === "issue_blockers_resolved")).toHaveLength(1);
+    expect(runs.filter((run) => (run.contextSnapshot as { wakeReason?: string })?.wakeReason === "finish_successful_run_handoff")).toHaveLength(1);
+    expect(mockAdapterExecute).toHaveBeenCalledTimes(runs.length);
+    expect(wakes[0]?.idempotencyKey).toBe(buildIssueBlockersResolvedWakeStateKey({
+      dependentIssueId: blockedIssueId, blockerIssueIds: [blockerIssueId],
+      blockedTransitionAt: (await db.select().from(issues).where(eq(issues.id, blockedIssueId)))[0]?.blockedTransitionAt,
+    }));
+  }, 60_000);
+
+  it("replays a todo dependent only after its blocker workspace finalizes", async () => {
+    const { companyId, blockedIssueId, blockerIssueId, executionWorkspaceId } =
+      await seedResolvedDependencyBackstopFixture({ workspaceState: "not_finalized" });
+    await db.update(issues).set({ status: "todo" }).where(eq(issues.id, blockedIssueId));
+    expect((await heartbeatService(db).reconcileResolvedDependencyWakes()).healed).toBe(0);
+    expect(await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, companyId))).toHaveLength(0);
+    await db.insert(workspaceOperations).values({
+      companyId, executionWorkspaceId, issueId: blockerIssueId,
+      phase: "workspace_finalize", status: "succeeded", startedAt: new Date(),
+    });
+    expect((await heartbeatService(db).reconcileResolvedDependencyWakes()).issueIds).toContain(blockedIssueId);
+  });
+
+  it("rechecks reassignment and re-block before replaying a todo dependent", async () => {
+    const { companyId, agentId, blockedIssueId, blockerIssueId } =
+      await seedResolvedDependencyBackstopFixture({ workspaceState: "none" });
+    await db.update(issues).set({ status: "todo", assigneeAgentId: null }).where(eq(issues.id, blockedIssueId));
+    expect((await heartbeatService(db).reconcileResolvedDependencyWakes()).healed).toBe(0);
+    await db.update(issues).set({ assigneeAgentId: agentId }).where(eq(issues.id, blockedIssueId));
+    await db.update(issues).set({ status: "todo" }).where(eq(issues.id, blockerIssueId));
+    expect((await heartbeatService(db).reconcileResolvedDependencyWakes()).healed).toBe(0);
+    expect(await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, companyId))).toHaveLength(0);
+    await db.update(issues).set({ status: "done" }).where(eq(issues.id, blockerIssueId));
+    expect((await heartbeatService(db).reconcileResolvedDependencyWakes()).issueIds).toContain(blockedIssueId);
+  });
+
+  it.each(["todo", "cancelled"] as const)("does not replay a todo dependent with a %s blocker", async (status) => {
+    const { companyId, blockedIssueId, blockerIssueId } =
+      await seedResolvedDependencyBackstopFixture({ workspaceState: "none" });
+    await db.update(issues).set({ status: "todo" }).where(eq(issues.id, blockedIssueId));
+    await db.update(issues).set({ status }).where(eq(issues.id, blockerIssueId));
+    const result = await heartbeatService(db).reconcileResolvedDependencyWakes();
+    expect(result.healed).toBe(0);
+    expect(await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, companyId))).toHaveLength(0);
   });
 
   it("heals a blocked dependent whose done blocker has no workspace finalize obligation", async () => {
