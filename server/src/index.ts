@@ -1809,6 +1809,12 @@ async function startServerWithDatabaseTeardown(
               }
             })
             .then(async () => {
+              const pulled = await heartbeat.pullIdleAgentTodoIssues();
+              if (pulled.pulled > 0) {
+                logger.warn({ ...pulled }, "periodic idle todo pull dispatched assigned todo cards");
+              }
+            })
+            .then(async () => {
               const reconciled = await heartbeat.reconcileTaskWatchdogs();
               if (reconciled.triggered > 0) {
                 logger.warn({ ...reconciled }, "periodic task-watchdog reconciliation triggered watchdog work");

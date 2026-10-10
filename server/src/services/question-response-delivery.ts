@@ -899,7 +899,10 @@ export function questionResponseDeliveryService(
           : "question_response_target_unavailable",
       });
     }
-    if (!issue.assigneeAgentId) {
+    if (
+      !issue.assigneeAgentId &&
+      !(issue.assigneeUserId && interaction.createdByAgentId && agent)
+    ) {
       // The answer is already recorded, but no agent owns the issue, so there
       // is no lawful `wake_assignee` target and nothing to steer. Park the
       // receipt instead of failing it: `sweepPending` retries it, and the first
@@ -910,7 +913,10 @@ export function questionResponseDeliveryService(
       await parkForAssignee(claimed, interaction, adapter, issue.status);
       return null;
     }
-    const assigneeAgentId = issue.assigneeAgentId;
+    // User-owned card whose answer came from an agent question: steer to the
+    // same-company creator without mutating assignment. Otherwise the assignee.
+    const assigneeAgentId =
+      issue.assigneeAgentId ?? interaction.createdByAgentId!;
     const inferredSourceCommentId =
       sourceRun && issueIdFromRun(sourceRun) === interaction.issueId
         ? sourceCommentIdFromRun(sourceRun)

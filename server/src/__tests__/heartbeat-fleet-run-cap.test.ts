@@ -342,6 +342,11 @@ describeEmbeddedPostgres("fleet-wide agent run ceiling", () => {
   const gates = new Map<string, () => void>();
   const startedRunIds: string[] = [];
   let blockExecutions = true;
+  // Assigned in the suite's beforeAll, after the DB handle exists, and reused by
+  // the queued-priority block below. Never declared twice at any scope: a
+  // duplicate `let` is a syntax error and a duplicate hoisted `function`
+  // silently replaces the original for the whole suite.
+  let runtimeEnvBaseFromSuite: Record<string, string | undefined> = {};
 
   beforeAll(async () => {
     tempDb = await startEmbeddedPostgresTestDatabase("paperclip-heartbeat-fleet-run-cap-");
@@ -352,6 +357,7 @@ describeEmbeddedPostgres("fleet-wide agent run ceiling", () => {
     };
     delete runtimeEnv[FLEET_MAX_CONCURRENT_RUNS_ENV_VAR];
     delete runtimeEnv[FLEET_RUN_LIVENESS_WINDOW_ENV_VAR];
+    runtimeEnvBaseFromSuite = runtimeEnv;
     heartbeat = heartbeatService(db, { runtimeEnv });
     heartbeatAtCeilingOne = heartbeatService(db, {
       runtimeEnv: { ...runtimeEnv, [FLEET_MAX_CONCURRENT_RUNS_ENV_VAR]: "1" },
@@ -392,10 +398,10 @@ describeEmbeddedPostgres("fleet-wide agent run ceiling", () => {
     blockExecutions = false;
     for (const release of gates.values()) release();
     gates.clear();
-    await heartbeat.drainActiveRunExecutions();
-    await heartbeatAtCeilingOne.drainActiveRunExecutions();
-    await heartbeatAtCeilingTwo.drainActiveRunExecutions();
-    await heartbeatAtCeilingTwoB.drainActiveRunExecutions();
+    // Drain every service in this file, including the ones the queued-priority
+    // block builds, and only now: the drains await parked executions, so they
+    // must run after the gate release above or they hang the suite.
+    await drainAllServices();
     runningProcesses.clear();
     startedRunIds.length = 0;
     // Any test that set a DB fleet-cap override (or warmed the cache) must not
@@ -431,6 +437,22 @@ describeEmbeddedPostgres("fleet-wide agent run ceiling", () => {
     gates.clear();
     await tempDb?.cleanup();
   });
+
+  // Every service instance this file constructs, drained as one. Services the
+  // queued-priority block adds are pushed here from its own beforeAll, so a
+  // parked execution can never outlive the test that started it.
+  const allHeartbeatServices: Array<ReturnType<typeof heartbeatService>> = [];
+  function registerHeartbeatService(
+    service: ReturnType<typeof heartbeatService>,
+  ): ReturnType<typeof heartbeatService> {
+    allHeartbeatServices.push(service);
+    return service;
+  }
+  async function drainAllServices() {
+    for (const service of allHeartbeatServices) {
+      await service.drainActiveRunExecutions();
+    }
+  }
 
   function executionsOf(runIds: string[]) {
     return startedRunIds.filter((runId) => runIds.includes(runId));
@@ -474,7 +496,13 @@ describeEmbeddedPostgres("fleet-wide agent run ceiling", () => {
     return agentId;
   }
 
-  async function seedAgentWithQueuedRun(input: { companyId: string; index: number; createdAt: Date }) {
+  async function seedAgentWithQueuedRun(input: {
+    companyId: string;
+    index: number;
+    createdAt: Date;
+    issueStatus?: "todo" | "in_progress";
+    priority?: string;
+  }) {
     const agentId = await seedAgent(input.companyId, input.index);
     const issueId = randomUUID();
     const wakeupRequestId = randomUUID();
@@ -483,8 +511,8 @@ describeEmbeddedPostgres("fleet-wide agent run ceiling", () => {
       id: issueId,
       companyId: input.companyId,
       title: `Fleet issue ${input.index}`,
-      status: "in_progress",
-      priority: "medium",
+      status: input.issueStatus ?? "in_progress",
+      priority: input.priority ?? "medium",
       assigneeAgentId: agentId,
       responsibleUserId: "responsible-user",
     });
@@ -533,6 +561,403 @@ describeEmbeddedPostgres("fleet-wide agent run ceiling", () => {
     }
     return { companyId, seeded };
   }
+
+  async function seedCompany() {
+    const companyId = randomUUID();
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      defaultResponsibleUserId: "responsible-user",
+      requireBoardApprovalForNewAgents: false,
+    });
+    return companyId;
+  }
+
+  // SPA-10513 slice 2 fixtures. One agent per seeded ticket, so the cross-agent
+  // sweep is the only thing that can decide which ticket reaches a freed slot.
+  // Every helper is declared inside the new describe block, so these functions
+  // must never be hoisted into the suite scope above: duplicate `function`
+  // declarations in the same scope silently win by hoist order and would
+  // replace the real `seedCompany` for every other test in this file.
+  describe("queued priority admission", () => {
+    // Default is priority-then-age; this is the documented revert to the
+    // previous oldest-ticket-first sweep ordering, by env var alone.
+    const FIFO_SWITCH = "PAPERCLIP_QUEUED_RUN_ORDER";
+
+    async function seedArchivedCompany() {
+      const companyId = randomUUID();
+      await db.insert(companies).values({
+        id: companyId,
+        name: "Paperclip Archived",
+        issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+        defaultResponsibleUserId: "responsible-user",
+        requireBoardApprovalForNewAgents: false,
+        status: "archived",
+      });
+      return companyId;
+    }
+
+    async function seedCrossAgentBacklog(input: {
+      companyId: string;
+      tickets: Array<{
+        priority: string;
+        ageMinutes: number;
+        issueStatus?: "todo" | "in_progress";
+      }>;
+      indexOffset?: number;
+    }) {
+      const base = Date.now();
+      const seeded = [];
+      for (const [index, ticket] of input.tickets.entries()) {
+        seeded.push(
+          await seedAgentWithQueuedRun({
+            companyId: input.companyId,
+            index: (input.indexOffset ?? 0) + index,
+            createdAt: new Date(base - ticket.ageMinutes * 60_000),
+            issueStatus: ticket.issueStatus,
+            priority: ticket.priority,
+          }),
+        );
+      }
+      return seeded;
+    }
+
+    const runtimeEnvBase = runtimeEnvBaseFromSuite;
+    let priorityHeartbeat!: ReturnType<typeof heartbeatService>;
+    let priorityHeartbeatFifo!: ReturnType<typeof heartbeatService>;
+    let priorityHeartbeatCeilingOne!: ReturnType<typeof heartbeatService>;
+    let priorityHeartbeatNoCeiling!: ReturnType<typeof heartbeatService>;
+    let priorityHeartbeatNoCeilingFifo!: ReturnType<typeof heartbeatService>;
+
+    beforeAll(() => {
+      priorityHeartbeat = registerHeartbeatService(
+        heartbeatService(db, {
+          runtimeEnv: {
+            ...runtimeEnvBase,
+            [FLEET_MAX_CONCURRENT_RUNS_ENV_VAR]: "2",
+          },
+        }),
+      );
+      priorityHeartbeatFifo = registerHeartbeatService(
+        heartbeatService(db, {
+          runtimeEnv: {
+            ...runtimeEnvBase,
+            [FLEET_MAX_CONCURRENT_RUNS_ENV_VAR]: "2",
+            [FIFO_SWITCH]: "fifo",
+          },
+        }),
+      );
+      priorityHeartbeatCeilingOne = registerHeartbeatService(
+        heartbeatService(db, {
+          runtimeEnv: {
+            ...runtimeEnvBase,
+            [FLEET_MAX_CONCURRENT_RUNS_ENV_VAR]: "1",
+          },
+        }),
+      );
+      priorityHeartbeatNoCeiling = registerHeartbeatService(
+        heartbeatService(db, {
+          runtimeEnv: { ...runtimeEnvBase },
+        }),
+      );
+      priorityHeartbeatNoCeilingFifo = registerHeartbeatService(
+        heartbeatService(db, {
+          runtimeEnv: {
+            ...runtimeEnvBase,
+            [FIFO_SWITCH]: "fifo",
+          },
+        }),
+      );
+    });
+
+    it("admits critical before high before medium before low across agents, then oldest first", async () => {
+      const companyId = await seedCompany();
+      // Deliberately anti-correlated with age: the only correct sweep admits
+      // every critical card first, even though each is newer than every low one.
+      const seeded = await seedCrossAgentBacklog({
+        companyId,
+        tickets: [
+          { priority: "low", ageMinutes: 120 },
+          { priority: "medium", ageMinutes: 90 },
+          { priority: "high", ageMinutes: 60 },
+          { priority: "critical", ageMinutes: 30 },
+          { priority: "critical", ageMinutes: 45 },
+          { priority: "low", ageMinutes: 150 },
+        ],
+      });
+      const seededRunIds = seeded.map((s) => s.runId);
+
+      await priorityHeartbeat.resumeQueuedRuns();
+      expect(await waitForExecutionsOf(seededRunIds, 2)).toBe(true);
+      await settle();
+
+      expect(
+        (await seededStatuses(seededRunIds)).running.sort(),
+      ).toEqual([seeded[3]!.runId, seeded[4]!.runId].sort());
+    }, 120_000);
+
+    it("breaks a priority tie by the oldest queued ticket, never by insertion order", async () => {
+      const companyId = await seedCompany();
+      const seeded = await seedCrossAgentBacklog({
+        companyId,
+        tickets: [
+          { priority: "high", ageMinutes: 45 },
+          { priority: "high", ageMinutes: 5 },
+          { priority: "low", ageMinutes: 300 },
+        ],
+      });
+      const seededRunIds = seeded.map((s) => s.runId);
+
+      await priorityHeartbeatCeilingOne.resumeQueuedRuns();
+      expect(await waitForExecutionsOf(seededRunIds, 1)).toBe(true);
+      await settle();
+
+      const statuses = await seededStatuses(seededRunIds);
+      expect(statuses.running).toEqual([seeded[0]!.runId]);
+      expect(statuses.queued.sort()).toEqual([seeded[1]!.runId, seeded[2]!.runId].sort());
+    }, 120_000);
+
+    it("admits a newer critical ahead of older high, medium and low tickets", async () => {
+      const companyId = await seedCompany();
+      const seeded = await seedCrossAgentBacklog({
+        companyId,
+        tickets: [
+          { priority: "low", ageMinutes: 240 },
+          { priority: "medium", ageMinutes: 180 },
+          { priority: "high", ageMinutes: 120 },
+          { priority: "critical", ageMinutes: 1 },
+        ],
+      });
+      const seededRunIds = seeded.map((s) => s.runId);
+
+      await priorityHeartbeatCeilingOne.resumeQueuedRuns();
+      expect(await waitForExecutionsOf(seededRunIds, 1)).toBe(true);
+      await settle();
+
+      expect((await seededStatuses(seededRunIds)).running).toEqual([
+        seeded[3]!.runId,
+      ]);
+    }, 120_000);
+
+    it("routes a freed slot to the highest-priority pending card", async () => {
+      const companyId = await seedCompany();
+      // The oldest critical ticket takes the first slot; its completion
+      // admits the remaining queued ticket.
+      const seeded = await seedCrossAgentBacklog({
+        companyId,
+        tickets: [
+          { priority: "critical", ageMinutes: 240 },
+          { priority: "low", ageMinutes: 200 },
+          { priority: "low", ageMinutes: 160 },
+        ],
+      });
+      const seededRunIds = seeded.map((s) => s.runId);
+
+      await priorityHeartbeat.resumeQueuedRuns();
+      expect(await waitForExecutionsOf(seededRunIds, 2)).toBe(true);
+      await settle();
+      expect(
+        (await seededStatuses(seededRunIds)).running.sort(),
+      ).toEqual([seeded[0]!.runId, seeded[1]!.runId].sort());
+
+      await releaseExecution(seeded[0]!.runId);
+      expect(
+        await waitForCondition(async () => {
+          const [row] = await db
+            .select({ status: heartbeatRuns.status })
+            .from(heartbeatRuns)
+            .where(eq(heartbeatRuns.id, seeded[0]!.runId));
+          return row?.status === "succeeded";
+        }, 30_000),
+      ).toBe(true);
+
+      await priorityHeartbeat.resumeQueuedRuns();
+      expect(await waitForExecutionsOf(seededRunIds, 3)).toBe(true);
+      await settle();
+
+      expect(executionsOf([seeded[2]!.runId])).toEqual([seeded[2]!.runId]);
+      const statuses = await seededStatuses(seededRunIds);
+      expect(statuses.running.sort()).toEqual(
+        [seeded[1]!.runId, seeded[2]!.runId].sort(),
+      );
+      expect(statuses.queued).toEqual([]);
+      expect(statuses.other.map((row) => [row.id, row.status])).toEqual([
+        [seeded[0]!.runId, "succeeded"],
+      ]);
+    }, 120_000);
+
+    it("keeps per-agent continuation readiness ahead of a newer critical card", async () => {
+      const companyId = await seedCompany();
+      // A continuing card keeps precedence over a newer critical card on the
+      // same agent; the other agent's critical ticket wins the first fleet slot.
+      const continuingAgentId = await seedAgent(companyId, 0);
+      const continuingIssueId = randomUUID();
+      const continuingRunId = randomUUID();
+      const continuingWakeupId = randomUUID();
+      await db.insert(issues).values({
+        id: continuingIssueId,
+        companyId,
+        title: "Continuing medium card",
+        status: "in_progress",
+        priority: "medium",
+        assigneeAgentId: continuingAgentId,
+        responsibleUserId: "responsible-user",
+      });
+      await db.insert(agentWakeupRequests).values({
+        id: continuingWakeupId,
+        companyId,
+        agentId: continuingAgentId,
+        source: "assignment",
+        triggerDetail: "system",
+        reason: "issue_assigned",
+        payload: { issueId: continuingIssueId },
+        status: "queued",
+      });
+      await db.insert(heartbeatRuns).values({
+        id: continuingRunId,
+        companyId,
+        agentId: continuingAgentId,
+        invocationSource: "assignment",
+        triggerDetail: "system",
+        status: "queued",
+        wakeupRequestId: continuingWakeupId,
+        contextSnapshot: { issueId: continuingIssueId, wakeReason: "issue_assigned" },
+        createdAt: new Date(Date.now() - 30 * 60_000),
+        updatedAt: new Date(Date.now() - 30 * 60_000),
+      });
+      await db
+        .update(agentWakeupRequests)
+        .set({ runId: continuingRunId })
+        .where(eq(agentWakeupRequests.id, continuingWakeupId));
+      const critical = await seedCrossAgentBacklog({
+        companyId,
+        tickets: [{ priority: "critical", ageMinutes: 1 }],
+        indexOffset: 7,
+      });
+
+      await priorityHeartbeatCeilingOne.resumeQueuedRuns();
+      expect(await waitForExecutionsOf(critical.map((c) => c.runId), 1)).toBe(true);
+      await settle();
+
+      expect((await seededStatuses([continuingRunId])).queued).toEqual([
+        continuingRunId,
+      ]);
+      expect((await seededStatuses(critical.map((c) => c.runId))).running).toEqual([critical[0]!.runId]);
+    }, 120_000);
+
+    it("does not let a company's priority ticket take a slot ahead of an older ticket elsewhere", async () => {
+      const companyA = await seedCompany();
+      const companyB = await seedCompany();
+      const inCompanyA = await seedCrossAgentBacklog({
+        companyId: companyA,
+        tickets: [
+          { priority: "critical", ageMinutes: 1 },
+          { priority: "low", ageMinutes: 10 },
+        ],
+      });
+      const inCompanyB = await seedCrossAgentBacklog({
+        companyId: companyB,
+        tickets: [
+          { priority: "low", ageMinutes: 60 },
+          { priority: "low", ageMinutes: 30 },
+        ],
+        indexOffset: 20,
+      });
+
+      await priorityHeartbeatCeilingOne.resumeQueuedRuns();
+      expect(await waitForExecutionsOf([inCompanyA[0]!.runId], 1)).toBe(true);
+      await settle();
+
+      expect((await seededStatuses([inCompanyA[0]!.runId])).running).toEqual([
+        inCompanyA[0]!.runId,
+      ]);
+      expect(
+        (await seededStatuses(inCompanyB.map((s) => s.runId))).running,
+      ).toEqual([]);
+    }, 120_000);
+
+    it("never admits a ticket whose company is not active", async () => {
+      const archivedCompanyId = await seedArchivedCompany();
+      const activeCompanyId = await seedCompany();
+      const archived = await seedCrossAgentBacklog({
+        companyId: archivedCompanyId,
+        tickets: [{ priority: "critical", ageMinutes: 1 }],
+        indexOffset: 30,
+      });
+      const active = await seedCrossAgentBacklog({
+        companyId: activeCompanyId,
+        tickets: [{ priority: "low", ageMinutes: 120 }],
+        indexOffset: 40,
+      });
+
+      await priorityHeartbeatCeilingOne.resumeQueuedRuns();
+      expect(
+        await waitForExecutionsOf(active.map((s) => s.runId), 1),
+      ).toBe(true);
+      await settle();
+
+      expect(
+        (await seededStatuses(archived.map((s) => s.runId))).queued,
+      ).toEqual(archived.map((s) => s.runId).sort());
+    }, 120_000);
+
+    it("reverts to oldest-ticket-first ordering through the revert env var", async () => {
+      const companyId = await seedCompany();
+      const seeded = await seedCrossAgentBacklog({
+        companyId,
+        tickets: [
+          { priority: "low", ageMinutes: 240 },
+          { priority: "medium", ageMinutes: 180 },
+          { priority: "high", ageMinutes: 120 },
+          { priority: "critical", ageMinutes: 1 },
+        ],
+      });
+      const seededRunIds = seeded.map((s) => s.runId);
+
+      await priorityHeartbeatFifo.resumeQueuedRuns();
+      expect(await waitForExecutionsOf(seededRunIds, 2)).toBe(true);
+      await settle();
+
+      expect((await seededStatuses(seededRunIds)).running.sort()).toEqual([
+        seeded[0]!.runId,
+        seeded[1]!.runId,
+      ].sort());
+    }, 120_000);
+
+    it("claims every slot it can when no ceiling is configured, under both orderings", async () => {
+      const tickets = [
+        { priority: "low", ageMinutes: 240 },
+        { priority: "critical", ageMinutes: 180 },
+        { priority: "medium", ageMinutes: 120 },
+        { priority: "high", ageMinutes: 60 },
+      ];
+
+      const priorityCompanyId = await seedCompany();
+      const underPriority = await seedCrossAgentBacklog({
+        companyId: priorityCompanyId,
+        tickets,
+        indexOffset: 50,
+      });
+      const underPriorityRunIds = underPriority.map((s) => s.runId);
+      await priorityHeartbeatNoCeiling.resumeQueuedRuns();
+      expect(await waitForExecutionsOf(underPriorityRunIds, 4)).toBe(true);
+      await settle();
+      expect((await seededStatuses(underPriorityRunIds)).running).toHaveLength(4);
+
+      const fifoCompanyId = await seedCompany();
+      const underFifo = await seedCrossAgentBacklog({
+        companyId: fifoCompanyId,
+        tickets,
+        indexOffset: 60,
+      });
+      const underFifoRunIds = underFifo.map((s) => s.runId);
+      await priorityHeartbeatNoCeilingFifo.resumeQueuedRuns();
+      expect(await waitForExecutionsOf(underFifoRunIds, 4)).toBe(true);
+      await settle();
+      expect((await seededStatuses(underFifoRunIds)).running).toHaveLength(4);
+    }, 120_000);
+  });
 
   // A pre-existing `running` row owned by a separate agent, to exercise the
   // stale-run guard. Timestamps default to two hours old (outside the window).

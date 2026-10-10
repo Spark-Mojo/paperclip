@@ -97,6 +97,12 @@ describeEmbeddedPostgres("question response delivery", () => {
       attachSourceCommentToInteraction?: boolean;
       /** SPA-9862: a card held by a human has no lawful wake target. */
       issueAssignee?: "agent" | "human";
+      /**
+       * SPA-10513: an agent-created question on a human-held card wakes the
+       * same-company creator, so the park shape needs a human-created
+       * interaction (no agent target at all) to stay parked.
+       */
+      interactionCreator?: "agent" | "human";
       issueStatus?: "in_progress" | "todo" | "done" | "cancelled";
     } = {},
   ) {
@@ -266,6 +272,15 @@ describeEmbeddedPostgres("question response delivery", () => {
       },
       { agentId, runId: sourceRunId },
     );
+    if (args.interactionCreator === "human") {
+      // A human-asked question has no agent creator to wake, so delivery
+      // parks until an agent owns the issue. The answer path still records
+      // the board-user answer below.
+      await db
+        .update(issueThreadInteractions)
+        .set({ createdByAgentId: null, createdByUserId: "board-user" })
+        .where(eq(issueThreadInteractions.id, interaction.id));
+    }
     const answered = await interactionSvc.answerQuestions(
       { id: issueId, companyId, status: "in_progress" },
       interaction.id,
@@ -292,6 +307,28 @@ describeEmbeddedPostgres("question response delivery", () => {
       interaction: answered,
     };
   }
+
+  it("user-assigned creator wake delivers an answered question to its author without assignment mutation", async () => {
+    const seeded = await seed();
+    await db.update(issues).set({ assigneeAgentId: null, assigneeUserId: "board-user" }).where(eq(issues.id, seeded.issueId));
+    const fallbackRunId = randomUUID();
+    const wakeup = vi.fn(async () => db.insert(heartbeatRuns).values({
+      id: fallbackRunId, companyId: seeded.companyId, agentId: seeded.agentId,
+      invocationSource: "automation", status: "queued", runtimeMode: "legacy",
+      driverKind: "codex", contextSnapshot: { issueId: seeded.issueId },
+    }).returning().then((rows) => rows[0]!));
+    const service = questionResponseDeliveryService(db, { heartbeat: { wakeup } as never });
+    const first = await service.deliver(seeded.interaction.id);
+    const second = await service.deliver(seeded.interaction.id);
+    expect(first).toMatchObject({ status: "fallback_queued", duplicate: false });
+    expect(second).toMatchObject({ duplicate: true });
+    expect(wakeup).toHaveBeenCalledTimes(1);
+    expect(wakeup).toHaveBeenCalledWith(seeded.agentId, expect.objectContaining({
+      payload: expect.objectContaining({ issueId: seeded.issueId, interactionId: seeded.interaction.id }),
+    }));
+    const [issue] = await db.select().from(issues).where(eq(issues.id, seeded.issueId));
+    expect(issue).toMatchObject({ assigneeAgentId: null, assigneeUserId: "board-user" });
+  });
 
   it("persists the receipt atomically and steers exactly once into a running successor", async () => {
     const seeded = await seed({ successorStatus: "running" });
@@ -1300,7 +1337,10 @@ describeEmbeddedPostgres("question response delivery", () => {
   }
 
   it("parks the answer for retry when the issue has no agent assignee", async () => {
-    const seeded = await seed({ issueAssignee: "human" });
+    const seeded = await seed({
+      issueAssignee: "human",
+      interactionCreator: "human",
+    });
     const wakeup = vi.fn();
     const service = questionResponseDeliveryService(db, {
       heartbeat: { wakeup } as never,
@@ -1323,7 +1363,10 @@ describeEmbeddedPostgres("question response delivery", () => {
   });
 
   it("delivers the parked answer once the issue gains an agent assignee", async () => {
-    const seeded = await seed({ issueAssignee: "human" });
+    const seeded = await seed({
+      issueAssignee: "human",
+      interactionCreator: "human",
+    });
     // A run row for another issue: it satisfies the `target_run_id` foreign key
     // the terminal receipt writes, and being scoped to a different issue it is
     // not a coalescing candidate, so the answer takes the wake path.
@@ -1365,7 +1408,10 @@ describeEmbeddedPostgres("question response delivery", () => {
   });
 
   it("does not issue a second wake for a replayed delivery of the same interaction", async () => {
-    const seeded = await seed({ issueAssignee: "human" });
+    const seeded = await seed({
+      issueAssignee: "human",
+      interactionCreator: "human",
+    });
     // A run row for another issue: it satisfies the `target_run_id` foreign key
     // the terminal receipt writes, and being scoped to a different issue it is
     // not a coalescing candidate, so the answer takes the wake path.
@@ -1445,7 +1491,10 @@ describeEmbeddedPostgres("question response delivery", () => {
   });
 
   it("keeps a missing agent assignee retryable across sweeps", async () => {
-    const seeded = await seed({ issueAssignee: "human" });
+    const seeded = await seed({
+      issueAssignee: "human",
+      interactionCreator: "human",
+    });
     const wakeup = vi.fn();
     const service = questionResponseDeliveryService(db, {
       heartbeat: { wakeup } as never,
