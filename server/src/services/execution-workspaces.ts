@@ -1416,7 +1416,7 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
               FROM ${issues}
               WHERE ${issues.companyId} = ${workspace.companyId}
                 AND ${issues.id} = ${workspace.sourceIssueId}
-              UNION ALL
+              UNION
               SELECT child.id
               FROM ${issues} child
               JOIN issue_tree parent ON child.parent_id = parent.id
@@ -2994,7 +2994,7 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
                   FROM ${issues} root
                   WHERE root.company_id = ${workspace.companyId}
                     AND root.id = ${workspace.sourceIssueId}
-                  UNION ALL
+                  UNION
                   SELECT child.id, child.status
                   FROM ${issues} child
                   JOIN issue_tree parent ON child.parent_id = parent.id
@@ -3014,7 +3014,7 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
                   FROM ${issues} root
                   WHERE root.company_id = ${workspace.companyId}
                     AND root.id = ${workspace.sourceIssueId}
-                  UNION ALL
+                  UNION
                   SELECT child.id, child.status, child.completed_at, child.cancelled_at, child.updated_at
                   FROM ${issues} child
                   JOIN cooldown_tree parent ON child.parent_id = parent.id
