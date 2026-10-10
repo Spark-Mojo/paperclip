@@ -5598,24 +5598,19 @@ export function recoveryService(
     const useCursor = !opts?.blockerIssueId;
 
     const queryCandidates = (afterIssueId: string | null) => {
-      // The blocker-scoped re-fire (the heartbeat workspace_finalize hook)
-      // must heal the same wakeable dependents the route-time emission admits:
-      // any assigned dependent not in a terminal/backlog status. `listWakeable
-      // BlockedDependents` filters `["backlog","done","cancelled"]`, so a
-      // `todo` dependent whose blocker resolved while its sync-back was still
-      // in flight would never re-fire if the finalize-time query only matched
-      // `blocked` issues (SPA-8580 / SPA-7489 / SPA-7490). The periodic
-      // all-issues sweep keeps its `blocked`-only filter so it only heals
-      // dependents that are still in the blocked state.
       const statusFilter = opts?.blockerIssueId
         ? notInArray(issues.status, ["backlog", "done", "cancelled"])
-        : eq(issues.status, "blocked");
+        : inArray(issues.status, ["blocked", "todo"]);
       const filters = [
         statusFilter,
         isNull(issues.conversationAgentId),
         visibleIssueCondition(),
         sql`${issues.assigneeAgentId} is not null`,
       ];
+      if (!opts?.blockerIssueId) {
+        filters.push(sql`exists (select 1 from ${issueRelations} where ${issueRelations.relatedIssueId} = ${issues.id} and ${issueRelations.companyId} = ${issues.companyId} and ${issueRelations.type} = 'blocks')`);
+        filters.push(sql`not exists (select 1 from ${issueRelations} as blocker_edge inner join ${issues} as blocker on blocker.id = blocker_edge.issue_id where blocker_edge.related_issue_id = ${issues.id} and blocker_edge.company_id = ${issues.companyId} and blocker_edge.type = 'blocks' and blocker.status <> 'done')`);
+      }
       if (opts?.companyId) filters.push(eq(issues.companyId, opts.companyId));
       if (afterIssueId) filters.push(gt(issues.id, afterIssueId));
 
