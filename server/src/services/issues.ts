@@ -9214,6 +9214,142 @@ export function issueService(db: Db) {
         }));
     },
 
+    /**
+     * SPA-10513 slice 3. Return `blocked` dependents of `blockerIssueId` whose
+     * whole blocker set is now resolved, so the caller can move them to `todo`
+     * and wake the assignee exactly once.
+     *
+     * This is the write-side projection of the same admission decision
+     * `listWakeableBlockedDependents` makes, and it deliberately repeats that
+     * query instead of calling it: that method is a pure read whose result many
+     * callers and route-test fixtures depend on, and its admission set also
+     * admits `todo`/`in_review` dependents. The extra `status = 'blocked'`
+     * predicate below is the load-bearing difference — only a genuinely blocked
+     * card may be transitioned by this path.
+     *
+     * Company, status and ownership rules are preserved: the blocker lookup is
+     * the same company-scoped join, conversation containers are excluded by the
+     * same predicate, backlog parks and terminal cards are excluded by the
+     * explicit status predicate, and the assignee must be a non-null agent with
+     * no human assignee.
+     *
+     * The caller MUST capture `blockedTransitionAt` from this result and use it
+     * for the wake idempotency key: the transition itself clears that column, so
+     * re-reading it after the write mints a different epoch and would let the
+     * same closure wake twice.
+     */
+    listBlockedDependentsReadyForAutoUnblock: async (
+      blockerIssueId: string,
+    ) => {
+      const dbOrTx = db;
+      const blockerIssue = await dbOrTx
+        .select({ id: issues.id, companyId: issues.companyId })
+        .from(issues)
+        .where(eq(issues.id, blockerIssueId))
+        .then((rows) => rows[0] ?? null);
+      if (!blockerIssue) return [];
+
+      const candidates = await dbOrTx
+        .select({
+          id: issues.id,
+          companyId: issues.companyId,
+          assigneeAgentId: issues.assigneeAgentId,
+          assigneeUserId: issues.assigneeUserId,
+          status: issues.status,
+          conversationAgentId: issues.conversationAgentId,
+          blockedTransitionAt: issues.blockedTransitionAt,
+        })
+        .from(issueRelations)
+        .innerJoin(issues, eq(issueRelations.relatedIssueId, issues.id))
+        .where(
+          and(
+            eq(issueRelations.companyId, blockerIssue.companyId),
+            eq(issueRelations.type, "blocks"),
+            eq(issueRelations.issueId, blockerIssueId),
+            isNull(issues.conversationAgentId),
+            // Only a genuinely blocked card is ever transitioned. `backlog` is a
+            // human parking surface and the terminal statuses are closed.
+            eq(issues.status, "blocked"),
+            // Human-owned work has no agent to hand back to, and a card can
+            // only have one assignee.
+            sql`${issues.assigneeAgentId} is not null`,
+            isNull(issues.assigneeUserId),
+          ),
+        );
+      if (candidates.length === 0) return [];
+
+      // Same unified readiness gate the wake path uses: every blocker done AND
+      // every done blocker's workspace finalize obligation discharged.
+      const readinessMap = await listIssueDependencyReadinessMap(
+        dbOrTx,
+        blockerIssue.companyId,
+        candidates.map((candidate) => candidate.id),
+      );
+
+      return candidates
+        .map((candidate) => ({
+          candidate,
+          readiness:
+            readinessMap.get(candidate.id) ??
+            createIssueDependencyReadiness(candidate.id),
+        }))
+        .filter(
+          ({ readiness }) =>
+            readiness.isDependencyReady && readiness.blockerIssueIds.length > 0,
+        )
+        .map(({ candidate, readiness }) => ({
+          id: candidate.id,
+          companyId: candidate.companyId,
+          assigneeAgentId: candidate.assigneeAgentId!,
+          blockerIssueIds: readiness.blockerIssueIds,
+          blockedTransitionAt: candidate.blockedTransitionAt,
+        }));
+    },
+
+    autoUnblockReadyDependent: async (candidate: {
+      id: string;
+      companyId: string;
+      assigneeAgentId: string;
+    }) => db.transaction(async (tx) => {
+      const [locked] = await tx.select({
+        status: issues.status,
+        assigneeAgentId: issues.assigneeAgentId,
+        assigneeUserId: issues.assigneeUserId,
+        conversationAgentId: issues.conversationAgentId,
+        blockedTransitionAt: issues.blockedTransitionAt,
+      })
+        .from(issues)
+        .where(and(eq(issues.id, candidate.id), eq(issues.companyId, candidate.companyId)))
+        .for("update")
+        .limit(1);
+      if (locked?.status !== "blocked" || locked.assigneeAgentId !== candidate.assigneeAgentId ||
+        locked.assigneeUserId || locked.conversationAgentId) return null;
+      const readiness = await listIssueDependencyReadinessMap(tx, candidate.companyId, [candidate.id]);
+      const state = readiness.get(candidate.id);
+      if (!state?.isDependencyReady || state.blockerIssueIds.length === 0) return null;
+      const [updated] = await tx.update(issues)
+        .set({
+          status: "todo",
+          unblockDescriptor: null,
+          blockedTransitionAt: null,
+          blockedOwnerNotifiedAt: null,
+          checkoutRunId: null,
+          executionRunId: null,
+          executionAgentNameKey: null,
+          executionLockedAt: null,
+          completedAt: null,
+          cancelledAt: null,
+          updatedAt: new Date(),
+        })
+        .where(and(eq(issues.id, candidate.id), eq(issues.companyId, candidate.companyId), eq(issues.status, "blocked")))
+        .returning({ id: issues.id });
+      return updated ? {
+        agentId: locked.assigneeAgentId,
+        blockedTransitionAt: locked.blockedTransitionAt,
+        blockerIssueIds: state.blockerIssueIds,
+      } : null;
+    }),
+
     getWakeableParentAfterChildCompletion: async (
       parentIssueId: string,
       completedChildResult?: { issueId: string; summary: string | null } | null,
