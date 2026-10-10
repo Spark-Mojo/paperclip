@@ -10750,7 +10750,12 @@ export function issueService(db: Db) {
         !doneGateOverride &&
         !doneGateBypass
       ) {
-        const { issueDoneGateService } = await import("./issue-done-gate.js");
+        const { assertIssueExecutionStagesComplete, issueDoneGateService } = await import("./issue-done-gate.js");
+        const closingState = issueData.executionState === undefined ? existing.executionState : issueData.executionState;
+        assertIssueExecutionStagesComplete({ executionPolicy: existing.executionPolicy, executionState: closingState });
+        if (issueData.executionPolicy !== undefined) {
+          assertIssueExecutionStagesComplete({ executionPolicy: issueData.executionPolicy, executionState: closingState });
+        }
         const gate = issueDoneGateService(db);
         const decision = await gate.evaluateDoneGate({
           id: existing.id,
