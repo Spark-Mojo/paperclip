@@ -814,6 +814,23 @@ export function classifyTaskWatchdogSubtree(input: TaskWatchdogClassifierInput):
       latestDocumentAt: optionalIso(issue.latestDocumentAt),
       latestWorkProductAt: optionalIso(issue.latestWorkProductAt),
     }));
+  // A stop verdict is only meaningful when there is something stopped. With no
+  // non-terminal leaf there is nothing to verify, and the empty
+  // `materialLeaves: []` fingerprint is a valid hash of an empty payload, so
+  // `stopped` would arm the watchdog on a state an agent can never act on —
+  // and re-arm it on any later change that puts a leaf back (SPA-9452). This is
+  // the same class as the zero-issue early return above: the watched subtree
+  // has nothing outstanding, so the watchdog has nothing to report.
+  if (leaves.length === 0) {
+    return {
+      state: "not_applicable",
+      reason: "Watched subtree has no non-terminal leaves.",
+      includedIssueIds: includedIds,
+      staleBlockerHolds: [],
+      blockersResolvedLeaves: [],
+    };
+  }
+
   const materialLeaves = leaves.map(materialLeaf);
   const stopFingerprint = stableStopFingerprint({
     companyId: input.watchdog.companyId,
