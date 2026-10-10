@@ -1190,7 +1190,8 @@ export function taskWatchdogService(db: Db, deps: TaskWatchdogServiceDeps = {}) 
           origin_kind,
           updated_at,
           created_at,
-          0 AS depth
+          0 AS depth,
+          ARRAY[id] AS path
         FROM issues
         WHERE company_id = ${companyId}
           AND id = ${watchedIssueId}
@@ -1209,7 +1210,8 @@ export function taskWatchdogService(db: Db, deps: TaskWatchdogServiceDeps = {}) 
           child.origin_kind,
           child.updated_at,
           child.created_at,
-          watched_issues.depth + 1
+          watched_issues.depth + 1,
+          watched_issues.path || child.id
         FROM issues child
         JOIN watched_issues ON child.parent_id = watched_issues.id
         WHERE child.company_id = ${companyId}
@@ -1217,6 +1219,7 @@ export function taskWatchdogService(db: Db, deps: TaskWatchdogServiceDeps = {}) 
           AND child.harness_kind IS NULL
           AND child.origin_kind <> ${TASK_WATCHDOG_ORIGIN_KIND}
           AND watched_issues.depth < ${TASK_WATCHDOG_SUBTREE_MAX_DEPTH - 1}
+          AND NOT child.id = ANY(watched_issues.path)
       )
       SELECT
         id,
@@ -1896,21 +1899,22 @@ export function taskWatchdogService(db: Db, deps: TaskWatchdogServiceDeps = {}) 
 
   async function activeWatchdogsForIssueAndAncestors(companyId: string, issueId: string) {
     const ancestorRows = await db.execute(sql`
-      WITH RECURSIVE ancestors(id, parent_id, depth) AS (
-        SELECT id, parent_id, 0
+      WITH RECURSIVE ancestors(id, parent_id, depth, path) AS (
+        SELECT id, parent_id, 0, ARRAY[id]
         FROM issues
         WHERE company_id = ${companyId}
           AND id = ${issueId}
           AND hidden_at IS NULL
           AND harness_kind IS NULL
         UNION ALL
-        SELECT parent.id, parent.parent_id, ancestors.depth + 1
+        SELECT parent.id, parent.parent_id, ancestors.depth + 1, ancestors.path || parent.id
         FROM issues parent
         JOIN ancestors ON parent.id = ancestors.parent_id
         WHERE parent.company_id = ${companyId}
           AND parent.hidden_at IS NULL
           AND parent.harness_kind IS NULL
           AND ancestors.depth < ${TASK_WATCHDOG_SUBTREE_MAX_DEPTH - 1}
+          AND NOT parent.id = ANY(ancestors.path)
       )
       SELECT id FROM ancestors
     `);

@@ -555,6 +555,25 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
     return { companyId, projectId, executionWorkspaceId, sourceIssueId, worktreePath };
   }
 
+  it("keeps a terminal workspace open when a deep descendant is active, even with a corrupt cycle", async () => {
+    const seeded = await seedAncestryTerminalWorkspace();
+    let parentId = seeded.sourceIssueId;
+    for (let index = 0; index < 102; index += 1) {
+      const id = randomUUID();
+      await db.insert(issues).values({
+        id, companyId: seeded.companyId, projectId: seeded.projectId,
+        parentId, title: `Deep descendant ${index}`, status: index === 101 ? "todo" : "done", priority: "medium",
+      });
+      parentId = id;
+    }
+    await db.update(issues).set({ parentId }).where(eq(issues.id, seeded.sourceIssueId));
+    const sweep = await svc.sweepTerminalWorkspaces();
+    expect(sweep.archived).toBe(0);
+    const [workspace] = await db.select({ status: executionWorkspaces.status })
+      .from(executionWorkspaces).where(eq(executionWorkspaces.id, seeded.executionWorkspaceId));
+    expect(workspace.status).toBe("active");
+  }, 30_000);
+
   it("archives a terminal workspace delivered by ancestry with no pull request", async () => {
     const seeded = await seedAncestryTerminalWorkspace();
 

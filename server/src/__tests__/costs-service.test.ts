@@ -431,6 +431,44 @@ describeEmbeddedPostgres("cost and finance aggregate overflow handling", () => {
     await tempDb?.cleanup();
   });
 
+  it("terminates subtree aggregation on a pre-existing parent cycle", async () => {
+    const companyId = randomUUID();
+    const rootId = randomUUID();
+    const childId = randomUUID();
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Cycle aggregation",
+      issuePrefix: "COSTCYCLE",
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(issues).values([
+      { id: rootId, companyId, title: "Root", status: "todo", priority: "medium" },
+      { id: childId, companyId, parentId: rootId, title: "Child", status: "todo", priority: "medium" },
+    ]);
+    await db.update(issues).set({ parentId: childId }).where(eq(issues.id, rootId));
+    await expect(costs.issueTreeSummary(companyId, rootId)).resolves.toMatchObject({ issueCount: 2 });
+    await expect(costs.issueTreeSummary(companyId, rootId, { excludeRoot: true })).resolves.toMatchObject({ issueCount: 2 });
+    await db.update(issues).set({ parentId: null }).where(eq(issues.id, rootId));
+  }, 20_000);
+
+  it("counts every issue in a valid tree deeper than 100 edges", async () => {
+    const companyId = randomUUID();
+    const ids = Array.from({ length: 103 }, () => randomUUID());
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Deep aggregation",
+      issuePrefix: "COSTDEEP",
+      requireBoardApprovalForNewAgents: false,
+    });
+    for (let index = 0; index < ids.length; index += 1) {
+      await db.insert(issues).values({
+        id: ids[index], companyId, title: `Level ${index}`, status: "todo", priority: "medium",
+        parentId: index === 0 ? null : ids[index - 1],
+      });
+    }
+    await expect(costs.issueTreeSummary(companyId, ids[0])).resolves.toMatchObject({ issueCount: 103 });
+  }, 30_000);
+
   it("persists unpriced token usage without inflating monthly spend", async () => {
     const companyId = randomUUID();
     const agentId = randomUUID();

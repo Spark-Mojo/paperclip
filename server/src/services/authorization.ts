@@ -883,17 +883,18 @@ export function authorizationService(db: Db | DbTransaction) {
 
   async function issueIdIsDescendantOf(issueId: string, rootIssueId: string, companyId: string) {
     const rows = await db.execute(sql`
-      WITH RECURSIVE ancestors(id, parent_id, depth) AS (
-        SELECT id, parent_id, 0
+      WITH RECURSIVE ancestors(id, parent_id, depth, path) AS (
+        SELECT id, parent_id, 0, ARRAY[id]
         FROM issues
         WHERE company_id = ${companyId}
           AND id = ${issueId}
         UNION ALL
-        SELECT parent.id, parent.parent_id, ancestors.depth + 1
+        SELECT parent.id, parent.parent_id, ancestors.depth + 1, ancestors.path || parent.id
         FROM issues parent
         JOIN ancestors ON parent.id = ancestors.parent_id
         WHERE parent.company_id = ${companyId}
           AND ancestors.depth < ${LOW_TRUST_ISSUE_ANCESTRY_MAX_DEPTH - 1}
+          AND NOT parent.id = ANY(ancestors.path)
       )
       SELECT EXISTS(SELECT 1 FROM ancestors WHERE id = ${rootIssueId}) AS is_descendant
     `);

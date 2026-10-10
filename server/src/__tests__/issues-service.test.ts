@@ -62,6 +62,87 @@ function deferred<T>() {
   return { promise, resolve, reject };
 }
 
+describeEmbeddedPostgres("issue parent cycles", () => {
+  let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
+
+  afterAll(async () => {
+    await tempDb?.cleanup();
+  });
+
+  it("rejects self-parenting and moving an ancestor beneath its descendant", async () => {
+    tempDb = await startEmbeddedPostgresTestDatabase("paperclip-parent-cycle-");
+    const db = createDb(tempDb.connectionString);
+    const companyId = randomUUID();
+    const rootId = randomUUID();
+    const childId = randomUUID();
+    await db.insert(companies).values({ id: companyId, name: "Cycle test", issuePrefix: "CYC", requireBoardApprovalForNewAgents: false });
+    await db.insert(issues).values([
+      { id: rootId, companyId, title: "Root", status: "todo", priority: "medium" },
+      { id: childId, companyId, parentId: rootId, title: "Child", status: "todo", priority: "medium" },
+    ]);
+    const svc = issueService(db);
+    await expect(svc.update(rootId, { parentId: rootId })).rejects.toMatchObject({ status: 422 });
+    await expect(svc.update(rootId, { parentId: childId })).rejects.toMatchObject({ status: 422 });
+    await expect(svc.create(companyId, { id: randomUUID(), parentId: childId, title: "Valid grandchild" })).resolves.toMatchObject({ parentId: childId });
+    await expect(svc.create(companyId, { id: rootId, parentId: rootId, title: "Invalid self parent" })).rejects.toMatchObject({ status: 422 });
+    const [root] = await db.select({ parentId: issues.parentId }).from(issues).where(eq(issues.id, rootId));
+    expect(root.parentId).toBeNull();
+  }, 20_000);
+
+  it("refuses to attach to an existing cyclic parent chain", async () => {
+    const db = createDb(tempDb!.connectionString);
+    const companyId = randomUUID();
+    const firstId = randomUUID();
+    const secondId = randomUUID();
+    const detachedId = randomUUID();
+    await db.insert(companies).values({ id: companyId, name: "Corrupt cycle", issuePrefix: "COR", requireBoardApprovalForNewAgents: false });
+    await db.insert(issues).values([
+      { id: firstId, companyId, title: "First", status: "todo", priority: "medium" },
+      { id: secondId, companyId, parentId: firstId, title: "Second", status: "todo", priority: "medium" },
+      { id: detachedId, companyId, title: "Detached", status: "todo", priority: "medium" },
+    ]);
+    await db.update(issues).set({ parentId: secondId }).where(eq(issues.id, firstId));
+    await expect(issueService(db).update(detachedId, { parentId: firstId })).rejects.toMatchObject({ status: 422 });
+    await db.update(issues).set({ parentId: null }).where(eq(issues.id, firstId));
+  }, 20_000);
+
+  it("rejects a descendant beyond the traversal limit without hanging", async () => {
+    const db = createDb(tempDb!.connectionString);
+    const companyId = randomUUID();
+    const ids = Array.from({ length: 103 }, () => randomUUID());
+    await db.insert(companies).values({ id: companyId, name: "Deep parents", issuePrefix: "DEP", requireBoardApprovalForNewAgents: false });
+    for (let index = 0; index < ids.length; index += 1) {
+      await db.insert(issues).values({
+        id: ids[index], companyId, title: `Level ${index}`, status: "todo", priority: "medium",
+        parentId: index === 0 ? null : ids[index - 1],
+      });
+    }
+    await expect(issueService(db).update(ids[0], { parentId: ids[102] })).rejects.toMatchObject({ status: 422 });
+  }, 30_000);
+
+  it("serializes opposite reparenting requests so only one succeeds", async () => {
+    const db = createDb(tempDb!.connectionString);
+    const companyId = randomUUID();
+    const firstId = randomUUID();
+    const secondId = randomUUID();
+    await db.insert(companies).values({ id: companyId, name: "Concurrent parents", issuePrefix: "CON", requireBoardApprovalForNewAgents: false });
+    await db.insert(issues).values([
+      { id: firstId, companyId, title: "First", status: "todo", priority: "medium" },
+      { id: secondId, companyId, title: "Second", status: "todo", priority: "medium" },
+    ]);
+    const svc = issueService(db);
+    const results = await Promise.allSettled([
+      svc.update(firstId, { parentId: secondId }),
+      svc.update(secondId, { parentId: firstId }),
+    ]);
+    expect(results.map((result) => result.status).sort()).toEqual(["fulfilled", "rejected"]);
+    const parents = await db.select({ id: issues.id, parentId: issues.parentId }).from(issues);
+    const first = parents.find((row) => row.id === firstId);
+    const second = parents.find((row) => row.id === secondId);
+    expect(first?.parentId === secondId && second?.parentId === firstId).toBe(false);
+  }, 20_000);
+});
+
 describe("issue list limit helpers", () => {
   it("clamps untrusted issue-list limits to the server maximum", () => {
     expect(clampIssueListLimit(0)).toBe(1);
