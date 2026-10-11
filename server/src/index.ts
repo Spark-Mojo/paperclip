@@ -1809,6 +1809,12 @@ async function startServerWithDatabaseTeardown(
               }
             })
             .then(async () => {
+              const settled = await heartbeat.sweepSettledAwaitingYouIssues();
+              if (settled.handedBack > 0 || settled.autoClosed > 0) {
+                logger.warn({ ...settled }, "periodic awaiting-you settlement settled fully-answered user-owned cards");
+              }
+            })
+            .then(async () => {
               const pulled = await heartbeat.pullIdleAgentTodoIssues();
               if (pulled.pulled > 0) {
                 logger.warn({ ...pulled }, "periodic idle todo pull dispatched assigned todo cards");
