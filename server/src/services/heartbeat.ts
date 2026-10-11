@@ -386,6 +386,8 @@ import {
   WORKTREE_INSTANCE_ROOT_METADATA_KEY,
 } from "./workspace-instance-cleanup.js";
 import { issueService } from "./issues.js";
+import { issueThreadInteractionService } from "./issue-thread-interactions.js";
+import { settleSettledAwaitingYouIssues } from "./awaiting-you-settlement.js";
 import {
   blockRunnerGoalRecovery,
   failRunnerGoalAction,
@@ -20426,6 +20428,30 @@ export function heartbeatService(
       .then((rows) => Boolean(rows[0]));
   }
 
+  // SPA-11242: periodic sweep settling fully-answered user-owned cards
+  // (hand back to live filer, else auto-close + wake dependents), keeping
+  // requiresManualAction cards open.
+  async function sweepSettledAwaitingYouIssues() {
+    const interactionSvc = issueThreadInteractionService(db);
+    return settleSettledAwaitingYouIssues(
+      db,
+      {
+        issuesSvc: {
+          update: (id, data) => issuesSvc.update(id, data),
+          addComment: (issueId, body) =>
+            issuesSvc.addComment(issueId, body, {}, { authorType: "system" }),
+        },
+        listInteractionsForIssue: (issueId) =>
+          interactionSvc.listForIssue(issueId),
+        enqueueWakeupFn: (agentId, opts) =>
+          enqueueWakeup(agentId, opts as WakeupOptions),
+        unblockDependentsFn: (blockerIssueId) =>
+          autoUnblockReadyDependents(blockerIssueId),
+        logFn: (obj, msg) => logger.warn(obj, msg),
+      },
+    );
+  }
+
   async function autoUnblockReadyDependents(blockerIssueId: string) {
     const enabled = resolveIdleTodoPullCanary(runtimeEnv.PAPERCLIP_AUTO_UNBLOCK_READY_DEPENDENTS).enabled && resolveIdleTodoPullGate().enabled;
     const result = { enabled, checked: 0, unblocked: 0, notReadySkipped: 0, deferredOrFailed: 0, issueIds: [] as string[] };
@@ -30774,6 +30800,7 @@ export function heartbeatService(
     reconcileStrandedAssignedIssues,
     pullIdleAgentTodoIssues,
     autoUnblockReadyDependents,
+    sweepSettledAwaitingYouIssues,
     recoverPendingSessionGoalActions,
     recoverActiveSessionGoals,
 
