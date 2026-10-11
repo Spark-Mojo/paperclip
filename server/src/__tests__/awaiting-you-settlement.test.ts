@@ -1,6 +1,23 @@
 import express from "express";
+import { randomUUID } from "node:crypto";
+import { eq } from "drizzle-orm";
 import request from "supertest";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import {
+  agents,
+  companies,
+  createDb,
+  issues,
+} from "@paperclipai/db";
+import {
+  getEmbeddedPostgresTestSupport,
+  startEmbeddedPostgresTestDatabase,
+} from "./helpers/embedded-postgres.js";
+import {
+  DECISION_INTERACTION_KINDS,
+  readRequiresManualAction,
+  settleSettledAwaitingYouIssues,
+} from "../services/awaiting-you-settlement.js";
 
 const FILER_AGENT_ID = "22222222-2222-4222-8222-222222222222";
 const ISSUE_ID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
@@ -340,4 +357,251 @@ describe.sequential("awaiting-you settlement", () => {
     expect(mockQuestionResponseDeliveries.deliver).toHaveBeenCalledWith("interaction-2");
     expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
   }, 10_000);
+});
+
+const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
+const describeEmbeddedPostgres = embeddedPostgresSupport.supported
+  ? describe.sequential
+  : describe.skip;
+
+describeEmbeddedPostgres("awaiting-you settlement sweep", () => {
+  let db!: ReturnType<typeof createDb>;
+  let tempDb: Awaited<
+    ReturnType<typeof startEmbeddedPostgresTestDatabase>
+  > | null = null;
+
+  beforeAll(async () => {
+    tempDb = await startEmbeddedPostgresTestDatabase(
+      "paperclip-awaiting-you-settlement-",
+    );
+    db = createDb(tempDb.connectionString);
+  }, 60_000);
+
+  afterEach(async () => {
+    await db.delete(issues);
+    await db.delete(agents);
+    await db.delete(companies);
+  });
+
+  afterAll(async () => {
+    await tempDb?.cleanup();
+  });
+
+  function answeredQuestionInteraction(filerId: string | null) {
+    return {
+      id: randomUUID(),
+      kind: "ask_user_questions",
+      status: "answered",
+      payload: {
+        version: 1,
+        title: "Scope?",
+        questions: [
+          {
+            id: "scope",
+            prompt: "Scope?",
+            selectionMode: "single",
+            options: [{ id: "phase-1", label: "Phase 1" }],
+          },
+        ],
+      },
+      result: {
+        version: 1,
+        answers: [{ questionId: "scope", optionIds: ["phase-1"] }],
+      },
+      createdByAgentId: filerId,
+      resolvedAt: new Date(),
+      updatedAt: new Date(),
+      createdAt: new Date(),
+    };
+  }
+
+  async function seedCompany(prefixSeed: string) {
+    const companyId = randomUUID();
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Settlement",
+      issuePrefix: `S${prefixSeed.replace(/-/g, "").slice(0, 6).toUpperCase()}${Date.now().toString(36).slice(-4).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    return companyId;
+  }
+
+  async function seedAgent(companyId: string, status = "active") {
+    const agentId = randomUUID();
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "Filer",
+      status,
+    });
+    return agentId;
+  }
+
+  async function seedUserOwnedCard(
+    companyId: string,
+    filerId: string | null,
+  ) {
+    const issueId = randomUUID();
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Awaiting you card",
+      status: "todo",
+      priority: "medium",
+      assigneeAgentId: null,
+      assigneeUserId: "local-board",
+      createdByAgentId: filerId,
+    });
+    return issueId;
+  }
+
+  function makeDeps(lists: Map<string, ReturnType<typeof answeredQuestionInteraction>[]>) {
+    const comments: { issueId: string; body: string }[] = [];
+    const wakeups: { agentId: string; opts: Record<string, unknown> }[] = [];
+    const unblocked: string[] = [];
+    return {
+      comments,
+      wakeups,
+      unblocked,
+      deps: {
+        issuesSvc: {
+          update: async (id: string, data: { assigneeAgentId?: string | null; assigneeUserId?: string | null; status?: string }) =>
+            db.update(issues).set(data).where(eq(issues.id, id)),
+          addComment: async (issueId: string, body: string) => {
+            comments.push({ issueId, body });
+            return null;
+          },
+        },
+        listInteractionsForIssue: async (issueId: string) =>
+          lists.get(issueId) ?? [],
+        enqueueWakeupFn: async (agentId: string, opts: Record<string, unknown>) => {
+          wakeups.push({ agentId, opts });
+          return null;
+        },
+        unblockDependentsFn: async (blockerIssueId: string) => {
+          unblocked.push(blockerIssueId);
+          return null;
+        },
+      },
+    };
+  }
+
+  it("hands a fully-answered card back to its live filing agent", async () => {
+    const companyId = await seedCompany(randomUUID());
+    const filerId = await seedAgent(companyId, "active");
+    const issueId = await seedUserOwnedCard(companyId, filerId);
+    // Negative: a second candidate with a still-pending decision must be skipped.
+    const pendingIssueId = await seedUserOwnedCard(companyId, filerId);
+    const lists = new Map([
+      [issueId, [answeredQuestionInteraction(filerId)]],
+      [pendingIssueId, [{ ...answeredQuestionInteraction(filerId), status: "pending" }]],
+    ]);
+    const { comments, wakeups, unblocked, deps } = makeDeps(lists);
+
+    const result = await settleSettledAwaitingYouIssues(db, deps as never);
+
+    expect(result).toMatchObject({ scanned: 2, handedBack: 1, autoClosed: 0, keptOpen: 0, failed: 0 });
+    expect(result.issueIds).toEqual([issueId]);
+    const [issue] = await db.select().from(issues).where(eq(issues.id, issueId));
+    expect(issue).toMatchObject({ assigneeAgentId: filerId, assigneeUserId: null });
+    expect(wakeups).toHaveLength(1);
+    expect(wakeups[0]).toMatchObject({ agentId: filerId });
+    expect(comments.some((c) => c.issueId === issueId)).toBe(true);
+    expect(unblocked).toEqual([]);
+    const [pending] = await db.select().from(issues).where(eq(issues.id, pendingIssueId));
+    expect(pending).toMatchObject({ assigneeAgentId: null, assigneeUserId: "local-board" });
+  }, 90_000);
+
+  it("auto-closes a fully-answered card with no live filer and wakes dependents", async () => {
+    const companyId = await seedCompany(randomUUID());
+    const issueId = await seedUserOwnedCard(companyId, null);
+    // Negative: a card with no decision interactions at all must be skipped.
+    const emptyIssueId = await seedUserOwnedCard(companyId, null);
+    const lists = new Map([
+      [issueId, [answeredQuestionInteraction(null)]],
+      [emptyIssueId, []],
+    ]);
+    const { comments, wakeups, unblocked, deps } = makeDeps(lists);
+
+    const result = await settleSettledAwaitingYouIssues(db, deps as never);
+
+    expect(result).toMatchObject({ scanned: 2, handedBack: 0, autoClosed: 1, keptOpen: 0, failed: 0 });
+    expect(result.issueIds).toEqual([issueId]);
+    const [issue] = await db.select().from(issues).where(eq(issues.id, issueId));
+    expect(issue?.status).toBe("done");
+    expect(unblocked).toEqual([issueId]);
+    expect(wakeups).toEqual([]);
+    expect(comments.some((c) => c.issueId === issueId)).toBe(true);
+    const [empty] = await db.select().from(issues).where(eq(issues.id, emptyIssueId));
+    expect(empty?.status).toBe("todo");
+  }, 90_000);
+
+  it("keeps a manual-action card open", async () => {
+    // Unit-level negatives: only an exact `true` keeps a card open.
+    expect(DECISION_INTERACTION_KINDS).toContain("ask_user_questions");
+    expect(readRequiresManualAction({ requiresManualAction: true })).toBe(true);
+    expect(readRequiresManualAction({ requiresManualAction: 1 })).toBe(false);
+    expect(readRequiresManualAction({ requiresManualAction: "true" })).toBe(false);
+    expect(readRequiresManualAction(null)).toBe(false);
+
+    const companyId = await seedCompany(randomUUID());
+    const filerId = await seedAgent(companyId, "active");
+    const issueId = await seedUserOwnedCard(companyId, filerId);
+    const manual = {
+      ...answeredQuestionInteraction(filerId),
+      payload: {
+        version: 1,
+        title: "Deploy?",
+        requiresManualAction: true,
+        questions: [
+          {
+            id: "scope",
+            prompt: "Scope?",
+            selectionMode: "single",
+            options: [{ id: "phase-1", label: "Phase 1" }],
+          },
+        ],
+      },
+    };
+    const lists = new Map([[issueId, [manual]]]);
+    const { comments, wakeups, unblocked, deps } = makeDeps(lists);
+
+    const result = await settleSettledAwaitingYouIssues(db, deps as never);
+
+    expect(result).toMatchObject({ scanned: 1, handedBack: 0, autoClosed: 0, keptOpen: 1, failed: 0 });
+    expect(result.issueIds).toEqual([]);
+    const [issue] = await db.select().from(issues).where(eq(issues.id, issueId));
+    expect(issue).toMatchObject({ status: "todo", assigneeAgentId: null, assigneeUserId: "local-board" });
+    expect(wakeups).toEqual([]);
+    expect(unblocked).toEqual([]);
+    expect(comments).toEqual([]);
+  }, 90_000);
+
+  it("settles once the manual-action flag is cleared", async () => {
+    const companyId = await seedCompany(randomUUID());
+    const filerId = await seedAgent(companyId, "active");
+    const issueId = await seedUserOwnedCard(companyId, filerId);
+    const base = answeredQuestionInteraction(filerId);
+    const manual = {
+      ...base,
+      payload: {
+        ...(base.payload as Record<string, unknown>),
+        requiresManualAction: true,
+      },
+    };
+    const lists = new Map([[issueId, [manual]]]);
+    const { deps } = makeDeps(lists);
+
+    const first = await settleSettledAwaitingYouIssues(db, deps as never);
+    expect(first).toMatchObject({ scanned: 1, keptOpen: 1, handedBack: 0, autoClosed: 0 });
+
+    // The filer clears the flag (e.g. finishes the credential/prod step);
+    // the next sweep settles the card.
+    lists.set(issueId, [answeredQuestionInteraction(filerId)]);
+    const second = await settleSettledAwaitingYouIssues(db, deps as never);
+    expect(second).toMatchObject({ scanned: 1, handedBack: 1, keptOpen: 0 });
+    expect(second.issueIds).toEqual([issueId]);
+    const [issue] = await db.select().from(issues).where(eq(issues.id, issueId));
+    expect(issue).toMatchObject({ assigneeAgentId: filerId, assigneeUserId: null });
+  }, 90_000);
 });
