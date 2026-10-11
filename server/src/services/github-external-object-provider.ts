@@ -1,5 +1,9 @@
 import type { Db } from "@paperclipai/db";
 import type { ExternalObjectCanonicalUrl } from "@paperclipai/shared";
+import {
+  resolveGitHubApiToken,
+  type GitHubAppCredentialSource,
+} from "./github-app-token-provider.js";
 import { DEFAULT_GITHUB_TOKEN_SECRET_NAMES } from "./git-credentials.js";
 import { ghFetch, gitHubApiBase } from "./github-fetch.js";
 import { secretService } from "./secrets.js";
@@ -13,7 +17,7 @@ import type {
 
 type FetchLike = (url: string, init?: RequestInit) => Promise<Response>;
 
-export interface GitHubExternalObjectProviderOptions {
+export interface GitHubExternalObjectProviderOptions extends GitHubAppCredentialSource {
   fetch?: FetchLike;
   tokenProvider?: (companyId: string) => Promise<string | null> | string | null;
   secretNames?: readonly string[];
@@ -323,8 +327,39 @@ async function safeJson(response: Response) {
   }
 }
 
-async function defaultTokenProvider(db: Db, companyId: string, secretNames: readonly string[]) {
+async function defaultTokenProvider(
+  db: Db,
+  companyId: string,
+  secretNames: readonly string[],
+  appSource?: GitHubAppCredentialSource,
+  fetchImpl?: FetchLike,
+) {
   const secrets = secretService(db);
+  const resolveSecret = async (cid: string, names: readonly string[]) => {
+    for (const secretName of names) {
+      const secret = await secrets.getByName(cid, secretName);
+      if (!secret) continue;
+      const token = await secrets.resolveSecretValue(cid, secret.id, "latest");
+      const trimmed = token.trim();
+      if (trimmed) return trimmed;
+    }
+    return null;
+  };
+  // SPA-11677: app-backed installation token first (cached, refreshed before
+  // its 1h expiry), static PAT as the fallback when App config is absent or
+  // minting fails. `resolveGitHubApiToken` never throws and never leaks
+  // secret values; a null return keeps the caller's fail-closed behavior.
+  try {
+    const token = await resolveGitHubApiToken({
+      companyId,
+      resolveSecret,
+      fetchImpl,
+      ...appSource,
+    });
+    if (token) return token;
+  } catch {
+    // Fall through to the legacy PAT scan below.
+  }
   for (const secretName of secretNames) {
     const secret = await secrets.getByName(companyId, secretName);
     if (!secret) continue;
@@ -343,7 +378,12 @@ export function createGitHubExternalObjectProvider(
   const secretNames = opts.secretNames ?? DEFAULT_GITHUB_TOKEN_SECRET_NAMES;
   const tokenProvider = Object.prototype.hasOwnProperty.call(opts, "tokenProvider") && opts.tokenProvider !== undefined
     ? opts.tokenProvider
-    : ((companyId: string) => defaultTokenProvider(db, companyId, secretNames));
+    : ((companyId: string) => defaultTokenProvider(db, companyId, secretNames, {
+        appIdSecretNames: opts.appIdSecretNames,
+        privateKeySecretNames: opts.privateKeySecretNames,
+        installationIdSecretNames: opts.installationIdSecretNames,
+        patSecretNames: opts.patSecretNames,
+      }, fetchImpl));
 
   const detector: ExternalObjectDetector = {
     key: "github",
