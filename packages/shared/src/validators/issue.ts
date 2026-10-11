@@ -1368,6 +1368,7 @@ export const askUserQuestionsPayloadSchema = z
     title: z.string().trim().max(240).nullable().optional(),
     submitLabel: z.string().trim().max(120).nullable().optional(),
     supersedeOnUserComment: z.boolean().optional(),
+    requiresManualAction: z.boolean().optional(),
     questions: z.array(askUserQuestionsQuestionSchema).min(1).max(64),
     /** Exact canonical presentation retained for a recovered harness request. */
     questionSet: paperclipQuestionSetPayloadSchema.optional(),
@@ -1529,6 +1530,7 @@ export const requestConfirmationPayloadSchema = z.object({
     .optional(),
   detailsMarkdown: z.string().max(20000).nullable().optional(),
   supersedeOnUserComment: z.boolean().optional(),
+  requiresManualAction: z.boolean().optional(),
   target: requestConfirmationTargetSchema.nullable().optional(),
   toolAction: requestConfirmationToolActionPayloadSchema.optional(),
   secretProposal: requestConfirmationSecretProposalPayloadSchema.optional(),
@@ -1569,6 +1571,7 @@ export const requestCheckboxConfirmationPayloadSchema = z
       .nullable()
       .optional(),
     supersedeOnUserComment: z.boolean().optional(),
+    requiresManualAction: z.boolean().optional(),
     target: requestConfirmationTargetSchema.nullable().optional(),
   })
   .superRefine((value, ctx) => {
@@ -1760,6 +1763,7 @@ export const requestItemVerdictsPayloadSchema = z
     reasonLabel: z.string().trim().min(1).max(160).nullable().optional(),
     allowBulkApprove: z.boolean().optional().default(true),
     supersedeOnUserComment: z.boolean().optional(),
+    requiresManualAction: z.boolean().optional(),
     target: requestConfirmationTargetSchema.nullable().optional(),
   })
   .superRefine((value, ctx) => {
