@@ -856,7 +856,19 @@ describe.sequential("issue thread interaction routes", () => {
     expect(mockQuestionResponseDeliveries.deliver).toHaveBeenCalledWith(
       "interaction-2",
     );
-    expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
+    // SPA-11242: the respond path queues the same continuation wake as
+    // accept/reject/verdicts so the assignee receives the answer.
+    expect(mockHeartbeatService.wakeup).toHaveBeenCalledWith(
+      ASSIGNEE_AGENT_ID,
+      expect.objectContaining({
+        idempotencyKey: "interaction:interaction-2:answered",
+        payload: expect.objectContaining({
+          interactionId: "interaction-2",
+          interactionKind: "ask_user_questions",
+          interactionStatus: "answered",
+        }),
+      }),
+    );
     expect(mockLogActivity).toHaveBeenCalledWith(
       expect.anything(),
       expect.objectContaining({
@@ -886,7 +898,14 @@ describe.sequential("issue thread interaction routes", () => {
 
     expect(res.status).toBe(200);
     expect(mockQuestionResponseDeliveries.deliver).toHaveBeenCalledWith("interaction-2");
-    expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
+    // SPA-11242: wake_assignee_on_accept treats an authoritative answer as the
+    // positive resolution, so the respond path wakes the assignee here.
+    expect(mockHeartbeatService.wakeup).toHaveBeenCalledWith(
+      ASSIGNEE_AGENT_ID,
+      expect.objectContaining({
+        idempotencyKey: "interaction:interaction-2:answered",
+      }),
+    );
   });
 
   it("submits item verdicts and emits one continuation wake with resolved item ids", async () => {
@@ -2381,7 +2400,13 @@ describe.sequential("issue thread interaction routes", () => {
       expect.objectContaining({ agentId: ASSIGNEE_AGENT_ID, runId: RUN_2, userId: null }),
     );
     expect(mockQuestionResponseDeliveries.deliver).toHaveBeenCalledWith("interaction-2");
-    expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
+    // SPA-11242: the respond path wakes the assignee just like accept/reject.
+    expect(mockHeartbeatService.wakeup).toHaveBeenCalledWith(
+      ASSIGNEE_AGENT_ID,
+      expect.objectContaining({
+        idempotencyKey: "interaction:interaction-2:answered",
+      }),
+    );
     expect(mockLogActivity).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
       actorType: "agent",
       agentId: ASSIGNEE_AGENT_ID,
