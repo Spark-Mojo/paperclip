@@ -16710,6 +16710,15 @@ export function issueRoutes(
         );
       });
 
+      await queueResolvedInteractionContinuationWakeup({
+        db,
+        heartbeat,
+        issue,
+        interaction,
+        actor,
+        source: "issue.interaction.respond",
+      });
+
       res.json(interaction);
     },
   );
