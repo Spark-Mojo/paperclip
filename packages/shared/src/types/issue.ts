@@ -1197,6 +1197,7 @@ export interface AskUserQuestionsPayload {
   title?: string | null;
   submitLabel?: string | null;
   supersedeOnUserComment?: boolean;
+  requiresManualAction?: boolean;
   questions: AskUserQuestionsQuestion[];
   /** Exact presentation for a recovered harness request. */
   questionSet?: PaperclipQuestionSetPayload;
@@ -1362,6 +1363,7 @@ export interface RequestConfirmationPayload {
   declineReasonPlaceholder?: string | null;
   detailsMarkdown?: string | null;
   supersedeOnUserComment?: boolean;
+  requiresManualAction?: boolean;
   target?: RequestConfirmationTarget | null;
   toolAction?: RequestConfirmationToolActionPayload;
   secretProposal?: RequestConfirmationSecretProposalPayload;
@@ -1389,6 +1391,7 @@ export interface RequestCheckboxConfirmationPayload {
   allowDeclineReason?: boolean;
   declineReasonPlaceholder?: string | null;
   supersedeOnUserComment?: boolean;
+  requiresManualAction?: boolean;
   target?: RequestConfirmationTarget | null;
 }
 
@@ -1413,6 +1416,7 @@ export interface RequestItemVerdictsPayload {
   reasonLabel?: string | null;
   allowBulkApprove?: boolean;
   supersedeOnUserComment?: boolean;
+  requiresManualAction?: boolean;
   target?: RequestConfirmationTarget | null;
 }
 
