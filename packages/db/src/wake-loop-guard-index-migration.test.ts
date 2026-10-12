@@ -37,9 +37,12 @@ async function applyMigrations(sql: postgres.Sql, onlyUpTo: string | null) {
   }
 }
 
-async function spinUp() {
+async function spinUp(requestedPort?: number) {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), "pg-wakeloop-"));
-  const port = 25432 + Math.floor(Math.random() * 1000);
+  // Callers that run two scenarios in one test pass explicit, distinct
+  // ports so the second EmbeddedPostgres cannot collide with the first.
+  // Callers that run alone fall back to a random port in the same range.
+  const port = requestedPort ?? 25432 + Math.floor(Math.random() * 1000);
   const pg = new EmbeddedPostgres({
     databaseDir: dir,
     user: "postgres",
