@@ -506,6 +506,7 @@ const TRANSIENT_INFRA_CONTINUATION_ERROR_CODES = new Set<string>([
   "codex_transient_upstream",
   "codex_harness_crash",
   "claude_transient_upstream",
+  "model_stream_stalled",
   "provider_quota",
   "timeout",
 ]);
