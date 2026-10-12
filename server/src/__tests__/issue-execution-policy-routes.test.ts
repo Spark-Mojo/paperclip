@@ -1,6 +1,6 @@
 import express from "express";
 import request from "supertest";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { normalizeIssueExecutionPolicy } from "../services/issue-execution-policy.ts";
 
 const mockIssueService = vi.hoisted(() => ({
@@ -24,6 +24,7 @@ const mockHeartbeatService = vi.hoisted(() => ({
   getRun: vi.fn(async () => null),
   getActiveRunForAgent: vi.fn(async () => null),
   cancelRun: vi.fn(async () => null),
+  cancelLiveRunsForIssue: vi.fn(async () => []),
 }));
 
 const mockAccessService = vi.hoisted(() => ({
@@ -32,6 +33,7 @@ const mockAccessService = vi.hoisted(() => ({
   hasPermission: vi.fn(async () => false),
 }));
 const mockDbSelectWhere = vi.hoisted(() => vi.fn(() => ({
+  orderBy: async () => [],
   for: () => ({
     then: (onFulfilled: (rows: unknown[]) => unknown, onRejected?: (reason: unknown) => unknown) =>
       Promise.resolve([{
@@ -193,15 +195,21 @@ async function createApp(actor?: TestActor) {
 }
 
 describe("issue execution policy routes", () => {
-  beforeEach(() => {
-    vi.resetModules();
-    vi.doUnmock("../services/index.js");
-    vi.doUnmock("../routes/issues.js");
-    vi.doUnmock("../middleware/index.js");
+  beforeAll(async () => {
     registerModuleMocks();
+    await createApp();
+  }, 60000);
+
+  beforeEach(() => {
     vi.clearAllMocks();
+    mockHeartbeatService.getActiveRunForAgent.mockResolvedValue(null);
+    mockHeartbeatService.cancelRun.mockResolvedValue(null);
+    mockHeartbeatService.cancelLiveRunsForIssue.mockResolvedValue([]);
+    mockLogActivity.mockResolvedValue(undefined);
     mockIssueService.assertCheckoutOwner.mockResolvedValue({ adoptedFromRunId: null });
     mockIssueService.getByIdForUpdate.mockImplementation(async () => mockIssueService.getById());
+    mockIssueService.getById.mockReset();
+    mockIssueService.update.mockReset();
     mockIssueService.findMentionedAgents.mockResolvedValue([]);
     mockIssueService.getRelationSummaries.mockResolvedValue({ blockedBy: [], blocks: [] });
     mockIssueService.listWakeableBlockedDependents.mockResolvedValue([]);
@@ -212,6 +220,7 @@ describe("issue execution policy routes", () => {
     mockDbSelect.mockImplementation(() => ({ from: mockDbSelectFrom }));
     mockDbSelectFrom.mockImplementation(() => ({ where: mockDbSelectWhere }));
     mockDbSelectWhere.mockImplementation(() => ({
+      orderBy: async () => [],
       for: () => ({
         then: (onFulfilled: (rows: unknown[]) => unknown, onRejected?: (reason: unknown) => unknown) =>
           Promise.resolve([{
@@ -597,6 +606,64 @@ describe("issue execution policy routes", () => {
       details: { code: "invalid_review_interaction" },
     });
     expect(mockIssueService.update).not.toHaveBeenCalled();
+  });
+
+  it("activates a review attached after checkout and refuses the builder's approval", async () => {
+    const builderId = "33333333-3333-4333-8333-333333333333";
+    const reviewerId = "44444444-4444-4444-8444-444444444444";
+    const issueId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    const runId = "55555555-5555-4555-8555-555555555555";
+    const policy = normalizeIssueExecutionPolicy({
+      stages: [{ type: "review", participants: [{ type: "agent", agentId: reviewerId }] }],
+    })!;
+    let issue: Record<string, unknown> = {
+      id: issueId,
+      companyId: "company-1",
+      status: "in_progress",
+      assigneeAgentId: builderId,
+      assigneeUserId: null,
+      createdByUserId: "local-board",
+      identifier: "PAP-1012",
+      title: "Mid-flight review",
+      executionPolicy: null,
+      executionState: null,
+    };
+    mockIssueService.getById.mockImplementation(async () => issue);
+    mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => {
+      issue = { ...issue, ...patch, updatedAt: new Date() };
+      return issue;
+    });
+    const builder = await createApp({ type: "agent", agentId: builderId, companyId: "company-1", runId });
+    mockHeartbeatService.getActiveRunForAgent.mockResolvedValueOnce({
+      id: runId,
+      status: "running",
+      contextSnapshot: { issueId },
+    });
+    mockHeartbeatService.cancelRun.mockImplementationOnce(async () => {
+      expect(issue).toMatchObject({ status: "in_review", assigneeAgentId: reviewerId });
+      throw new Error("cancellation unavailable");
+    });
+    const attached = await request(builder).patch(`/api/issues/${issueId}`).send({ executionPolicy: policy });
+    expect(attached.status).toBe(200);
+    expect(mockHeartbeatService.cancelRun).toHaveBeenCalledWith(runId, expect.any(String), expect.anything());
+    expect(mockLogActivity).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({ action: "heartbeat.cancel_failed", details: expect.objectContaining({ source: "mid_flight_review_activation" }) }),
+    );
+    expect(issue).toMatchObject({
+      status: "in_review",
+      assigneeAgentId: reviewerId,
+      executionState: {
+        status: "pending",
+        currentParticipant: { type: "agent", agentId: reviewerId },
+        returnAssignee: { type: "agent", agentId: builderId },
+      },
+    });
+    expect(mockHeartbeatService.wakeup).toHaveBeenCalled();
+    const builderDecision = await request(builder).patch(`/api/issues/${issueId}`).send({ status: "done", comment: "Approve" });
+    expect(builderDecision.status).toBe(422);
+    expect(issue.status).toBe("in_review");
+    expect((issue.executionState as { lastDecisionOutcome: unknown }).lastDecisionOutcome).toBeNull();
   });
 
   it("allows an agent-authored in_review transition with a typed execution participant", async () => {

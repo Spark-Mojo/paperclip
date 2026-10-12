@@ -4827,6 +4827,13 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
         ...(attachmentIds?.length ? { attachmentIds } : {}),
         assigneeAgentId: reassignment.assigneeAgentId,
         assigneeUserId: reassignment.assigneeUserId,
+        // SPA-10357 / SPA-10859 board-actor ownership-transfer CAS: a
+        // reassignment is an ownership transfer, so it must carry the
+        // caller-observed current values. The composer's loaded copy of the
+        // issue is that observation; a stale copy 409s and the user retries
+        // on fresh data instead of silently overwriting a concurrent move.
+        expectedAssigneeAgentId: issue?.assigneeAgentId ?? null,
+        expectedAssigneeUserId: issue?.assigneeUserId ?? null,
         ...(reopen ? { status: "todo" } : {}),
         ...(interrupt ? { interrupt } : {}),
       }),

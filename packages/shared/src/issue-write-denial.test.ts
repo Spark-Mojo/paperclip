@@ -129,6 +129,24 @@ describe("describeIssueWriteDenial", () => {
     const copy = describeIssueWriteDenial("issue_write_responsible_user_ceiling");
     expect(copy.description).toContain("the responsible user");
   });
+
+  it("names the read-back so a lost-response retry is not ambiguous", () => {
+    // SPA-10721 / GitHub #1288: a PATCH can commit while its response is
+    // dropped (client sees HTTP 000). A retry then re-asserts the terminal
+    // status the card already holds. The denial copy must tell that caller the
+    // write already landed, so it can stop resending.
+    const done = describeIssueWriteDenial("issue_write_terminal_recomplete", {
+      terminalStatus: "done",
+    });
+    expect(done.status).toBe(409);
+    expect(done.description).toContain("already in effect");
+    expect(done.description).toContain("already landed");
+
+    const cancelled = describeIssueWriteDenial("issue_write_terminal_recomplete", {
+      terminalStatus: "cancelled",
+    });
+    expect(cancelled.description).toContain("already in effect");
+  });
 });
 
 describe("issueWriteDenialCodeForResponsibleUserDenial", () => {

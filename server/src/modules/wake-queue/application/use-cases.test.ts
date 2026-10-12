@@ -41,6 +41,8 @@ const ISSUE: IssueSnapshot = {
   assigneeUserId: null,
   hiddenAt: null,
   originKind: null,
+  completedAt: null,
+  cancelledAt: null,
   monitorNextCheckAt: null,
   executionState: null,
   responsibleUserId: null,
@@ -114,6 +116,7 @@ function createFakeTransaction(overrides: Partial<WakeQueueTransaction> = {}): W
       releasePolicy: null,
     })),
     getCommentSelfAuthorship: vi.fn(async () => ({ allSelfAuthored: false })),
+    getDeferredCommentCreatedAt: vi.fn(async () => []),
     isCompletedDelegationMention: vi.fn(async () => false),
     reopenIssue: vi.fn(async () => null),
     claimDeferredWakeForPromotion: vi.fn(async () => true),
@@ -510,7 +513,13 @@ describe("releaseIssueExecution", () => {
     expect(result.outcome.kind).toBe("released");
   });
 
+  // SPA-11798 / GH #1178: this used to assert the reopen unconditionally. A
+  // human comment is new information only when it landed AFTER the close; the
+  // stale handoff (SPA-175, SPA-10970, SPA-11067) was armed before it. The
+  // reopen now survives only for post-close comments — see the pre-close
+  // deferred regression block below for the full matrix.
   it("reopens a completed task before promoting its assignee's human follow-up", async () => {
+    const closedAt = new Date("2026-10-03T15:28:30.000Z");
     const queue = [wakeCandidate({
       agentId: ISSUE.assigneeAgentId!,
       requestedByActorType: "user",
@@ -518,10 +527,12 @@ describe("releaseIssueExecution", () => {
     })];
     const transaction = createFakeTransaction({
       findNextDeferredWake: vi.fn(async () => queue.shift() ?? null),
+      getDeferredCommentCreatedAt: vi.fn(async ({ commentIds }: { commentIds: string[] }) =>
+        commentIds.map((commentId) => ({ commentId, createdAt: new Date(closedAt.getTime() + 1000) }))),
       reopenIssue: vi.fn(async () => ({ ...ISSUE, status: "todo" })),
     });
     const release = createReleaseIssueExecution({
-      issueLock: createFakeIssueLock(createFakeHost(), transaction, { ...ISSUE, status: "done" }),
+      issueLock: createFakeIssueLock(createFakeHost(), transaction, { ...ISSUE, status: "done", completedAt: closedAt }),
       recovery: createFakeRecovery(),
     });
 
@@ -531,6 +542,184 @@ describe("releaseIssueExecution", () => {
     expect(transaction.reopenIssue).toHaveBeenCalledTimes(1);
     expect(transaction.finalizePromotedWake).toHaveBeenCalledTimes(1);
     expect(result.outcome.kind).toBe("promoted");
+  });
+
+  // GH #1178 regression guard. Every deferred wake whose comments ALL predate
+  // the close is a stale notification for work that already finished; it must
+  // not reopen the card. Anything created after the close still reopens.
+  describe("pre-close deferred comment does not reopen a terminal task", () => {
+    const CLOSED_AT = new Date("2026-10-03T15:28:30.000Z");
+    const BEFORE = new Date(CLOSED_AT.getTime() - 22 * 60_000);
+    const AFTER = new Date(CLOSED_AT.getTime() + 40_000);
+
+    async function runCase(input: {
+      status: "done" | "cancelled";
+      commentTimes: Date[];
+      actorType?: "user" | "agent";
+      wakeReason?: string;
+      agentAuthored?: boolean;
+      selfAuthored?: boolean;
+      resumeIntent?: boolean;
+    }) {
+      const commentIds = input.commentTimes.map((_, index) => `comment-${index}`);
+      const queue = [wakeCandidate({
+        agentId: ISSUE.assigneeAgentId!,
+        requestedByActorType: input.actorType ?? "user",
+        requestedByActorId: input.actorType === "agent" ? "delegating-agent" : "actor-1",
+        wakeReason: input.wakeReason ?? "issue_commented",
+        queuedCommentIds: commentIds,
+        deferredCommentIds: commentIds,
+        deferredContextSeed: input.resumeIntent ? { resumeIntent: true } : {},
+      })];
+      const transaction = createFakeTransaction({
+        findNextDeferredWake: vi.fn(async () => queue.shift() ?? null),
+        getQueuedCommentLiveness: vi.fn(async () => ({
+          liveNonSelfCommentIds: commentIds,
+          containedSelfAuthoredComment: input.selfAuthored === true,
+        })),
+        getDeferredCommentCreatedAt: vi.fn(async ({ commentIds }: { commentIds: string[] }) =>
+          commentIds.map((commentId, index) => ({ commentId, createdAt: input.commentTimes[index] }))),
+        getCommentSelfAuthorship: vi.fn(async () => ({ allSelfAuthored: input.selfAuthored === true })),
+        reopenIssue: vi.fn(async () => ({ ...ISSUE, status: "todo" })),
+      });
+      const release = createReleaseIssueExecution({
+        issueLock: createFakeIssueLock(createFakeHost(), transaction, {
+          ...ISSUE,
+          status: input.status,
+          completedAt: input.status === "done" ? CLOSED_AT : null,
+          cancelledAt: input.status === "cancelled" ? CLOSED_AT : null,
+        }),
+        recovery: createFakeRecovery(),
+      });
+      const result = await release({ companyId: RUN.companyId, runId: RUN.id, now: new Date() });
+      return { transaction, result };
+    }
+
+    it.each([
+      { status: "done" as const, label: "done" },
+      { status: "cancelled" as const, label: "cancelled" },
+    ])("suppresses a stale user comment that predates the close ($label)", async ({ status }) => {
+      const { transaction } = await runCase({ status, commentTimes: [BEFORE] });
+
+      expect(transaction.reopenIssue).not.toHaveBeenCalled();
+    });
+
+    it("suppresses a stale board notification exactly at the close instant", async () => {
+      const { transaction } = await runCase({ status: "done", commentTimes: [new Date(CLOSED_AT.getTime())] });
+
+      expect(transaction.reopenIssue).not.toHaveBeenCalled();
+    });
+
+    it("keeps the reopen for a comment created after the close", async () => {
+      const { transaction, result } = await runCase({ status: "done", commentTimes: [AFTER] });
+
+      expect(transaction.reopenIssue).toHaveBeenCalledTimes(1);
+      expect(result.outcome.kind).toBe("promoted");
+    });
+
+    it("keeps the reopen for a mixed pre-close and post-close set", async () => {
+      const { transaction, result } = await runCase({ status: "done", commentTimes: [BEFORE, AFTER] });
+
+      expect(transaction.reopenIssue).toHaveBeenCalledTimes(1);
+      expect(result.outcome.kind).toBe("promoted");
+    });
+
+    it("keeps the reopen for a stale issue_reopened_via_comment posted after the close", async () => {
+      const { transaction } = await runCase({
+        status: "done",
+        commentTimes: [AFTER],
+        wakeReason: "issue_reopened_via_comment",
+      });
+
+      expect(transaction.reopenIssue).toHaveBeenCalledTimes(1);
+    });
+
+    it("does not suppress the agent resumeIntent clause at the close instant", async () => {
+      const { transaction, result } = await runCase({
+        status: "done",
+        commentTimes: [new Date(CLOSED_AT.getTime())],
+        actorType: "agent",
+        agentAuthored: true,
+        resumeIntent: true,
+      });
+
+      expect(transaction.reopenIssue).toHaveBeenCalledTimes(1);
+      expect(result.outcome.kind).toBe("promoted");
+    });
+
+    it("keeps a self-authored closing comment from reopening", async () => {
+      const { transaction } = await runCase({
+        status: "done",
+        commentTimes: [AFTER],
+        actorType: "agent",
+        selfAuthored: true,
+      });
+
+      expect(transaction.reopenIssue).not.toHaveBeenCalled();
+    });
+
+    // Fail-closed guard. A comment the adapter could not read must NOT count
+    // as evidence that the wake predates the close: if the caller allowed a
+    // short array through, `.every()` would pass vacuously and silently
+    // suppress a reopen the guard never actually justified.
+    it("keeps the reopen when a comment's creation instant could not be read", async () => {
+      const commentIds = ["readable", "unreadable"];
+      const queue = [wakeCandidate({
+        agentId: ISSUE.assigneeAgentId!,
+        requestedByActorType: "user",
+        queuedCommentIds: commentIds,
+        deferredCommentIds: commentIds,
+      })];
+      const transaction = createFakeTransaction({
+        findNextDeferredWake: vi.fn(async () => queue.shift() ?? null),
+        getQueuedCommentLiveness: vi.fn(async () => ({
+          liveNonSelfCommentIds: commentIds,
+          containedSelfAuthoredComment: false,
+        })),
+        // A short array: only the first comment came back.
+        getDeferredCommentCreatedAt: vi.fn(async () => [{ commentId: "readable", createdAt: BEFORE }]),
+        reopenIssue: vi.fn(async () => ({ ...ISSUE, status: "todo" })),
+      });
+      const release = createReleaseIssueExecution({
+        issueLock: createFakeIssueLock(createFakeHost(), transaction, {
+          ...ISSUE, status: "done", completedAt: CLOSED_AT, cancelledAt: null,
+        }),
+        recovery: createFakeRecovery(),
+      });
+
+      await release({ companyId: RUN.companyId, runId: RUN.id, now: new Date() });
+
+      expect(transaction.reopenIssue).toHaveBeenCalledTimes(1);
+    });
+
+    it("keeps the reopen when a returned creation instant is null", async () => {
+      const commentIds = ["unreadable"];
+      const queue = [wakeCandidate({
+        agentId: ISSUE.assigneeAgentId!,
+        requestedByActorType: "user",
+        queuedCommentIds: commentIds,
+        deferredCommentIds: commentIds,
+      })];
+      const transaction = createFakeTransaction({
+        findNextDeferredWake: vi.fn(async () => queue.shift() ?? null),
+        getQueuedCommentLiveness: vi.fn(async () => ({
+          liveNonSelfCommentIds: commentIds,
+          containedSelfAuthoredComment: false,
+        })),
+        getDeferredCommentCreatedAt: vi.fn(async () => [{ commentId: "unreadable", createdAt: null }]),
+        reopenIssue: vi.fn(async () => ({ ...ISSUE, status: "todo" })),
+      });
+      const release = createReleaseIssueExecution({
+        issueLock: createFakeIssueLock(createFakeHost(), transaction, {
+          ...ISSUE, status: "done", completedAt: CLOSED_AT, cancelledAt: null,
+        }),
+        recovery: createFakeRecovery(),
+      });
+
+      await release({ companyId: RUN.companyId, runId: RUN.id, now: new Date() });
+
+      expect(transaction.reopenIssue).toHaveBeenCalledTimes(1);
+    });
   });
 
   it.each(["done_live", "cancelled_live", "done_missing", "done_self", "done_no_resume", "done_untracked_comment"])("handles explicit agent feedback after completion: %s", async (scenario) => {

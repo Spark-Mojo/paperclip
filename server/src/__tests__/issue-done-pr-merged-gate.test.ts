@@ -162,6 +162,128 @@ describeEmbeddedPostgres("issue done gate — unmerged PR refuses done (SPA-8957
     });
   });
 
+  it("refuses done when review stage has no verdict", async () => {
+    const policy = normalizeIssueExecutionPolicy({
+      stages: [{ type: "review", participants: [{ type: "agent", agentId }] }],
+    })!;
+    const card = await createCard(db, companyId, {
+      status: "blocked",
+      executionPolicy: policy,
+      executionState: null,
+    });
+    await expect(issueService(db).update(card.id, { status: "done" })).rejects.toMatchObject({
+      status: 409,
+      details: { code: "issue_done_with_incomplete_execution_stage" },
+    });
+    const after = await db.select().from(issues).where(eq(issues.id, card.id)).then((rows) => rows[0]!);
+    expect(after.status).toBe("blocked");
+  });
+
+  it("refuses done when a completed state omits a configured review stage", async () => {
+    const policy = normalizeIssueExecutionPolicy({
+      stages: [{ type: "review", participants: [{ type: "agent", agentId }] }],
+    })!;
+    const card = await createCard(db, companyId, {
+      executionPolicy: policy,
+      executionState: {
+        status: "completed",
+        currentStageId: null,
+        currentStageIndex: null,
+        currentStageType: null,
+        currentParticipant: null,
+        returnAssignee: null,
+        completedStageIds: [],
+        lastDecisionId: null,
+        lastDecisionOutcome: "approved",
+      },
+    });
+    await expect(issueService(db).update(card.id, { status: "done" })).rejects.toMatchObject({
+      status: 409,
+      details: { code: "issue_done_with_incomplete_execution_stage", incompleteStageIds: [policy.stages[0].id] },
+    });
+  });
+
+  it("refuses a same-request policy removal and done transition", async () => {
+    const policy = normalizeIssueExecutionPolicy({
+      stages: [{ type: "review", participants: [{ type: "agent", agentId }] }],
+    })!;
+    const card = await createCard(db, companyId, { executionPolicy: policy, executionState: null });
+    await expect(issueService(db).update(card.id, { status: "done", executionPolicy: null })).rejects.toMatchObject({
+      status: 409,
+      details: { code: "issue_done_with_incomplete_execution_stage" },
+    });
+  });
+
+  it("allows a completed self-review skip without a decision", async () => {
+    const policy = normalizeIssueExecutionPolicy({
+      stages: [{ type: "review", participants: [{ type: "agent", agentId }] }],
+    })!;
+    const card = await createCard(db, companyId, {
+      assigneeAgentId: agentId,
+      executionPolicy: policy,
+      executionState: {
+        status: "completed",
+        currentStageId: null,
+        currentStageIndex: null,
+        currentStageType: null,
+        currentParticipant: null,
+        returnAssignee: { type: "agent", agentId },
+        completedStageIds: [policy.stages[0].id],
+        lastDecisionId: null,
+        lastDecisionOutcome: null,
+      },
+    });
+    const updated = await issueService(db).update(card.id, { status: "done" });
+    expect(updated?.status).toBe("done");
+  });
+
+  it("refuses a stale completed state when policy stage IDs changed", async () => {
+    const policy = normalizeIssueExecutionPolicy({
+      stages: [{ type: "review", participants: [{ type: "agent", agentId }] }],
+    })!;
+    const card = await createCard(db, companyId, {
+      executionPolicy: policy,
+      executionState: {
+        status: "completed",
+        currentStageId: null,
+        currentStageIndex: null,
+        currentStageType: null,
+        currentParticipant: null,
+        returnAssignee: null,
+        completedStageIds: ["99999999-9999-4999-8999-999999999991"],
+        lastDecisionId: null,
+        lastDecisionOutcome: "approved",
+      },
+    });
+    await expect(issueService(db).update(card.id, { status: "done" })).rejects.toMatchObject({
+      status: 409,
+      details: { code: "issue_done_with_incomplete_execution_stage" },
+    });
+  });
+
+  it("board override records why an incomplete review was closed", async () => {
+    const policy = normalizeIssueExecutionPolicy({
+      stages: [{ type: "review", participants: [{ type: "agent", agentId }] }],
+    })!;
+    const card = await createCard(db, companyId, { executionPolicy: policy, executionState: null });
+    const updated = await issueService(db).update(card.id, {
+      status: "done",
+      doneGateOverride: {
+        reason: "Board reviewed the legacy close and waived the stage",
+        actorType: "board",
+        actorId: "local-board",
+        agentId: null,
+        runId: null,
+      },
+    });
+    expect(updated?.status).toBe("done");
+    const rows = await db.select().from(activityLog).where(eq(activityLog.entityId, card.id));
+    expect(rows).toContainEqual(expect.objectContaining({
+      action: "issue.done_gate_overridden",
+      details: expect.objectContaining({ reason: expect.stringContaining("waived the stage") }),
+    }));
+  });
+
   it("done_allowed_without_pr: control card with no PR closes cleanly", async () => {
     const card = await createCard(db, companyId, { assigneeAgentId: agentId });
     const updated = await issueService(db).update(card.id, { status: "done" });

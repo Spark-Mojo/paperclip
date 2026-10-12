@@ -6612,6 +6612,65 @@ async function countBlockedInboxIssues(
   }, 0);
 }
 
+export type IssueWriteOwnershipCASExpectations = {
+  expectedStatus?: string | null;
+  expectedAssigneeUserId?: string | null;
+  expectedAssigneeAgentId?: string | null;
+};
+
+export type IssueWriteOwnershipCASRow = {
+  status: string;
+  assigneeUserId: string | null;
+  assigneeAgentId: string | null;
+};
+
+export type IssueWriteOwnershipCASChanges = {
+  statusChanged: boolean;
+  assigneeUserIdChanged: boolean;
+  assigneeAgentIdChanged: boolean;
+};
+
+export function assertIssueWriteOwnershipCAS(
+  existing: IssueWriteOwnershipCASRow,
+  expected: IssueWriteOwnershipCASExpectations | undefined,
+  changes: IssueWriteOwnershipCASChanges,
+) {
+  if (!expected) expected = {};
+  const compare = (
+    key: "expectedStatus" | "expectedAssigneeUserId" | "expectedAssigneeAgentId",
+    liveValue: string | null,
+    changed: boolean,
+  ) => {
+    if (!changed) return;
+    const suppliedRaw = (expected as Record<string, string | null | undefined>)[key];
+    if (suppliedRaw === undefined) {
+      throw conflict(
+        `Issue write rejected: caller did not supply expected value for ${key}; ownership-transfer CAS is required when changing this field (SPA-10357)`,
+        {
+          code: "issue_write_ownership_cas_missing",
+          field: key,
+        },
+      );
+    }
+    const suppliedNorm = suppliedRaw ?? null;
+    const liveNorm = liveValue ?? null;
+    if (suppliedNorm !== liveNorm) {
+      throw conflict(
+        `Issue write rejected: caller-supplied expected value for ${key} does not match the row's current value`,
+        {
+          code: "issue_write_ownership_cas_mismatch",
+          field: key,
+          callerExpected: suppliedNorm,
+          live: liveNorm,
+        },
+      );
+    }
+  };
+  compare("expectedStatus", existing.status, changes.statusChanged);
+  compare("expectedAssigneeUserId", existing.assigneeUserId, changes.assigneeUserIdChanged);
+  compare("expectedAssigneeAgentId", existing.assigneeAgentId, changes.assigneeAgentIdChanged);
+}
+
 export function issueService(db: Db) {
   const instanceSettings = instanceSettingsService(db);
   const treeControlSvc = issueTreeControlService(db);
@@ -9155,6 +9214,142 @@ export function issueService(db: Db) {
         }));
     },
 
+    /**
+     * SPA-10513 slice 3. Return `blocked` dependents of `blockerIssueId` whose
+     * whole blocker set is now resolved, so the caller can move them to `todo`
+     * and wake the assignee exactly once.
+     *
+     * This is the write-side projection of the same admission decision
+     * `listWakeableBlockedDependents` makes, and it deliberately repeats that
+     * query instead of calling it: that method is a pure read whose result many
+     * callers and route-test fixtures depend on, and its admission set also
+     * admits `todo`/`in_review` dependents. The extra `status = 'blocked'`
+     * predicate below is the load-bearing difference — only a genuinely blocked
+     * card may be transitioned by this path.
+     *
+     * Company, status and ownership rules are preserved: the blocker lookup is
+     * the same company-scoped join, conversation containers are excluded by the
+     * same predicate, backlog parks and terminal cards are excluded by the
+     * explicit status predicate, and the assignee must be a non-null agent with
+     * no human assignee.
+     *
+     * The caller MUST capture `blockedTransitionAt` from this result and use it
+     * for the wake idempotency key: the transition itself clears that column, so
+     * re-reading it after the write mints a different epoch and would let the
+     * same closure wake twice.
+     */
+    listBlockedDependentsReadyForAutoUnblock: async (
+      blockerIssueId: string,
+    ) => {
+      const dbOrTx = db;
+      const blockerIssue = await dbOrTx
+        .select({ id: issues.id, companyId: issues.companyId })
+        .from(issues)
+        .where(eq(issues.id, blockerIssueId))
+        .then((rows) => rows[0] ?? null);
+      if (!blockerIssue) return [];
+
+      const candidates = await dbOrTx
+        .select({
+          id: issues.id,
+          companyId: issues.companyId,
+          assigneeAgentId: issues.assigneeAgentId,
+          assigneeUserId: issues.assigneeUserId,
+          status: issues.status,
+          conversationAgentId: issues.conversationAgentId,
+          blockedTransitionAt: issues.blockedTransitionAt,
+        })
+        .from(issueRelations)
+        .innerJoin(issues, eq(issueRelations.relatedIssueId, issues.id))
+        .where(
+          and(
+            eq(issueRelations.companyId, blockerIssue.companyId),
+            eq(issueRelations.type, "blocks"),
+            eq(issueRelations.issueId, blockerIssueId),
+            isNull(issues.conversationAgentId),
+            // Only a genuinely blocked card is ever transitioned. `backlog` is a
+            // human parking surface and the terminal statuses are closed.
+            eq(issues.status, "blocked"),
+            // Human-owned work has no agent to hand back to, and a card can
+            // only have one assignee.
+            sql`${issues.assigneeAgentId} is not null`,
+            isNull(issues.assigneeUserId),
+          ),
+        );
+      if (candidates.length === 0) return [];
+
+      // Same unified readiness gate the wake path uses: every blocker done AND
+      // every done blocker's workspace finalize obligation discharged.
+      const readinessMap = await listIssueDependencyReadinessMap(
+        dbOrTx,
+        blockerIssue.companyId,
+        candidates.map((candidate) => candidate.id),
+      );
+
+      return candidates
+        .map((candidate) => ({
+          candidate,
+          readiness:
+            readinessMap.get(candidate.id) ??
+            createIssueDependencyReadiness(candidate.id),
+        }))
+        .filter(
+          ({ readiness }) =>
+            readiness.isDependencyReady && readiness.blockerIssueIds.length > 0,
+        )
+        .map(({ candidate, readiness }) => ({
+          id: candidate.id,
+          companyId: candidate.companyId,
+          assigneeAgentId: candidate.assigneeAgentId!,
+          blockerIssueIds: readiness.blockerIssueIds,
+          blockedTransitionAt: candidate.blockedTransitionAt,
+        }));
+    },
+
+    autoUnblockReadyDependent: async (candidate: {
+      id: string;
+      companyId: string;
+      assigneeAgentId: string;
+    }) => db.transaction(async (tx) => {
+      const [locked] = await tx.select({
+        status: issues.status,
+        assigneeAgentId: issues.assigneeAgentId,
+        assigneeUserId: issues.assigneeUserId,
+        conversationAgentId: issues.conversationAgentId,
+        blockedTransitionAt: issues.blockedTransitionAt,
+      })
+        .from(issues)
+        .where(and(eq(issues.id, candidate.id), eq(issues.companyId, candidate.companyId)))
+        .for("update")
+        .limit(1);
+      if (locked?.status !== "blocked" || locked.assigneeAgentId !== candidate.assigneeAgentId ||
+        locked.assigneeUserId || locked.conversationAgentId) return null;
+      const readiness = await listIssueDependencyReadinessMap(tx, candidate.companyId, [candidate.id]);
+      const state = readiness.get(candidate.id);
+      if (!state?.isDependencyReady || state.blockerIssueIds.length === 0) return null;
+      const [updated] = await tx.update(issues)
+        .set({
+          status: "todo",
+          unblockDescriptor: null,
+          blockedTransitionAt: null,
+          blockedOwnerNotifiedAt: null,
+          checkoutRunId: null,
+          executionRunId: null,
+          executionAgentNameKey: null,
+          executionLockedAt: null,
+          completedAt: null,
+          cancelledAt: null,
+          updatedAt: new Date(),
+        })
+        .where(and(eq(issues.id, candidate.id), eq(issues.companyId, candidate.companyId), eq(issues.status, "blocked")))
+        .returning({ id: issues.id });
+      return updated ? {
+        agentId: locked.assigneeAgentId,
+        blockedTransitionAt: locked.blockedTransitionAt,
+        blockerIssueIds: state.blockerIssueIds,
+      } : null;
+    }),
+
     getWakeableParentAfterChildCompletion: async (
       parentIssueId: string,
       completedChildResult?: { issueId: string; summary: string | null } | null,
@@ -10628,6 +10823,16 @@ export function issueService(db: Db) {
          * completions (watchdog evaluation folds). Never settable from HTTP.
          */
         doneGateBypass?: boolean;
+        /**
+         * SPA-10357 / SPA-10429 ownership-transfer CAS. Each expected* field
+         * is the value the caller observed before submitting this PATCH; if
+         * it does not match the row's locked snapshot at write time, the
+         * PATCH fails 409 without mutating. The route handler enforces
+         * "required iff the corresponding target field is changing".
+         */
+        expectedStatus?: string | null;
+        expectedAssigneeUserId?: string | null;
+        expectedAssigneeAgentId?: string | null;
       },
       dbOrTx: any = db,
       postCommitActivityPublications?: ActivityPublication[],
@@ -10675,8 +10880,21 @@ export function issueService(db: Db) {
         companyGuard,
         doneGateOverride,
         doneGateBypass,
+        expectedStatus,
+        expectedAssigneeUserId,
+        expectedAssigneeAgentId,
         ...issueData
       } = data;
+      const writeOwnershipCASExpectations: IssueWriteOwnershipCASExpectations = {
+        expectedStatus,
+        expectedAssigneeUserId,
+        expectedAssigneeAgentId,
+      };
+
+      const hasAnyCASExpectation =
+        expectedStatus !== undefined ||
+        expectedAssigneeUserId !== undefined ||
+        expectedAssigneeAgentId !== undefined;
       if (
         issueData.assigneeAgentId !== undefined &&
         issueData.assigneeAgentId !== existing.assigneeAgentId
@@ -10750,7 +10968,12 @@ export function issueService(db: Db) {
         !doneGateOverride &&
         !doneGateBypass
       ) {
-        const { issueDoneGateService } = await import("./issue-done-gate.js");
+        const { assertIssueExecutionStagesComplete, issueDoneGateService } = await import("./issue-done-gate.js");
+        const closingState = issueData.executionState === undefined ? existing.executionState : issueData.executionState;
+        assertIssueExecutionStagesComplete({ executionPolicy: existing.executionPolicy, executionState: closingState });
+        if (issueData.executionPolicy !== undefined) {
+          assertIssueExecutionStagesComplete({ executionPolicy: issueData.executionPolicy, executionState: closingState });
+        }
         const gate = issueDoneGateService(db);
         const decision = await gate.evaluateDoneGate({
           id: existing.id,
@@ -10984,6 +11207,34 @@ export function issueService(db: Db) {
           .for("update")
           .then((rows: Array<typeof issues.$inferSelect>) => rows[0] ?? null);
         if (!receiptExisting) return null;
+        if (hasAnyCASExpectation) {
+          // SPA-10859 boundary (Dex option (a)): the service validates the
+          // expectations the caller actually supplied against the locked
+          // snapshot. It does NOT synthesize a requirement for a field the
+          // caller left out — the board-actor mandatory set
+          // (ownership-transmit fields only) is enforced at the route, where
+          // the actor class is known. Gating each `*Changed` flag on its
+          // expectation being present keeps status CAS opt-in here, so a
+          // board write that carries expectedAssignee* but not
+          // expectedStatus is not silently re-promoted to mandatory status
+          // (which would re-break the in-repo board UI), and in-tree
+          // service callers that never set these fields pass through intact.
+          const lockedChanges: IssueWriteOwnershipCASChanges = {
+            statusChanged:
+              expectedStatus !== undefined && issueData.status !== undefined,
+            assigneeUserIdChanged:
+              expectedAssigneeUserId !== undefined &&
+              issueData.assigneeUserId !== undefined,
+            assigneeAgentIdChanged:
+              expectedAssigneeAgentId !== undefined &&
+              issueData.assigneeAgentId !== undefined,
+          };
+          assertIssueWriteOwnershipCAS(
+            receiptExisting,
+            writeOwnershipCASExpectations,
+            lockedChanges,
+          );
+        }
         if (actorAgentId && patch.status === "done") {
           const [review] = await tx.select({ id: toolActionRequests.id }).from(toolActionRequests).where(and(eq(toolActionRequests.companyId, existing.companyId), eq(toolActionRequests.issueId, id), inArray(toolActionRequests.status, ["pending", "approved", "executing"]))).limit(1);
           if (review) throw conflict("This task is waiting for a connection review. Finish unrelated work, then yield in_review without retrying the governed call.", { code: "tool_review_pending", actionRequestId: review.id });

@@ -13,6 +13,7 @@ const {
   createAppMock,
   createBetterAuthInstanceMock,
   createDbMock,
+  reconcileEphemeralWorktreesOnStartupMock,
   detectPortMock,
   deriveAuthTrustedOriginsMock,
   environmentCustomImagesServiceMock,
@@ -45,6 +46,12 @@ const {
       from: vi.fn(() => ({ where: vi.fn(async () => []) })),
     })),
   }) as never);
+  const reconcileEphemeralWorktreesOnStartupMock = vi.fn(async () => ({
+    reposScanned: 0,
+    reaper: { scanned: 0, removed: 0, rescued: 0, errors: [] },
+    sweep: { scanned: 0, archived: 0, rescued: 0, errors: [] },
+    totalErrors: [],
+  }));
   const detectPortMock = vi.fn(async ({ port }: { port: number; hostname: string }) => port);
   const deriveAuthTrustedOriginsMock = vi.fn(() => []);
   const resolveHeartbeatSchedulingSuppressionMock = vi.fn(() => ({
@@ -76,6 +83,7 @@ const {
       issueIds: [],
     })),
     reconcileResolvedDependencyWakes: vi.fn(async () => ({ healed: 0 })),
+    pullIdleAgentTodoIssues: vi.fn(async () => ({ enabled: false, checked: 0, pulled: 0 })),
     reconcileTaskWatchdogs: vi.fn(async () => ({ triggered: 0 })),
     scanSilentActiveRuns: vi.fn(async () => ({ created: 0, escalated: 0 })),
     sweepStaleIssueLocks: vi.fn(async () => ({ cleared: 0 })),
@@ -139,6 +147,7 @@ const {
     createAppMock,
     createBetterAuthInstanceMock,
     createDbMock,
+    reconcileEphemeralWorktreesOnStartupMock,
     detectPortMock,
     deriveAuthTrustedOriginsMock,
     environmentCustomImagesServiceMock,
@@ -329,12 +338,7 @@ vi.mock("../services/index.js", () => ({
     unknown: 0,
     duplicates: 0,
   })),
-  reconcileEphemeralWorktreesOnStartup: vi.fn(async () => ({
-    reposScanned: 0,
-    reaper: { scanned: 0, removed: 0, rescued: 0, errors: [] },
-    sweep: { scanned: 0, archived: 0, rescued: 0, errors: [] },
-    totalErrors: [],
-  })),
+  reconcileEphemeralWorktreesOnStartup: reconcileEphemeralWorktreesOnStartupMock,
   reconcilePersistedRuntimeServicesOnStartup: vi.fn(async () => ({ reconciled: 0 })),
   resolveHeartbeatSchedulingSuppression: resolveHeartbeatSchedulingSuppressionMock,
   routineService: routineServiceFactoryMock,
@@ -432,6 +436,13 @@ describe("startServer feedback export wiring", () => {
     createBetterAuthInstanceMock.mockReturnValue({});
     deriveAuthTrustedOriginsMock.mockReturnValue([]);
     process.env.BETTER_AUTH_SECRET = "test-secret";
+  });
+
+  it("passes the initialized database to ephemeral worktree reconciliation", async () => {
+    await startServer();
+    const db = createDbMock.mock.results[0]?.value;
+    expect(db).toBeDefined();
+    expect(reconcileEphemeralWorktreesOnStartupMock).toHaveBeenCalledWith({ db });
   });
 
   it("starts without PAPERCLIP_DECISION_SIGNING_SECRET by generating a persisted key", async () => {

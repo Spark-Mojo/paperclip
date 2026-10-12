@@ -127,6 +127,7 @@ import {
   isStrandedIssueRecoveryOriginKind,
 } from "./origins.js";
 import { withRecoveryContext } from "./status-only-context.js";
+import { buildIssueReviewPathLostIdempotencyKey } from "./review-path-recovery.js";
 import { isAutomaticRecoverySuppressedByPauseHold } from "./pause-hold-guard.js";
 import {
   collectDispositionRepairSourceState,
@@ -159,6 +160,7 @@ const STRANDED_ISSUE_RECOVERY_ORIGIN_KIND =
 const DEFERRED_WAKE_CONTEXT_KEY = "_paperclipWakeContext";
 const EXECUTION_REVIEW_PARTICIPANT_RECOVERY_REASON =
   "execution_review_participant_recovery";
+const STRANDED_STAGE_ENTRY_THRESHOLD_MS = 15 * 60_000;
 const STRANDED_BOARD_ESCALATION_POLICY = "board_escalation_no_takeover_v1";
 const DISPOSITION_REPAIR_IDEMPOTENCY_INDEX =
   "agent_wakeup_requests_disposition_repair_idempotency_uq";
@@ -210,6 +212,10 @@ type RecoveryWakeupOptions = {
   issueStateGuard?: {
     statuses: string[];
     assigneeAgentId: string;
+    stageId?: string;
+    participantAgentId?: string;
+    lastDecisionId?: string | null;
+    stageEnteredAt?: string;
   };
 };
 
@@ -2065,6 +2071,7 @@ export function recoveryService(
     source: string;
     retryOfRunId?: string | null;
     idempotencyKey?: string;
+    issueStateGuard?: RecoveryWakeupOptions["issueStateGuard"];
     extraContext?: Record<string, unknown>;
   }) {
     if (input.retryOfRunId) {
@@ -2153,6 +2160,7 @@ export function recoveryService(
           }
         : {}),
       ...(input.idempotencyKey ? { idempotencyKey: input.idempotencyKey } : {}),
+      ...(input.issueStateGuard ? { issueStateGuard: input.issueStateGuard } : {}),
       payload: withRecoveryContext(
         {
           issueId: input.issueId,
@@ -2180,7 +2188,11 @@ export function recoveryService(
       if (input.idempotencyKey && conflict?.code === "23505" &&
         (conflict.constraint === "agent_wakeup_requests_handoff_bounded_continuation_uq" ||
           conflict.constraint_name === "agent_wakeup_requests_handoff_bounded_continuation_uq" ||
-          conflict.message?.includes("agent_wakeup_requests_handoff_bounded_continuation_uq"))) return null;
+           conflict.message?.includes("agent_wakeup_requests_handoff_bounded_continuation_uq") ||
+           (input.idempotencyKey.startsWith("issue_review_path_lost:") &&
+             (conflict.constraint === "agent_wakeup_requests_review_path_recovery_idempotency_uq" ||
+               conflict.constraint_name === "agent_wakeup_requests_review_path_recovery_idempotency_uq" ||
+               conflict.message?.includes("agent_wakeup_requests_review_path_recovery_idempotency_uq"))))) return null;
       throw error;
     });
 
@@ -5094,6 +5106,9 @@ export function recoveryService(
           continue;
         }
         const participantLatestRun = participantLatestRunForRecovery;
+        const participantRunBelongsToStage = participantLatestRun?.createdAt && pendingExecutionState.stageEnteredAt
+          ? participantLatestRun.createdAt.getTime() >= Date.parse(pendingExecutionState.stageEnteredAt)
+          : false;
 
         if (
           !participantLatestRun ||
@@ -5109,6 +5124,55 @@ export function recoveryService(
             });
             if (updated) {
               result.escalated += 1;
+              result.issueIds.push(issue.id);
+            } else {
+              result.skipped += 1;
+            }
+          } else if (
+            pendingExecutionState.currentStageType === "review" &&
+            !participantRunBelongsToStage &&
+            pendingExecutionState.stageEnteredAt != null &&
+            Number.isFinite(Date.parse(pendingExecutionState.stageEnteredAt)) &&
+            Date.parse(pendingExecutionState.stageEnteredAt) <= Date.now() - STRANDED_STAGE_ENTRY_THRESHOLD_MS &&
+            !(await hasQueuedIssueWake(issue.companyId, issue.id, participantAgentId)) &&
+            !(await db.select({ id: agentWakeupRequests.id })
+              .from(agentWakeupRequests)
+              .where(and(
+                eq(agentWakeupRequests.companyId, issue.companyId),
+                eq(agentWakeupRequests.agentId, participantAgentId),
+                eq(agentWakeupRequests.status, "deferred_issue_execution"),
+                sql`${agentWakeupRequests.payload} ->> 'issueId' = ${issue.id}`,
+              )).limit(1))[0] &&
+            !(await isInvocationBudgetBlocked(issue, participantAgentId))
+          ) {
+            const queued = await enqueueStrandedIssueRecovery({
+              issueId: issue.id,
+              agentId: participantAgentId,
+              reason: EXECUTION_REVIEW_PARTICIPANT_RECOVERY_REASON,
+              retryReason: EXECUTION_REVIEW_PARTICIPANT_RECOVERY_REASON,
+              source: "issue.execution_review_recovery",
+              idempotencyKey: buildIssueReviewPathLostIdempotencyKey({
+                issueId: issue.id,
+                consumedPathRef: `stage:${pendingExecutionState.currentStageId}:${participantAgentId}:${pendingExecutionState.stageEnteredAt}:${Math.floor(Date.now() / STRANDED_STAGE_ENTRY_THRESHOLD_MS)}`,
+              }),
+              issueStateGuard: {
+                statuses: ["in_review"],
+                assigneeAgentId: issue.assigneeAgentId!,
+                stageId: pendingExecutionState.currentStageId!,
+                participantAgentId,
+                lastDecisionId: pendingExecutionState.lastDecisionId,
+                stageEnteredAt: pendingExecutionState.stageEnteredAt!,
+              },
+              extraContext: {
+                currentStageId: pendingExecutionState.currentStageId ?? null,
+                currentStageType: pendingExecutionState.currentStageType,
+                stageEnteredAt: pendingExecutionState.stageEnteredAt,
+                reviewStageEntryRecovery: true,
+                reviewRecoveryInstruction: "The review stage has no participant run or queued wake. Submit the review decision now, or mark the issue blocked with the exact unblock action.",
+              },
+            });
+            if (queued) {
+              result.reviewParticipantRequeued += 1;
               result.issueIds.push(issue.id);
             } else {
               result.skipped += 1;
@@ -5674,24 +5738,19 @@ export function recoveryService(
     const useCursor = !opts?.blockerIssueId;
 
     const queryCandidates = (afterIssueId: string | null) => {
-      // The blocker-scoped re-fire (the heartbeat workspace_finalize hook)
-      // must heal the same wakeable dependents the route-time emission admits:
-      // any assigned dependent not in a terminal/backlog status. `listWakeable
-      // BlockedDependents` filters `["backlog","done","cancelled"]`, so a
-      // `todo` dependent whose blocker resolved while its sync-back was still
-      // in flight would never re-fire if the finalize-time query only matched
-      // `blocked` issues (SPA-8580 / SPA-7489 / SPA-7490). The periodic
-      // all-issues sweep keeps its `blocked`-only filter so it only heals
-      // dependents that are still in the blocked state.
       const statusFilter = opts?.blockerIssueId
         ? notInArray(issues.status, ["backlog", "done", "cancelled"])
-        : eq(issues.status, "blocked");
+        : inArray(issues.status, ["blocked", "todo"]);
       const filters = [
         statusFilter,
         isNull(issues.conversationAgentId),
         visibleIssueCondition(),
         sql`${issues.assigneeAgentId} is not null`,
       ];
+      if (!opts?.blockerIssueId) {
+        filters.push(sql`exists (select 1 from ${issueRelations} where ${issueRelations.relatedIssueId} = ${issues.id} and ${issueRelations.companyId} = ${issues.companyId} and ${issueRelations.type} = 'blocks')`);
+        filters.push(sql`not exists (select 1 from ${issueRelations} as blocker_edge inner join ${issues} as blocker on blocker.id = blocker_edge.issue_id where blocker_edge.related_issue_id = ${issues.id} and blocker_edge.company_id = ${issues.companyId} and blocker_edge.type = 'blocks' and blocker.status <> 'done')`);
+      }
       if (opts?.companyId) filters.push(eq(issues.companyId, opts.companyId));
       if (afterIssueId) filters.push(gt(issues.id, afterIssueId));
 

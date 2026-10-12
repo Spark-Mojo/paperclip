@@ -112,6 +112,8 @@ function toIssueSnapshot(row: IssueRow): IssueSnapshot {
     assigneeUserId: row.assigneeUserId,
     hiddenAt: row.hiddenAt,
     originKind: row.originKind,
+    completedAt: row.completedAt,
+    cancelledAt: row.cancelledAt,
     monitorNextCheckAt: row.monitorNextCheckAt,
     executionState: (row.executionState as Record<string, unknown> | null) ?? null,
     responsibleUserId: row.responsibleUserId,
@@ -373,6 +375,29 @@ function buildTransaction(tx: Db, deps: WakeQueuePostgresAdapterDeps, db: Db, ru
         .from(issueComments)
         .where(and(eq(issueComments.companyId, companyId), eq(issueComments.issueId, issueId), inArray(issueComments.id, commentIds)));
       return { allSelfAuthored: rows.length > 0 && rows.every((row) => row.createdByRunId === finishingRunId) };
+    },
+
+    async getDeferredCommentCreatedAt({ companyId, issueId, commentIds }) {
+      const uniqueIds = [...new Set(commentIds)];
+      if (uniqueIds.length === 0) return [];
+      const rows = await tx
+        .select({ id: issueComments.id, createdAt: issueComments.createdAt })
+        .from(issueComments)
+        .where(and(
+          eq(issueComments.companyId, companyId),
+          eq(issueComments.issueId, issueId),
+          inArray(issueComments.id, uniqueIds),
+        ));
+      // One fact per REQUESTED id, including a `createdAt: null` placeholder for
+      // any id the row read did not return. The caller suppresses a reopen only
+      // on a complete, all-pre-close reading, so an unreadable comment must
+      // surface as a gap rather than silently shortening the array and letting
+      // `.every()` pass vacuously.
+      const byId = new Map(rows.map((row) => [row.id, row.createdAt]));
+      return uniqueIds.map((id) => ({
+        commentId: id,
+        createdAt: byId.get(id) ?? null,
+      }));
     },
 
     async isCompletedDelegationMention({ companyId, issueId, finishingRunId, wakeAgentId, commentIds }) {

@@ -7,6 +7,22 @@ export function readNonEmptyString(value: unknown): string | null {
   return typeof value === "string" && value.trim().length > 0 ? value : null;
 }
 
+/**
+ * The instant the issue entered its CURRENT terminal state, or null when it is
+ * not terminal. Status picks the timestamp: a `done` issue is stamped by
+ * `completedAt`, a `cancelled` one by `cancelledAt`. Never mix them — an issue
+ * cancelled today may carry a `completedAt` from an earlier terminal stretch.
+ */
+export function pickTerminalAt(issue: {
+  status: string;
+  completedAt: Date | null;
+  cancelledAt: Date | null;
+}): Date | null {
+  if (issue.status === "done") return issue.completedAt;
+  if (issue.status === "cancelled") return issue.cancelledAt;
+  return null;
+}
+
 export function parseObject(value: unknown): Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value)
     ? (value as Record<string, unknown>)

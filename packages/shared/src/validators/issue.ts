@@ -505,6 +505,7 @@ export const issueExecutionStateSchema = z.object({
   currentStageId: z.string().guid().nullable(),
   currentStageIndex: z.number().int().nonnegative().nullable(),
   currentStageType: z.enum(ISSUE_EXECUTION_STAGE_TYPES).nullable(),
+  stageEnteredAt: z.string().datetime().nullable().optional(),
   currentParticipant: issueExecutionStagePrincipalSchema.nullable(),
   returnAssignee: issueExecutionStagePrincipalSchema.nullable(),
   reviewRequest: issueReviewRequestSchema.nullable().optional().default(null),
@@ -843,6 +844,22 @@ const issueCommentAttachmentIdsSchema = z
     message: "Attachment ids must be unique",
   });
 
+// Caller-supplied compare-and-set expectations for ownership-transfer CAS
+// (SPA-10357 / SPA-10429 / SPA-10859). A caller that opts in supplies the
+// row's current value for status, assigneeUserId, or assigneeAgentId; the
+// service compares it against the row re-read under the issue write
+// service's existing `for("update")` row lock. Mismatch returns 409 and
+// leaves the row untouched. The fields are optional in the schema so
+// callers that don't opt in (title-only edits, status-only writes,
+// in-tree service callers) keep working unchanged; the board-actor
+// mandatory set (ownership-transmit fields on a real transfer) is enforced
+// at the PATCH route, where the actor class is known.
+const issueWriteOwnershipCASSchema = z.object({
+  expectedStatus: z.enum(ISSUE_STATUSES).optional(),
+  expectedAssigneeUserId: z.string().trim().min(1).nullable().optional(),
+  expectedAssigneeAgentId: z.string().trim().min(1).nullable().optional(),
+});
+
 export const updateIssueSchema = objectWithoutDefaults(
   createIssueBaseSchema.omit({
     createdByUserId: true,
@@ -867,7 +884,8 @@ export const updateIssueSchema = objectWithoutDefaults(
     /** Assignment-only handoff; the following structured goal action owns the wake. */
     deferWakeForGoal: z.boolean().optional(),
     hiddenAt: z.string().datetime().nullable().optional(),
-  });
+  })
+  .merge(issueWriteOwnershipCASSchema);
 
 export type UpdateIssue = z.infer<typeof updateIssueSchema>;
 export type IssueExecutionWorkspaceSettings = z.infer<
@@ -1350,6 +1368,7 @@ export const askUserQuestionsPayloadSchema = z
     title: z.string().trim().max(240).nullable().optional(),
     submitLabel: z.string().trim().max(120).nullable().optional(),
     supersedeOnUserComment: z.boolean().optional(),
+    requiresManualAction: z.boolean().optional(),
     questions: z.array(askUserQuestionsQuestionSchema).min(1).max(64),
     /** Exact canonical presentation retained for a recovered harness request. */
     questionSet: paperclipQuestionSetPayloadSchema.optional(),
@@ -1511,6 +1530,7 @@ export const requestConfirmationPayloadSchema = z.object({
     .optional(),
   detailsMarkdown: z.string().max(20000).nullable().optional(),
   supersedeOnUserComment: z.boolean().optional(),
+  requiresManualAction: z.boolean().optional(),
   target: requestConfirmationTargetSchema.nullable().optional(),
   toolAction: requestConfirmationToolActionPayloadSchema.optional(),
   secretProposal: requestConfirmationSecretProposalPayloadSchema.optional(),
@@ -1551,6 +1571,7 @@ export const requestCheckboxConfirmationPayloadSchema = z
       .nullable()
       .optional(),
     supersedeOnUserComment: z.boolean().optional(),
+    requiresManualAction: z.boolean().optional(),
     target: requestConfirmationTargetSchema.nullable().optional(),
   })
   .superRefine((value, ctx) => {
@@ -1742,6 +1763,7 @@ export const requestItemVerdictsPayloadSchema = z
     reasonLabel: z.string().trim().min(1).max(160).nullable().optional(),
     allowBulkApprove: z.boolean().optional().default(true),
     supersedeOnUserComment: z.boolean().optional(),
+    requiresManualAction: z.boolean().optional(),
     target: requestConfirmationTargetSchema.nullable().optional(),
   })
   .superRefine((value, ctx) => {
