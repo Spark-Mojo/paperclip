@@ -85,6 +85,12 @@ export type DeferredWakeCandidate = {
   authorizedFailedChatRetry?: boolean;
 };
 
+/** One deferred comment's creation instant, carried under its own id. */
+export type DeferredCommentFact = {
+  commentId: string;
+  createdAt: Date | null;
+};
+
 export type PromoteDeferredWakeInput = {
   companyId: string;
   wakeId: string;
@@ -158,6 +164,19 @@ export interface WakeQueueTransaction {
     finishingRunId: string;
     commentIds: string[];
   }): Promise<{ allSelfAuthored: boolean }>;
+  /**
+   * Creation instants for the candidate's deferred comments, keyed by comment
+   * id so the caller can tell a comment that predates the issue's close from a
+   * comment it could not read. A deferred wake whose every comment predates
+   * that close was armed before it and cannot have been informed by it, so it
+   * must not reopen the task. A comment id with no returned fact is NOT
+   * evidence of pre-close authorship; callers must fail open (reopen).
+   */
+  getDeferredCommentCreatedAt(input: {
+    companyId: string;
+    issueId: string;
+    commentIds: string[];
+  }): Promise<DeferredCommentFact[]>;
   /** Proves all candidate comments only report completed child work in the finishing parent's own run. */
   isCompletedDelegationMention(input: {
     companyId: string;
