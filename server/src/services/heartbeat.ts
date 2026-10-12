@@ -1307,7 +1307,8 @@ function readHeartbeatRunErrorFamily(
   if (
     run.errorCode === "codex_transient_upstream" ||
     run.errorCode === "claude_transient_upstream" ||
-    run.errorCode === "codex_harness_crash"
+    run.errorCode === "codex_harness_crash" ||
+    run.errorCode === "model_stream_stalled"
   ) {
     return "transient_upstream";
   }
