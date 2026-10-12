@@ -1996,6 +1996,13 @@
       "when": 1791784239660,
       "tag": "9285_wake_loop_guard_index",
       "breakpoints": true
+    },
+    {
+      "idx": 9286,
+      "version": "7",
+      "when": 1791784240660,
+      "tag": "9286_heartbeat_run_list_projection_columns",
+      "breakpoints": true
     }
   ]
 }

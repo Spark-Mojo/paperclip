@@ -68,6 +68,39 @@ function expectRealRunListSql(statement: { sql: string } | undefined) {
   return sql;
 }
 
+// SPA-11947 — the fifteen stored generated columns are read-side plumbing. The
+// run-list projections consume them under the PUBLIC names the API already
+// returned (resultSummary, wakeCommentIds, contextCommentId, ...), so getRun
+// must keep returning the pre-9286 public shape and must NOT start exposing the
+// generated columns themselves. Both spellings are listed because a leaked
+// column could surface under either the drizzle property name or the SQL column
+// name, and the shape contract covers the row object, not the SELECT list.
+const SPA11947_INTERNAL_PROJECTION_COLUMNS = {
+  contextTaskKey: "context_task_key",
+  contextCommentId: "context_comment_id",
+  contextWakeCommentId: "context_wake_comment_id",
+  contextWakeCommentIds: "context_wake_comment_ids",
+  contextWakeReason: "context_wake_reason",
+  contextWakeSource: "context_wake_source",
+  contextWakeTriggerDetail: "context_wake_trigger_detail",
+  resultListSummary: "result_list_summary",
+  resultListResult: "result_list_result",
+  resultListMessage: "result_list_message",
+  resultListError: "result_list_error",
+  resultListTotalCostUsd: "result_list_total_cost_usd",
+  resultListCostUsd: "result_list_cost_usd",
+  resultListCostUsdCamel: "result_list_cost_usd_camel",
+  resultLedgerSummary: "result_ledger_summary",
+} as const;
+
+function expectNoInternalProjectionColumns(run: object | null | undefined) {
+  expect(run, "expected getRun to return the run").toBeTruthy();
+  for (const [property, column] of Object.entries(SPA11947_INTERNAL_PROJECTION_COLUMNS)) {
+    expect(Object.hasOwn(run!, property), `${property} must stay internal to getRun`).toBe(false);
+    expect(Object.hasOwn(run!, column), `${column} must stay internal to getRun`).toBe(false);
+  }
+}
+
 describeEmbeddedPostgres("heartbeat list", () => {
   let db!: ReturnType<typeof createDb>;
   let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
@@ -195,6 +228,70 @@ describeEmbeddedPostgres("heartbeat list", () => {
       summary: "done",
       structured: { ok: true },
     });
+  });
+
+  it("keeps getRun's public shape while hiding the generated projection columns", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const runId = randomUUID();
+    const issueId = randomUUID();
+    const taskId = randomUUID();
+    const contextSnapshot = {
+      issueId,
+      taskId,
+      taskKey: "SPA-11947",
+      commentId: randomUUID(),
+      wakeCommentId: randomUUID(),
+      wakeCommentIds: [randomUUID()],
+      wakeReason: "issue_assigned",
+      wakeSource: "assignment",
+      wakeTriggerDetail: "card checkout",
+    };
+    const resultJson = { summary: "done", structured: { ok: true } };
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "CodexCoder",
+      role: "engineer",
+      status: "running",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    await db.insert(heartbeatRuns).values({
+      id: runId,
+      companyId,
+      agentId,
+      invocationSource: "assignment",
+      status: "succeeded",
+      contextSnapshot,
+      resultJson,
+    });
+
+    const safe = await heartbeatService(db).getRun(runId);
+    const unsafe = await heartbeatService(db).getRun(runId, { unsafeFullResultJson: true });
+
+    for (const run of [safe, unsafe]) {
+      expect(run).toMatchObject({
+        id: runId,
+        companyId,
+        agentId,
+        status: "succeeded",
+        contextIssueId: issueId,
+        contextTaskId: taskId,
+        contextSnapshot,
+        resultJson,
+      });
+      expectNoInternalProjectionColumns(run);
+    }
   });
 
   it("returns summary list rows without heavy run detail fields", async () => {
@@ -357,7 +454,13 @@ describeEmbeddedPostgres("heartbeat list", () => {
       agentId,
       invocationSource: "assignment",
       status: "succeeded",
-      resultJson: { summary: "large run summary", stdout: "x".repeat(20_000) },
+      resultJson: {
+        summary: "large run summary",
+        stdout: "x".repeat(20_000),
+        total_cost_usd: 1.25,
+        cost_usd: 1.5,
+        costUsd: 1.75,
+      },
       contextSnapshot: { issueId: randomUUID(), wakeReason: "issue_assigned" },
     });
 
@@ -367,11 +470,55 @@ describeEmbeddedPostgres("heartbeat list", () => {
     const runs = await heartbeatService(observedDb).list(companyId, agentId, 5);
 
     expect(runs.map((run) => run.id)).toEqual([runId]);
+    expect(runs[0]?.resultJson).toEqual({
+      summary: "large run summary",
+      total_cost_usd: 1.25,
+      cost_usd: 1.5,
+      costUsd: 1.75,
+    });
 
     const sql = expectRealRunListSql(captured[0]);
     expect(sql).not.toContain("context_snapshot");
     expect(sql).not.toContain("result_json");
     expect(sql).toContain("context_issue_id");
+  });
+
+  it("keeps non-summary list result text bounded after moving it to narrow columns", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const runId = randomUUID();
+    const oversizedSummary = "s".repeat(5_000);
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "CodexCoder",
+      role: "engineer",
+      status: "running",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    await db.insert(heartbeatRuns).values({
+      id: runId,
+      companyId,
+      agentId,
+      invocationSource: "assignment",
+      status: "succeeded",
+      resultJson: { summary: oversizedSummary },
+    });
+
+    const runs = await heartbeatService(db).list(companyId, agentId, 5);
+    const result = runs[0]?.resultJson as Record<string, unknown> | null;
+
+    expect(result?.summary).toBe(oversizedSummary.slice(0, 500));
   });
 
   it("bounds oversized legacy result json payloads on getRun", async () => {
