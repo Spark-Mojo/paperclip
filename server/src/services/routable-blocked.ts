@@ -1,4 +1,5 @@
 import type { IssueUnblockDescriptor } from "@paperclipai/shared";
+import { isAwaitingInteractionResolution } from "./pending-interaction-hold.js";
 
 export const ROUTABLE_BLOCKED_ROLLOUT_AT = new Date("2026-07-23T18:13:03.000Z");
 
@@ -31,10 +32,22 @@ export async function deliverAgentUnblockNotification(input: {
     contextSnapshot: { wakeReason: "issue_unblock_requested"; issueId: string; taskId: string };
   }) => Promise<unknown>;
   markNotified: (notifiedAt: Date) => Promise<unknown>;
+  /** Interactions the hold actually rests on (SPA-11807). */
+  pendingInteractions?: ReadonlyArray<{ status: string }> | null;
   now?: () => Date;
 }) {
   const { issue } = input;
   if (!isProspectiveBlockedTransition(issue) || !issue.unblockDescriptor || issue.blockedOwnerNotifiedAt) {
+    return false;
+  }
+
+  // SPA-11807: naming an unblock owner is not authority to wake. If the card is
+  // waiting on an interaction that has not been answered, there is nothing new
+  // for the owner to act on — the witness card woke its agent while the ruling
+  // it named belonged to a human and had not been given. Notifying here is
+  // also what would clear `blockedOwnerNotifiedAt`, so skipping leaves the
+  // notification owed once the interaction resolves.
+  if (isAwaitingInteractionResolution(input.pendingInteractions)) {
     return false;
   }
 

@@ -51,6 +51,41 @@ describe("routable blocked notifications", () => {
     expect(markNotified).not.toHaveBeenCalled();
   });
 
+  // SPA-11807: the witness card (SPA-10598) was blocked on a still-pending
+  // interaction whose unblocking action belonged to James. Naming the
+  // unblock owner is not authority to wake: while the interaction the hold
+  // actually rests on is still pending, there is nothing new to act on.
+  it("does not wake an owner while a referenced interaction is still pending", async () => {
+    const wakeup = vi.fn(async () => undefined);
+    const markNotified = vi.fn(async () => undefined);
+
+    await expect(
+      deliverAgentUnblockNotification({
+        issue: blockedIssue(),
+        pendingInteractions: [{ id: "interaction-1", status: "pending" }],
+        wakeup,
+        markNotified,
+      }),
+    ).resolves.toBe(false);
+    expect(wakeup).not.toHaveBeenCalled();
+    expect(markNotified).not.toHaveBeenCalled();
+  });
+
+  it("wakes again once the pending interaction is resolved", async () => {
+    const wakeup = vi.fn(async () => undefined);
+    const markNotified = vi.fn(async () => undefined);
+
+    await expect(
+      deliverAgentUnblockNotification({
+        issue: blockedIssue(),
+        pendingInteractions: [{ id: "interaction-1", status: "accepted" }],
+        wakeup,
+        markNotified,
+      }),
+    ).resolves.toBe(true);
+    expect(wakeup).toHaveBeenCalledTimes(1);
+  });
+
   it("deduplicates one transition and notifies again after a blocked flap", async () => {
     const wakeup = vi.fn(async () => undefined);
     const markNotified = vi.fn(async () => undefined);
