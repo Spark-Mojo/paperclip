@@ -7272,12 +7272,27 @@ export function issueService(db: Db) {
     projectId: string | null | undefined,
     executionWorkspaceId: string,
     dbOrTx: DbReader = db,
+    options?: {
+      projectWorkspaceId?: string | null;
+      /**
+       * When `true`, the caller is asserting this pin came from an explicit
+       * `executionWorkspaceId` argument rather than from inherited workspace
+       * linkage. SPA-11953 (second shape) refuses a caller-supplied pin
+       * whose execution workspace belongs to a different project workspace
+       * than the child — explicit pins are intent, never silently dropped.
+       * Inherited pins are reconciled (cleared) earlier in `create`, so by the
+       * time this assertion runs the only pin reaching it is either a true
+       * caller-supplied pin or a same-repo inherited pin.
+       */
+      callerSuppliedExecutionWorkspaceId?: boolean;
+    },
   ) {
     const workspace = await dbOrTx
       .select({
         id: executionWorkspaces.id,
         companyId: executionWorkspaces.companyId,
         projectId: executionWorkspaces.projectId,
+        projectWorkspaceId: executionWorkspaces.projectWorkspaceId,
       })
       .from(executionWorkspaces)
       .where(eq(executionWorkspaces.id, executionWorkspaceId))
@@ -7288,6 +7303,16 @@ export function issueService(db: Db) {
     if (projectId && workspace.projectId !== projectId) {
       throw unprocessable(
         "Execution workspace must belong to the selected project",
+      );
+    }
+    if (
+      options?.callerSuppliedExecutionWorkspaceId === true &&
+      options.projectWorkspaceId &&
+      (workspace.projectWorkspaceId == null ||
+        workspace.projectWorkspaceId !== options.projectWorkspaceId)
+    ) {
+      throw unprocessable(
+        `Selected project workspace ${options.projectWorkspaceId} differs from caller-supplied execution workspace's project workspace ${workspace.projectWorkspaceId ?? "(legacy null)"} (execution workspace ${executionWorkspaceId}). Pick an execution workspace that belongs to the selected project workspace, or omit executionWorkspaceId to let the issue provision a fresh workspace for the selected project workspace.`,
       );
     }
     return workspace;
@@ -10121,6 +10146,22 @@ export function issueService(db: Db) {
         let executionWorkspaceSettings =
           (issueData.executionWorkspaceSettings as
             Record<string, unknown> | null | undefined) ?? null;
+        // SPA-11953 (second shape): flag when the execution workspace pin we
+        // are about to persist was INHERITED from a source issue, so the
+        // post-resolution reconciliation step (after projectWorkspaceId is
+        // finally resolved against the project's defaults) can drop a
+        // cross-repo inherited pin while leaving a CALLER-SUPPLIED pin
+        // alone. Caller-supplied pins with a mismatched projectWorkspaceId
+        // are refused by `assertValidExecutionWorkspace` further below — an
+        // explicit pin is intent, never silently discarded.
+        let inheritedExecutionWorkspacePin = false;
+        let inheritedSourceProjectWorkspaceId: string | null = null;
+        let pendingDropReceipt: {
+          parentIssueId: string | null;
+          droppedExecutionWorkspaceId: string;
+          sourceProjectWorkspaceId: string | null;
+          resolvedProjectWorkspaceId: string | null;
+        } | null = null;
         const workspaceInheritanceIssueId = skipExecutionWorkspaceInheritance
           ? null
           : (inheritExecutionWorkspaceFromIssueId ??
@@ -10165,6 +10206,7 @@ export function issueService(db: Db) {
               .select({
                 id: executionWorkspaces.id,
                 mode: executionWorkspaces.mode,
+                projectWorkspaceId: executionWorkspaces.projectWorkspaceId,
               })
               .from(executionWorkspaces)
               .where(
@@ -10187,6 +10229,13 @@ export function issueService(db: Db) {
                   sourceWorkspace.mode,
                 ),
               };
+              inheritedExecutionWorkspacePin = true;
+              // SPA-11953 (second shape): capture the source workspace's
+              // projectWorkspaceId here so the post-resolution reconciliation
+              // step below can compare against the child's resolved value
+              // without re-querying the same row inside the same tx.
+              inheritedSourceProjectWorkspaceId =
+                sourceWorkspace.projectWorkspaceId ?? null;
             }
           }
         }
@@ -10306,12 +10355,81 @@ export function issueService(db: Db) {
             tx,
           );
         }
+        // SPA-11953 (second shape): an inherited execution workspace pin
+        // whose source projectWorkspaceId does not match the child's
+        // resolved projectWorkspaceId must be DROPPED here, not later in the
+        // heartbeat allocator. The child's projectWorkspaceId may have been
+        // inherited from the source project (10151-10157) or resolved from
+        // the project's primary workspace (10266-10300); the comparison
+        // runs against whichever value is final at this point. A CALLER-
+        // SUPPLIED pin with a mismatched projectWorkspaceId is REFUSED
+        // further below — explicit pins are intent, never silently dropped.
+        // `sourceWorkspace.projectWorkspaceId` may be NULL on legacy rows; we
+        // treat null-vs-set as a mismatch because we have no proof the legacy
+        // row belongs to this child's repo, and the cost of a wrong skip
+        // (one extra clone) is strictly less than the cost of a wrong inherit
+        // (the deterministic `setup_failed` this card fixes).
+        if (inheritedExecutionWorkspacePin && executionWorkspaceId) {
+          // SPA-11953 (second shape): the source workspace's projectWorkspaceId
+          // was captured at the inheritance site (so we don't re-query the
+          // same row inside the same tx). Compare against the child's now-
+          // resolved `projectWorkspaceId`. Null source is treated as a
+          // mismatch because we have no proof the legacy row belongs to this
+          // child's repo; the cost of a wrong skip is one extra clone, the
+          // cost of a wrong inherit is the deterministic `setup_failed` this
+          // card fixes.
+          const sourceProjectWorkspaceId = inheritedSourceProjectWorkspaceId;
+          if (
+            sourceProjectWorkspaceId == null ||
+            sourceProjectWorkspaceId !== projectWorkspaceId
+          ) {
+            const droppedExecutionWorkspaceId = executionWorkspaceId;
+            executionWorkspaceId = null;
+            executionWorkspacePreference = null;
+            executionWorkspaceSettings = null;
+            // SPA-11953 second shape: the inherited pin was just nulled, so
+            // the child is now in the same state as a freshly-created issue
+            // with no inherited/explicit pin. Re-run the project policy
+            // default-fill (mirroring the block above at :10289-10301) so the
+            // child ends up with the project's default settings, not a
+            // settings=null column. The block above was skipped at the time
+            // because the inherited pin was still set, so its work is owed
+            // here.
+            if (issueData.projectId) {
+              executionWorkspaceSettings =
+                defaultIssueExecutionWorkspaceSettingsForProject(
+                  gateProjectExecutionWorkspacePolicy(
+                    await loadProjectPolicyOnce(),
+                    isolatedWorkspacesEnabled,
+                  ),
+                ) as Record<string, unknown> | null;
+            }
+            // Receipt is deferred and emitted AFTER the issue insert below;
+            // logging inside the open tx would publish a "dropped" receipt
+            // for an issue that later rolls back (e.g. a downstream
+            // constraint failure), which would mislead the monitor's
+            // worktree-path-collision-across-repos ledger class.
+            pendingDropReceipt = {
+              parentIssueId:
+                inheritExecutionWorkspaceFromIssueId ?? issueData.parentId ?? null,
+              droppedExecutionWorkspaceId,
+              sourceProjectWorkspaceId,
+              resolvedProjectWorkspaceId: projectWorkspaceId,
+            };
+          }
+        }
         if (executionWorkspaceId) {
           await assertValidExecutionWorkspace(
             companyId,
             issueData.projectId,
             executionWorkspaceId,
             tx,
+            {
+              projectWorkspaceId,
+              callerSuppliedExecutionWorkspaceId:
+                !inheritedExecutionWorkspacePin &&
+                issueData.executionWorkspaceId !== undefined,
+            },
           );
         }
         if (
@@ -10455,6 +10573,17 @@ export function issueService(db: Db) {
           [enriched],
           tx,
         );
+        if (pendingDropReceipt) {
+          logger.info(
+            {
+              companyId,
+              issueId: issue.id,
+              identifier: issue.identifier,
+              ...pendingDropReceipt,
+            },
+            "issues.create dropped inherited cross-repo execution workspace pin (SPA-11953)",
+          );
+        }
         return withRelations;
       };
       if (dbOrTx === db) return db.transaction(persist);
