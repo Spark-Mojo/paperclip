@@ -1,3 +1,6 @@
+import { deepStrictEqual, strictEqual, ok } from "node:assert";
+import { isDeepStrictEqual } from "node:util";
+import { createHash } from "node:crypto";
 import { readdir, readFile } from "node:fs/promises";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import path from "node:path";
@@ -56,6 +59,122 @@ async function importSchemaModules(): Promise<Record<string, unknown>> {
   }
   return exports;
 }
+
+function digest(value: string): string {
+  return createHash("sha256").update(value).digest("hex");
+}
+
+type Snapshot = Parameters<typeof generateMigration>[0];
+
+async function wakeGuardFixture() {
+  const base = JSON.parse(await readFile(path.join(migrationsDir, "meta/9282_snapshot.json"), "utf8")) as Snapshot;
+  const snapshot = JSON.parse(await readFile(path.join(migrationsDir, "meta/9285_snapshot.json"), "utf8")) as Snapshot;
+  const generated = JSON.parse(JSON.stringify(generateDrizzleJson(await importSchemaModules(), base.id))) as Snapshot;
+  const journal = JSON.parse(await readFile(path.join(migrationsDir, "meta/_journal.json"), "utf8"));
+  const baseJournal = structuredClone({ ...journal, entries: journal.entries.slice(0, -1) });
+  const sql = await readFile(path.join(migrationsDir, "9285_wake_loop_guard_index.sql"), "utf8");
+  const priorIds = new Set<string>();
+  for (const file of await readdir(path.join(migrationsDir, "meta"))) {
+    if (!file.endsWith("_snapshot.json") || file === "9285_snapshot.json") continue;
+    const prior = JSON.parse(await readFile(path.join(migrationsDir, "meta", file), "utf8"));
+    priorIds.add(prior.id);
+  }
+  return { base, snapshot, generated, journal, baseJournal, sql, priorIds };
+}
+
+async function validateWakeGuard(fixture: Awaited<ReturnType<typeof wakeGuardFixture>>) {
+  const { base, snapshot, generated, journal, baseJournal, sql, priorIds } = fixture;
+  const semantic = (value: Snapshot) => {
+    const { id, prevId, ...content } = value;
+    return content;
+  };
+  ok(isDeepStrictEqual(semantic(snapshot), semantic(generated)), "complete snapshot schema mismatch");
+  strictEqual(snapshot.version, "7");
+  strictEqual(snapshot.dialect, "postgresql");
+  ok(/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(snapshot.id));
+  ok(!priorIds.has(snapshot.id), "snapshot id must be unique");
+  // Chain walk: snapshot.prevId must lead back to base.id through prior snapshots,
+  // matching the multi-step journal chain that the live fork has accumulated.
+  const allSnapshots = new Map<string, string>();
+  for (const file of await readdir(path.join(migrationsDir, "meta"))) {
+    if (!file.endsWith("_snapshot.json")) continue;
+    const prior = JSON.parse(await readFile(path.join(migrationsDir, "meta", file), "utf8"));
+    allSnapshots.set(prior.id, prior.prevId);
+  }
+  let cursor = snapshot.prevId;
+  let chainOk = false;
+  let chainLen = 0;
+  const seen = new Set<string>();
+  while (cursor && chainLen < 100) {
+    if (seen.has(cursor)) break;
+    seen.add(cursor);
+    if (cursor === base.id) { chainOk = true; break; }
+    cursor = allSnapshots.get(cursor) ?? "";
+    chainLen += 1;
+  }
+  ok(chainOk, `snapshot.prevId (${snapshot.prevId}) must chain back to base.id (${base.id}); walked ${chainLen} steps`);
+  strictEqual(priorIds.has(snapshot.prevId), true);
+  const predecessors = (await readdir(path.join(migrationsDir, "meta"))).filter((file) => file.endsWith("_snapshot.json"));
+  let predecessorCount = 0;
+  for (const file of predecessors) {
+    const prior = JSON.parse(await readFile(path.join(migrationsDir, "meta", file), "utf8"));
+    if (prior.id === snapshot.prevId) predecessorCount += 1;
+  }
+  strictEqual(predecessorCount, 1);
+  const { entries, ...metadata } = journal;
+  const { entries: baseEntries, ...baseMetadata } = baseJournal;
+  deepStrictEqual(metadata, baseMetadata);
+  deepStrictEqual(entries.slice(0, -1), baseEntries);
+  strictEqual(entries.length, baseEntries.length + 1);
+  const last = entries.at(-1);
+  deepStrictEqual({ ...last, when: undefined }, {
+    idx: 9285, version: "7", tag: "9285_wake_loop_guard_index", breakpoints: true, when: undefined,
+  });
+  strictEqual(baseEntries.at(-1).idx, 9284);
+  ok(Number.isSafeInteger(last.when) && last.when > baseEntries.at(-1).when);
+  const statements = await generateMigration(base, snapshot);
+  // The wake-loop guard index must be present; the rest of the statements
+  // chain through 9283/9284 features (terminal_liveness_idx, context_issue_id,
+  // context_task_id, compound ctx_ids idx) that landed on the fork tip after
+  // PR #110 was authored. We assert the wake-guard's CREATE INDEX exactly
+  // matches the migration SQL once the comments and breakpoints are stripped.
+  const wakeGuardIndex = `CREATE INDEX "agent_wakeup_requests_company_agent_issue_created_idx" ON "agent_wakeup_requests" USING btree ("company_id","agent_id",("payload" ->> 'issueId'),"created_at");`;
+  ok(
+    statements.some((statement: string) => statement.trim() === wakeGuardIndex),
+    `wake-guard index missing from generated migration statements: ${JSON.stringify(statements)}`,
+  );
+  strictEqual(sql.replace(/^--[^\n]*(?:\n|$)/gm, "").trim(), wakeGuardIndex);
+}
+
+describe("SPA-9280 snapshot reproduction", { timeout: 60_000 }, () => {
+  it("reproduces complete schema, chain, append-only journal and exact index SQL", async () => {
+    await validateWakeGuard(await wakeGuardFixture());
+  });
+
+  it("rejects semantic corruption", async () => {
+    const fixture = await wakeGuardFixture();
+    fixture.snapshot.tables = {};
+    await expect(validateWakeGuard(fixture)).rejects.toThrow();
+  });
+
+  it("rejects duplicate generation identity and wrong predecessor", async () => {
+    const fixture = await wakeGuardFixture();
+    fixture.snapshot.id = fixture.base.id;
+    await expect(validateWakeGuard(fixture)).rejects.toThrow();
+    fixture.snapshot.id = "00000000-0000-0000-0000-000000000000";
+    fixture.snapshot.prevId = "00000000-0000-0000-0000-000000000000";
+    await expect(validateWakeGuard(fixture)).rejects.toThrow();
+  });
+
+  it("rejects journal and SQL corruption", async () => {
+    const fixture = await wakeGuardFixture();
+    fixture.journal.entries[0].tag = "corrupted";
+    await expect(validateWakeGuard(fixture)).rejects.toThrow();
+    const sqlFixture = await wakeGuardFixture();
+    sqlFixture.sql += '\nDROP TABLE "agent_wakeup_requests";';
+    await expect(validateWakeGuard(sqlFixture)).rejects.toThrow();
+  });
+});
 
 describe("migration snapshot drift", () => {
   it("keeps the newest snapshot in sync with the drizzle schema", async () => {
