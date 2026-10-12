@@ -1,5 +1,9 @@
 import type { ExecutionContinuationEnvelope } from "@paperclipai/shared";
 import { spawn, type ChildProcess } from "node:child_process";
+import {
+  createStreamStallDetector,
+  MODEL_STREAM_STALLED_ERROR_CODE,
+} from "./stream-stall-detector.js";
 import { scopedRunCommand, stopRunScope } from "./run-resource-scope.js";
 import { createHash, randomUUID } from "node:crypto";
 import { constants as fsConstants, promises as fs, type Dirent } from "node:fs";
@@ -4870,12 +4874,39 @@ export async function runChildProcess(
               }, opts.timeoutSec * 1000)
             : null;
 
+        // Stream-stall detector (SPA-11981).
+        // The detector's only action is to call `onStall` once the root has
+        // produced no stdout/stderr activity for the configured idle window
+        // AND the root is still alive. It NEVER enumerates processes, NEVER
+        // walks /proc, and NEVER issues a kill signal itself. Containment
+        // belongs to `cleanupScope()` (`systemctl --user stop <unit>`), which
+        // is the cgroup fence and only ever reaches pids inside the unit.
+        let streamStalled = false;
+        const streamStallDetector = createStreamStallDetector({
+          onStall: ({ idleMs: observedIdle }) => {
+            streamStalled = true;
+            // Set the resolve flag first so the eventual `close` handler
+            // emits errorCode. Then tear down the cgroup; the child will
+            // receive SIGKILL from systemd and emit `close` shortly.
+            void cleanupScope();
+            onLogError(
+              new Error(
+                `model stream stalled after ${Math.round(observedIdle / 1000)}s of root inactivity`,
+              ),
+              runId,
+              "stream_stall_detector",
+            );
+          },
+          isRootAlive: () => child.exitCode === null && child.signalCode === null,
+        });
+
         child.stdout?.on("data", (chunk: unknown) => {
           const readable = child.stdout;
           if (!readable) return;
           readable.pause();
           const text = String(chunk);
           stdout = appendWithCap(stdout, text);
+          streamStallDetector.noteActivity();
           maybeArmTerminalResultCleanup();
           logChain = logChain
             .then(() => opts.onLog("stdout", text))
@@ -4894,6 +4925,7 @@ export async function runChildProcess(
           readable.pause();
           const text = String(chunk);
           stderr = appendWithCap(stderr, text);
+          streamStallDetector.noteActivity();
           maybeArmTerminalResultCleanup();
           logChain = logChain
             .then(() => opts.onLog("stderr", text))
@@ -4930,6 +4962,7 @@ export async function runChildProcess(
         child.on("error", (err: Error) => {
           if (timeout) clearTimeout(timeout);
           clearTerminalCleanupTimers();
+          streamStallDetector.stop();
           runningProcesses.delete(runId);
           void cleanupScope();
           void target.cleanup?.();
@@ -4943,6 +4976,7 @@ export async function runChildProcess(
         });
 
         child.on("exit", () => {
+          streamStallDetector.stop();
           maybeArmTerminalResultCleanup();
           void cleanupScope();
         });
@@ -4952,6 +4986,7 @@ export async function runChildProcess(
           (code: number | null, signal: NodeJS.Signals | null) => {
             if (timeout) clearTimeout(timeout);
             clearTerminalCleanupTimers();
+            streamStallDetector.stop();
             runningProcesses.delete(runId);
             void logChain.finally(async () => {
               const scopeStopped = await cleanupScope();
@@ -4966,6 +5001,9 @@ export async function runChildProcess(
                     exitCode: code,
                     signal,
                     timedOut,
+                    errorCode: streamStalled
+                      ? MODEL_STREAM_STALLED_ERROR_CODE
+                      : null,
                     stdout,
                     stderr,
                     pid: child.pid ?? null,
