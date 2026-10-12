@@ -1,7 +1,33 @@
 import { describe, expect, it } from "vitest";
 import {
+  isCheckoutHoldRejection,
   shouldAutoCheckoutIssueForWake,
 } from "../services/heartbeat.ts";
+import { HttpError } from "../errors.ts";
+
+// SPA-11807: auto-checkout passes `blocked` in expectedStatuses, so it can now
+  // meet the new interaction hold (422). That must degrade to "did not claim
+  // execution", exactly like a 409 conflict — not crash the whole run.
+describe("isCheckoutHoldRejection", () => {
+  it("treats a checkout hold as a non-claimable outcome", () => {
+    expect(
+      isCheckoutHoldRejection(
+        new HttpError(422, "Issue is blocked on an unanswered interaction"),
+      ),
+    ).toBe(true);
+    expect(
+      isCheckoutHoldRejection(new HttpError(422, "Issue is blocked by unresolved blockers")),
+    ).toBe(true);
+  });
+
+  it.each([409, 500])("does not swallow a %s failure", (status) => {
+    expect(isCheckoutHoldRejection(new HttpError(status, "boom"))).toBe(false);
+  });
+
+  it("does not swallow a non-HttpError failure", () => {
+    expect(isCheckoutHoldRejection(new Error("kaboom"))).toBe(false);
+  });
+});
 
 describe("shouldAutoCheckoutIssueForWake", () => {
   it("auto-checks out an assigned todo issue for an actionable wake", () => {

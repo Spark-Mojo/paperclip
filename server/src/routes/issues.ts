@@ -13995,6 +13995,17 @@ export function issueRoutes(
         let ownerNotifiedAt: Date | null = null;
         await deliverAgentUnblockNotification({
           issue: blockedIssue,
+          // SPA-11807: an unanswered interaction is itself a legitimate reason to
+          // hold this card blocked, so the auto-wake must yield to it.
+          pendingInteractions: await db
+            .select({ status: issueThreadInteractions.status })
+            .from(issueThreadInteractions)
+            .where(
+              and(
+                eq(issueThreadInteractions.companyId, blockedIssue.companyId),
+                eq(issueThreadInteractions.issueId, blockedIssue.id),
+              ),
+            ),
           wakeup: heartbeat.wakeup,
           markNotified: async (blockedOwnerNotifiedAt) => {
             ownerNotifiedAt = blockedOwnerNotifiedAt;
