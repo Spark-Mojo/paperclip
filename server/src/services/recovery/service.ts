@@ -3093,6 +3093,46 @@ export function recoveryService(
     return openChildren;
   }
 
+  async function partitionCycleSafeBlockers(
+    companyId: string,
+    issueId: string,
+    childIds: string[],
+  ) {
+    if (childIds.length === 0) {
+      return { safe: [] as string[], skipped: [] as string[] };
+    }
+    const edges = await db
+      .select({
+        blockerIssueId: issueRelations.issueId,
+        blockedIssueId: issueRelations.relatedIssueId,
+      })
+      .from(issueRelations)
+      .where(
+        and(
+          eq(issueRelations.companyId, companyId),
+          eq(issueRelations.type, "blocks"),
+        ),
+      );
+    const adjacency = new Map<string, string[]>();
+    for (const edge of edges) {
+      const targets = adjacency.get(edge.blockerIssueId) ?? [];
+      targets.push(edge.blockedIssueId);
+      adjacency.set(edge.blockerIssueId, targets);
+    }
+    const downstream = new Set<string>();
+    const queue = [issueId];
+    while (queue.length > 0) {
+      const current = queue.shift()!;
+      if (downstream.has(current)) continue;
+      downstream.add(current);
+      queue.push(...(adjacency.get(current) ?? []));
+    }
+    return {
+      safe: childIds.filter((id) => !downstream.has(id)),
+      skipped: childIds.filter((id) => downstream.has(id)),
+    };
+  }
+
   async function resolveContinuationWaitingOnReview(
     issue: typeof issues.$inferSelect,
   ) {
@@ -3620,25 +3660,61 @@ export function recoveryService(
         ]);
       const durablePathRestored =
         action.ownerType !== "board" && sourceState.hasDurableWaitingPath;
+      const cycleSafeChildren = !sourceState.hasDurableWaitingPath
+        ? await partitionCycleSafeBlockers(
+            issue.companyId,
+            issue.id,
+            healthyChildren.map((child) => child.id),
+          )
+        : {
+            safe: healthyChildren.map((child) => child.id),
+            skipped: [] as string[],
+          };
+      if (cycleSafeChildren.skipped.length > 0) {
+        await db
+          .update(issueRecoveryActions)
+          .set({
+            evidence: {
+              ...parseObject(action.evidence),
+              skippedCyclicBlockerIssueIds: cycleSafeChildren.skipped,
+            },
+            updatedAt: new Date(),
+          })
+          .where(
+            and(
+              eq(issueRecoveryActions.id, action.id),
+              inArray(issueRecoveryActions.status, ["active", "escalated"]),
+            ),
+          );
+      }
       if (
         durablePathRestored ||
-        healthyChildren.length > 0 ||
+        cycleSafeChildren.safe.length > 0 ||
         hasNewSourcePath
       ) {
-        if (healthyChildren.length > 0 && !sourceState.hasDurableWaitingPath) {
+        if (
+          cycleSafeChildren.safe.length > 0 &&
+          !sourceState.hasDurableWaitingPath
+        ) {
           const blockerIds = await existingUnresolvedBlockerIssueIds(
             issue.companyId,
             issue.id,
           );
-          await issuesSvc.update(issue.id, {
-            status: "blocked",
-            blockedByIssueIds: [
-              ...new Set([
-                ...blockerIds,
-                ...healthyChildren.map((child) => child.id),
-              ]),
-            ],
-          });
+          try {
+            await issuesSvc.update(issue.id, {
+              status: "blocked",
+              blockedByIssueIds: [
+                ...new Set([...blockerIds, ...cycleSafeChildren.safe]),
+              ],
+            });
+          } catch (err) {
+            logger.error(
+              { err, recoveryActionId: action.id },
+              "recovery blocker update failed; action remains active",
+            );
+            result.skipped += 1;
+            continue;
+          }
         }
         const resolved = await recoveryActionsSvc.resolveActiveForIssue({
           companyId: action.companyId,
