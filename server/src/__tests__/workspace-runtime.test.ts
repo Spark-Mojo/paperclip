@@ -43,6 +43,7 @@ import {
   releaseRunExecutionWorkspaceForHeartbeat,
   releaseRuntimeServicesForRun,
   UnresolvedWorkspaceBaseRefError,
+  WorkspaceRuntimeValidationFailure,
   resetRuntimeServicesForTests,
   MANAGED_RUNTIME_PUBLIC_URL_ENV,
   resolveManagedPaperclipRuntimePublicOrigin,
@@ -11783,6 +11784,251 @@ describe("ensurePersistedExecutionWorkspaceAvailable SPA-9437 project workspace 
       ])
     ).stdout.trim();
     expect(branchOnPersistedWorktree).toBe(persistedBranch);
+  }, 20_000);
+});
+
+describe("realizeExecutionWorkspace SPA-11953 shared configured worktree path", () => {
+  it("names the foreign repository that owns a colliding configured worktree path", async () => {
+    const repoA = await createTempRepo();
+    const repoB = await createTempRepo();
+    const sharedParentDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-shared-worktrees-"));
+    const issue = {
+      id: "issue-spa11953-shared-path",
+      identifier: "PAP-11953",
+      title: "Shared Card Path Collides Across Repos",
+    };
+    const agent = {
+      id: "agent-1",
+      name: "Codex Coder",
+      companyId: "company-1",
+    };
+
+    const first = await realizeExecutionWorkspace({
+      base: {
+        baseCwd: repoA,
+        source: "project_primary",
+        projectId: "project-1",
+        workspaceId: "workspace-a",
+        repoUrl: null,
+        repoRef: "HEAD",
+      },
+      config: {
+        workspaceStrategy: {
+          type: "git_worktree",
+          branchTemplate: "{{issue.identifier}}-{{slug}}",
+          worktreeParentDir: sharedParentDir,
+        },
+      },
+      issue,
+      agent,
+    });
+    expect(first.branchName).toBe("PAP-11953-shared-card-path-collides-across-repos");
+    const collidingPath = first.worktreePath!;
+    const canonicalCollidingPath = await fs.realpath(collidingPath);
+    const canonicalRepoA = await fs.realpath(repoA);
+    const canonicalRepoB = await fs.realpath(repoB);
+    const listedCanonicalWorktrees = async (repoRoot: string) => Promise.all(
+      (await readGit(repoRoot, ["worktree", "list", "--porcelain"]))
+        .split(/\r?\n/)
+        .filter((line) => line.startsWith("worktree "))
+        .map((line) => fs.realpath(line.slice("worktree ".length))),
+    );
+    expect(path.resolve(path.dirname(collidingPath))).toBe(path.resolve(sharedParentDir));
+    // Precondition, stated not assumed: repo A owns the colliding path. Compare
+    // canonical paths because os.tmpdir() may be reached through a host symlink.
+    expect(await listedCanonicalWorktrees(repoA)).toContain(canonicalCollidingPath);
+
+    let error: unknown = null;
+    try {
+      await realizeExecutionWorkspace({
+        base: {
+          baseCwd: repoB,
+          source: "project_primary",
+          projectId: "project-1",
+          workspaceId: "workspace-b",
+          repoUrl: null,
+          repoRef: "HEAD",
+        },
+        config: {
+          workspaceStrategy: {
+            type: "git_worktree",
+            branchTemplate: "{{issue.identifier}}-{{slug}}",
+            worktreeParentDir: sharedParentDir,
+          },
+        },
+        issue,
+        agent,
+      });
+    } catch (caught) {
+      error = caught;
+    }
+
+    // R1 oracle: same card/path against repo B must fail closed with the
+    // foreign (occupying) repository named, never succeed or clobber.
+    expect(error).toBeInstanceOf(WorkspaceRuntimeValidationFailure);
+    if (!(error instanceof WorkspaceRuntimeValidationFailure)) throw new Error("unreachable");
+    expect(error.code).toBe("workspace_validation_failed");
+    const validation = (error.resultJson as { workspaceValidation: Record<string, unknown> }).workspaceValidation;
+    expect(validation).toMatchObject({
+      reason: "git_worktree_belongs_to_other_repo",
+      reasonCode: "configured_path_owned_by_other_repo",
+      worktreePath: collidingPath,
+      branchName: first.branchName,
+      currentRepoRoot: canonicalRepoB,
+    });
+    expect(validation["occupyingRepoRoot"]).toBe(canonicalRepoA);
+    expect(validation).not.toHaveProperty("persistedRepoRoot");
+    expect(error.message).toContain(collidingPath);
+    expect(error.message).toContain(canonicalRepoA);
+    expect(error.message).toContain(canonicalRepoB);
+    expect(error.message).toMatch(/other repo|owned by|belongs to/i);
+
+    // Repo A's worktree is preserved untouched and still registered.
+    expect(await fs.stat(collidingPath)).toBeTruthy();
+    expect(await listedCanonicalWorktrees(repoA)).toContain(canonicalCollidingPath);
+    await expect(readGit(collidingPath, ["branch", "--show-current"])).resolves.toBe(first.branchName);
+
+    // Repo B created neither the branch nor a worktree at the shared path.
+    await expect(readGit(repoB, ["branch", "--list", first.branchName!])).resolves.toBe("");
+    expect(await listedCanonicalWorktrees(repoB)).not.toContain(canonicalCollidingPath);
+  }, 20_000);
+
+  it("preserves a foreign worktree before ephemeral stale-path cleanup", async () => {
+    const repoA = await createTempRepo();
+    const repoB = await createTempRepo();
+    const sharedParentDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-shared-ephemeral-"));
+    const issue = {
+      id: "issue-spa11953-ephemeral-collision",
+      identifier: "PAP-11953",
+      title: "Ephemeral Shared Path Must Not Delete Foreign Worktree",
+    };
+    const agent = {
+      id: "agent-1",
+      name: "Codex Coder",
+      companyId: "company-1",
+    };
+    const config = {
+      workspaceStrategy: {
+        type: "git_worktree",
+        branchTemplate: "{{issue.identifier}}-{{slug}}",
+        worktreeParentDir: sharedParentDir,
+      },
+    };
+    const first = await realizeExecutionWorkspace({
+      base: {
+        baseCwd: repoA,
+        source: "project_primary",
+        projectId: "project-1",
+        workspaceId: "workspace-a",
+        repoUrl: null,
+        repoRef: "HEAD",
+      },
+      config,
+      issue,
+      agent,
+      ephemeralLifecycle: true,
+      heartbeatRunId: "same-run-id",
+    });
+    const collidingPath = first.worktreePath!;
+    const canonicalCollidingPath = await fs.realpath(collidingPath);
+    await fs.writeFile(path.join(collidingPath, "foreign-repo-marker.txt"), "preserve me\n", "utf8");
+
+    let error: unknown = null;
+    try {
+      await realizeExecutionWorkspace({
+        base: {
+          baseCwd: repoB,
+          source: "project_primary",
+          projectId: "project-1",
+          workspaceId: "workspace-b",
+          repoUrl: null,
+          repoRef: "HEAD",
+        },
+        config,
+        issue,
+        agent,
+        ephemeralLifecycle: true,
+        heartbeatRunId: "same-run-id",
+      });
+    } catch (caught) {
+      error = caught;
+    }
+
+    expect(error).toBeInstanceOf(WorkspaceRuntimeValidationFailure);
+    expect(error).toMatchObject({
+      resultJson: {
+        workspaceValidation: expect.objectContaining({
+          reasonCode: "configured_path_owned_by_other_repo",
+          worktreePath: collidingPath,
+          occupyingRepoRoot: await fs.realpath(repoA),
+          currentRepoRoot: await fs.realpath(repoB),
+        }),
+      },
+    });
+    expect(await fs.readFile(path.join(collidingPath, "foreign-repo-marker.txt"), "utf8"))
+      .toBe("preserve me\n");
+    const listedRepoA = (await readGit(repoA, ["worktree", "list", "--porcelain"]))
+      .split(/\r?\n/)
+      .filter((line) => line.startsWith("worktree "));
+    expect(await Promise.all(listedRepoA.map((line) => fs.realpath(line.slice("worktree ".length)))))
+      .toContain(canonicalCollidingPath);
+  }, 20_000);
+
+  it("reuses the configured path when baseCwd is another worktree of the same owning repo", async () => {
+    const repo = await createTempRepo();
+    const baseCwd = path.join(repo, ".paperclip", "worktrees", "project-base");
+    const sharedParentDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-same-repo-worktrees-"));
+    await fs.mkdir(path.dirname(baseCwd), { recursive: true });
+    await runGit(repo, ["worktree", "add", "-b", "project-base", baseCwd, "HEAD"]);
+    const input = {
+      base: {
+        baseCwd,
+        source: "project_primary" as const,
+        projectId: "project-1",
+        workspaceId: "workspace-same-repo",
+        repoUrl: null,
+        repoRef: "HEAD",
+      },
+      config: {
+        workspaceStrategy: {
+          type: "git_worktree",
+          branchTemplate: "{{issue.identifier}}-{{slug}}",
+          worktreeParentDir: sharedParentDir,
+        },
+      },
+      issue: {
+        id: "issue-spa11953-same-repo",
+        identifier: "PAP-11953",
+        title: "Same Owner Must Reuse Configured Path",
+      },
+      agent: {
+        id: "agent-1",
+        name: "Codex Coder",
+        companyId: "company-1",
+      },
+    };
+
+    const first = await realizeExecutionWorkspace(input);
+    expect(first.created).toBe(true);
+    const canonicalRepoRoot = await fs.realpath(repo);
+    expect(await fs.realpath(first.worktreePath!)).toBe(await fs.realpath(first.cwd));
+    expect(await readGit(first.worktreePath!, ["rev-parse", "--git-common-dir"]))
+      .toContain(path.basename(repo));
+
+    // The second realization reaches the SPA-11953 existing-path guard with
+    // baseCwd and the occupied path as TWO worktrees of the SAME owning repo.
+    // Owner-root normalization must compare equal and continue to normal reuse.
+    const second = await realizeExecutionWorkspace(input);
+    expect(second.created).toBe(false);
+    expect(second.worktreePath).toBe(first.worktreePath);
+    expect(await fs.realpath(second.worktreePath!)).toBe(await fs.realpath(first.worktreePath!));
+    expect(await readGit(second.worktreePath!, ["branch", "--show-current"]))
+      .toBe(first.branchName);
+    const currentOwner = path.dirname(path.resolve(
+      second.worktreePath!,
+      await readGit(second.worktreePath!, ["rev-parse", "--git-common-dir"]),
+    ));
+    expect(await fs.realpath(currentOwner)).toBe(canonicalRepoRoot);
   }, 20_000);
 });
 
