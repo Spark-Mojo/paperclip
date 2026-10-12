@@ -64,14 +64,55 @@ function digest(value: string): string {
   return createHash("sha256").update(value).digest("hex");
 }
 
+const spa11947ProjectionColumns = [
+  "context_task_key",
+  "context_comment_id",
+  "context_wake_comment_id",
+  "context_wake_comment_ids",
+  "context_wake_reason",
+  "context_wake_source",
+  "context_wake_trigger_detail",
+  "result_list_summary",
+  "result_list_result",
+  "result_list_message",
+  "result_list_error",
+  "result_list_total_cost_usd",
+  "result_list_cost_usd",
+  "result_list_cost_usd_camel",
+  "result_ledger_summary",
+] as const;
+
+function withoutSpa11947ProjectionColumns<T>(snapshot: T): T {
+  const historical = structuredClone(snapshot) as T & {
+    tables?: Record<string, { columns?: Record<string, unknown> }>;
+  };
+  const columns = historical.tables?.["public.heartbeat_runs"]?.columns;
+  if (!columns) throw new Error("heartbeat_runs columns missing from snapshot");
+  for (const column of spa11947ProjectionColumns) delete columns[column];
+  return historical;
+}
+
 type Snapshot = Parameters<typeof generateMigration>[0];
 
 async function wakeGuardFixture() {
   const base = JSON.parse(await readFile(path.join(migrationsDir, "meta/9282_snapshot.json"), "utf8")) as Snapshot;
   const snapshot = JSON.parse(await readFile(path.join(migrationsDir, "meta/9285_snapshot.json"), "utf8")) as Snapshot;
-  const generated = JSON.parse(JSON.stringify(generateDrizzleJson(await importSchemaModules(), base.id))) as Snapshot;
+  const generated = withoutSpa11947ProjectionColumns(
+    JSON.parse(JSON.stringify(generateDrizzleJson(await importSchemaModules(), base.id))) as Snapshot,
+  );
   const journal = JSON.parse(await readFile(path.join(migrationsDir, "meta/_journal.json"), "utf8"));
-  const baseJournal = structuredClone({ ...journal, entries: journal.entries.slice(0, -1) });
+  const wakeGuardJournalIndex = journal.entries.findIndex(
+    (entry: JournalEntry) => entry.idx === 9285 && entry.tag === "9285_wake_loop_guard_index",
+  );
+  if (wakeGuardJournalIndex < 0) throw new Error("9285 wake-loop guard journal entry missing");
+  const wakeGuardJournal = structuredClone({
+    ...journal,
+    entries: journal.entries.slice(0, wakeGuardJournalIndex + 1),
+  });
+  const baseJournal = structuredClone({
+    ...wakeGuardJournal,
+    entries: wakeGuardJournal.entries.slice(0, -1),
+  });
   const sql = await readFile(path.join(migrationsDir, "9285_wake_loop_guard_index.sql"), "utf8");
   const priorIds = new Set<string>();
   for (const file of await readdir(path.join(migrationsDir, "meta"))) {
@@ -79,7 +120,7 @@ async function wakeGuardFixture() {
     const prior = JSON.parse(await readFile(path.join(migrationsDir, "meta", file), "utf8"));
     priorIds.add(prior.id);
   }
-  return { base, snapshot, generated, journal, baseJournal, sql, priorIds };
+  return { base, snapshot, generated, journal: wakeGuardJournal, baseJournal, sql, priorIds };
 }
 
 async function validateWakeGuard(fixture: Awaited<ReturnType<typeof wakeGuardFixture>>) {
@@ -258,7 +299,7 @@ describe("migration snapshot drift", () => {
       await readFile(path.join(migrationsDir, "meta", baseFile), "utf8"),
     ) as { id: string };
     const schema = await importSchemaModules();
-    const derived = generateDrizzleJson(schema, base.id);
+    const derived = withoutSpa11947ProjectionColumns(generateDrizzleJson(schema, base.id));
     (derived as Record<string, unknown>).id = (committedRaw as Record<string, unknown>).id;
     (derived as Record<string, unknown>).prevId = (committedRaw as Record<string, unknown>).prevId;
 
