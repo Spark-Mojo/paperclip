@@ -1,6 +1,7 @@
 import { and, asc, eq, isNotNull, isNull, notInArray } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { agents, issues } from "@paperclipai/db";
+import { isAgentStatusInvokable } from "@paperclipai/shared";
 import { HttpError } from "../errors.js";
 import { queueIssueAssignmentWakeup } from "./issue-assignment-wakeup.js";
 
@@ -11,9 +12,83 @@ import { queueIssueAssignmentWakeup } from "./issue-assignment-wakeup.js";
  * exists so blocked dependents can unblock and wake. Cards whose payload
  * carries `requiresManualAction: true` always stay open.
  *
+ * SPA-11924: the auto-close arm no longer fires on a work-receipt-free path,
+ * and the hand-back arm is no longer dead code. See the two corrections below.
+ *
  * Idempotency: a handed-back card has an agent assignee and a closed card is
- * terminal, so neither matches the candidate query on the next sweep.
+ * terminal, so neither matches the candidate query on the next sweep. A card
+ * withheld for want of a receipt DOES stay a candidate, so it is never given a
+ * card comment — the sweep only counts and logs it, or it would append a
+ * comment every 30 seconds forever.
  */
+
+/**
+ * SPA-11924 correction 1 — an administrative outcome is not an answer.
+ *
+ * The old predicate was `status !== "pending"`, which counted `expired`
+ * (nobody ever responded), `cancelled` and `withdrawn` (the filing agent gave
+ * up) as "resolved". Only a real decision releases the human owner:
+ * `answered` / `accepted` / `rejected`.
+ */
+export const AFFIRMATIVE_RESOLUTION_STATUSES = new Set<string>([
+  "answered",
+  "accepted",
+  "rejected",
+]);
+
+/**
+ * SPA-11924 correction 2 — `done` requires a positive work receipt.
+ *
+ * Settling is necessary but not sufficient to close. A rejection is a real
+ * answer (the human decided NOT to proceed) and an `ask_user_questions` answer
+ * is a real answer, but neither is evidence that the requested work happened,
+ * so neither may write `done`. An accepted confirmation is the receipt: a
+ * human explicitly authorised the action, and the row records that outcome.
+ */
+export const SETTLEMENT_CLOSE_RECEIPT_STATUS = "accepted";
+
+/** Fail-closed: an absent result object carries no contradictory outcome. */
+function readRecordedOutcome(interaction: SettlementInteraction): string | null {
+  const result =
+    interaction.result && typeof interaction.result === "object"
+      ? (interaction.result as Record<string, unknown>)
+      : null;
+  return typeof result?.["outcome"] === "string" ? result["outcome"] : null;
+}
+
+/**
+ * At least one decision was genuinely made. Administrative-only cards
+ * (expired / cancelled / withdrawn) do not settle and keep their human owner.
+ */
+export function hasAffirmativeResolution(
+  resolved: SettlementInteraction[],
+): boolean {
+  return resolved.some((interaction) =>
+    AFFIRMATIVE_RESOLUTION_STATUSES.has(interaction.status),
+  );
+}
+
+/**
+ * At least one accepted confirmation whose recorded outcome agrees. An
+ * `accepted` row whose result says something else (e.g. a superseded/expired
+ * outcome left on the row) is not a receipt.
+ */
+export function hasAcceptedCloseReceipt(
+  resolved: SettlementInteraction[],
+): boolean {
+  return resolved.some((interaction) => {
+    if (interaction.status !== SETTLEMENT_CLOSE_RECEIPT_STATUS) return false;
+    const outcome = readRecordedOutcome(interaction);
+    return outcome === null || outcome === SETTLEMENT_CLOSE_RECEIPT_STATUS;
+  });
+}
+
+/**
+ * Provenance stamped on the wake this sweep triggers, so a reader can tell
+ * "blocker settled unexecuted" from "blocker completed" (`blocker_done`, the
+ * human PATCH path). The auto-unblock arm otherwise carries no mutation at all.
+ */
+export const SETTLED_UNEXECUTED_MUTATION = "blocker_settled_unexecuted";
 
 export const DECISION_INTERACTION_KINDS = [
   "ask_user_questions",
@@ -73,7 +148,10 @@ export interface AwaitingYouSettlementDeps {
     opts: Record<string, unknown>,
   ) => Promise<unknown>;
   /** Production wires heartbeat.autoUnblockReadyDependents (same pattern, same gate). */
-  unblockDependentsFn: (blockerIssueId: string) => Promise<unknown>;
+  unblockDependentsFn: (
+    blockerIssueId: string,
+    opts?: { mutation?: string },
+  ) => Promise<unknown>;
   logFn?: (obj: Record<string, unknown>, msg: string) => void;
 }
 
@@ -81,9 +159,13 @@ export interface AwaitingYouSettlementResult {
   scanned: number;
   handedBack: number;
   autoClosed: number;
+  /** Cards deliberately left open: requiresManualAction plus receipt-less closes. Inclusive. */
   keptOpen: number;
   failed: number;
   issueIds: string[];
+  /** SPA-11924: settled in principle, withheld from `done` for want of a work receipt. */
+  unproven: number;
+  unprovenIssueIds: string[];
 }
 
 function interactionTime(value: Date | string | null | undefined): number {
@@ -199,6 +281,8 @@ export async function settleSettledAwaitingYouIssues(
     keptOpen: 0,
     failed: 0,
     issueIds: [],
+    unproven: 0,
+    unprovenIssueIds: [],
   };
 
   const candidates = await db
@@ -227,12 +311,16 @@ export async function settleSettledAwaitingYouIssues(
       const resolved = decision.filter(
         (interaction) => interaction.status !== "pending",
       );
-      // Fully answered means at least one resolved decision interaction
-      // and zero still-pending ones. answered/accepted/rejected (and
-      // administrative outcomes like withdrawn/expired) all release the
-      // human owner — only a pending decision keeps the card waiting.
-      // Non-decision kinds (suggest_tasks, connection_intent) never block.
+      // Fully answered means at least one AFFIRMATIVE decision interaction and
+      // zero still-pending ones. Non-decision kinds (suggest_tasks,
+      // connection_intent) never block.
+      //
+      // SPA-11924: the old test was `status !== "pending"`, which also counted
+      // expired / cancelled / withdrawn as answers. Those are administrative —
+      // nobody ever decided — so a card whose only outcomes are administrative
+      // must not settle, and must keep its human owner.
       if (resolved.length === 0 || pending.length > 0) continue;
+      if (!hasAffirmativeResolution(resolved)) continue;
 
       // Keep-open: ANY decision payload (pending or resolved) demanding a
       // manual action keeps the card with its human owner.
@@ -258,7 +346,15 @@ export async function settleSettledAwaitingYouIssues(
         if (
           filer &&
           filer.companyId === issue.companyId &&
-          filer.status === "active"
+          // SPA-11924: the old literal equality test against the agent status
+          // "active" was dead code — "active" is declared in AGENT_STATUSES but
+          // no write path ever stores it on an agent, so liveFilerId was always
+          // null and every answered user-owned card was auto-closed. Invokable
+          // is the correct predicate: idle/running agents can be woken. `paused`
+          // is deliberately excluded (it is assignable but not invokable) —
+          // handing a card to a paused agent while clearing the human owner
+          // would strand it with nobody.
+          isAgentStatusInvokable(filer.status)
         ) {
           liveFilerId = filer.id;
         }
@@ -291,6 +387,27 @@ export async function settleSettledAwaitingYouIssues(
         continue;
       }
 
+      // SPA-11924: no work receipt, no `done`. Settling releases the human
+      // owner, but it is not evidence the requested work happened, and the
+      // done-gate cannot catch this class — these cards have no bound PR and a
+      // null executionPolicy, so `issue_done_with_unmerged_pull_request` and
+      // `issue_done_with_incomplete_execution_stage` are both inert for them.
+      //
+      // Deliberately no card comment: this card stays a sweep candidate, so a
+      // comment per sweep would grow the thread without bound. Count + log is
+      // the receipt. Dependents are also NOT released — a blocker that was
+      // never resolved must not unblock the chain behind it.
+      if (!hasAcceptedCloseReceipt(ordered)) {
+        result.keptOpen += 1;
+        result.unproven += 1;
+        result.unprovenIssueIds.push(issue.id);
+        log(
+          { issueId: issue.id, reason: "awaiting_you_settlement_no_work_receipt" },
+          "awaiting-you settlement withheld auto-close: no accepted work receipt",
+        );
+        continue;
+      }
+
       await deps.issuesSvc.addComment(
         issue.id,
         buildResolutionComment(ordered, "auto_close"),
@@ -318,7 +435,8 @@ export async function settleSettledAwaitingYouIssues(
           if (
             retryFiler &&
             retryFiler.companyId === issue.companyId &&
-            retryFiler.status === "active"
+            // Same invokable predicate as the primary read (SPA-11924).
+            isAgentStatusInvokable(retryFiler.status)
           ) {
             await deps.issuesSvc.update(issue.id, {
               assigneeAgentId: retryFiler.id,
@@ -349,7 +467,9 @@ export async function settleSettledAwaitingYouIssues(
         }
         throw err;
       }
-      await deps.unblockDependentsFn(issue.id);
+      await deps.unblockDependentsFn(issue.id, {
+        mutation: SETTLED_UNEXECUTED_MUTATION,
+      });
       result.autoClosed += 1;
       result.issueIds.push(issue.id);
     } catch (err) {

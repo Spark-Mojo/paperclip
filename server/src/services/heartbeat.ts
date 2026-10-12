@@ -20554,14 +20554,21 @@ export function heartbeatService(
           interactionSvc.listForIssue(issueId),
         enqueueWakeupFn: (agentId, opts) =>
           enqueueWakeup(agentId, opts as WakeupOptions),
-        unblockDependentsFn: (blockerIssueId) =>
-          autoUnblockReadyDependents(blockerIssueId),
+        unblockDependentsFn: (blockerIssueId, unblockOpts) =>
+          autoUnblockReadyDependents(blockerIssueId, unblockOpts),
         logFn: (obj, msg) => logger.warn(obj, msg),
       },
     );
   }
 
-  async function autoUnblockReadyDependents(blockerIssueId: string) {
+  async function autoUnblockReadyDependents(
+    blockerIssueId: string,
+    // SPA-11924: the human PATCH path stamps `mutation: "blocker_done"` on the
+    // dependents-resolved wake. This arm used to carry no mutation at all, so a
+    // settlement-driven wake was the only one a reader could not distinguish
+    // from a completed blocker. Callers pass their own provenance.
+    opts?: { mutation?: string },
+  ) {
     const enabled = resolveIdleTodoPullCanary(runtimeEnv.PAPERCLIP_AUTO_UNBLOCK_READY_DEPENDENTS).enabled && resolveIdleTodoPullGate().enabled;
     const result = { enabled, checked: 0, unblocked: 0, notReadySkipped: 0, deferredOrFailed: 0, issueIds: [] as string[] };
     if (!enabled || (await getSchedulingSuppression()).suppressed) return result;
@@ -20578,7 +20585,7 @@ export function heartbeatService(
       try {
         await enqueueWakeup(transitioned.agentId, {
           source: "automation", triggerDetail: "system", reason: ISSUE_BLOCKERS_RESOLVED_WAKE_REASON,
-          payload: { issueId: candidate.id, resolvedBlockerIssueId: blockerIssueId, blockerIssueIds: transitioned.blockerIssueIds },
+          payload: { issueId: candidate.id, resolvedBlockerIssueId: blockerIssueId, blockerIssueIds: transitioned.blockerIssueIds, ...(opts?.mutation ? { mutation: opts.mutation } : {}) },
           idempotencyKey: buildIssueBlockersResolvedWakeStateKey({ dependentIssueId: candidate.id, blockerIssueIds: transitioned.blockerIssueIds, blockedTransitionAt: transitioned.blockedTransitionAt }),
           requestedByActorType: "system",
           contextSnapshot: { issueId: candidate.id, taskId: candidate.id, wakeReason: ISSUE_BLOCKERS_RESOLVED_WAKE_REASON },
