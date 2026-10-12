@@ -433,6 +433,78 @@ describeEmbeddedPostgres("terminal environment leases (SPA-9423)", () => {
       .where(eq(environmentLeases.id, cancelledLease.lease.id));
     expect(cancelledAfter[0]?.status).not.toBe("active");
     expect(cancelledAfter[0]?.releasedAt).not.toBeNull();
+
+    // SPA-11861 AC1 + AC2 leaked-call path: prove the backstop sweep
+    // recovers a lease whose owning run reached the terminal shape WITHOUT
+    // going through `releaseEnvironmentLeasesForRun`. This mirrors the
+    // production leak path in `execution-control-reconciliation.ts:153-190`,
+    // which writes `failed + errorCode = execution_finalization_deadline_exceeded`
+    // in a transaction with NO lease-release call.
+    //
+    // Case A: leaked `failed` + `execution_finalization_deadline_exceeded`
+    // (the SPA-11657 / SPA-11661 / SPA-11635 shape).
+    const leakedFinRunId = await seedRun({
+      companyId,
+      agentId,
+      status: "failed",
+    });
+    await db
+      .update(heartbeatRuns)
+      .set({ errorCode: "execution_finalization_deadline_exceeded" })
+      .where(eq(heartbeatRuns.id, leakedFinRunId));
+    const leakedFinLease = await runtime.acquireRunLease({
+      companyId,
+      environment: await seedEnvironment({ companyId, driver: "local" }),
+      issueId: null,
+      heartbeatRunId: leakedFinRunId,
+      persistedExecutionWorkspace: null,
+    });
+
+    // Case B: leaked `cancelled` write that bypasses the 4
+    // releaseEnvironmentLeasesForRun call sites in heartbeat.ts
+    // (the `drainRunningRunsForShutdown` / `settleRecoveredNativeWorkspace` /
+    // process_lost / finally boundary all gate the release path; raw
+    // `cancelled` writes at heartbeat.ts :16809 / :16860 / :26972 skip them).
+    const leakedCancelRunId = await seedRun({
+      companyId,
+      agentId,
+      status: "cancelled",
+    });
+    const leakedCancelLease = await runtime.acquireRunLease({
+      companyId,
+      environment: await seedEnvironment({ companyId, driver: "local" }),
+      issueId: null,
+      heartbeatRunId: leakedCancelRunId,
+      persistedExecutionWorkspace: null,
+    });
+
+    // Run the backstop sweep — no manual release call.
+    const sweepResult = await heartbeat.reclaimTerminalEnvironmentLeases({
+      batchSize: RECLAIM_BATCH,
+    });
+    expect(sweepResult.releasedLeaseIds).toContain(leakedFinLease.lease.id);
+    expect(sweepResult.releasedLeaseIds).toContain(leakedCancelLease.lease.id);
+
+    // Both leaked leases must have releasedAt set after the sweep.
+    const leakedFinAfter = await db
+      .select({
+        status: environmentLeases.status,
+        releasedAt: environmentLeases.releasedAt,
+      })
+      .from(environmentLeases)
+      .where(eq(environmentLeases.id, leakedFinLease.lease.id));
+    expect(leakedFinAfter[0]?.status).not.toBe("active");
+    expect(leakedFinAfter[0]?.releasedAt).not.toBeNull();
+
+    const leakedCancelAfter = await db
+      .select({
+        status: environmentLeases.status,
+        releasedAt: environmentLeases.releasedAt,
+      })
+      .from(environmentLeases)
+      .where(eq(environmentLeases.id, leakedCancelLease.lease.id));
+    expect(leakedCancelAfter[0]?.status).not.toBe("active");
+    expect(leakedCancelAfter[0]?.releasedAt).not.toBeNull();
   });
 
   it("LEASE-GATES: sweep-guards", async () => {
