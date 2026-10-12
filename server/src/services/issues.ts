@@ -11504,6 +11504,30 @@ export function issueService(db: Db) {
           }
           if (updated.status === "done" || updated.status === "cancelled") {
             await finalizeSummarySlotsForTerminalIssue(tx, updated);
+            // SPA-11805 A2: a terminal transition retires pending execution
+            // work for the issue. Drain only unclaimed rows
+            // (`deferred_issue_execution`/`queued` with no run bound): a wake
+            // armed before the close must die at the close, and a claimed or
+            // running row belongs to a live run that the close must not kill.
+            await tx
+              .update(agentWakeupRequests)
+              .set({
+                status: "cancelled",
+                finishedAt: new Date(),
+                error: "issue_terminal",
+                updatedAt: new Date(),
+              })
+              .where(
+                and(
+                  eq(agentWakeupRequests.companyId, updated.companyId),
+                  inArray(agentWakeupRequests.status, [
+                    "deferred_issue_execution",
+                    "queued",
+                  ]),
+                  isNull(agentWakeupRequests.runId),
+                  wakeRequestTargetsIssue(updated.id),
+                ),
+              );
             // Every terminal transition funnels through here, including direct
             // service callers (tree control, recovery, pipelines, status cards)
             // that never touch the HTTP routes, so pending interaction cards
