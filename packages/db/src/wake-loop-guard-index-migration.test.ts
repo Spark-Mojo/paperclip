@@ -102,6 +102,30 @@ async function runProbeAndCapture(sql: postgres.Sql): Promise<string[]> {
   return plan;
 }
 
+async function runProbePair(sql: postgres.Sql): Promise<{
+  dedup: { planText: string; executionMs: number };
+  hourly: { planText: string; executionMs: number };
+}> {
+  const dedupRows = await sql.unsafe(
+    "EXPLAIN ANALYZE SELECT count(*) FROM agent_wakeup_requests WHERE company_id = $1 AND agent_id = $2 AND (payload->>'issueId') = $3 AND created_at > now() - interval '60 seconds'",
+    ["00000000-0000-4000-8000-000000000001", "00000000-0000-4000-8000-000000000001", "is-5"],
+  );
+  const hourlyRows = await sql.unsafe(
+    "EXPLAIN ANALYZE SELECT count(*) FROM agent_wakeup_requests WHERE company_id = $1 AND agent_id = $2 AND (payload->>'issueId') = $3 AND created_at > now() - interval '1 hour'",
+    ["00000000-0000-4000-8000-000000000001", "00000000-0000-4000-8000-000000000001", "is-5"],
+  );
+  const flatten = (rows: postgres.RowList<postgres.Row[]>) =>
+    rows.map((r: postgres.Row) => r["QUERY PLAN"] ?? Object.values(r)[0]).join("\n");
+  const parseMs = (text: string): number => {
+    const m = text.match(/Execution Time:\s+([0-9.]+)\s+ms/);
+    return m ? parseFloat(m[1]) : NaN;
+  };
+  return {
+    dedup: { planText: flatten(dedupRows), executionMs: parseMs(flatten(dedupRows)) },
+    hourly: { planText: flatten(hourlyRows), executionMs: parseMs(flatten(hourlyRows)) },
+  };
+}
+
 describe("SPA-11886 wake-loop guard index migration", { timeout: 120_000 }, () => {
   it("applying 9285 creates the composite index and the pre-existing payload-issue index remains", async () => {
     const { pg, dir, connectionString } = await spinUp();
@@ -151,6 +175,61 @@ describe("SPA-11886 wake-loop guard index migration", { timeout: 120_000 }, () =
       await sql.end();
       await pg.stop();
       await fs.rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  // Card oracle (d): EXPLAIN ANALYZE on BOTH the dedup probe AND the
+  // hourly-cap probe, with before/after timings. This test runs the same
+  // pair of probes in two scenarios — once with only the pre-existing
+  // payload-issue index (apply through 9284) and once with both indexes
+  // (apply through 9285) — and asserts: (i) neither probe regresses to a
+  // Seq Scan, (ii) the planner picks one of the two agent_wakeup_requests
+  // indexes, (iii) execution timings are reported for both probes.
+  it("EXPLAIN ANALYZE before/after 9285: dedup + hourly-cap probes stay on Index Scan and timings are reported", async () => {
+    const portA = 25432 + Math.floor(Math.random() * 1000);
+    const portB = portA + 1;
+    // Two scenarios: BEFORE 9285 (only the pre-existing payload-issue index)
+    // and AFTER 9285 (both indexes co-resident). throughLast=null means
+    // apply all migrations including 9285.
+    const scenarios: Array<{ name: string; port: number; throughLast: string | null }> = [
+      { name: "before-9285 (payload-issue index only)", port: portA, throughLast: "9284_heartbeat_context_snapshot_id_columns.sql" },
+      { name: "after-9285 (both indexes co-resident)", port: portB, throughLast: null },
+    ];
+    const reports: Array<{ name: string; dedup: { index: string; ms: number }; hourly: { index: string; ms: number } }> = [];
+    for (const sc of scenarios) {
+      const { pg, dir, connectionString } = await spinUp(sc.port);
+      const sql = postgres(connectionString);
+      try {
+        await applyMigrations(sql, sc.throughLast);
+        await populateFixtures(sql, 5000);
+        const { dedup, hourly } = await runProbePair(sql);
+        const extractIndex = (plan: string): string => {
+          const m = plan.match(/Index Scan using (agent_wakeup_requests_\w+)/);
+          return m ? m[1] : "NONE";
+        };
+        expect(dedup.planText, `[${sc.name}] dedup must not Seq Scan`).not.toMatch(/Seq Scan on agent_wakeup_requests/);
+        expect(hourly.planText, `[${sc.name}] hourly must not Seq Scan`).not.toMatch(/Seq Scan on agent_wakeup_requests/);
+        expect(dedup.planText, `[${sc.name}] dedup must use one of the two indexes`).toMatch(/Index Scan using agent_wakeup_requests_(company_payload_issue_idx|company_agent_issue_created_idx)/);
+        expect(hourly.planText, `[${sc.name}] hourly must use one of the two indexes`).toMatch(/Index Scan using agent_wakeup_requests_(company_payload_issue_idx|company_agent_issue_created_idx)/);
+        reports.push({
+          name: sc.name,
+          dedup: { index: extractIndex(dedup.planText), ms: dedup.executionMs },
+          hourly: { index: extractIndex(hourly.planText), ms: hourly.executionMs },
+        });
+        // Print timings so the verifier's run log captures them verbatim
+        // (the card spec asks for before/after timings pasted).
+        console.log(`SPA-11886 EXPLAIN ${sc.name}: dedup index=${extractIndex(dedup.planText)} exec=${dedup.executionMs}ms; hourly index=${extractIndex(hourly.planText)} exec=${hourly.executionMs}ms`);
+      } finally {
+        await sql.end();
+        await pg.stop();
+        await fs.rm(dir, { recursive: true, force: true });
+      }
+    }
+    // Sanity: both probes reported a measured execution time (not NaN from
+    // a missing EXPLAIN ANALYZE summary).
+    for (const r of reports) {
+      ok(Number.isFinite(r.dedup.ms), `dedup ms reported: ${JSON.stringify(r)}`);
+      ok(Number.isFinite(r.hourly.ms), `hourly ms reported: ${JSON.stringify(r)}`);
     }
   });
 });
