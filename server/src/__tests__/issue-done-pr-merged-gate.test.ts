@@ -11,8 +11,10 @@ import {
   createDb,
   heartbeatRuns,
   issueComments,
+  executionWorkspaces,
   issueWorkProducts,
   issues,
+  projects,
 } from "@paperclipai/db";
 import {
   getEmbeddedPostgresTestSupport,
@@ -97,6 +99,31 @@ async function attachPullRequestWorkProduct(
   });
 }
 
+async function seedExecutionWorkspace(
+  db: ReturnType<typeof createDb>,
+  companyId: string,
+  card: { id: string },
+  repoUrl: string,
+  branchName: string,
+) {
+  const project = await db
+    .insert(projects)
+    .values({ companyId, name: `Project ${randomUUID()}`, status: "in_progress" })
+    .returning()
+    .then((rows) => rows[0]!);
+  await db.insert(executionWorkspaces).values({
+    companyId,
+    projectId: project.id,
+    mode: "isolated_workspace",
+    strategyType: "git_worktree",
+    name: `workspace ${randomUUID()}`,
+    status: "active",
+    sourceIssueId: card.id,
+    repoUrl,
+    branchName,
+  });
+}
+
 describeEmbeddedPostgres("issue done gate — unmerged PR refuses done (SPA-8957)", () => {
   let db!: ReturnType<typeof createDb>;
   let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
@@ -121,6 +148,8 @@ describeEmbeddedPostgres("issue done gate — unmerged PR refuses done (SPA-8957
     await db.delete(issueComments);
     await db.delete(issueWorkProducts);
     await db.delete(activityLog);
+    await db.delete(executionWorkspaces);
+    await db.delete(projects);
     await db.delete(issues);
   });
 
@@ -411,6 +440,169 @@ describeEmbeddedPostgres("issue done gate — unmerged PR refuses done (SPA-8957
     expect(decision).toMatchObject({ outcome: "refuse" });
     const refused = (decision as { reason: { pullRequests: { state: string }[] } }).reason.pullRequests;
     expect(refused.every((entry) => entry.state !== "unknown" || false)).toBe(true);
+  });
+
+  // SPA-9981: historical/foreign PR citations wedge a card even after its
+  // actual deliverable PR merged. The fix classifies prose-derived refs using
+  // the resolved PR's headRef against (1) the issue's execution-workspace
+  // branches and (2) the issue's identifier. These tests pin the classifier.
+  it("SPA-9981: prose PR on the card's workspace branch, open, still refuses done", async () => {
+    const card = await createCard(db, companyId, { identifier: "SPA-9808", assigneeAgentId: agentId });
+    await seedExecutionWorkspace(db, companyId, card, "https://github.com/Spark-Mojo/paperclip", "docs/SPA-9808");
+    await issueService(db).addComment(card.id, "PR: https://github.com/Spark-Mojo/paperclip/pull/1029", {});
+    const gate = issueDoneGateService(db, {
+      resolvePullRequestDetails: async () => ({ ...details("open", "open"), headRef: "docs/SPA-9808" }),
+    });
+    const decision = await gate.evaluateDoneGate({ id: card.id, companyId, identifier: "SPA-9808" });
+    expect(decision).toMatchObject({
+      outcome: "refuse",
+      reason: {
+        kind: "open_pull_requests",
+        pullRequests: [expect.objectContaining({ state: "open", reference: expect.objectContaining({ number: 1029 }) })],
+      },
+    });
+  });
+
+  it("SPA-9981: card-lane prose PR with no merged sibling still refuses (SPA-9038 preserved)", async () => {
+    const card = await createCard(db, companyId, { identifier: "SPA-9036", assigneeAgentId: agentId });
+    await issueService(db).addComment(card.id, "PR up: https://github.com/Spark-Mojo/paperclip/pull/1140", {});
+    const gate = issueDoneGateService(db, {
+      resolvePullRequestDetails: async () => ({ ...details("open", "open"), headRef: "juno/SPA-9036-fix" }),
+    });
+    expect(await gate.evaluateDoneGate({ id: card.id, companyId, identifier: "SPA-9036" })).toMatchObject({
+      outcome: "refuse",
+      reason: { kind: "open_pull_requests" },
+    });
+  });
+
+  it("SPA-9981: foreign open PR cited as evidence never binds (SPA-10557 shape)", async () => {
+    const card = await createCard(db, companyId, { identifier: "SPA-10557", assigneeAgentId: agentId });
+    await seedExecutionWorkspace(db, companyId, card, "https://github.com/Spark-Mojo/spark-mojo-platform", "sparkmojo-scheduling/SPA-10557");
+    await issueService(db).addComment(card.id, "Deliverable: https://github.com/Spark-Mojo/spark-mojo-platform/pull/1412", {});
+    await issueService(db).addComment(card.id, "Evidence: https://github.com/Spark-Mojo/spark-mojo-platform/pull/1394", {});
+    let calls = 0;
+    const gate = issueDoneGateService(db, {
+      resolvePullRequestDetails: async (_companyId, reference) => {
+        calls += 1;
+        return reference.number === 1412
+          ? { ...details("merged"), headRef: "sparkmojo-scheduling/SPA-10557" }
+          : { ...details("open", "open"), headRef: "dex/spa-10485-actionlint-cap" };
+      },
+    });
+    expect(await gate.evaluateDoneGate({ id: card.id, companyId, identifier: "SPA-10557" })).toEqual({ outcome: "allow" });
+    expect(calls).toBe(2);
+  });
+
+  it("SPA-9981: abandoned prior card-lane attempt stops binding once replacement merged (SPA-9808 shape)", async () => {
+    const card = await createCard(db, companyId, { identifier: "SPA-9808", assigneeAgentId: agentId });
+    await issueService(db).addComment(card.id, "First attempt: https://github.com/Spark-Mojo/sparkmojo-internal/pull/1011", {});
+    await issueService(db).addComment(card.id, "Replacement: https://github.com/Spark-Mojo/sparkmojo-internal/pull/1029", {});
+    const gate = issueDoneGateService(db, {
+      resolvePullRequestDetails: async (_companyId, reference) =>
+        reference.number === 1011
+          ? { ...details("open", "open"), headRef: "ty/SPA-9808-verifier-order" }
+          : { ...details("merged"), headRef: "ty/SPA-9808-sigorder-v2" },
+    });
+    expect(await gate.evaluateDoneGate({ id: card.id, companyId, identifier: "SPA-9808" })).toEqual({ outcome: "allow" });
+  });
+
+  it("SPA-9981: unresolvable headRef stays fail-closed beside a merged sibling", async () => {
+    const card = await createCard(db, companyId, { identifier: "SPA-9808", assigneeAgentId: agentId });
+    await issueService(db).addComment(card.id, "First attempt: https://github.com/Spark-Mojo/sparkmojo-internal/pull/1011", {});
+    await issueService(db).addComment(card.id, "Replacement: https://github.com/Spark-Mojo/sparkmojo-internal/pull/1029", {});
+    const gate = issueDoneGateService(db, {
+      resolvePullRequestDetails: async (_companyId, reference) =>
+        reference.number === 1011
+          ? { ...details("unknown"), headRef: null }
+          : { ...details("merged"), headRef: "ty/SPA-9808-sigorder-v2" },
+    });
+    expect(await gate.evaluateDoneGate({ id: card.id, companyId, identifier: "SPA-9808" })).toMatchObject({
+      outcome: "refuse",
+      reason: { kind: "unknown_pull_request_state" },
+    });
+  });
+
+  it("SPA-9981: an open pull_request work product still refuses beside a merged card-lane prose sibling", async () => {
+    const card = await createCard(db, companyId, { identifier: "SPA-9808", assigneeAgentId: agentId });
+    await attachPullRequestWorkProduct(db, card, 4242);
+    await issueService(db).addComment(card.id, "Merged: https://github.com/Spark-Mojo/sparkmojo-internal/pull/1029", {});
+    const gate = issueDoneGateService(db, {
+      resolvePullRequestDetails: async (_companyId, reference) =>
+        reference.number === 4242
+          ? details("open", "open")
+          : { ...details("merged"), headRef: "ty/SPA-9808-sigorder-v2" },
+    });
+    expect(await gate.evaluateDoneGate({ id: card.id, companyId, identifier: "SPA-9808" })).toMatchObject({
+      outcome: "refuse",
+      reason: {
+        kind: "open_pull_requests",
+        pullRequests: [expect.objectContaining({ reference: expect.objectContaining({ number: 4242 }) })],
+      },
+    });
+  });
+
+  it("SPA-9981: muted foreign refs are absent from the refusal payload", async () => {
+    const card = await createCard(db, companyId, { identifier: "SPA-9808", assigneeAgentId: agentId });
+    await issueService(db).addComment(card.id, "Attempt: https://github.com/Spark-Mojo/sparkmojo-internal/pull/1011", {});
+    await issueService(db).addComment(card.id, "Evidence: https://github.com/Spark-Mojo/sparkmojo-internal/pull/1394", {});
+    const gate = issueDoneGateService(db, {
+      resolvePullRequestDetails: async (_companyId, reference) =>
+        reference.number === 1011
+          ? { ...details("open", "open"), headRef: "ty/SPA-9808-verifier-order" }
+          : { ...details("open", "open"), headRef: "dex/spa-10485-actionlint-cap" },
+    });
+    const decision = await gate.evaluateDoneGate({ id: card.id, companyId, identifier: "SPA-9808" });
+    expect(decision).toMatchObject({ outcome: "refuse", reason: { kind: "open_pull_requests" } });
+    const refused = (decision as { reason: { pullRequests: { reference: { number: number } }[] } }).reason.pullRequests;
+    expect(refused).toHaveLength(1);
+    expect(refused[0]!.reference.number).toBe(1011);
+  });
+
+  it("SPA-9981: an open workspace-deliverable PR is NOT superseded by a merged sibling in the same repo", async () => {    // The current deliverable (headRef === the card's workspace branch) binds
+    // until IT merges — a merged product or card-lane sibling in the same repo
+    // does not retire it. Muting here would close the card with its actual
+    // deliverable unmerged.
+    const card = await createCard(db, companyId, { identifier: "SPA-9808", assigneeAgentId: agentId });
+    await seedExecutionWorkspace(db, companyId, card, "https://github.com/Spark-Mojo/paperclip", "docs/SPA-9808");
+    await attachPullRequestWorkProduct(db, card, 1029);
+    await issueService(db).addComment(card.id, "Current: https://github.com/Spark-Mojo/paperclip/pull/1011", {});
+    const gate = issueDoneGateService(db, {
+      resolvePullRequestDetails: async (_companyId, reference) =>
+        reference.number === 1011
+          ? { ...details("open", "open"), headRef: "docs/SPA-9808" }
+          : { ...details("merged"), headRef: "ty/SPA-9808-sigorder-v2" },
+    });
+    const decision = await gate.evaluateDoneGate({ id: card.id, companyId, identifier: "SPA-9808" });
+    expect(decision).toMatchObject({ outcome: "refuse", reason: { kind: "open_pull_requests" } });
+    const refused = (decision as { reason: { pullRequests: { reference: { number: number } }[] } }).reason.pullRequests;
+    expect(refused).toHaveLength(1);
+    expect(refused[0]!.reference.number).toBe(1011);
+  });
+
+  it("SPA-9981: identifier match is token-delimited — a digit-prefix sibling card is foreign", async () => {
+    // SPA-9808 must NOT classify a `spa-98081-hotfix` branch (a different
+    // card whose identifier merely shares the digit prefix) as its lane:
+    // that PR is foreign and does not bind. The control side: a branch
+    // carrying the exact delimited token still binds.
+    const card = await createCard(db, companyId, { identifier: "SPA-9808", assigneeAgentId: agentId });
+    await issueService(db).addComment(card.id, "Other card's PR: https://github.com/Spark-Mojo/sparkmojo-internal/pull/1394", {});
+    const gate = issueDoneGateService(db, {
+      resolvePullRequestDetails: async (_companyId, reference) =>
+        reference.number === 1394
+          ? { ...details("open", "open"), headRef: "spa-98081-hotfix" }
+          : { ...details("open", "open"), headRef: "ty/SPA-9808-verifier-order" },
+    });
+    // The digit-prefix branch alone: foreign, muted, nothing else binds.
+    const onlyPrefix = await gate.evaluateDoneGate({ id: card.id, companyId, identifier: "SPA-9808" });
+    expect(onlyPrefix).toEqual({ outcome: "allow" });
+
+    // Control: the same card also cites a delimited-token branch — it binds.
+    await issueService(db).addComment(card.id, "Mine: https://github.com/Spark-Mojo/sparkmojo-internal/pull/1011", {});
+    const withControl = await gate.evaluateDoneGate({ id: card.id, companyId, identifier: "SPA-9808" });
+    expect(withControl).toMatchObject({ outcome: "refuse", reason: { kind: "open_pull_requests" } });
+    const refusedCtl = (withControl as { reason: { pullRequests: { reference: { number: number } }[] } }).reason.pullRequests;
+    expect(refusedCtl).toHaveLength(1);
+    expect(refusedCtl[0]!.reference.number).toBe(1011);
   });
 
   it("a deleted comment's PR link does not bind", async () => {
