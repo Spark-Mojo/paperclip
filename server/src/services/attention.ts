@@ -1680,10 +1680,16 @@ export function attentionService(db: Db, serviceOptions: AttentionServiceOptions
             .select({
               agentId: heartbeatRuns.agentId,
               createdAt: heartbeatRuns.createdAt,
-              // Project just the ids readRunIssueId needs; pulling the whole
-              // context_snapshot detoasts megabytes per feed build.
-              runIssueId: sql<string | null>`${heartbeatRuns.contextSnapshot} ->> 'issueId'`,
-              runTaskId: sql<string | null>`${heartbeatRuns.contextSnapshot} ->> 'taskId'`,
+              // SPA-11865 — project the two ids from STORED generated columns
+              // (added by migration 9284) so the planner can answer the call
+              // with the new covering btree index-only scan instead of
+              // dereferencing the 70 KB JSONB TOAST per row. Pulling the
+              // raw context_snapshot() entries here de-TOASTed 2.6 GB on the
+              // saturated root SSD and stalled the board API for 3-4
+              // minutes per call. readRunIssueId looks at issueId first
+              // and falls back to taskId, so we project both.
+              runIssueId: heartbeatRuns.contextIssueId,
+              runTaskId: heartbeatRuns.contextTaskId,
             })
             .from(heartbeatRuns)
             .where(and(
