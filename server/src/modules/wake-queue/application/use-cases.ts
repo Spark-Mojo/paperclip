@@ -10,6 +10,7 @@ import {
   EXECUTION_REVIEW_PARTICIPANT_RECOVERY_RETRY_REASON,
   isConfigurationIncompleteFailedRun,
   isWorkspaceValidationFailedRun,
+  pickTerminalAt,
   readNonEmptyString,
 } from "../domain/values.js";
 import type {
@@ -376,8 +377,36 @@ async function promoteDeferredWake(
       finishingRunId: run.id,
       commentIds: workingCandidate.deferredCommentIds,
     });
+    // An external notification (a `pr-review-handoff` / `pr-merge-handoff`, a
+    // board comment, any `user` comment) that landed BEFORE the close cannot
+    // have been informed by it. Promoting it would reopen work the closing run
+    // already finished, which is what SPA-175 / SPA-10970 / SPA-11067 report
+    // and what turned SPA-10460 into a loop. Comments created after the close
+    // are still new information and keep the reopen. Scoped to the two
+    // external branches only: the resumeIntent clause below can legitimately
+    // carry a comment written in the same call as the status write, where
+    // `createdAt === completedAt`, and must never be suppressed.
+    const terminalAt = pickTerminalAt(currentIssue);
+    const preCloseExternalComment = await (async () => {
+      if (!terminalAt) return false;
+      if (workingCandidate.requestedByActorType !== "user"
+        && workingCandidate.wakeReason !== "issue_reopened_via_comment") return false;
+      const facts = await ports.transaction.getDeferredCommentCreatedAt({
+        companyId: run.companyId,
+        issueId: currentIssue.id,
+        commentIds: workingCandidate.deferredCommentIds,
+      });
+      // Fail closed: only a COMPLETE reading, every fact present and every one
+      // at or before the close, suppresses the reopen. A missing fact means the
+      // wake may carry work this guard cannot see, so the reopen stands.
+      if (facts.length === 0) return false;
+      if (facts.length !== new Set(workingCandidate.deferredCommentIds).size) return false;
+      return facts.every((fact) =>
+        fact.createdAt !== null && fact.createdAt.getTime() <= terminalAt.getTime());
+    })();
     shouldReopen =
       !selfAuthorship.allSelfAuthored &&
+      !preCloseExternalComment &&
       (workingCandidate.requestedByActorType === "user" ||
         workingCandidate.wakeReason === "issue_reopened_via_comment" ||
         (currentIssue.status === "done" &&

@@ -37,6 +37,9 @@ export type IssueSnapshot = {
   assigneeUserId: string | null;
   hiddenAt: Date | null;
   originKind: string | null;
+  /** When the issue entered its current terminal state, per `status`. */
+  completedAt: Date | null;
+  cancelledAt: Date | null;
   monitorNextCheckAt: Date | null;
   executionState: Record<string, unknown> | null;
   /** Carried so the routine-env and responsible-user reader ports can use this
