@@ -375,6 +375,7 @@ async function promoteDeferredWake(
       companyId: run.companyId,
       issueId: currentIssue.id,
       finishingRunId: run.id,
+      finishingRunAgentId: run.agentId,
       commentIds: workingCandidate.deferredCommentIds,
     });
     // An external notification (a `pr-review-handoff` / `pr-merge-handoff`, a
@@ -404,8 +405,20 @@ async function promoteDeferredWake(
       return facts.every((fact) =>
         fact.createdAt !== null && fact.createdAt.getTime() <= terminalAt.getTime());
     })();
+    // SPA-11805: the agent that just closed this task reporting its own closing
+    // receipt is not new input, and reopening on it is the second cycle of
+    // the SPA-10460 loop. `allSelfAuthored` cannot see that receipt — it is a
+    // SEPARATE call, so `createdByRunId` names a prior run of the same agent
+    // (the card's own note: do not assume #168 already covers this). The
+    // author-keyed fact does. Deliberately NOT scoped to
+    // `workingCandidate.agentId === run.agentId`: a finishing agent's own
+    // receipt is not a reason to restart that work, whoever the deferred
+    // wake happens to be aimed at. A wake carrying any comment that is NOT
+    // the finishing agent's own still reopens — a human follow-up is real
+    // information, and `preCloseExternalComment` remains #168's own guard.
     shouldReopen =
       !selfAuthorship.allSelfAuthored &&
+      !selfAuthorship.allAuthoredByFinishingRunAgent &&
       !preCloseExternalComment &&
       (workingCandidate.requestedByActorType === "user" ||
         workingCandidate.wakeReason === "issue_reopened_via_comment" ||
