@@ -1508,6 +1508,31 @@ async function startServerWithDatabaseTeardown(
           );
         }
 
+        try {
+          // SPA-11948 R1: reaps `paperclip-agent-*.scope` units the previous
+          // engine left behind across a restart, so the cgroup the orphan
+          // reaper runs against no longer holds a cap slot. Order is
+          // load-bearing: must run AFTER hot-restart adoption (so adopted
+          // runs enter the owned set) and BEFORE the orphan reaper and any
+          // queued admission (so a foreign scope cannot hold a cap slot while
+          // queued work is admitted).
+          const staleScopes = await heartbeat.reconcileStaleRunScopes();
+          if (staleScopes.units.length > 0) {
+            logger.warn(
+              {
+                units: staleScopes.units,
+                detachedRunIds: staleScopes.detachedRunIds,
+              },
+              "startup stale agent run scope reconciliation reaped cgroups left across the restart",
+            );
+          }
+        } catch (err) {
+          logger.error(
+            { err },
+            "startup stale agent run scope reconciliation failed - retained scopes will be retried on the next boot",
+          );
+        }
+
         for (let attempt = 1; attempt <= 2; attempt++) {
           try {
             const result = await heartbeat.reapOrphanedRuns();

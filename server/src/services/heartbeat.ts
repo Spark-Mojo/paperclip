@@ -260,6 +260,16 @@ import {
   PROVIDER_TRACE_MAX_BYTES,
 } from "./provider-trace-store.js";
 import { getServerAdapter, runningProcesses } from "../adapters/index.js";
+import {
+  killRunScopeProcessTree,
+  listAgentRunScopeUnits,
+  listRunScopeGroupMembers,
+  readRunScopeProcessIdentity,
+  reconcileStaleRunScopes as reconcileAgentRunScopes,
+  stopRunScope,
+  type AgentRunScopeUnit,
+  type ReconcileStaleRunScopesResult,
+} from "@paperclipai/adapter-utils/run-resource-scope";
 import type {
   AdapterExecutionResult,
   AdapterInvocationMeta,
@@ -916,6 +926,10 @@ const PAPERCLIP_HARNESS_CHECKOUT_KEY = "paperclipHarnessCheckedOut";
 const PAPERCLIP_EXTERNAL_CHAT_EXECUTION_BOUND_KEY =
   "paperclipExternalChatExecutionBound";
 const DETACHED_PROCESS_ERROR_CODE = "process_detached";
+/** `true` for an integer pid / pgid that could name a real process. */
+function isLiveProcessId(value: number | null | undefined): value is number {
+  return typeof value === "number" && Number.isInteger(value) && value > 0;
+}
 const NATIVE_OWNERSHIP_UNVERIFIED_MESSAGE =
   "Native execution ownership could not be verified; automatic recovery is blocked";
 // The reaper sweeps at most this many pending_cleanup leases per tick.
@@ -9891,6 +9905,19 @@ export function heartbeatService(
   options: HeartbeatServiceOptions = {},
 ) {
   let shutdownInProgress = false;
+  // SPA-11948: the most recent hot-restart adoption report, captured so the
+  // boot sweep that runs immediately after (this engine's
+  // `reconcileStaleRunScopes`) can pass the adopted ids into the reaper's
+  // owned set without re-running the intent read or re-writing the report.
+  let lastHotRestartAdoption:
+    | {
+        adoptedRunIds: string[];
+        finalizedWhileDownRunIds: string[];
+        lostRunIds: string[];
+        skippedRunIds: string[];
+        mode: string;
+      }
+    | null = null;
   const instanceSettings = instanceSettingsService(db);
   const getCurrentUserRedactionOptions = async () => ({
     enabled: (await instanceSettings.getGeneral()).censorUsernameInLogs,
@@ -15465,6 +15492,17 @@ export function heartbeatService(
     });
     await removeHotRestartIntent(undefined, intent);
 
+    // SPA-11948: capture the report for the next boot step (stale-scope
+    // reconciliation), which needs the adopted ids to keep the reaper from
+    // killing work the previous engine handed off.
+    lastHotRestartAdoption = {
+      mode: "reported",
+      adoptedRunIds,
+      finalizedWhileDownRunIds,
+      lostRunIds,
+      skippedRunIds,
+    };
+
     logger.info(
       {
         previousServerPid: report.previousServerPid,
@@ -19378,6 +19416,157 @@ export function heartbeatService(
         ? { onReplacementDispatched: opts.onReplacementDispatched }
         : {}),
     });
+  }
+
+  /**
+   * SPA-11948. Reap the `paperclip-agent-*.scope` units a previous engine left
+   * behind across a restart, and durably move their run rows out of `running`.
+   *
+   * Order of operations at boot is load-bearing:
+   *   1. `recoverNativeRunsAfterRestart` — restores durable native state.
+   *   2. `reconcileHotRestartAdoption` — claims runs the previous engine
+   *      handed off, so the reaper must skip them.
+   *   3. `reconcileStaleRunScopes` (this method) — stops and kills the cgroups
+   *      the previous engine left behind, on units this one does NOT own.
+   *   4. `reapOrphanedRuns` — clears the `running` rows the reaper detached
+   *      above plus any other rows that lost their live process.
+   *   5. `resumeQueuedRuns` — only now may queued work be admitted, so a
+   *      foreign scope cannot hold a cap slot during admission.
+   *
+   * The unit -> run correlation, the ambiguity skip, the identity-mismatch
+   * refusal and the owned-set are owned by the adapter seam
+   * (`packages/adapter-utils/run-resource-scope`). This method only (a) projects
+   * the live run rows into the candidates the adapter expects, (b) feeds the
+   * live-registry + adopted ids into the owned set, and (c) durably
+   * transitions each detached run out of `running` with `process_detached` and
+   * a finishedAt so the next boot and the UI can both explain why it died.
+   *
+   * The optional `deps` argument exists so the boot-step regression test can
+   * inject deterministic seams without touching real systemd or `/proc`; in
+   * production `index.ts` calls this with no arguments and the production
+   * helpers from `@paperclipai/adapter-utils/run-resource-scope` are used.
+   */
+  async function reconcileStaleRunScopes(
+    deps?: Partial<{
+      listUnits: () => Promise<AgentRunScopeUnit[]>;
+      stopUnit: (unit: string) => Promise<void>;
+      killProcessTree: (pids: number[]) => void;
+      readProcessIdentity: (pid: number) => Promise<{ startedAt: string } | null>;
+      listGroupMembers: (pgid: number) => Promise<number[]>;
+    }>,
+    now: Date = new Date(),
+  ) {
+    // Only `running` rows are candidates. Queued runs are deliberately not
+    // enumerated: a queued run was never attached to a cgroup, and admitting
+    // a foreign `paperclip-agent-*.scope` whose only claim is a queued row
+    // would let the boot sweep race a future spawn.
+    const rows = await db
+      .select({
+        id: heartbeatRuns.id,
+        processPid: heartbeatRuns.processPid,
+        processGroupId: heartbeatRuns.processGroupId,
+        processStartedAt: heartbeatRuns.processStartedAt,
+      })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.status, "running"));
+
+    const adopted = (() => {
+      try {
+        // Hot-restart adoption runs immediately before this method, so any
+        // run that survived the previous engine must be passed in as owned.
+        // If adoption has not yet run, its report is empty and every running
+        // row is treated as foreign, which the reaper's ambiguity skip turns
+        // into a no-op for anything a future adoption will claim.
+        return lastHotRestartAdoption?.adoptedRunIds ?? [];
+      } catch {
+        return [];
+      }
+    })();
+
+    const candidates = rows
+      .filter((row) => isLiveProcessId(row.processPid) || isLiveProcessId(row.processGroupId))
+      .map((row) => ({
+        runId: row.id,
+        processPid: row.processPid,
+        processGroupId: row.processGroupId,
+        processStartedAt:
+          row.processStartedAt instanceof Date
+            ? row.processStartedAt.toISOString()
+            : null,
+      }));
+
+    // The live registry is what makes a child of THIS engine instance owned:
+    // hot-restart adoption covers the previous engine's survivors, and any
+    // child we ourselves forked enters the registry at spawn time.
+    const registryOwned = new Set<string>();
+    for (const [runId, entry] of runningProcesses.entries()) {
+      if (entry?.child?.pid !== undefined) registryOwned.add(runId);
+    }
+    const ownedRunIds = [...new Set([...adopted, ...registryOwned])];
+
+    let result: ReconcileStaleRunScopesResult;
+    try {
+      result = await reconcileAgentRunScopes({
+        runs: candidates,
+        ownedRunIds,
+        listUnits: deps?.listUnits ?? listAgentRunScopeUnits,
+        readProcessIdentity: deps?.readProcessIdentity ?? readRunScopeProcessIdentity,
+        listGroupMembers: deps?.listGroupMembers ?? listRunScopeGroupMembers,
+        stopUnit: deps?.stopUnit ?? stopRunScope,
+        killProcessTree: deps?.killProcessTree ?? killRunScopeProcessTree,
+      });
+    } catch (err) {
+      logger.warn(
+        { err },
+        "stale agent run scope reconciliation failed; periodic reaper will retry",
+      );
+      return { units: [] as string[], detachedRunIds: [] as string[] };
+    }
+
+    if (result.detachedRunIds.length > 0) {
+      const fromStatuses = ["running"];
+      await db.transaction(async (tx) => {
+        for (const runId of result.detachedRunIds) {
+          const written = await setRunStatusFromLive(
+            runId,
+            "interrupted",
+            fromStatuses,
+            {
+              error:
+                "Stale run scope reaped: previous engine left the process group alive across the restart and no live registry entry adopted it",
+              errorCode: DETACHED_PROCESS_ERROR_CODE,
+              finishedAt: now,
+              processPid: null,
+              processGroupId: null,
+              processStartedAt: null,
+            },
+          );
+          const run = written.run;
+          if (!written.updated || !run) continue;
+          await appendRunEvent(run, {
+            eventType: "lifecycle",
+            stream: "system",
+            level: "warn",
+            message: "Stale run scope reaped at startup",
+            payload: {
+              units: result.units,
+              previousProcessPid: candidates.find((candidate) => candidate.runId === run.id)?.processPid ?? null,
+              previousProcessGroupId:
+                candidates.find((candidate) => candidate.runId === run.id)?.processGroupId ?? null,
+            },
+          });
+        }
+      });
+    }
+
+    if (result.units.length > 0) {
+      logger.info(
+        { units: result.units, detachedRunIds: result.detachedRunIds },
+        "stale agent run scopes reaped at startup",
+      );
+    }
+
+    return result;
   }
 
   async function reapOrphanedRuns(opts?: { staleThresholdMs?: number }) {
@@ -30871,6 +31060,7 @@ export function heartbeatService(
 
     prepareHotRestartShutdown,
     reconcileHotRestartAdoption,
+    reconcileStaleRunScopes,
     recoverNativeRunsAfterRestart,
     reapOrphanedRuns,
     sweepPendingCleanupLeases,
