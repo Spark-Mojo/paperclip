@@ -11113,6 +11113,7 @@ export function issueService(db: Db) {
         const decision = await gate.evaluateDoneGate({
           id: existing.id,
           companyId: existing.companyId,
+          identifier: existing.identifier,
           // SPA-9038: the card's own description can carry binding PR links.
           description: typeof issueData.description === "string"
             ? issueData.description
