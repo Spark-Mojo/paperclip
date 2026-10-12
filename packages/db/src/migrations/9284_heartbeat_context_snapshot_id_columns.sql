@@ -1,0 +1,42 @@
+-- SPA-11865 — bound the failed-run attention feed's "newer runs" subquery.
+--
+-- The subquery in server/src/services/attention.ts:1671-1695 projects
+-- context_snapshot->>'issueId' and context_snapshot->>'taskId' against
+-- heartbeat_runs filtered by (company_id, agent_id in $failedAgentIds,
+-- created_at > $oldestFailedRunCreatedAt). The same filter shape was the
+-- target of three expression indexes (0209, 0210, 0211) but those indexes
+-- only satisfy the WHERE clause, not the projection — PG still visits the
+-- heap, dereferences the TOAST pointer, and de-compresses the full
+-- 70 KB JSONB for every row in the window. With 7-10 concurrent copies of
+-- this query against the 2.6 GB TOAST footprint (heartbeat_runs heap is
+-- 72 MB; total relation size is 2.7 GB), the IO pile on the saturated
+-- root SSD stalls the board API for 3-4 minutes per call.
+--
+-- Fix: project the two ids from new STORED generated columns that hold
+-- the same (->> 'key') values, plus a covering btree that includes those
+-- columns via INCLUDE. The planner then answers the call with an
+-- index-only scan (zero heap visit, zero TOAST dereference).
+--
+-- STORED ADD COLUMN rewrites the table (PG 17, ACCESS EXCLUSIVE +
+-- full-table rewrite of 2.7 GB). The rewrite is unavoidable in this PG
+-- version — STORED is the only mode that supports INCLUDE on the
+-- expression result. The rewrite happens once at migration time.
+--
+-- paperclip:migration-safety-ignore full-table-mutation-large-table: ADD
+-- COLUMN ... GENERATED ALWAYS AS (...) STORED has no WHERE clause — it's
+-- the Postgres-native definition of "rewrite the entire relation to add
+-- the stored expression". PG 17 cannot add a STORED generated column
+-- without rewriting the heap; the rewrite is the cost of fixing the stall.
+-- We accept the one-time 2.7 GB rewrite during a quiet window. SPA-9282's
+-- audit/block trigger pair is still active and has held terminal-row
+-- rewrites byte-stable since 2026-09-30.
+--
+-- paperclip:migration-safety-ignore large-create-index-not-concurrently:
+-- Drizzle migrations run transactionally, so CONCURRENTLY is unavailable
+-- here. The CREATE INDEX is the second half of the bound (the covering
+-- columns are INCLUDEd so the planner picks index-only scan); both halves
+-- must land in the same migration or the table is briefly in an
+-- asymmetric state.
+ALTER TABLE "heartbeat_runs" ADD COLUMN IF NOT EXISTS "context_issue_id" text GENERATED ALWAYS AS (context_snapshot->>'issueId') STORED;--> statement-breakpoint
+ALTER TABLE "heartbeat_runs" ADD COLUMN IF NOT EXISTS "context_task_id" text GENERATED ALWAYS AS (context_snapshot->>'taskId') STORED;--> statement-breakpoint
+CREATE INDEX IF NOT EXISTS "heartbeat_runs_company_agent_created_ctx_ids_idx" ON "heartbeat_runs" USING btree ("company_id", "agent_id", "created_at") INCLUDE ("context_issue_id", "context_task_id");
