@@ -217,6 +217,99 @@ d("SPA-11865 heartbeat context_snapshot id columns migration", () => {
     ]);
   }, 240_000);
 
+  it("EXPLAIN ANALYZE of the failed-run attention feed's exact query shows the new covering btree with Heap Fetches: 0", async () => {
+    const dbh = await startEmbeddedPostgresTestDatabase("pap11865-explain-buffers-");
+    cleanups.push(() => dbh.cleanup());
+    const sql = postgres(dbh.connectionString, { max: 1 });
+    cleanups.push(async () => { await sql.end(); });
+
+    const companyId = "00000000-0000-0000-0000-0000000000c1";
+    const c1Agent = "00000000-0000-0000-0000-0000000000c2";
+    const c1Agent2 = "00000000-0000-0000-0000-0000000000c3";
+    await sql`INSERT INTO companies (id, name, issue_prefix) VALUES (${companyId}::uuid, 'SPA-11865', 'SP65')`;
+    await sql`INSERT INTO agents (id, company_id, name, role, adapter_type) VALUES (${c1Agent}::uuid, ${companyId}::uuid, 'SPA-11865 A', 'engineer', 'process')`;
+    await sql`INSERT INTO agents (id, company_id, name, role, adapter_type) VALUES (${c1Agent2}::uuid, ${companyId}::uuid, 'SPA-11865 B', 'engineer', 'process')`;
+
+    const bigSnapshot = (issueId: string) => ({
+      issueId,
+      taskId: `task-${issueId}`,
+      payload: Array.from({ length: 1200 }, (_, i) => `x-${i}-${"filler-filler-filler-filler-filler"}`).join("|"),
+    });
+
+    // Seed a few rows so the planner has data to cost. We do NOT need to
+    // reproduce production volume here: production volume exists so the
+    // planner sees the heap-touch cost. We isolate that path below by
+    // disabling bitmap and seq plans, which forces the planner to choose
+    // between heap-touching index plans and the only no-heap option, our
+    // covering index. Any index that can serve the projection without a
+    // heap visit wins — and our new btree is the ONLY one whose leaf
+    // pages carry context_issue_id/context_task_id as INCLUDE cols.
+    const noiseAgents = Array.from({ length: 18 }, (_, i) =>
+      `00000000-0000-0000-0000-0000000000${(i + 10).toString(16).padStart(2, "0")}`,
+    );
+    for (const agentId of noiseAgents) {
+      await sql`INSERT INTO agents (id, company_id, name, role, adapter_type) VALUES (${agentId}::uuid, ${companyId}::uuid, ${`N-${agentId.slice(-4)}`}, 'engineer', 'process')`;
+    }
+    const allAgents = [c1Agent, c1Agent2, ...noiseAgents];
+    for (let i = 0; i < 500; i += 1) {
+      const agent = allAgents[i % allAgents.length];
+      const ageMinutes = (i % 90) + 1;
+      const status = i % 3 === 0 ? "running" : (i % 3 === 1 ? "queued" : "failed");
+      await sql`
+        INSERT INTO heartbeat_runs (
+          id, company_id, agent_id, status, context_snapshot, created_at, updated_at
+        ) VALUES (
+          ${crypto.randomUUID()}::uuid, ${companyId}::uuid, ${agent}::uuid, ${status},
+          ${sql.json(bigSnapshot(`run-${i}`))}::jsonb,
+          NOW() - (${ageMinutes}::int * INTERVAL '1 minute'),
+          NOW()
+        )
+      `;
+    }
+
+    // Force stats so the planner has real cost data.
+    await sql.unsafe("ANALYZE heartbeat_runs");
+    // After ANALYZE, run a sentinel VACUUM so the visibility map marks our
+    // freshly-inserted rows as all-visible. Without this, IOScan cannot
+    // answer without re-checking the heap (PG refuses IOScan unless the
+    // visibility map says the heap pages are all-visible). On a real
+    // cluster the autovacuum daemon does this; here we trigger it
+    // explicitly because embedded PG has no autovacuum worker.
+    await sql.unsafe("VACUUM heartbeat_runs");
+    // Planner isolation: disable bitmap scans and seq scans so the planner
+    // must choose between heap-touching index plans and the only no-heap
+    // option — our covering index. We are NOT pinning the new index: any
+    // index that can serve the projection without a heap visit wins, and
+    // our index is the only btree whose leaf pages carry
+    // context_issue_id/context_task_id as INCLUDE columns.
+    await sql.unsafe("SET enable_bitmapscan = off");
+    await sql.unsafe("SET enable_seqscan = off");
+    // The failed-run feed's exact query, with the projection from the new
+    // covering btree. EXPLAIN ANALYZE BUFFERS gives us Heap Fetches on
+    // Index Only Scan plans — that is the field that proves IOScan
+    // answered the projection without a heap visit.
+    const planRows = await sql.unsafe(
+      `EXPLAIN (ANALYZE, BUFFERS)
+       SELECT agent_id, created_at, context_issue_id, context_task_id
+       FROM heartbeat_runs
+       WHERE company_id = $1 AND agent_id IN ($2, $3) AND created_at > NOW() - INTERVAL '60 minutes'`,
+      [companyId, c1Agent, c1Agent2],
+    );
+    const planText = (planRows as Array<Record<string, unknown>>)
+      .map((row) => Object.values(row)[0])
+      .join("\n");
+
+    // The covering btree is the only index that can serve this projection
+    // without a heap visit. Either the planner picks it (Index Only Scan,
+    // Heap Fetches: 0), or it picks a smaller index (Heap Fetches > 0),
+    // which would re-trigger the de-TOAST the fix is built to eliminate.
+    // We assert the WIN: Index Only Scan on the new btree, Heap Fetches: 0.
+    expect(planText).toContain(SPA_11865_INDEX_NAME);
+    expect(planText).toMatch(/Index Only Scan/);
+    // Heap Fetches: N where N > 0 — fail closed on any non-zero count.
+    expect(planText).not.toMatch(/Heap Fetches:\s*[1-9]\d*/);
+  }, 240_000);
+
   it("declares the generated columns in the drizzle schema with the same GENERATED expression", async () => {
     const schema = await readFile(SCHEMA_PATH, "utf8");
     expect(schema).toContain(`text("${SPA_11865_ISSUE_ID_COL}")`);
