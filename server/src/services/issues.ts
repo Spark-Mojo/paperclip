@@ -193,6 +193,11 @@ import {
 import { buildIssueChanges } from "./issue-change-receipt.js";
 import { projectSafeChatPublication } from "./chat-publication-projection.js";
 import { issueThreadInteractionAttentionAgentAllowed } from "./issue-thread-interaction-resolution.js";
+import {
+  buildIssueBlockersResolvedWakeStateKey,
+  findExistingIssueBlockersResolvedWakeForReadyState,
+  ISSUE_BLOCKERS_RESOLVED_WAKE_REASON,
+} from "./issue-dependency-wakeups.js";
 
 const ALL_ISSUE_STATUSES = [
   "backlog",
@@ -11619,6 +11624,190 @@ export function issueService(db: Db) {
             },
           });
           activityPublications.push(publication);
+        }
+        // SPA-11863 (James ruling 2026-09-14 on SPA-7212) — auto-drop
+        // first-class `blocks` edges when the blocker reaches `cancelled`.
+        // The cancelled half was operator-served in the old shape; the
+        // ruling makes the cancelled half self-serving on the read model.
+        // We drop the edge here, log it (blocker + dependent + actor), and
+        // queue exactly one `issue_blockers_resolved` wake per ready
+        // dependent. No drop on any non-terminal state, no drop of a
+        // `done` edge, never cross `company_id`; if we cannot prove
+        // `cancelled` at drop time we retain the edge. The woken dependent
+        // reaches a runnable state without a human PATCH: the existing
+        // auto-unblock backstop flips `blocked` -> `todo` once readiness
+        // is clean, and the wake fires here so the assignee's queue moves
+        // immediately. Only the dependents this cancellation actually
+        // gated get a wake; level-triggered idempotency dedups across
+        // a second transition for the same ready state.
+        //
+        // The drop loop keeps the edge for non-`blocked` dependents
+        // (already `in_progress`, `todo`, etc. — the audit trail stays);
+        // the wake only fires for `blocked` dependents with an agent
+        // assignee. Human-owned or conversation-container dependents
+        // get the drop + log row but no wake (no agent queue to land on).
+        if (
+          existing.status !== "cancelled" &&
+          updated.status === "cancelled"
+        ) {
+          const dropNow = new Date();
+          // Walk every `blocks` edge whose head is the just-cancelled
+          // issue and whose tail is a same-company dependent currently
+          // `blocked`. The same-company predicate on `issues` is the
+          // cross-company fence; the relation's `companyId` may have been
+          // seeded by an out-of-band writer that crossed boundaries, and
+          // we must not auto-drop a cross-company edge.
+          const dependentRows = await tx
+            .select({
+              dependentId: issueRelations.relatedIssueId,
+              dependentAssigneeAgentId: issues.assigneeAgentId,
+              dependentAssigneeUserId: issues.assigneeUserId,
+              dependentConversationAgentId: issues.conversationAgentId,
+              dependentBlockedTransitionAt: issues.blockedTransitionAt,
+              dependentCompanyId: issues.companyId,
+            })
+            .from(issueRelations)
+            .innerJoin(
+              issues,
+              eq(issueRelations.relatedIssueId, issues.id),
+            )
+            .where(
+              and(
+                eq(issueRelations.companyId, updated.companyId),
+                eq(issueRelations.type, "blocks"),
+                eq(issueRelations.issueId, updated.id),
+                eq(issues.companyId, updated.companyId),
+                eq(issues.status, "blocked"),
+              ),
+            );
+          for (const dependent of dependentRows) {
+            // Drop the edge atomically with the cancellation. The
+            // same-company predicate is redundant after the SELECT but
+            // is the read-side safety belt if the dependent row's
+            // companyId were rewritten between the SELECT and the DELETE.
+            const deleted = await tx
+              .delete(issueRelations)
+              .where(
+                and(
+                  eq(issueRelations.companyId, updated.companyId),
+                  eq(issueRelations.type, "blocks"),
+                  eq(issueRelations.issueId, updated.id),
+                  eq(issueRelations.relatedIssueId, dependent.dependentId),
+                ),
+              )
+              .returning({ issueId: issueRelations.issueId });
+            if (deleted.length === 0) {
+              // Lost the race (e.g., another caller dropped the same
+              // edge between our candidate read and the delete).
+              // Retain; do not log or wake.
+              continue;
+            }
+            await logActivity(tx as unknown as Db, {
+              companyId: updated.companyId,
+              actorType: actorAgentId
+                ? "agent"
+                : actorUserId
+                  ? "user"
+                  : "system",
+              actorId:
+                actorAgentId ?? actorUserId ?? "issue_service",
+              agentId: actorAgentId ?? null,
+              action: "issue.blocker_edge_auto_dropped",
+              entityType: "issue",
+              entityId: updated.id,
+              details: {
+                blockerIssueId: updated.id,
+                blockerIdentifier: updated.identifier ?? null,
+                blockerTitle: updated.title ?? null,
+                dependentIssueId: dependent.dependentId,
+                blockerStatusAtDrop: "cancelled",
+                droppedAt: dropNow.toISOString(),
+                // Source is a protocol discriminator, not a credential.
+                // The sanitizer's JWT-shape heuristic would otherwise
+                // blank it (three dotted segments); a hyphenated /
+                // snake_case token falls outside the heuristic.
+                source: "issue-cancelled-blocker-auto-drop",
+                requestedByActorType: actorAgentId
+                  ? "agent"
+                  : actorUserId
+                    ? "user"
+                    : "system",
+                requestedByActorId:
+                  actorAgentId ?? actorUserId ?? null,
+              },
+            });
+            // Recompute the dependent's readiness NOW (post-drop, still
+            // inside the same tx so the join reads the new reality).
+            // Only wake if the dependent is genuinely ready and owned
+            // by an agent (the agent queue is the surface that turns
+            // readiness into motion).
+            const postReadiness = await listIssueDependencyReadinessMap(
+              tx,
+              dependent.dependentCompanyId,
+              [dependent.dependentId],
+            );
+            const state = postReadiness.get(dependent.dependentId);
+            if (!state || !state.isDependencyReady) {
+              // Other blockers are still gating this dependent. The
+              // drop is committed and the log row is written; there
+              // is no ready-dependent-to-wake for this edge.
+              continue;
+            }
+            const assigneeAgentId =
+              dependent.dependentAssigneeAgentId ?? null;
+            if (
+              !assigneeAgentId ||
+              dependent.dependentAssigneeUserId ||
+              dependent.dependentConversationAgentId
+            ) {
+              // Human-owned or conversation-container dependents get
+              // the drop + log row but no wake (no agent queue).
+              continue;
+            }
+            const wakeIdempotencyKey =
+              buildIssueBlockersResolvedWakeStateKey({
+                dependentIssueId: dependent.dependentId,
+                blockerIssueIds: state.blockerIssueIds,
+                blockedTransitionAt:
+                  dependent.dependentBlockedTransitionAt ?? null,
+              });
+            const existingWake =
+              await findExistingIssueBlockersResolvedWakeForReadyState(
+                tx,
+                {
+                  companyId: dependent.dependentCompanyId,
+                  dependentIssueId: dependent.dependentId,
+                  blockerIssueIds: state.blockerIssueIds,
+                  blockedTransitionAt:
+                    dependent.dependentBlockedTransitionAt ?? null,
+                },
+              );
+            if (existingWake) {
+              continue;
+            }
+            await tx.insert(agentWakeupRequests).values({
+              companyId: dependent.dependentCompanyId,
+              agentId: assigneeAgentId,
+              source: "automation",
+              triggerDetail: "system",
+              status: "queued",
+              reason: ISSUE_BLOCKERS_RESOLVED_WAKE_REASON,
+              payload: {
+                issueId: dependent.dependentId,
+                resolvedBlockerIssueId: updated.id,
+                blockerIssueIds: state.blockerIssueIds,
+                source: "issue-cancelled-blocker-auto-drop",
+              },
+              idempotencyKey: wakeIdempotencyKey,
+              contextSnapshot: {
+                issueId: dependent.dependentId,
+                taskId: dependent.dependentId,
+                wakeReason: ISSUE_BLOCKERS_RESOLVED_WAKE_REASON,
+                resolvedBlockerIssueId: updated.id,
+                blockerIssueIds: state.blockerIssueIds,
+              },
+            });
+          }
         }
         return {
           ...enriched,
