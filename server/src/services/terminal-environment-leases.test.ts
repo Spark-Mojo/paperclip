@@ -353,6 +353,88 @@ describeEmbeddedPostgres("terminal environment leases (SPA-9423)", () => {
     expect(reclaimStatus[0]?.status).not.toBe("active");
   });
 
+  // SPA-11861 AC1 direct assertion: the card body's leak path is a run that
+  // ends `failed` with `errorCode = "execution_finalization_deadline_exceeded"`,
+  // and a run that is cancelled. Both must leave `released_at` set after the
+  // release path runs. The `LEASE-GATES: terminal-release` test above asserts
+  // lease `status`, not `released_at` directly — a lease transitioning through
+  // `pending_cleanup` or `failed` would also satisfy `not.toBe("active")`.
+  // This test pins the oracle's letter.
+  it("LEASE-GATES: direct-released-at-on-execution-finalization-deadline-and-cancelled", async () => {
+    const { companyId, agentId } = await seedCompanyAndAgent();
+    const heartbeat = heartbeatService(db);
+    const runtime = environmentRuntimeService(db);
+
+    // Case 1: a run that ends `failed` with `errorCode =
+    // "execution_finalization_deadline_exceeded"`. This is the exact terminal
+    // shape the SPA-11861 monitor observed (SPA-11657/SPA-11661/SPA-11635).
+    const execFinRunId = await seedRun({ companyId, agentId, status: "failed" });
+    await db
+      .update(heartbeatRuns)
+      .set({ errorCode: "execution_finalization_deadline_exceeded" })
+      .where(eq(heartbeatRuns.id, execFinRunId));
+    const execFinLease = await runtime.acquireRunLease({
+      companyId,
+      environment: await seedEnvironment({ companyId, driver: "local" }),
+      issueId: null,
+      heartbeatRunId: execFinRunId,
+      persistedExecutionWorkspace: null,
+    });
+    expect(execFinLease.lease.status).toBe("active");
+    expect(execFinLease.lease.releasedAt).toBeNull();
+
+    await heartbeat.releaseEnvironmentLeasesForRun({
+      runId: execFinRunId,
+      companyId,
+      agentId,
+      status: "failed",
+      failureReason: "execution_finalization_deadline_exceeded",
+    });
+
+    const execFinAfter = await db
+      .select({
+        status: environmentLeases.status,
+        releasedAt: environmentLeases.releasedAt,
+      })
+      .from(environmentLeases)
+      .where(eq(environmentLeases.id, execFinLease.lease.id));
+    expect(execFinAfter[0]?.status).not.toBe("active");
+    expect(execFinAfter[0]?.releasedAt).not.toBeNull();
+
+    // Case 2: a run that is cancelled. Mirror the same shape.
+    const cancelledRunId = await seedRun({
+      companyId,
+      agentId,
+      status: "cancelled",
+    });
+    const cancelledLease = await runtime.acquireRunLease({
+      companyId,
+      environment: await seedEnvironment({ companyId, driver: "local" }),
+      issueId: null,
+      heartbeatRunId: cancelledRunId,
+      persistedExecutionWorkspace: null,
+    });
+    expect(cancelledLease.lease.status).toBe("active");
+    expect(cancelledLease.lease.releasedAt).toBeNull();
+
+    await heartbeat.releaseEnvironmentLeasesForRun({
+      runId: cancelledRunId,
+      companyId,
+      agentId,
+      status: "cancelled",
+    });
+
+    const cancelledAfter = await db
+      .select({
+        status: environmentLeases.status,
+        releasedAt: environmentLeases.releasedAt,
+      })
+      .from(environmentLeases)
+      .where(eq(environmentLeases.id, cancelledLease.lease.id));
+    expect(cancelledAfter[0]?.status).not.toBe("active");
+    expect(cancelledAfter[0]?.releasedAt).not.toBeNull();
+  });
+
   it("LEASE-GATES: sweep-guards", async () => {
     const { companyId: companyA, agentId: agentA } = await seedCompanyAndAgent();
     const { companyId: companyB } = await seedCompanyAndAgent();
