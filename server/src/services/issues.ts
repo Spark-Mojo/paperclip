@@ -1,6 +1,7 @@
 import { documentService } from "./documents.js";
 import { parseTaskSearch, taskSearchCtes, taskSearchScore } from "./task-search.js";
 import { createdFromIssueCondition } from "./issue-creation-origin.js";
+import { isAwaitingInteractionResolution } from "./pending-interaction-hold.js";
 import { executionProjectionsForRuns } from "./execution-projection.js";
 import type { ExecutionProjection } from "@paperclipai/shared";
 import { Buffer } from "node:buffer";
@@ -11738,11 +11739,12 @@ export function issueService(db: Db) {
       checkoutRunId: string | null,
     ) => {
       const issueCompany = await db
-        .select({ companyId: issues.companyId })
+        .select({ companyId: issues.companyId, status: issues.status })
         .from(issues)
         .where(eq(issues.id, id))
         .then((rows) => rows[0] ?? null);
       if (!issueCompany) throw notFound("Issue not found");
+      const currentBlockedStatus = issueCompany.status === "blocked";
       await assertAssignableAgent(db, issueCompany.companyId, agentId, {
         kind: "work",
       });
@@ -11795,6 +11797,38 @@ export function issueService(db: Db) {
           unresolvedBlockerIssueIds,
           unresolvedBlockers,
         });
+      }
+
+      // SPA-11807: a card can be blocked on an unanswered interaction instead
+      // of on a blocker relation, and checkout sets `in_progress`
+      // unconditionally. Dependency readiness cannot see that hold, so a wake
+      // or checkout could silently release a card still waiting on a human
+      // decision — and because checkout logs no status activity, the release
+      // left no audit trail. Refuse, naming the interaction, so the caller
+      // learns the real reason instead of assuming it holds execution.
+      if (currentBlockedStatus) {
+        const holdingInteractions = await db
+          .select({
+            id: issueThreadInteractions.id,
+            status: issueThreadInteractions.status,
+          })
+          .from(issueThreadInteractions)
+          .where(
+            and(
+              eq(issueThreadInteractions.companyId, issueCompany.companyId),
+              eq(issueThreadInteractions.issueId, id),
+            ),
+          );
+        if (isAwaitingInteractionResolution(holdingInteractions)) {
+          throw unprocessable(
+            "Issue is blocked on an unanswered interaction",
+            {
+              holdingInteractionIds: holdingInteractions
+                .filter((interaction) => interaction.status === "pending")
+                .map((interaction) => interaction.id),
+            },
+          );
+        }
       }
 
       const sameRunAssigneeCondition = checkoutRunId

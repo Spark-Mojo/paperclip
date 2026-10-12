@@ -7458,6 +7458,16 @@ function isCheckoutConflictError(error: unknown): boolean {
   );
 }
 
+/**
+ * SPA-11807: checkout also rejects with 422 when the card is still held —
+ * by unresolved blockers, or by an unanswered interaction. Both are ordinary
+ * "not claimable right now" outcomes for an auto-checkout attempt, distinct
+ * from a 409 conflict on the run lock.
+ */
+export function isCheckoutHoldRejection(error: unknown): boolean {
+  return error instanceof HttpError && error.status === 422;
+}
+
 export { extractWakeCommentIds };
 
 function mergeWakeCommentIds(...values: Array<unknown>): string[] {
@@ -21290,7 +21300,17 @@ export function heartbeatService(
           );
           context[PAPERCLIP_HARNESS_CHECKOUT_KEY] = true;
         } catch (error) {
-          if (!isCheckoutConflictError(error)) throw error;
+          // SPA-11807: auto-checkout refuses a card still held by an unanswered
+          // interaction (422), exactly as it already refuses a card with
+          // unresolved blockers (422). Both mean "this wake may not claim
+          // execution", which is a normal outcome here — rethrow only genuine
+          // unexpected failures, or the hold would crash the whole run.
+          if (
+            !isCheckoutConflictError(error) &&
+            !isCheckoutHoldRejection(error)
+          ) {
+            throw error;
+          }
           context[PAPERCLIP_HARNESS_CHECKOUT_KEY] = false;
         }
         issueContext = await getIssueExecutionContext(agent.companyId, issueId);
