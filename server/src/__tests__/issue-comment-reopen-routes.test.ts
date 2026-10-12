@@ -30,6 +30,11 @@ const mockHeartbeatService = vi.hoisted(() => ({
   getActiveRunForAgent: vi.fn(async () => null),
   cancelRun: vi.fn(async () => null),
   cancelLiveRunsForIssue: vi.fn(async () => [] as Array<{ id: string; companyId: string; agentId: string; status: string }>),
+  // SPA-11905: the route calls heartbeat.autoUnblockReadyDependents on a
+  // becameDone transition (issues.ts); a missing mock turned every such
+  // transition into an unhandled TypeError that also aborted the
+  // listWakeableBlockedDependents assertions downstream.
+  autoUnblockReadyDependents: vi.fn(async () => undefined),
 }));
 
 const mockAgentService = vi.hoisted(() => ({
@@ -521,6 +526,9 @@ describe.sequential("issue comment reopen routes", () => {
       .send({
         comment: "hello",
         reopen: true,
+        // SPA-10357 board-actor ownership-transfer CAS: a reassignment from
+        // the row's current assignee requires the expected pre-transfer value.
+        expectedAssigneeAgentId: "22222222-2222-4222-8222-222222222222",
         assigneeAgentId: "33333333-3333-4333-8333-333333333333",
       });
 
@@ -551,6 +559,7 @@ describe.sequential("issue comment reopen routes", () => {
         comment: "Inspect the file",
         commentClientRequestId: "77777777-7777-4777-8777-777777777777",
         attachmentIds: [id],
+        expectedAssigneeAgentId: "22222222-2222-4222-8222-222222222222",
         assigneeAgentId: "33333333-3333-4333-8333-333333333333",
       });
     expect(res.status).toBe(200);
@@ -600,6 +609,7 @@ describe.sequential("issue comment reopen routes", () => {
       .send({
         comment: "Inspect",
         attachmentIds: ["9af8228f-0be7-45ae-a104-6fbe0af6f1d3"],
+        expectedAssigneeAgentId: "22222222-2222-4222-8222-222222222222",
         assigneeAgentId: "33333333-3333-4333-8333-333333333333",
       });
     expect(res.status).toBe(409);
@@ -619,6 +629,7 @@ describe.sequential("issue comment reopen routes", () => {
       .patch("/api/issues/11111111-1111-4111-8111-111111111111")
       .send({
         comment: "hello",
+        expectedAssigneeAgentId: "22222222-2222-4222-8222-222222222222",
         assigneeAgentId: "33333333-3333-4333-8333-333333333333",
       });
 
@@ -656,7 +667,7 @@ describe.sequential("issue comment reopen routes", () => {
 
     const res = await request(await installActor(createApp()))
       .patch("/api/issues/11111111-1111-4111-8111-111111111111")
-      .send({ comment: "hello", assigneeAgentId: "codexcoder" });
+      .send({ comment: "hello", expectedAssigneeAgentId: "22222222-2222-4222-8222-222222222222", assigneeAgentId: "codexcoder" });
 
     expect(res.status).toBe(200);
     expect(mockAgentService.resolveByReference).toHaveBeenCalledWith(
@@ -707,6 +718,9 @@ describe.sequential("issue comment reopen routes", () => {
       .send({
         comment: "hello",
         reopen: true,
+        // SPA-10357 board-actor ownership-transfer CAS: a reassignment from
+        // the row's current assignee requires the expected pre-transfer value.
+        expectedAssigneeAgentId: "22222222-2222-4222-8222-222222222222",
         assigneeAgentId: "33333333-3333-4333-8333-333333333333",
       });
 
@@ -2861,6 +2875,7 @@ describe.sequential("issue comment reopen routes", () => {
       .send({
         comment: "hello",
         interrupt: true,
+        expectedAssigneeAgentId: "22222222-2222-4222-8222-222222222222",
         assigneeAgentId: "33333333-3333-4333-8333-333333333333",
       });
 
