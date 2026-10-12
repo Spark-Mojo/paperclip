@@ -145,6 +145,10 @@ import {
   type RunOutputSilenceSummary,
   type WatchdogDecisionActor,
 } from "../../modules/active-run-watchdog/index.js";
+import {
+  isTerminalIssueStatusForWake,
+  loadIssueStatusForWakeGuard,
+} from "../wake-loop-guard.js";
 
 const EXECUTION_PATH_HEARTBEAT_RUN_STATUSES = [
   "queued",
@@ -2196,6 +2200,26 @@ export function recoveryService(
           };
         }
       }
+    }
+    // SPA-9280: terminal-status guard at the recovery emit. The recovery
+    // sweep's candidates query filters `status IN ('todo','in_progress',
+    // 'in_review')`, but a status transition committed between candidate read
+    // and this call can still leak through. Defense-in-depth: re-read the
+    // issue status here and short-circuit before any wake insert. Broad wake
+    // history accounting does not belong on this path: it can suppress or
+    // escalate legitimate recovery traffic that merely shares the tuple.
+    const liveIssueStatus = await loadIssueStatusForWakeGuard(db, input.issueId);
+    if (isTerminalIssueStatusForWake(liveIssueStatus)) {
+      logger.debug(
+        {
+          issueId: input.issueId,
+          agentId: input.agentId,
+          issueStatus: liveIssueStatus,
+          source: input.source,
+        },
+        "recovery sweep refused to enqueue wake for terminal-status issue",
+      );
+      return { queued: false, chainStop: null };
     }
     const queued = await deps.enqueueWakeup(input.agentId, {
       source: "automation",
