@@ -4927,6 +4927,86 @@ describeEmbeddedPostgres("issueService blockers and dependency wake readiness", 
     });
   });
 
+  // SPA-11807 regression: a card may be blocked while waiting on a thread
+  // interaction rather than on a blocker relation. Checkout used to accept
+  // `blocked` in expectedStatuses and set in_progress unconditionally, so a
+  // wake could release the card — silently, since checkout logs no status
+  // activity — while the interaction was still unanswered.
+  describe("checkout holds a blocked card on an unanswered interaction", () => {
+    async function seedInteractionHeldCard(interactionStatus: string) {
+      const companyId = randomUUID();
+      const assigneeAgentId = randomUUID();
+      await db.insert(companies).values({
+        id: companyId,
+        name: "Paperclip",
+        issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+        requireBoardApprovalForNewAgents: false,
+      });
+      await db.insert(agents).values({
+        id: assigneeAgentId,
+        companyId,
+        name: "QA",
+        role: "qa",
+        status: "active",
+        adapterType: "claude_local",
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+      });
+      const issueId = randomUUID();
+      await db.insert(issues).values({
+        id: issueId,
+        companyId,
+        title: "Waiting on a ruling",
+        status: "blocked",
+        priority: "medium",
+        assigneeAgentId,
+        blockedTransitionAt: new Date("2026-10-04T09:28:11.996Z"),
+      });
+      const interactionId = randomUUID();
+      await db.insert(issueThreadInteractions).values({
+        id: interactionId,
+        companyId,
+        issueId,
+        kind: "ask_user_questions",
+        status: interactionStatus,
+        payload: { version: 1, questions: [] },
+        continuationPolicy: "wake_assignee",
+      } as never);
+      return { issueId, interactionId, assigneeAgentId };
+    }
+
+    it("refuses checkout and leaves the card blocked while the interaction is pending", async () => {
+      const { issueId, interactionId, assigneeAgentId } =
+        await seedInteractionHeldCard("pending");
+
+      await expect(
+        svc.checkout(issueId, assigneeAgentId, ["blocked"], null),
+      ).rejects.toMatchObject({
+        status: 422,
+        details: { holdingInteractionIds: [interactionId] },
+      });
+
+      const [row] = await db
+        .select({ status: issues.status })
+        .from(issues)
+        .where(eq(issues.id, issueId));
+      expect(row?.status).toBe("blocked");
+    });
+
+    it.each(["accepted", "rejected", "answered", "expired"])(
+      "releases checkout once the interaction is %s",
+      async (interactionStatus) => {
+        const { issueId, assigneeAgentId } =
+          await seedInteractionHeldCard(interactionStatus);
+
+        await expect(
+          svc.checkout(issueId, assigneeAgentId, ["blocked"], null),
+        ).resolves.toMatchObject({ status: "in_progress" });
+      },
+    );
+  });
+
   it("wakes parents only when all direct children are terminal", async () => {
     const companyId = randomUUID();
     const assigneeAgentId = randomUUID();
