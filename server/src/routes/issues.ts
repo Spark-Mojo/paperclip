@@ -819,6 +819,38 @@ function authenticatedActorResponsibleUserId(req: Request) {
     : undefined;
 }
 
+/**
+ * Reads the caller-supplied idempotency key for a comment write.
+ *
+ * SPA-11706 D1: this used to be `actor.actorType === "user" ? req.body.clientRequestId
+ * : undefined` at each call site, which silently dropped the key for every agent. An
+ * agent retrying after an ambiguous failure therefore had no way to make the write
+ * idempotent, and a bisect loop wrote 75 copies of one comment. The key is now
+ * opt-in for all actors, and a blank or non-string value is treated as absent so a
+ * stray whitespace key cannot bind an unintended unique constraint.
+ *
+ * Read from BOTH the standard `Idempotency-Key` request header and the
+ * `clientRequestId` body field, header first. The body field is what the existing
+ * board chat surface already sends; the header is the conventional transport and
+ * the one the agent guide documents. Documenting a header the server does not
+ * read would make this fix inert for its own documented consumer (SPA-9687 review
+ * finding D1, carried forward).
+ */
+export function readCommentIdempotencyKey(
+  body: unknown,
+  headers?: unknown,
+): string | undefined {
+  const headerValue = (headers as { [key: string]: unknown } | null | undefined)?.[
+    "idempotency-key"
+  ];
+  if (typeof headerValue === "string" && headerValue.trim().length > 0) {
+    return headerValue;
+  }
+  const raw = (body as { clientRequestId?: unknown } | null | undefined)
+    ?.clientRequestId;
+  return typeof raw === "string" && raw.trim().length > 0 ? raw : undefined;
+}
+
 // Matches the partial unique index that guarantees at most one onboarding
 // first-task issue per company (packages/db/src/schema/issues.ts).
 function isOnboardingFirstTaskConflict(error: unknown): boolean {
@@ -13872,7 +13904,9 @@ export function issueRoutes(
                 },
                 {
                   attachmentIds: commentAttachmentIds,
-                  clientRequestId: actor.actorType === "user" ? commentClientRequestId : undefined,
+                  // SPA-11706 D1: the PATCH-with-comment path threads the same
+                  // opt-in key for agents and users alike (was user-only).
+                  clientRequestId: commentClientRequestId,
                   authorizationReason: issueMutationAuthorizationReason,
                   sourceTrust: attachmentCommentSourceTrust,
                 },
@@ -14538,7 +14572,8 @@ export function issueRoutes(
           },
           {
             authorizationReason: issueMutationAuthorizationReason,
-            clientRequestId: actor.actorType === "user" ? commentClientRequestId : undefined,
+            // SPA-11706 D1: same opt-in key for agents and users alike.
+            clientRequestId: commentClientRequestId,
             sourceTrust: await sourceTrustForActorWrite(issue, actor),
           },
         );
@@ -16704,26 +16739,37 @@ export function issueRoutes(
         },
       });
 
-      await questionResponseDeliveries.deliver(interaction.id).catch((err) => {
-        logger.warn(
-          {
-            err,
-            companyId: issue.companyId,
-            issueId: issue.id,
-            interactionId: interaction.id,
-          },
-          "synchronous question response delivery failed; durable outbox will retry",
-        );
-      });
+      const deliveryOutcome = await questionResponseDeliveries
+        .deliver(interaction.id)
+        .catch((err) => {
+          logger.warn(
+            {
+              err,
+              companyId: issue.companyId,
+              issueId: issue.id,
+              interactionId: interaction.id,
+            },
+            "synchronous question response delivery failed; durable outbox will retry",
+          );
+          return null;
+        });
 
-      await queueResolvedInteractionContinuationWakeup({
-        db,
-        heartbeat,
-        issue,
-        interaction,
-        actor,
-        source: "issue.interaction.respond",
-      });
+      // SPA-11805 B1: when the answer was just delivered into a live run
+      // (steered or coalesced), that run already holds the answer — queueing a
+      // `wake_assignee` continuation on top of it is the duplicate wake James
+      // flagged on SPA-11120. B2's delivery-side cancel covers a wake armed by
+      // another route before delivery landed; this skip covers the wake this
+      // route would arm after delivery already landed.
+      if (deliveryOutcome?.status !== "delivered") {
+        await queueResolvedInteractionContinuationWakeup({
+          db,
+          heartbeat,
+          issue,
+          interaction,
+          actor,
+          source: "issue.interaction.respond",
+        });
+      }
 
       res.json(interaction);
     },
@@ -17486,6 +17532,12 @@ export function issueRoutes(
         if (!(await assertAgentIssueCommentAllowed(req, res, issue))) return;
         if (req.body.body.trim() !== "/new" && !(await assertBoardCommentNotPaused(req, res, issue))) return;
         const actor = getActorInfo(req);
+        // Unchanged by SPA-11706 D1: this path already required and validated a
+        // body clientRequestId (the 422 above), and it is a board-user path, not
+        // the agent path whose key was being stripped. Reading the header here
+        // would let the guard above and the pre-SELECT below disagree about
+        // which key is in force.
+        const commentClientRequestId = req.body.clientRequestId;
         const userId = req.actor.userId;
         const publications: ActivityPublication[] = [];
         const comment = await db.transaction(async (tx) => {
@@ -17494,10 +17546,10 @@ export function issueRoutes(
           )).for("update");
           const [existing] = await tx.select({ id: issueComments.id }).from(issueComments).where(and(
             eq(issueComments.issueId, issue.id), eq(issueComments.authorUserId, userId),
-            eq(issueComments.clientRequestId, req.body.clientRequestId),
+            eq(issueComments.clientRequestId, commentClientRequestId),
           ));
           const saved = await svc.addComment(issue.id, req.body.body, { userId }, {
-            clientRequestId: req.body.clientRequestId, authorType: "user", attachmentIds: req.body.attachmentIds,
+            clientRequestId: commentClientRequestId, authorType: "user", attachmentIds: req.body.attachmentIds,
           }, tx);
           if (!existing) await logActivity(tx as unknown as Db, {
             companyId: issue.companyId, actorType: actor.actorType, actorId: actor.actorId,
@@ -17550,6 +17602,13 @@ export function issueRoutes(
         await getClosedIssueExecutionWorkspace(issue);
 
       const actor = getActorInfo(req);
+      // SPA-11706 D1: the idempotency key is opt-in for every actor, agents
+      // included. Agents used to have it stripped unconditionally, so an agent
+      // retry after an ambiguous failure wrote a duplicate comment every attempt.
+      const commentClientRequestId = readCommentIdempotencyKey(
+        req.body,
+        req.headers,
+      );
       const commentPresentation =
         req.body.presentation ??
         (await deriveRecoveryCommentPresentation(
@@ -17883,7 +17942,7 @@ export function issueRoutes(
           presentation: commentPresentation,
           metadata: req.body.metadata ?? null,
           attachmentIds: req.body.attachmentIds,
-          clientRequestId: actor.actorType === "user" ? req.body.clientRequestId : undefined,
+          clientRequestId: commentClientRequestId,
           sourceTrust,
         };
         let txResult: {
@@ -17995,7 +18054,7 @@ export function issueRoutes(
           presentation: commentPresentation,
           metadata: req.body.metadata ?? null,
           attachmentIds: req.body.attachmentIds,
-          clientRequestId: actor.actorType === "user" ? req.body.clientRequestId : undefined,
+          clientRequestId: commentClientRequestId,
           authorizationReason: commentAuthorizationReason,
           sourceTrust: await sourceTrustForActorWrite(currentIssue, actor),
         };

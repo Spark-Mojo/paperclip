@@ -162,8 +162,10 @@ export interface WakeQueueTransaction {
     companyId: string;
     issueId: string;
     finishingRunId: string;
+    /** The finishing run's own agent, the author identity used by `allAuthoredByFinishingRunAgent`. */
+    finishingRunAgentId: string;
     commentIds: string[];
-  }): Promise<{ allSelfAuthored: boolean }>;
+  }): Promise<{ allSelfAuthored: boolean; allAuthoredByFinishingRunAgent: boolean }>;
   /**
    * Creation instants for the candidate's deferred comments, keyed by comment
    * id so the caller can tell a comment that predates the issue's close from a

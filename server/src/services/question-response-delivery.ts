@@ -37,6 +37,51 @@ class DeliveryClaimUnavailableError extends Error {
     this.name = "DeliveryClaimUnavailableError";
   }
 }
+
+/**
+ * SPA-11805 B2: the answer reached a live run, so a `/respond`-adjacent
+ * continuation wake armed for the same interaction is dead work. Cancel only
+ * pending rows that carry this interaction's id, never claimed/running rows
+ * (those belong to a live run) and never rows for other interactions.
+ */
+async function cancelPendingWakesForDeliveredInteraction(
+  database: Db,
+  input: { companyId: string; issueId: string; interactionId: string },
+): Promise<void> {
+  const at = new Date();
+  await database
+    .update(agentWakeupRequests)
+    .set({
+      status: "cancelled",
+      finishedAt: at,
+      error: "question_response_delivered",
+      updatedAt: at,
+    })
+    .where(
+      and(
+        eq(agentWakeupRequests.companyId, input.companyId),
+        inArray(agentWakeupRequests.status, [
+          "queued",
+          "deferred_issue_execution",
+        ]),
+        isNull(agentWakeupRequests.runId),
+        or(
+          eq(
+            sql<string | null>`${agentWakeupRequests.payload} ->> 'interactionId'`,
+            input.interactionId,
+          ),
+          eq(
+            sql<string | null>`${agentWakeupRequests.idempotencyKey}`,
+            `question-response:${input.interactionId}`,
+          ),
+          eq(
+            sql<string | null>`${agentWakeupRequests.idempotencyKey}`,
+            `interaction:${input.interactionId}:answered`,
+          ),
+        ),
+      ),
+    );
+}
 const DURABLE_WAKE_REQUEST_STATUSES = [
   "queued",
   "claimed",
@@ -1153,6 +1198,11 @@ export function questionResponseDeliveryService(
           resolveNativeQuestion(hydratedInteraction),
         );
         if (nativeDisposition === "queued") {
+          await cancelPendingWakesForDeliveredInteraction(db, {
+            companyId: interaction.companyId,
+            issueId: interaction.issueId,
+            interactionId: interaction.id,
+          });
           return recordTerminal({
             delivery: claimed,
             interaction,
@@ -1216,6 +1266,11 @@ export function questionResponseDeliveryService(
             correlationId: claimed.correlationId,
           }),
         );
+        await cancelPendingWakesForDeliveredInteraction(db, {
+          companyId: interaction.companyId,
+          issueId: interaction.issueId,
+          interactionId: interaction.id,
+        });
         return recordTerminal({
           delivery: claimed,
           interaction,
@@ -1319,6 +1374,13 @@ export function questionResponseDeliveryService(
       const coalesced = Boolean(
         eligibleQueuedSuccessor && targetRun?.id === eligibleQueuedSuccessor.id,
       );
+      if (coalesced) {
+        await cancelPendingWakesForDeliveredInteraction(db, {
+          companyId: interaction.companyId,
+          issueId: interaction.issueId,
+          interactionId: interaction.id,
+        });
+      }
       return recordTerminal({
         delivery: claimed,
         interaction,
@@ -1350,6 +1412,13 @@ export function questionResponseDeliveryService(
             eligibleQueuedSuccessor &&
             targetRun?.id === eligibleQueuedSuccessor.id,
           );
+          if (coalesced) {
+            await cancelPendingWakesForDeliveredInteraction(db, {
+              companyId: interaction.companyId,
+              issueId: interaction.issueId,
+              interactionId: interaction.id,
+            });
+          }
           return recordTerminal({
             delivery: claimed,
             interaction,
