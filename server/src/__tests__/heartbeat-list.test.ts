@@ -16,6 +16,58 @@ if (!embeddedPostgresSupport.supported) {
   );
 }
 
+// SPA-11947 — the run-list projections are read on every board poll. Draining the
+// 70 KB `context_snapshot` / `result_json` TOAST value per row is what stalled the
+// board API on 2026-10-12, so the regression guard has to read the SQL the
+// service actually emits (not the nulls it happens to return). This proxy records
+// the generated SQL of every select the service runs while still executing it.
+function captureRunListSql(db: ReturnType<typeof createDb>) {
+  const captured: { sql: string }[] = [];
+
+  const wrapBuilder = (builder: unknown): unknown => {
+    if (typeof builder !== "object" || builder === null) return builder;
+    return new Proxy(builder as Record<PropertyKey, unknown>, {
+      get(target, property) {
+        if (property === "then") {
+          return (...args: unknown[]) => {
+            const built = (target.toSQL as () => { sql: string })();
+            captured.push({ sql: built.sql });
+            return (target.then as (...thenArgs: unknown[]) => unknown)(...args);
+          };
+        }
+        const value = Reflect.get(target, property);
+        if (typeof value === "function") {
+          return (...args: unknown[]) =>
+            wrapBuilder((value as (...callArgs: unknown[]) => unknown).apply(target, args));
+        }
+        return value;
+      },
+    });
+  };
+
+  const observedDb = new Proxy(db, {
+    get(target, property, receiver) {
+      if (property === "select") {
+        return (...args: unknown[]) =>
+          wrapBuilder(Reflect.apply(target.select as (...selectArgs: unknown[]) => unknown, target, args));
+      }
+      return Reflect.get(target, property, receiver);
+    },
+  });
+
+  return { observedDb, captured };
+}
+
+// Guards against a vacuous pass: an uncaptured or empty statement must fail the
+// test before the "no raw JSONB" assertions are even reached.
+function expectRealRunListSql(statement: { sql: string } | undefined) {
+  expect(statement, "expected the run-list select to be captured").toBeDefined();
+  const sql = statement!.sql;
+  expect(sql).toMatch(/^\s*select/i);
+  expect(sql).toContain('"heartbeat_runs"');
+  return sql;
+}
+
 describeEmbeddedPostgres("heartbeat list", () => {
   let db!: ReturnType<typeof createDb>;
   let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
@@ -222,6 +274,104 @@ describeEmbeddedPostgres("heartbeat list", () => {
         wakeReason: "issue_assigned",
       },
     });
+  });
+
+  it("keeps the summary run list off the raw heartbeat_runs jsonb TOAST columns", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const runId = randomUUID();
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "CodexCoder",
+      role: "engineer",
+      status: "running",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+
+    await db.insert(heartbeatRuns).values({
+      id: runId,
+      companyId,
+      agentId,
+      invocationSource: "assignment",
+      status: "succeeded",
+      usageJson: { provider: "openai", model: "gpt-5", inputTokens: 123 },
+      resultJson: { summary: "done", stdout: "x".repeat(20_000) },
+      contextSnapshot: { issueId: randomUUID(), wakeReason: "issue_assigned" },
+    });
+
+    const { observedDb, captured } = captureRunListSql(db);
+
+    const runs = await heartbeatService(observedDb).list(companyId, agentId, 5, { summary: true });
+
+    // The list still returns the run; the point is what it had to ask Postgres for.
+    expect(runs.map((run) => run.id)).toEqual([runId]);
+
+    const sql = expectRealRunListSql(captured[0]);
+    // The summary projection is the one the board polls. It must not dereference
+    // the wide JSONB documents at all — neither in the projection nor in a filter.
+    expect(sql).not.toContain("context_snapshot");
+    expect(sql).not.toContain("result_json");
+    // Narrow stored columns are the sanctioned way to read these scalars.
+    expect(sql).toContain("context_issue_id");
+  });
+
+  it("keeps the non-summary run list off the raw heartbeat_runs jsonb TOAST columns", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const runId = randomUUID();
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "CodexCoder",
+      role: "engineer",
+      status: "running",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+
+    await db.insert(heartbeatRuns).values({
+      id: runId,
+      companyId,
+      agentId,
+      invocationSource: "assignment",
+      status: "succeeded",
+      resultJson: { summary: "large run summary", stdout: "x".repeat(20_000) },
+      contextSnapshot: { issueId: randomUUID(), wakeReason: "issue_assigned" },
+    });
+
+    const { observedDb, captured } = captureRunListSql(db);
+
+    // Default (non-summary) projection — the richer of the two run-list shapes.
+    const runs = await heartbeatService(observedDb).list(companyId, agentId, 5);
+
+    expect(runs.map((run) => run.id)).toEqual([runId]);
+
+    const sql = expectRealRunListSql(captured[0]);
+    expect(sql).not.toContain("context_snapshot");
+    expect(sql).not.toContain("result_json");
+    expect(sql).toContain("context_issue_id");
   });
 
   it("bounds oversized legacy result json payloads on getRun", async () => {

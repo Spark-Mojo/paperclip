@@ -49,6 +49,65 @@ async function waitForIssueRun(
   throw new Error(`Timed out waiting for issue run. Latest run count: ${latestRuns.length}`);
 }
 
+// SPA-11947 — `runsForIssue` is the issue ledger the board reads on every poll.
+// It has to project its context/result scalars without dereferencing the wide
+// `heartbeat_runs` JSONB TOAST documents. The guard reads the SQL the service
+// actually emits, since a run that merely returns nulls proves nothing about
+// what Postgres was asked to fetch.
+function captureRunListSql(db: ReturnType<typeof createDb>) {
+  const captured: { sql: string }[] = [];
+
+  const wrapBuilder = (builder: unknown): unknown => {
+    if (typeof builder !== "object" || builder === null) return builder;
+    return new Proxy(builder as Record<PropertyKey, unknown>, {
+      get(target, property) {
+        if (property === "then") {
+          return (...args: unknown[]) => {
+            const built = (target.toSQL as () => { sql: string })();
+            captured.push({ sql: built.sql });
+            return (target.then as (...thenArgs: unknown[]) => unknown)(...args);
+          };
+        }
+        const value = Reflect.get(target, property);
+        if (typeof value === "function") {
+          return (...args: unknown[]) =>
+            wrapBuilder((value as (...callArgs: unknown[]) => unknown).apply(target, args));
+        }
+        return value;
+      },
+    });
+  };
+
+  const observedDb = new Proxy(db, {
+    get(target, property, receiver) {
+      if (property === "select") {
+        return (...args: unknown[]) =>
+          wrapBuilder(
+            Reflect.apply(target.select as (...selectArgs: unknown[]) => unknown, target, args),
+          );
+      }
+      return Reflect.get(target, property, receiver);
+    },
+  });
+
+  return { observedDb, captured };
+}
+
+// `runsForIssue` fans out into follow-up queries (liveness backfill, exhaustion
+// events, leases). Only the ledger projection itself is in scope here, so select
+// it by shape rather than by position: the ledger is the only statement joining
+// `heartbeat_runs` to `agents`, and that join is part of the service's return
+// contract (`runs[].adapterType` comes from the agents row), so it survives the fix.
+// Drizzle emits plain columns unaliased, so there is no `as "runId"` to key on.
+function runListSql(captured: { sql: string }[]) {
+  const statement = captured.find((entry) => entry.sql.includes('inner join "agents"'));
+  expect(statement, "expected the runsForIssue ledger select to be captured").toBeDefined();
+  const sql = statement!.sql;
+  expect(sql).toMatch(/^\s*select/i);
+  expect(sql).toContain('"heartbeat_runs"');
+  return sql;
+}
+
 async function waitForEligibleStampPlateau(
   db: ReturnType<typeof createDb>,
   eligibleRunIds: Set<string>,
@@ -245,6 +304,75 @@ describeEmbeddedPostgres("activity service", () => {
       nextAction: "Review the completed output.",
     });
     expect(runs[0]).not.toHaveProperty("contextSnapshot");
+  });
+
+  it("keeps the issue run ledger off the raw heartbeat_runs jsonb TOAST columns", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const issueId = randomUUID();
+    const runId = randomUUID();
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "CodexCoder",
+      role: "engineer",
+      status: "idle",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Run ledger stays narrow",
+      description: "The issue ledger must not de-toast context_snapshot or result_json.",
+      status: "in_progress",
+      priority: "medium",
+      assigneeAgentId: agentId,
+    });
+
+    await db.insert(heartbeatRuns).values({
+      id: runId,
+      companyId,
+      agentId,
+      invocationSource: "assignment",
+      status: "succeeded",
+      contextSnapshot: {
+        issueId,
+        wakeReason: "issue_assigned",
+        enormousBlob: "x".repeat(256_000),
+      },
+      usageJson: { inputTokens: 11, costUsd: 0.42, enormousBlob: "x".repeat(256_000) },
+      resultJson: { summary: "done", nestedHuge: { payload: "y".repeat(256_000) } },
+      // Pre-stamped so the liveness backfill never schedules extra queries and
+      // the only heartbeat_runs select under test is the ledger projection.
+      livenessState: "advanced",
+      livenessReason: "Run produced concrete action evidence",
+      lastUsefulActionAt: new Date("2026-04-18T19:59:00.000Z"),
+    });
+
+    const { observedDb, captured } = captureRunListSql(db);
+
+    const runs = await activityService(observedDb).runsForIssue(companyId, issueId);
+
+    expect(runs.map((run) => run.runId)).toEqual([runId]);
+
+    const sql = runListSql(captured);
+    // Neither the projection nor the issue predicate may dereference the wide
+    // JSONB documents; both must read the narrow stored columns instead.
+    expect(sql).not.toContain("context_snapshot");
+    expect(sql).not.toContain("result_json");
+    expect(sql).toContain("context_issue_id");
   });
 
   it("coalesces repeated legacy backfill scans and picks up new terminal runs", async () => {
