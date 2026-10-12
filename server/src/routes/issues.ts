@@ -13313,13 +13313,14 @@ export function issueRoutes(
       const descriptor = updateFields.unblockDescriptor ?? null;
       if (descriptor && typeof descriptor === "object") {
         const owner = descriptor.owner;
+        const invalidAgentUnblockOwnerMessage =
+          'Agents may only name themselves or use owner: "board" for a board-owned hold';
         if (
           req.actor.type === "agent" &&
-          (owner === "board" || "userId" in owner)
+          owner !== "board" &&
+          "userId" in owner
         ) {
-          throw forbidden(
-            "Agents may only name themselves as an unblock owner",
-          );
+          throw forbidden(invalidAgentUnblockOwnerMessage);
         }
         if (owner !== "board" && "agentId" in owner) {
           const target = await db
@@ -13341,9 +13342,7 @@ export function issueRoutes(
             req.actor.type === "agent" &&
             req.actor.agentId !== owner.agentId
           ) {
-            throw forbidden(
-              "Agents may only name themselves as an unblock owner",
-            );
+            throw forbidden(invalidAgentUnblockOwnerMessage);
           }
         } else if (owner !== "board" && "userId" in owner) {
           const member = await db
