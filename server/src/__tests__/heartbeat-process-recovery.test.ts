@@ -6883,6 +6883,234 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     );
   });
 
+  it("keeps a board recovery action active when its healthy child is downstream in the blocker graph", async () => {
+    const { companyId, agentId, issueId } = await seedStrandedIssueFixture({
+      status: "blocked",
+      runStatus: "failed",
+    });
+    const childId = randomUUID();
+    const middleId = randomUUID();
+    await db.insert(issues).values([
+      {
+        id: middleId,
+        companyId,
+        title: "Downstream blocker",
+        status: "todo",
+      },
+      {
+        id: childId,
+        companyId,
+        parentId: issueId,
+        title: "Healthy child",
+        status: "in_progress",
+        assigneeAgentId: agentId,
+      },
+    ]);
+    await db.insert(issueRelations).values([
+      { companyId, issueId, relatedIssueId: middleId, type: "blocks" },
+      { companyId, issueId: middleId, relatedIssueId: childId, type: "blocks" },
+    ]);
+    await db.insert(heartbeatRuns).values({
+      companyId,
+      agentId,
+      status: "scheduled_retry",
+      scheduledRetryAt: new Date(Date.now() + 60_000),
+      contextSnapshot: { issueId: childId },
+    });
+    const [action] = await db
+      .insert(issueRecoveryActions)
+      .values({
+        companyId,
+        sourceIssueId: issueId,
+        kind: "stranded_assigned_issue",
+        status: "active",
+        ownerType: "board",
+        cause: "stranded_assigned_issue",
+        fingerprint: `cycle:${issueId}`,
+        evidence: {},
+        nextAction: "Board operator must reconcile this issue.",
+      })
+      .returning();
+
+    const result = await heartbeatService(db).reconcileStrandedAssignedIssues();
+
+    await expect(sourceBlockerIssueIds(companyId, issueId)).resolves.toEqual(
+      [],
+    );
+    const [persisted] = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.id, action!.id));
+    expect(persisted).toMatchObject({
+      status: "active",
+      evidence: expect.objectContaining({
+        skippedCyclicBlockerIssueIds: [childId],
+      }),
+    });
+    expect(result).toMatchObject({ escalated: 0 });
+  });
+
+  it("adds a blocking edge for a healthy child not downstream of the stranded issue and resolves the board action", async () => {
+    const { companyId, agentId, issueId } = await seedStrandedIssueFixture({
+      status: "blocked",
+      runStatus: "failed",
+    });
+    const safeChildId = randomUUID();
+    await db.insert(issues).values({
+      id: safeChildId,
+      companyId,
+      parentId: issueId,
+      title: "Healthy child",
+      status: "in_progress",
+      assigneeAgentId: agentId,
+    });
+    await db.insert(heartbeatRuns).values({
+      companyId,
+      agentId,
+      status: "scheduled_retry",
+      scheduledRetryAt: new Date(Date.now() + 60_000),
+      contextSnapshot: { issueId: safeChildId },
+    });
+    const [action] = await db
+      .insert(issueRecoveryActions)
+      .values({
+        companyId,
+        sourceIssueId: issueId,
+        kind: "stranded_assigned_issue",
+        status: "active",
+        ownerType: "board",
+        cause: "stranded_assigned_issue",
+        fingerprint: `safe:${issueId}`,
+        evidence: {},
+        nextAction: "Board operator must reconcile this issue.",
+      })
+      .returning();
+
+    const result = await heartbeatService(db).reconcileStrandedAssignedIssues();
+
+    await expect(sourceBlockerIssueIds(companyId, issueId)).resolves.toEqual([
+      safeChildId,
+    ]);
+    const [persisted] = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.id, action!.id));
+    expect(persisted).toMatchObject({
+      status: "resolved",
+      outcome: "restored",
+      resolutionNote: "durable_path_restored:healthy_child",
+    });
+    expect(result).toMatchObject({ escalated: 0 });
+  });
+
+  it("blocks only the safe healthy child in a mixed graph, preserving existing blockers and recording the skipped cyclic child", async () => {
+    const { companyId, agentId, issueId } = await seedStrandedIssueFixture({
+      status: "blocked",
+      runStatus: "failed",
+    });
+    const issuePrefix = `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+    const existingBlockerId = randomUUID();
+    const cyclicChildId = randomUUID();
+    const safeChildId = randomUUID();
+    const middleId = randomUUID();
+    await db.insert(issues).values([
+      {
+        id: existingBlockerId,
+        companyId,
+        title: "Existing blocker",
+        status: "in_progress",
+        hiddenAt: new Date(),
+        priority: "medium",
+        issueNumber: 20,
+        identifier: `${issuePrefix}-20`,
+      },
+      {
+        id: middleId,
+        companyId,
+        title: "Downstream blocker",
+        status: "todo",
+        priority: "medium",
+        issueNumber: 21,
+        identifier: `${issuePrefix}-21`,
+      },
+      {
+        id: cyclicChildId,
+        companyId,
+        parentId: issueId,
+        title: "Healthy child",
+        status: "in_progress",
+        assigneeAgentId: agentId,
+        priority: "medium",
+        issueNumber: 22,
+        identifier: `${issuePrefix}-22`,
+      },
+      {
+        id: safeChildId,
+        companyId,
+        parentId: issueId,
+        title: "Healthy child",
+        status: "in_progress",
+        assigneeAgentId: agentId,
+        priority: "medium",
+        issueNumber: 23,
+        identifier: `${issuePrefix}-23`,
+      },
+    ]);
+    await db.insert(issueRelations).values([
+      { companyId, issueId: existingBlockerId, relatedIssueId: issueId, type: "blocks" },
+      { companyId, issueId, relatedIssueId: middleId, type: "blocks" },
+      { companyId, issueId: middleId, relatedIssueId: cyclicChildId, type: "blocks" },
+    ]);
+    await db.insert(heartbeatRuns).values([
+      {
+        companyId,
+        agentId,
+        status: "scheduled_retry",
+        scheduledRetryAt: new Date(Date.now() + 60_000),
+        contextSnapshot: { issueId: cyclicChildId },
+      },
+      {
+        companyId,
+        agentId,
+        status: "scheduled_retry",
+        scheduledRetryAt: new Date(Date.now() + 60_000),
+        contextSnapshot: { issueId: safeChildId },
+      },
+    ]);
+    const [action] = await db
+      .insert(issueRecoveryActions)
+      .values({
+        companyId,
+        sourceIssueId: issueId,
+        kind: "stranded_assigned_issue",
+        status: "active",
+        ownerType: "board",
+        cause: "stranded_assigned_issue",
+        fingerprint: `mixed:${issueId}`,
+        evidence: {},
+        nextAction: "Board operator must reconcile this issue.",
+      })
+      .returning();
+
+    const result = await heartbeatService(db).reconcileStrandedAssignedIssues();
+
+    const blockers = await sourceBlockerIssueIds(companyId, issueId);
+    expect(blockers.sort()).toEqual([existingBlockerId, safeChildId].sort());
+    const [persisted] = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.id, action!.id));
+    expect(persisted).toMatchObject({
+      status: "resolved",
+      outcome: "restored",
+      resolutionNote: "durable_path_restored:healthy_child",
+      evidence: expect.objectContaining({
+        skippedCyclicBlockerIssueIds: [cyclicChildId],
+      }),
+    });
+    expect(result).toMatchObject({ escalated: 0 });
+  });
+
   it("folds a persisted disposition-repair action when a current typed wait appears", async () => {
     const { companyId, issueId } = await seedStrandedIssueFixture({
       status: "in_progress",
