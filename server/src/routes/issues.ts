@@ -16698,26 +16698,37 @@ export function issueRoutes(
         },
       });
 
-      await questionResponseDeliveries.deliver(interaction.id).catch((err) => {
-        logger.warn(
-          {
-            err,
-            companyId: issue.companyId,
-            issueId: issue.id,
-            interactionId: interaction.id,
-          },
-          "synchronous question response delivery failed; durable outbox will retry",
-        );
-      });
+      const deliveryOutcome = await questionResponseDeliveries
+        .deliver(interaction.id)
+        .catch((err) => {
+          logger.warn(
+            {
+              err,
+              companyId: issue.companyId,
+              issueId: issue.id,
+              interactionId: interaction.id,
+            },
+            "synchronous question response delivery failed; durable outbox will retry",
+          );
+          return null;
+        });
 
-      await queueResolvedInteractionContinuationWakeup({
-        db,
-        heartbeat,
-        issue,
-        interaction,
-        actor,
-        source: "issue.interaction.respond",
-      });
+      // SPA-11805 B1: when the answer was just delivered into a live run
+      // (steered or coalesced), that run already holds the answer — queueing a
+      // `wake_assignee` continuation on top of it is the duplicate wake James
+      // flagged on SPA-11120. B2's delivery-side cancel covers a wake armed by
+      // another route before delivery landed; this skip covers the wake this
+      // route would arm after delivery already landed.
+      if (deliveryOutcome?.status !== "delivered") {
+        await queueResolvedInteractionContinuationWakeup({
+          db,
+          heartbeat,
+          issue,
+          interaction,
+          actor,
+          source: "issue.interaction.respond",
+        });
+      }
 
       res.json(interaction);
     },
