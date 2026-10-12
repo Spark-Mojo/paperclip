@@ -1989,6 +1989,13 @@
       "when": 1791784238660,
       "tag": "9284_heartbeat_context_snapshot_id_columns",
       "breakpoints": true
+    },
+    {
+      "idx": 9285,
+      "version": "7",
+      "when": 1791784239660,
+      "tag": "9285_wake_loop_guard_index",
+      "breakpoints": true
     }
   ]
 }
