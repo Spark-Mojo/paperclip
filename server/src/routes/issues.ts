@@ -17973,7 +17973,7 @@ export function issueRoutes(
                 companyId: currentIssue.companyId,
                 description: currentIssue.description,
               }))
-                  .map((reference) =>
+                  .references.map((reference) =>
                     `${reference.owner.toLowerCase()}/${reference.repo.toLowerCase()}#${reference.number}`,
                   )
                   .sort();
@@ -18013,7 +18013,7 @@ export function issueRoutes(
                   description: lockedIssue.description,
                 })
               )
-                .map((reference) =>
+                .references.map((reference) =>
                   `${reference.owner.toLowerCase()}/${reference.repo.toLowerCase()}#${reference.number}`,
                 )
                 .sort();

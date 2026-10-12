@@ -38,6 +38,21 @@ export const STAGE_APPROVAL_MISSING_CODE = "issue_stage_approval_missing_require
 export const STAGE_APPROVAL_SCAN_BUDGET_CODE = "issue_stage_approval_scan_budget_exceeded";
 /** A head SHA that is not a full lowercase-canonical 40-hex object id. */
 export const STAGE_APPROVAL_AMBIGUOUS_SHA_CODE = "issue_stage_approval_ambiguous_pull_request_head_sha";
+/**
+ * SPA-9396 — a relative PR link (e.g. `#1202`) whose adjacent identity is
+ * missing or ambiguous: the bound-set reader could not resolve the link to a
+ * single `(owner, repo)` pair, so a reviewer cannot have reviewed it. Distinct
+ * from `DONE_GATE_OPEN_PR_REFUSAL` on purpose: the approval path is a
+ * different authority surface and uses its own code so triage can route the
+ * refusal to the right gate.
+ */
+export const STAGE_APPROVAL_UNRESOLVED_CODE = "issue_stage_approval_unresolved_pull_request_reference";
+
+/** Bound set the approval path reads from its injection seam. */
+export type StageApprovalBoundPullRequests = {
+  references: GitHubPullRequestReference[];
+  unresolved: number[];
+};
 
 /** The approval path's own budget — the done-gate's limits stay its own. */
 export const WORK_PRODUCT_SCAN_LIMIT_APPROVAL = APPROVAL_WORK_PRODUCT_SCAN_LIMIT;
@@ -183,13 +198,13 @@ export type StageApprovalPullRequestReader = (
 export type ScanBudgetSeam = (
   issue: { id: string; companyId: string; description?: string | null },
   handle: Db,
-) => Promise<GitHubPullRequestReference[]>;
+) => Promise<StageApprovalBoundPullRequests>;
 
 export type IssueStageApprovalServiceOptions = {
   resolvePullRequestDetails?: StageApprovalPullRequestReader;
   listBoundPullRequests?: (
     issue: { id: string; companyId: string; description?: string | null },
-  ) => Promise<GitHubPullRequestReference[]>;
+  ) => Promise<StageApprovalBoundPullRequests>;
   /**
    * SPA-9396 — transaction handle. When the service is constructed INSIDE a
    * `db.transaction`, pass the `tx` here: every bound-set read then executes on
@@ -309,6 +324,26 @@ export function scanBudgetRefusal(
   );
 }
 
+/**
+ * SPA-9396: the bound set carries a relative PR link whose adjacent
+ * (Spark-Mojo/<repo>) identity is missing or ambiguous. A reviewer cannot have
+ * reviewed what the engine cannot identify, so the stage approval is refused
+ * with its OWN code (the done-gate's `DONE_GATE_OPEN_PR_REFUSAL` is a different
+ * authority surface). Mirrors the done-gate's `unresolved_pull_request_reference`
+ * refusal so the same defect on a different surface reads the same way.
+ */
+export function unresolvedReferenceRefusal(unresolved: number[]): never {
+  const numbers = unresolved.map((number) => `#${number}`).join(", ");
+  throw conflict(
+    `Issue cannot be marked done from this approval: relative PR link(s) ${numbers} lack an adjacent (Spark-Mojo/repo) identity. Add the repository next to each link or attach a pull_request work product.`,
+    {
+      code: STAGE_APPROVAL_UNRESOLVED_CODE,
+      pullRequests: [],
+      unresolvedPullRequestNumbers: unresolved,
+    },
+  );
+}
+
 export function issueStageApprovalService(db: Db, opts: IssueStageApprovalServiceOptions = {}) {
   const resolveDetails: StageApprovalPullRequestReader =
     opts.resolvePullRequestDetails ??
@@ -369,9 +404,17 @@ export function issueStageApprovalService(db: Db, opts: IssueStageApprovalServic
 
     const { entries: claim, duplicates } = normalizeClaim(input.claim);
     const bound = await readBound(input.issue);
+    // SPA-9396: a relative PR link whose adjacent (Spark-Mojo/<repo>) identity
+    // is missing or ambiguous refuses the approval with the approval path's OWN
+    // code — done first, before the set-equality check, because a reviewer
+    // cannot have reviewed what the engine cannot identify, and the bound
+    // set is not closed enough to compare against.
+    if (bound.unresolved.length > 0) {
+      unresolvedReferenceRefusal(bound.unresolved);
+    }
     const { reviewable, nonPullRequests } = await resolveReviewable(
       input.issue.companyId,
-      bound,
+      bound.references,
     );
 
     if (duplicates.length > 0) {
@@ -429,10 +472,14 @@ export function issueStageApprovalService(db: Db, opts: IssueStageApprovalServic
     companyId: string;
     description?: string | null;
   }): Promise<boolean> {
+    // SPA-9396: a card with an unresolved PR ref is still PR-backed — the
+    // caller uses this to decide whether to enter the gate, and the gate's own
+    // unresolved refusal does the fail-closed work. Treating it as "not bound"
+    // here would let a PR-backed card skip the gate entirely.
     const bound = await readBound(issue);
-    if (bound.length === 0) return false;
-    const { reviewable } = await resolveReviewable(issue.companyId, bound);
-    return reviewable.size > 0;
+    if (bound.references.length === 0 && bound.unresolved.length === 0) return false;
+    const { reviewable } = await resolveReviewable(issue.companyId, bound.references);
+    return reviewable.size > 0 || bound.unresolved.length > 0;
   }
 
   async function evaluateStageApprovalGate(input: {
@@ -456,9 +503,26 @@ export function issueStageApprovalService(db: Db, opts: IssueStageApprovalServic
     }
 
     const bound = await readBound(input.issue);
+    // SPA-9396: a relative PR link whose adjacent (Spark-Mojo/<repo>) identity
+    // is missing or ambiguous refuses the approval with the approval path's
+    // OWN code — done first, before the set-equality check, exactly mirroring
+    // the done-gate's `unresolved_pull_request_reference` refusal (see
+    // `issue-done-gate.ts:316-320`). The reviewer cannot have reviewed what
+    // the engine cannot identify, and the bound set is not closed enough to
+    // compare against.
+    if (bound.unresolved.length > 0) {
+      return {
+        outcome: "refuse",
+        reason: `relative PR link(s) ${bound.unresolved.map((number) => `#${number}`).join(", ")} lack an adjacent (Spark-Mojo/repo) identity; add the repository next to each link or attach a pull_request work product`,
+        details: {
+          code: STAGE_APPROVAL_UNRESOLVED_CODE,
+          unresolvedPullRequestNumbers: bound.unresolved,
+        },
+      };
+    }
     const reviewable = new Set<string>();
-    if (bound.length > 0) {
-      const resolved = await resolveReviewable(input.issue.companyId, bound);
+    if (bound.references.length > 0) {
+      const resolved = await resolveReviewable(input.issue.companyId, bound.references);
       for (const key of resolved.reviewable.keys()) reviewable.add(key);
     }
 
@@ -562,7 +626,7 @@ export function issueStageApprovalService(db: Db, opts: IssueStageApprovalServic
       }
       if (mismatched.length > 0) break;
       for (const key of [...approvedKeys].sort()) {
-        const reference = bound.find((candidate) => referenceKey(candidate) === key)!;
+        const reference = bound.references.find((candidate) => referenceKey(candidate) === key)!;
         const details = await resolveDetails(input.issue.companyId, reference);
         if (details.state === "unknown" || !details.headSha) {
           throw ambiguousRead(reference);

@@ -77,7 +77,7 @@ function service(input: {
   details: (reference: GitHubPullRequestReference) => PullRequestMergeDetails;
 }) {
   return issueStageApprovalService({} as Db, {
-    listBoundPullRequests: async () => input.bound,
+    listBoundPullRequests: async () => ({ references: input.bound, unresolved: [] }),
     resolvePullRequestDetails: async (_companyId, reference) =>
       input.details(reference),
   });

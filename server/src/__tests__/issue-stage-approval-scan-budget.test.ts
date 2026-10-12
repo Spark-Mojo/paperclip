@@ -32,9 +32,11 @@ import {
   STAGE_APPROVAL_SCAN_BUDGET_CODE,
   STAGE_APPROVAL_AMBIGUOUS_SHA_CODE,
   STAGE_APPROVAL_INCOMPLETE_SET_CODE,
+  STAGE_APPROVAL_UNRESOLVED_CODE,
   issueExecutionPolicyFingerprint,
   issueStageApprovalService,
   scanBudgetRefusal,
+  unresolvedReferenceRefusal,
   type ScanBudgetSeam,
 } from "../services/issue-stage-approvals.ts";
 
@@ -290,7 +292,8 @@ describe("truncated binding surface fails CLOSED (DEFECT 2)", () => {
 
     const bound = await svc.readBound(ISSUE);
 
-    expect(bound).toHaveLength(WORK_PRODUCT_SCAN_LIMIT_APPROVAL);
+    expect(bound.references).toHaveLength(WORK_PRODUCT_SCAN_LIMIT_APPROVAL);
+    expect(bound.unresolved).toEqual([]);
     expect(db.limit).toHaveBeenCalledWith(WORK_PRODUCT_SCAN_LIMIT_APPROVAL + 1);
   });
 
@@ -299,7 +302,8 @@ describe("truncated binding surface fails CLOSED (DEFECT 2)", () => {
 
     const bound = await svc.readBound(ISSUE);
 
-    expect(bound).toHaveLength(COMMENT_SCAN_LIMIT_APPROVAL);
+    expect(bound.references).toHaveLength(COMMENT_SCAN_LIMIT_APPROVAL);
+    expect(bound.unresolved).toEqual([]);
     expect(db.limit).toHaveBeenCalledWith(COMMENT_SCAN_LIMIT_APPROVAL + 1);
   });
 
@@ -325,7 +329,7 @@ describe("truncated binding surface fails CLOSED (DEFECT 2)", () => {
 
   it("T2 negative control: an exactly-matching approval still ALLOWS terminal done", async () => {
     const gate = issueStageApprovalService({} as Db, {
-      listBoundPullRequests: async () => [pr(1202)],
+      listBoundPullRequests: async () => ({ references: [pr(1202)], unresolved: [] }),
       resolvePullRequestDetails: async () => mergedDetails(headA),
     });
 
@@ -340,11 +344,11 @@ describe("truncated binding surface fails CLOSED (DEFECT 2)", () => {
     // The only difference between this and the allow case above is the 101st
     // row, so the budget refusal cannot be attributed to anything else.
     const atBudget = issueStageApprovalService({} as Db, {
-      listBoundPullRequests: async () => [pr(1202)],
+      listBoundPullRequests: async () => ({ references: [pr(1202)], unresolved: [] }),
       resolvePullRequestDetails: async () => mergedDetails(headA),
     });
     const overBudget = issueStageApprovalService({} as Db, {
-      listBoundPullRequests: async () => [pr(1202), pr(1203)],
+      listBoundPullRequests: async () => ({ references: [pr(1202), pr(1203)], unresolved: [] }),
       resolvePullRequestDetails: async () => mergedDetails(headA),
     });
 
@@ -388,7 +392,7 @@ describe("truncated binding surface fails CLOSED (DEFECT 2)", () => {
 describe("head SHAs are canonicalized to lowercase 40-hex, prefixes refused", () => {
   function claimService(headSha: string) {
     return issueStageApprovalService({} as Db, {
-      listBoundPullRequests: async () => [pr(1202)],
+      listBoundPullRequests: async () => ({ references: [pr(1202)], unresolved: [] }),
       resolvePullRequestDetails: async () => openDetails(headA),
     });
   }
@@ -428,7 +432,7 @@ describe("head SHAs are canonicalized to lowercase 40-hex, prefixes refused", ()
 
   it("refuses when the RESOLVER hands back a non-40-hex head, not only the claim", async () => {
     const svc = issueStageApprovalService({} as Db, {
-      listBoundPullRequests: async () => [pr(1202)],
+      listBoundPullRequests: async () => ({ references: [pr(1202)], unresolved: [] }),
       resolvePullRequestDetails: async () => openDetails(headA.slice(0, 7)),
     });
 
@@ -442,7 +446,7 @@ describe("head SHAs are canonicalized to lowercase 40-hex, prefixes refused", ()
 
   it("refuses a stale-head verdict when the live resolver head is a prefix", async () => {
     const svc = issueStageApprovalService({} as Db, {
-      listBoundPullRequests: async () => [pr(1202)],
+      listBoundPullRequests: async () => ({ references: [pr(1202)], unresolved: [] }),
       resolvePullRequestDetails: async () => openDetails(headB.slice(0, 8)),
     });
 
@@ -458,7 +462,7 @@ describe("head SHAs are canonicalized to lowercase 40-hex, prefixes refused", ()
     const gate = issueStageApprovalService({} as Db, {
       // The bound set MATCHES the recorded approval, so the set-equality guard
       // passes and the head check is reached: the prefix must be refused there.
-      listBoundPullRequests: async () => [pr(1202)],
+      listBoundPullRequests: async () => ({ references: [pr(1202)], unresolved: [] }),
       resolvePullRequestDetails: async () => mergedDetails(headA),
     });
 
@@ -476,7 +480,7 @@ describe("head SHAs are canonicalized to lowercase 40-hex, prefixes refused", ()
 
   it("refuses a terminal-done check when the LIVE head is a prefix", async () => {
     const gate = issueStageApprovalService({} as Db, {
-      listBoundPullRequests: async () => [pr(1202)],
+      listBoundPullRequests: async () => ({ references: [pr(1202)], unresolved: [] }),
       resolvePullRequestDetails: async () => mergedDetails(headB.slice(0, 8)),
     });
 
@@ -488,5 +492,98 @@ describe("head SHAs are canonicalized to lowercase 40-hex, prefixes refused", ()
       status: 409,
       details: { code: STAGE_APPROVAL_AMBIGUOUS_SHA_CODE },
     });
+  });
+});
+
+/**
+ * SPA-9396: a relative PR link whose adjacent (Spark-Mojo/<repo>) identity is
+ * missing or ambiguous cannot have been reviewed by anyone, so the approval
+ * path refuses the request with its OWN code (mirroring the done-gate's
+ * `unresolved_pull_request_reference` refusal). The done-gate uses code
+ * `DONE_GATE_OPEN_PR_REFUSAL`; the approval path uses
+ * `STAGE_APPROVAL_UNRESOLVED_CODE` because the gate is a different authority
+ * surface and triage needs the codes to read as distinct.
+ */
+describe("unresolved PR references fail CLOSED on the approval path (DEFECT 3)", () => {
+  it("verifyReviewedPullRequests: refuses an approval when the bound set carries an unresolved PR ref", async () => {
+    const svc = issueStageApprovalService({} as Db, {
+      listBoundPullRequests: async () => ({ references: [], unresolved: [1202] }),
+    });
+
+    // The claim names #1202, the bound set returns the relative link with no
+    // adjacent repo identity. The refusal is the specific UNRESOLVED code —
+    // not the set-equality refusal, not the budget refusal, not a generic 409.
+    await expect(
+      svc.verifyReviewedPullRequests({
+        issue: ISSUE,
+        claim: [{ owner: "Spark-Mojo", repo: "spark-mojo-platform", number: 1202, headSha: headA }],
+      }),
+    ).rejects.toMatchObject({
+      status: 409,
+      details: {
+        code: STAGE_APPROVAL_UNRESOLVED_CODE,
+        unresolvedPullRequestNumbers: [1202],
+      },
+    });
+  });
+
+  it("evaluateStageApprovalGate: refuses the gate with the UNRESOLVED code (not the set-equality code)", async () => {
+    const gate = issueStageApprovalService({} as Db, {
+      // Bound set has the empty-reference shape: no resolved reference, but
+      // one unresolved PR number — the exact shape `listBoundPullRequests`
+      // returns when only a relative link is present in description/comments.
+      listBoundPullRequests: async () => ({ references: [], unresolved: [1202] }),
+      resolvePullRequestDetails: async () => mergedDetails(headA),
+    });
+
+    // The state names an approval carrying #1202, so a set-equality check
+    // would land on the `unexpected` branch. The unresolved refusal must
+    // preempt it: a reviewer cannot have reviewed a PR whose (owner, repo)
+    // the engine cannot identify.
+    await expect(
+      gate.evaluateStageApprovalGate({
+        issue: { ...ISSUE, executionPolicy: POLICY, executionState: approvedState() },
+      }),
+    ).resolves.toMatchObject({
+      outcome: "refuse",
+      details: {
+        code: STAGE_APPROVAL_UNRESOLVED_CODE,
+        unresolvedPullRequestNumbers: [1202],
+      },
+    });
+  });
+
+  it("hasBoundPullRequests: an unresolved PR ref keeps the card PR-backed so the gate is entered", async () => {
+    const svc = issueStageApprovalService({} as Db, {
+      // Empty references, one unresolved number — the read returned a
+      // relative link with no adjacent identity.
+      listBoundPullRequests: async () => ({ references: [], unresolved: [1202] }),
+    });
+
+    // The caller uses this signal to decide whether to enter the gate.
+    // Treating an unresolved ref as "not bound" would let a PR-backed card
+    // skip the gate entirely, so the unresolved card must report PR-backed.
+    await expect(svc.hasBoundPullRequests(ISSUE)).resolves.toBe(true);
+  });
+
+  it("hasBoundPullRequests: an empty bound set is NOT PR-backed", async () => {
+    const svc = issueStageApprovalService({} as Db, {
+      listBoundPullRequests: async () => ({ references: [], unresolved: [] }),
+    });
+
+    await expect(svc.hasBoundPullRequests(ISSUE)).resolves.toBe(false);
+  });
+
+  it("readBound: returns the same {references, unresolved} shape the done-gate produces", async () => {
+    // Tying the seam-shape contract to a real assertion: any future change to
+    // the done-gate's return shape is caught here, not at the test boundary.
+    const { svc } = budgetService([[], []]);
+    const bound = await svc.readBound(ISSUE);
+    expect(bound).toEqual(
+      expect.objectContaining({
+        references: expect.any(Array),
+        unresolved: expect.any(Array),
+      }),
+    );
   });
 });
