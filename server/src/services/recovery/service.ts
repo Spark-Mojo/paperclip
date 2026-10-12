@@ -52,6 +52,11 @@ import {
   workAssessments,
 } from "@paperclipai/db";
 import { parseObject, asBoolean, asNumber } from "../../adapters/utils.js";
+import {
+  PRODUCTIVE_CONTINUATION_RECOVERY_SOURCE,
+  gateContinuationChain,
+  type ContinuationChainStop,
+} from "./continuation-chain-budget.js";
 import { runningProcesses } from "../../adapters/index.js";
 import {
   isNativeRunnerOwnershipHeld,
@@ -976,6 +981,25 @@ function isRepeatedProductiveContinuationRecovery(
     isProductiveContinuationRun(latestRun)
   );
 }
+
+/**
+ * The outcome of one `enqueueStrandedIssueRecovery` attempt.
+ *
+ * It is a discriminated union rather than a bare run row (or `null`) because a
+ * refusal now has two distinct causes a caller must be able to tell apart: the
+ * ordinary "nothing to enqueue" case, and the chain-wide budget refusing to
+ * extend a spent chain. The second carries the stop receipt so the caller can
+ * escalate exactly once and stay silent on every later sweep.
+ */
+type StrandedRecoveryChainStop = {
+  stop: ContinuationChainStop;
+  /** True when this chain already carries a durable stop receipt. */
+  alreadyStopped: boolean;
+};
+
+type StrandedRecoveryEnqueueOutcome =
+  | { queued: true; run: typeof heartbeatRuns.$inferSelect }
+  | { queued: false; chainStop: StrandedRecoveryChainStop | null };
 
 export function recoveryService(
   db: Db,
@@ -2073,7 +2097,7 @@ export function recoveryService(
     idempotencyKey?: string;
     issueStateGuard?: RecoveryWakeupOptions["issueStateGuard"];
     extraContext?: Record<string, unknown>;
-  }) {
+  }): Promise<StrandedRecoveryEnqueueOutcome> {
     if (input.retryOfRunId) {
       const [predecessor] = await db
         .select()
@@ -2092,7 +2116,8 @@ export function recoveryService(
       ) {
         // Failure recovery shares the durable incident budget and delay. It
         // cannot fall through into the productive-work continuation queue.
-        if (predecessor.runtimeMode === "native") return null;
+        if (predecessor.runtimeMode === "native")
+          return { queued: false, chainStop: null };
         // SPA-9001: a graceful-shutdown-interrupted predecessor is retriable
         // infrastructure, never a legacy execution needing board
         // reconciliation, and never a bounded transient retry (whose own
@@ -2112,16 +2137,20 @@ export function recoveryService(
             run: predecessor,
             status: predecessor.status,
           });
-          return null;
+          return { queued: false, chainStop: null };
         }
-        if (deps.scheduleRecoveryRetry)
-          return deps.scheduleRecoveryRetry(predecessor.id);
-        return null;
+        if (deps.scheduleRecoveryRetry) {
+          const retryRun = await deps.scheduleRecoveryRetry(predecessor.id);
+          return retryRun
+            ? { queued: true, run: retryRun }
+            : { queued: false, chainStop: null };
+        }
+        return { queued: false, chainStop: null };
       }
     }
     if (
       input.retryOfRunId &&
-      input.source === "issue.productive_terminal_continuation_recovery"
+      input.source === PRODUCTIVE_CONTINUATION_RECOVERY_SOURCE
     ) {
       const [source] = await db
         .select({
@@ -2142,7 +2171,31 @@ export function recoveryService(
             })
           ).kind !== "clear")
       )
-        return null;
+        return { queued: false, chainStop: null };
+      // SPA-11836: the chain-wide retry budget lives on the `retryOfRunId`
+      // ancestry, not on the run. The per-run bounded-retry counters
+      // (`scheduledRetryAttempt`, `continuationAttempt`) never move on this lane,
+      // so nothing else stops an automatic continuation chain that keeps
+      // re-declaring the same blocker. Enforced here, at the single chokepoint
+      // every productive-continuation successor passes through, so no caller can
+      // route around it.
+      if (source.agentId === input.agentId) {
+        const chainGate = await gateContinuationChain(db, {
+          companyId: source.companyId,
+          agentId: input.agentId,
+          issueId: input.issueId,
+          latestRunId: input.retryOfRunId,
+        });
+        if (!chainGate.allowed) {
+          return {
+            queued: false,
+            chainStop: {
+              stop: chainGate.stop,
+              alreadyStopped: chainGate.alreadyStopped,
+            },
+          };
+        }
+      }
     }
     const queued = await deps.enqueueWakeup(input.agentId, {
       source: "automation",
@@ -2197,7 +2250,7 @@ export function recoveryService(
     });
 
     if (queued && input.retryOfRunId) {
-      return db
+      const linkedRun: typeof heartbeatRuns.$inferSelect = await db
         .update(heartbeatRuns)
         .set({
           retryOfRunId: input.retryOfRunId,
@@ -2206,9 +2259,10 @@ export function recoveryService(
         .where(eq(heartbeatRuns.id, queued.id))
         .returning()
         .then((rows) => rows[0] ?? queued);
+      return { queued: true, run: linkedRun };
     }
 
-    return queued;
+    return queued ? { queued: true, run: queued } : { queued: false, chainStop: null };
   }
 
   async function enqueueInitialAssignedTodoDispatch(
@@ -4505,6 +4559,11 @@ export function recoveryService(
       dispatchRequeued: 0,
       continuationRequeued: 0,
       dispositionRepairRequeued: 0,
+      // SPA-11836: how many issues had an automatic continuation chain stopped by
+      // the chain-wide retry budget this sweep, and escalated to `blocked`. Always
+      // visible on every trip so the bound is observable rather than inferred
+      // from the absence of a run.
+      continuationChainStopped: 0,
       productiveContinuationObserved: 0,
       successfulContinuationObserved: 0,
       orphanBlockersAssigned: 0,
@@ -5090,7 +5149,7 @@ export function recoveryService(
                 acceptedInteractionResolvedAt.toISOString(),
             },
           });
-          if (queued) {
+          if (queued.queued) {
             result.continuationRequeued += 1;
             result.issueIds.push(issue.id);
           } else {
@@ -5171,7 +5230,7 @@ export function recoveryService(
                 reviewRecoveryInstruction: "The review stage has no participant run or queued wake. Submit the review decision now, or mark the issue blocked with the exact unblock action.",
               },
             });
-            if (queued) {
+            if (queued.queued) {
               result.reviewParticipantRequeued += 1;
               result.issueIds.push(issue.id);
             } else {
@@ -5317,7 +5376,7 @@ export function recoveryService(
               "The previous reviewer run ended while this execution-review stage was still pending. Submit the review decision now, or mark the issue blocked with the exact unblock action.",
           },
         });
-        if (queued) {
+        if (queued.queued) {
           result.reviewParticipantRequeued += 1;
           result.issueIds.push(issue.id);
         } else {
@@ -5414,7 +5473,7 @@ export function recoveryService(
           source: "issue.assignment_recovery",
           retryOfRunId: latestRun.id,
         });
-        if (queued) {
+        if (queued.queued) {
           result.dispatchRequeued += 1;
           result.issueIds.push(issue.id);
         } else {
@@ -5562,9 +5621,37 @@ export function recoveryService(
               }
             : undefined,
         });
-        if (queued) {
+        if (queued.queued) {
           result.continuationRequeued += 1;
           result.issueIds.push(issue.id);
+        } else if (queued.chainStop && !queued.chainStop.alreadyStopped) {
+          // SPA-11836: the chain spent its budget. Escalate ONCE — the issue
+          // moves to `blocked`, which is outside this sweep's candidate statuses,
+          // so no further automatic successor can be minted from it. The durable
+          // stop receipt on the chain makes every later sweep over the same
+          // ancestry refuse silently rather than escalating and commenting again.
+          const updated = await escalateStrandedAssignedIssue({
+            issue,
+            previousStatus: "in_progress",
+            latestRun: successfulRun,
+            notice: {
+              body:
+                `Paperclip stopped queueing automatic continuations for this issue: ` +
+                `${queued.chainStop.stop.message} Every automatic continuation in this ` +
+                `chain ended without advancing the card, so the retry budget is spent. ` +
+                `Moving it to \`blocked\` so it is visible for intervention. Re-dispatch ` +
+                `the issue to start a fresh chain with a fresh budget.`,
+              title: "Automatic continuation chain exhausted",
+              tone: "danger",
+            },
+          });
+          if (updated) {
+            result.continuationChainStopped += 1;
+            result.escalated += 1;
+            result.issueIds.push(issue.id);
+          } else {
+            result.skipped += 1;
+          }
         } else {
           result.skipped += 1;
         }
@@ -5686,7 +5773,7 @@ export function recoveryService(
         source: "issue.continuation_recovery",
         retryOfRunId: latestRun?.id ?? issue.checkoutRunId ?? null,
       });
-      if (queued) {
+      if (queued.queued) {
         result.continuationRequeued += 1;
         result.issueIds.push(issue.id);
       } else {
