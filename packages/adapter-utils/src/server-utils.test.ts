@@ -74,7 +74,7 @@ let restoreSpawnAdmissionEnter: (() => void) | null = null;
  *
  *     const ticket = fence.enterAdmission();   // counts IMMEDIATELY
  *     const child = spawn(...);                // ← the vulnerable window
- *     await ticket.admit({ pid, processGroupId });  // refuses when closed
+ *     await ticket.admit({ pid, processGroupId, resourceUnit }); // refuses when closed
  *     runningProcesses.set(runId, ...);
  *     ticket.settle();
  *
@@ -91,6 +91,7 @@ let restoreSpawnAdmissionEnter: (() => void) | null = null;
 type SpawnAdmissionMeta = {
   pid: number;
   processGroupId: number | null;
+  resourceUnit: string | null;
 };
 
 type SpawnAdmissionTicket = {
@@ -1104,6 +1105,42 @@ afterEach(() => {
 });
 
 describe("runChildProcess — spawn-during-shutdown admission fence (SPA-11948)", () => {
+  it.skipIf(process.platform !== "linux")(
+    "settles the pre-spawn admission lease when spawn throws synchronously",
+    async () => {
+      const getSpawnAdmissionFence = serverUtilsApi.getSpawnAdmissionFence as
+        | (() => SpawnAdmissionFence)
+        | undefined;
+      expect(
+        typeof getSpawnAdmissionFence,
+        "missing_spawn_admission_api:getSpawnAdmissionFence",
+      ).toBe("function");
+      const fence = getSpawnAdmissionFence!();
+      fence.reopen();
+      expect(fence.inFlight()).toBe(0);
+
+      await expect(
+        runChildProcess(
+          randomUUID(),
+          process.execPath,
+          ["-e", "process.exit(0)", "\u0000"],
+          {
+            cwd: process.cwd(),
+            env: {},
+            timeoutSec: 1,
+            graceSec: 1,
+            onLog: async () => {},
+          },
+        ),
+      ).rejects.toThrow();
+
+      expect(
+        fence.inFlight(),
+        "synchronous_spawn_throw_leaked_an_admission_lease",
+      ).toBe(0);
+    },
+  );
+
   // SPA-11948 R2. The full contract is pinned by the `SpawnAdmissionFence`
   // type block at the top of this file. What is pinned HERE is the behaviour:
   //
@@ -1148,10 +1185,7 @@ describe("runChildProcess — spawn-during-shutdown admission fence (SPA-11948)"
       // vacuously while the production bug stayed unfixed.
       const realEnterAdmission = fence.enterAdmission;
       let inFlightAtEnter = -1;
-      const atSpawnWindow = deferred<{
-        pid: number;
-        processGroupId: number | null;
-      }>();
+      const atSpawnWindow = deferred<SpawnAdmissionMeta>();
       const releaseAdmit = deferred();
       restoreSpawnAdmissionEnter = () => {
         fence.enterAdmission = realEnterAdmission;
@@ -1162,10 +1196,7 @@ describe("runChildProcess — spawn-during-shutdown admission fence (SPA-11948)"
         inFlightAtEnter = fence.inFlight();
         const realAdmit = ticket.admit;
         ticket.admit = async (meta) => {
-          atSpawnWindow.resolve({
-            pid: meta.pid,
-            processGroupId: meta.processGroupId,
-          });
+          atSpawnWindow.resolve(meta);
           await releaseAdmit.promise;
           return realAdmit.call(ticket, meta);
         };
@@ -1228,6 +1259,7 @@ describe("runChildProcess — spawn-during-shutdown admission fence (SPA-11948)"
         // wrapper, the group kill below must still clean the agent.
         trackSpawnFenceFixturePid(parked.pid);
         trackSpawnFenceFixturePid(parked.processGroupId);
+        expect(parked.resourceUnit).toMatch(/^paperclip-agent-[0-9a-f]+\.scope$/);
 
         // Resolve the REAL agent pid before asserting anything about it.
         const agentPid = await waitForAgentPidFile(pidFile);
@@ -1242,10 +1274,11 @@ describe("runChildProcess — spawn-during-shutdown admission fence (SPA-11948)"
         expect(isPidAlive(agentPid!)).toBe(true);
         expect(runningProcesses.has(runId)).toBe(false);
         expect(durableSpawnRecord).toBe(null);
-        // On Linux `child.pid` is the systemd-run wrapper and the agent is a
-        // descendant of it, which is exactly why the wrapper pid alone cannot
-        // prove the agent died.
-        expect(agentPid).not.toBe(parked.pid);
+        // Depending on the systemd version, `systemd-run --scope` either stays
+        // as a wrapper or execs the payload in place. The oracle is the real
+        // agent pid written by the payload itself; it must die below in either
+        // topology, so pid inequality is not a portable precondition.
+        expect(agentPid).toBeGreaterThan(0);
 
         // The load-bearing timing fact of this card: the lease was counted at the
         // PRE-spawn instant, so a drain has something to see even though nothing

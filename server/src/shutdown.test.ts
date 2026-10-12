@@ -581,6 +581,123 @@ describe("coordinateHeartbeatSchedulerShutdown", () => {
       waitedForSchedulerIdle: true,
     });
   });
+
+  it.skipIf(process.platform === "win32")(
+    "closes and drains spawn admission before the hot-restart snapshot without killing registered adoptable runs",
+    async () => {
+      const adapterApi = adapterServerUtils as unknown as Record<string, unknown>;
+      const getFence = adapterApi.getSpawnAdmissionFence as
+        | (() => SpawnAdmissionFence)
+        | undefined;
+      expect(typeof getFence, "missing_spawn_admission_api:getSpawnAdmissionFence").toBe(
+        "function",
+      );
+      const fence = getFence!();
+      fence.reopen();
+      expect(fence.inFlight()).toBe(0);
+
+      const adoptable = spawn(
+        process.execPath,
+        ["-e", "setInterval(() => {}, 1000)"],
+        { detached: true, stdio: "ignore" },
+      );
+      trackShutdownFixturePid(adoptable.pid);
+      adoptable.unref();
+      const order: string[] = [];
+      const originalClose = fence.close;
+      const originalDrain = fence.drain;
+      fence.close = () => {
+        order.push("admission_close");
+        originalClose.call(fence);
+      };
+      fence.drain = async (options) => {
+        order.push("admission_drain");
+        return originalDrain.call(fence, options);
+      };
+
+      try {
+        await vi.waitFor(() => expect(isPidAlive(adoptable.pid!)).toBe(true));
+        const prepareHotRestartShutdown = vi.fn(async () => {
+          order.push("snapshot");
+          expect(fence.isClosed()).toBe(true);
+          expect(fence.inFlight()).toBe(0);
+          expect(isPidAlive(adoptable.pid!)).toBe(true);
+          return { mode: "hot_restart" as const, skipDrain: true as const };
+        });
+
+        await expect(
+          coordinateHeartbeatSchedulerShutdown({
+            signal: "SIGTERM",
+            prepareHotRestartShutdown,
+            waitForHeartbeatSchedulerIdle: async () => {
+              order.push("scheduler_idle");
+            },
+            spawnAdmissionFence: fence,
+            log: stubLogger(),
+          }),
+        ).resolves.toEqual({
+          hotRestart: { mode: "hot_restart", skipDrain: true },
+          preparationError: null,
+          waitedForSchedulerIdle: true,
+        });
+
+        expect(order).toEqual([
+          "scheduler_idle",
+          "admission_close",
+          "admission_drain",
+          "snapshot",
+        ]);
+        expect(fence.isClosed()).toBe(true);
+        expect(isPidAlive(adoptable.pid!)).toBe(true);
+      } finally {
+        fence.close = originalClose;
+        fence.drain = originalDrain;
+        fence.reopen();
+        forceKillShutdownFixtures();
+      }
+    },
+    20_000,
+  );
+
+  it("refuses to take a hot-restart snapshot when spawn admission does not drain", async () => {
+    let closed = false;
+    const fence = {
+      close: vi.fn(() => {
+        closed = true;
+      }),
+      reopen: vi.fn(() => {
+        closed = false;
+      }),
+      isClosed: () => closed,
+      inFlight: () => 1,
+      enterAdmission: () => ({
+        admit: async () => undefined,
+        settle: () => undefined,
+      }),
+      drain: vi.fn(async () => "timed_out" as const),
+    } satisfies SpawnAdmissionFence;
+    const prepareHotRestartShutdown = vi.fn(async () => ({
+      mode: "hot_restart" as const,
+      skipDrain: true as const,
+    }));
+
+    const result = await coordinateHeartbeatSchedulerShutdown({
+      signal: "SIGTERM",
+      prepareHotRestartShutdown,
+      waitForHeartbeatSchedulerIdle: async () => undefined,
+      spawnAdmissionFence: fence,
+      spawnAdmissionDrainTimeoutMs: 5,
+      log: stubLogger(),
+    });
+
+    expect(prepareHotRestartShutdown).not.toHaveBeenCalled();
+    expect(result.hotRestart).toBeNull();
+    expect(result.preparationError).toBeInstanceOf(Error);
+    expect((result.preparationError as Error).message).toContain(
+      "spawn_admission_drain_timed_out",
+    );
+    expect(fence.isClosed()).toBe(true);
+  });
 });
 
 // SPA-11948 R2. The spawn-admission fence (`getSpawnAdmissionFence`) and the
@@ -597,7 +714,11 @@ describe("coordinateHeartbeatSchedulerShutdown", () => {
 // contract. This file only consumes the process-global singleton the server
 // itself imports through `@paperclipai/adapter-utils/server-utils`, so the
 // fence it closes is the same object the production spawn path gates on.
-type SpawnAdmissionMeta = { pid: number; processGroupId: number | null };
+type SpawnAdmissionMeta = {
+  pid: number;
+  processGroupId: number | null;
+  resourceUnit: string | null;
+};
 
 type SpawnAdmissionTicket = {
   /** Post-spawn. Rejects `spawn_admission_closed` after signalling the tree. */
@@ -724,7 +845,11 @@ describe("drainRunsForGracefulShutdown — spawn-admission ordering (SPA-11948)"
         // Admission is OPEN here, so this one is registered rather than refused.
         let openAdmissionError: unknown;
         try {
-          await ticket.admit({ pid: fixture.pid!, processGroupId: fixture.pid! });
+          await ticket.admit({
+            pid: fixture.pid!,
+            processGroupId: fixture.pid!,
+            resourceUnit: null,
+          });
         } catch (error) {
           openAdmissionError = error;
         }
@@ -784,6 +909,7 @@ describe("drainRunsForGracefulShutdown — spawn-admission ordering (SPA-11948)"
           await lateTicket.admit({
             pid: lateFixture.pid!,
             processGroupId: lateFixture.pid!,
+            resourceUnit: null,
           });
         } catch (error) {
           refusal = error;
@@ -811,6 +937,57 @@ describe("drainRunsForGracefulShutdown — spawn-admission ordering (SPA-11948)"
     },
     20_000,
   );
+
+  it("fails closed on an admission timeout before registered-run or finalizer drains", async () => {
+    const timeoutFence = {
+      close: vi.fn(),
+      reopen: vi.fn(),
+      drain: vi.fn(async () => "timed_out" as const),
+    };
+    const drainRuns = vi.fn(async () => undefined);
+    const drainExecutionFinalizers = vi.fn(async () => undefined);
+
+    await expect(
+      readShutdownApis().drainRunsForGracefulShutdown({
+        signal: "SIGTERM",
+        spawnAdmissionFence: timeoutFence as unknown as SpawnAdmissionFence,
+        drainRuns,
+        drainExecutionFinalizers,
+        timeoutMs: 5,
+        log: stubLogger(),
+      }),
+    ).rejects.toThrow("spawn_admission_drain_timed_out");
+
+    expect(drainRuns).not.toHaveBeenCalled();
+    expect(drainExecutionFinalizers).not.toHaveBeenCalled();
+  });
+
+  it("still drains execution finalizers when the registered-run drain rejects", async () => {
+    const runDrainError = new Error("registered run drain failed");
+    const order: string[] = [];
+    const drainedFence = {
+      close: vi.fn(),
+      reopen: vi.fn(),
+      drain: vi.fn(async () => "drained" as const),
+    };
+
+    await expect(
+      readShutdownApis().drainRunsForGracefulShutdown({
+        signal: "SIGTERM",
+        spawnAdmissionFence: drainedFence as unknown as SpawnAdmissionFence,
+        drainRuns: async () => {
+          order.push("run_drain");
+          throw runDrainError;
+        },
+        drainExecutionFinalizers: async () => {
+          order.push("execution_finalizer_drain");
+        },
+        log: stubLogger(),
+      }),
+    ).rejects.toBe(runDrainError);
+
+    expect(order).toEqual(["run_drain", "execution_finalizer_drain"]);
+  });
 
   it.skipIf(process.platform === "win32")(
     "holds the run and finalizer drains until admitted mid-spawn work has settled",

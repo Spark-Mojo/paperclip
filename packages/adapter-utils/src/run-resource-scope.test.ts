@@ -855,3 +855,33 @@ describe.skipIf(process.platform !== "linux")(
     }, 20_000);
   },
 );
+
+describe.skipIf(process.platform !== "linux")("killRunScope (SPA-11948 R2)", () => {
+  it("resolves without error for a unit that does not exist", async () => {
+    // The fence's refusal path kills the scope's whole cgroup with
+    // `systemctl --user kill`. A unit that is already gone is the DESIRED
+    // end state, not a failure: across `systemctl` versions the
+    // "not loaded" / "not active" message appears on stdout or stderr
+    // with varying exit codes, so `killRunScope` matches the message
+    // rather than the code. A random unit name cannot collide with a
+    // live one.
+    const killRunScope = runScopeApi.killRunScope as
+      | ((unit: string | null) => Promise<void>)
+      | undefined;
+    expect(
+      typeof killRunScope,
+      "missing_run_scope_api:killRunScope",
+    ).toBe("function");
+    await expect(
+      killRunScope!(`paperclip-agent-${randomUUID()}.scope`),
+    ).resolves.toBeUndefined();
+  });
+
+  it("short-circuits on a null unit", async () => {
+    const killRunScope = runScopeApi.killRunScope as
+      | ((unit: string | null) => Promise<void>)
+      | undefined;
+    expect(typeof killRunScope).toBe("function");
+    await expect(killRunScope!(null)).resolves.toBeUndefined();
+  });
+});

@@ -117,10 +117,11 @@ import { createDecisionRetentionNotifyOriginAgent, createDecisionWakeOriginAgent
 import {
   closeHttpListenerForShutdown,
   coordinateHeartbeatSchedulerShutdown,
-  drainRunExecutionFinalizersForShutdown,
+  drainRunsForGracefulShutdown,
   finalizeServerShutdown,
   loadWithoutCoordinatedShutdownSignalHooks,
 } from "./shutdown.js";
+import { getSpawnAdmissionFence } from "@paperclipai/adapter-utils/server-utils";
 import { initializeCloudRuntimeIdentity } from "./services/cloud-runtime-identity.js";
 import { systemdNotify } from "./services/systemd-notify.js";
 import { flushInFlightRunLogMirrors } from "./services/run-log-store.js";
@@ -2057,13 +2058,15 @@ async function startServerWithDatabaseTeardown(
       signal,
       prepareHotRestartShutdown,
       waitForHeartbeatSchedulerIdle,
+      spawnAdmissionFence: getSpawnAdmissionFence(),
+      log: logger,
     });
     const skipHeartbeatDrain = heartbeatShutdown.hotRestart?.skipDrain === true;
     const selectiveDrainRunIds = heartbeatShutdown.hotRestart?.drainRunIds ?? null;
     if (skipHeartbeatDrain) {
       logger.info(
         { signal, hotRestart: heartbeatShutdown.hotRestart },
-        "hot-restart shutdown prepared after scheduler quiescence; skipping graceful run drain",
+        "hot-restart shutdown prepared after scheduler quiescence and spawn-admission drain; skipping graceful run drain so adoptable runs stay alive",
       );
     } else if (heartbeatShutdown.preparationError) {
       logger.error(
@@ -2080,19 +2083,23 @@ async function startServerWithDatabaseTeardown(
 
     if (!skipHeartbeatDrain && drainHeartbeatRunsForShutdown) {
       try {
-        const drain = await drainHeartbeatRunsForShutdown(signal, selectiveDrainRunIds);
-        logger.info({ signal, drain }, "graceful heartbeat run drain complete");
+        await drainRunsForGracefulShutdown({
+          signal,
+          spawnAdmissionFence: getSpawnAdmissionFence(),
+          drainRuns: async () => {
+            const drain = await drainHeartbeatRunsForShutdown!(
+              signal,
+              selectiveDrainRunIds,
+            );
+            logger.info({ signal, drain }, "graceful heartbeat run drain complete");
+          },
+          drainExecutionFinalizers:
+            drainHeartbeatExecutionFinalizers ?? (async () => undefined),
+          log: logger,
+        });
       } catch (err) {
         logger.error({ err, signal }, "graceful heartbeat run drain failed");
       }
-    }
-
-    if (!skipHeartbeatDrain) {
-      await drainRunExecutionFinalizersForShutdown({
-        signal,
-        drain: drainHeartbeatExecutionFinalizers,
-        log: logger,
-      });
     }
 
     // Whatever the drain did not finalize (timed-out runs, the hot-restart

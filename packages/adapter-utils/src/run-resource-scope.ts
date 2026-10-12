@@ -51,6 +51,48 @@ export async function stopRunScope(unit: string | null): Promise<void> {
 }
 
 /**
+ * Immediately signal every process in one run scope. Unlike `systemctl stop`,
+ * this does not wait through the unit's graceful stop timeout; it is the
+ * fail-closed primitive for a child that was spawned after shutdown admission
+ * closed and must not outlive the engine process.
+ */
+export async function killRunScope(unit: string | null): Promise<void> {
+  if (!unit) return;
+  await new Promise<void>((resolve, reject) => {
+    // `systemctl --user kill` may exit 0/1/4/5 across versions and locales
+    // for a unit that is already gone -- the message is the load-bearing
+    // signal: "not loaded" / "not active" / "no such unit" all mean
+    // "nothing left to kill", which is the desired end state. Anything
+    // else (or an actual spawn error) is a real failure.
+    const control = spawn(
+      "systemctl",
+      ["--user", "kill", "--kill-whom=all", "--signal=SIGKILL", unit],
+      { stdio: ["ignore", "pipe", "pipe"] },
+    );
+    let stderr = "";
+    control.stderr?.on("data", (chunk: Buffer) => {
+      stderr += chunk.toString("utf8");
+    });
+    let stdout = "";
+    control.stdout?.on("data", (chunk: Buffer) => {
+      stdout += chunk.toString("utf8");
+    });
+    control.once("error", reject);
+    control.once("close", (code) => {
+      const combined = `${stdout}\n${stderr}`;
+      if (
+        /not loaded|not active|not found|no such unit/i.test(combined) ||
+        code === 0
+      ) {
+        resolve();
+        return;
+      }
+      reject(new Error(`run_scope_kill_failed:${code}: ${stderr.trim() || stdout.trim()}`));
+    });
+  });
+}
+
+/**
  * One `running` run row, projected onto the only identity it persisted at spawn
  * time. A pid on its own is not an identity: the kernel recycles pids, so the
  * start instant recorded alongside it is what makes the pid safe to act on.
