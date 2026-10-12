@@ -3,7 +3,7 @@ import { randomUUID } from "node:crypto";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it } from "vitest";
 import { CONNECTION_INTENT_AGENT_GUIDANCE } from "@paperclipai/shared";
 import {
   readPaperclipRuntimeSkillEntries,
@@ -40,6 +40,86 @@ import {
   WATCHDOG_DEFAULT_MANDATE,
   writeRunPromptToFile,
 } from "./server-utils.js";
+import * as serverUtilsModule from "./server-utils.js";
+
+const serverUtilsApi = serverUtilsModule as unknown as Record<string, unknown>;
+let restoreSpawnAdmissionEnter: (() => void) | null = null;
+
+/**
+ * SPA-11948 R2 — the spawn-admission fence contract this card specifies.
+ *
+ * Declared LOCALLY rather than imported from `./server-utils.js`. The
+ * production export does not exist yet, and a type-only import of a missing
+ * member is a hard tests-only-commit `tsc` failure; declaring the shape here
+ * keeps the whole file typechecking while still specifying the API precisely.
+ * The tests reach the real implementation through the namespace cast above, so
+ * a missing export surfaces as ONE precise assertion failure
+ * (`missing_spawn_admission_api:getSpawnAdmissionFence`) instead of a module
+ * link error that would take every other case in this 1200-line file down with
+ * it.
+ *
+ * ## Why the counter starts BEFORE the spawn
+ *
+ * Graceful shutdown drains the run registry exactly once. A child that is
+ * mid-spawn — `spawn()` has returned, so the OS process is real, but
+ * `runningProcesses.set` and the durable `onSpawn` callback have not run yet —
+ * is in no registry a drain consults, so the drain reports "clean" and the
+ * mid-spawn child survives the restart as an orphan still holding a
+ * concurrency cap slot.
+ *
+ * A gate that opens only at `admit()` cannot fix that, because the gate would
+ * open in the same instant the process already exists: the count still rises
+ * too late to cover the window. So admission is a LEASE, and it is taken
+ * BEFORE `spawn()` is called:
+ *
+ *     const ticket = fence.enterAdmission();   // counts IMMEDIATELY
+ *     const child = spawn(...);                // ← the vulnerable window
+ *     await ticket.admit({ pid, processGroupId });  // refuses when closed
+ *     runningProcesses.set(runId, ...);
+ *     ticket.settle();
+ *
+ * `admit()` rejecting means the spawn was refused: the fence has already
+ * signalled the admitted tree, so a refused spawn is KILLED rather than
+ * orphaned, and `runChildProcess` surfaces the refusal as a rejection instead
+ * of a fabricated success. `settle()` is called on BOTH paths — admitted or
+ * refused — so a leaked ticket can never wedge the drain, and it is idempotent
+ * so the teardown can call it defensively.
+ *
+ * `drain()` resolves `"drained"` only once no lease is outstanding. It never
+ * reports `"drained"` merely because the gate is closed.
+ */
+type SpawnAdmissionMeta = {
+  pid: number;
+  processGroupId: number | null;
+};
+
+type SpawnAdmissionTicket = {
+  /**
+   * Post-spawn. Binds the real process identity to the lease. Rejects with
+   * `spawn_admission_closed` when the fence is closed — AFTER signalling
+   * `meta.processGroupId ?? meta.pid`, so a refused spawn dies instead of
+   * being orphaned.
+   */
+  admit: (meta: SpawnAdmissionMeta) => Promise<void>;
+  /** End the attempt. Idempotent; required on both the admitted and refused paths. */
+  settle: () => void;
+};
+
+type SpawnAdmissionDrainOutcome = "drained" | "timed_out";
+
+type SpawnAdmissionFence = {
+  /** Take an admission lease. MUST be called BEFORE `spawn()`. */
+  enterAdmission: () => SpawnAdmissionTicket;
+  /** Close the gate. Outstanding leases stay counted; later ones are refused. */
+  close: () => void;
+  /** Reopen the gate. Restores the pre-shutdown behaviour. */
+  reopen: () => void;
+  isClosed: () => boolean;
+  /** Leases taken and not yet settled. Covers the whole pre-spawn → registered window. */
+  inFlight: () => number;
+  /** Resolves `"drained"` only once no lease is outstanding. */
+  drain: (options: { timeoutMs: number }) => Promise<SpawnAdmissionDrainOutcome>;
+};
 
 describe("runtime connection tool delivery", () => {
   const access = {
@@ -177,6 +257,65 @@ async function waitForTextMatch(
     await new Promise((resolve) => setTimeout(resolve, 25));
   }
   return read().match(pattern);
+}
+
+// SPA-11948 R2. Fixture processes are tracked at module scope, not just inside
+// the test body. A vitest-level timeout kills the test WITHOUT unwinding its
+// `finally`, so a body-only cleanup would leak a live agent process. The
+// `afterEach` sweep below is the backstop for that path, and the fixture script
+// self-terminates as a second, independent bound.
+const spawnFenceFixturePids = new Set<number>();
+
+function trackSpawnFenceFixturePid(pid: number | null | undefined) {
+  if (typeof pid === "number" && Number.isInteger(pid) && pid > 0) {
+    spawnFenceFixturePids.add(pid);
+  }
+}
+
+function forceKillSpawnFenceFixtures() {
+  for (const pid of spawnFenceFixturePids) {
+    // Prefer the process group (the child is spawned detached, so it leads one),
+    // then fall back to the bare pid for a non-leader.
+    try {
+      process.kill(-pid, "SIGKILL");
+      continue;
+    } catch {
+      // Not a process group leader; fall through to the direct pid.
+    }
+    try {
+      process.kill(pid, "SIGKILL");
+    } catch {
+      // Already dead.
+    }
+  }
+  spawnFenceFixturePids.clear();
+}
+
+afterEach(() => {
+  forceKillSpawnFenceFixtures();
+});
+
+/**
+ * Reads the REAL agent pid out of the fixture pid file.
+ *
+ * `runChildProcess` reports `child.pid`, which on Linux is the `systemd-run
+ * --scope` WRAPPER, not the agent: the payload is forked into its own cgroup,
+ * so the agent is a descendant that a wrapper-pid assertion can never observe.
+ * The fixture writes `process.pid` from inside the agent, which is the only
+ * identity that survives the wrapper.
+ */
+async function waitForAgentPidFile(pidFile: string, timeoutMs = 10_000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    try {
+      const pid = Number.parseInt((await fs.readFile(pidFile, "utf8")).trim(), 10);
+      if (Number.isInteger(pid) && pid > 0) return pid;
+    } catch {
+      // Not written yet.
+    }
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  return null;
 }
 
 describe("buildInvocationEnvForLogs", () => {
@@ -936,6 +1075,256 @@ describe("runChildProcess", () => {
         }
       }
     },
+  );
+});
+
+function deferred<T = void>() {
+  let resolve!: (value: T) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((res, rej) => {
+    resolve = res;
+    reject = rej;
+  });
+  return { promise, resolve, reject };
+}
+
+// The fence is process-global. The fence test restores it in its own `finally`,
+// but a vitest-level timeout kills that test without unwinding, which would
+// leave admission closed and fail every later `runChildProcess` case in this
+// file for an unrelated reason. Reopening on the way out keeps a leaked fence
+// from contaminating the rest of the suite.
+afterEach(() => {
+  restoreSpawnAdmissionEnter?.();
+  restoreSpawnAdmissionEnter = null;
+  const getSpawnAdmissionFence = serverUtilsApi.getSpawnAdmissionFence as
+    | (() => SpawnAdmissionFence)
+    | undefined;
+  if (typeof getSpawnAdmissionFence !== "function") return;
+  getSpawnAdmissionFence().reopen();
+});
+
+describe("runChildProcess — spawn-during-shutdown admission fence (SPA-11948)", () => {
+  // SPA-11948 R2. The full contract is pinned by the `SpawnAdmissionFence`
+  // type block at the top of this file. What is pinned HERE is the behaviour:
+  //
+  //   - the admission lease is counted BEFORE `spawn()` is ever called, so the
+  //     count covers the whole vulnerable window;
+  //   - a spawn whose lease reaches a CLOSED gate is refused, not registered;
+  //   - the refusal kills the REAL agent process, which on Linux is a
+  //     descendant of the `systemd-run --scope` wrapper `spawn()` returns;
+  //   - the drain does not report "drained" while a lease is outstanding, and
+  //     only reports it once the refused spawn has been settled.
+  //
+  // Linux-gated: `runChildProcess` routes every spawn through
+  // `scopedRunCommand`, which wraps the payload in a `systemd-run --user
+  // --scope` unit on Linux. That wrapper is what makes the real agent a
+  // DESCENDANT of `spawn()`'s return value, so the "a wrapper pid alone cannot
+  // prove the agent died" premise — and the fixture's self-terminating bound
+  // that keeps a leaked scope unit from outliving the suite — are Linux-only.
+  it.skipIf(process.platform !== "linux")(
+    "refuses a spawn admitted after shutdown closed the gate, counting it from before spawn()",
+    async () => {
+      const getSpawnAdmissionFence = serverUtilsApi.getSpawnAdmissionFence as
+        | (() => SpawnAdmissionFence)
+        | undefined;
+      expect(
+        typeof getSpawnAdmissionFence,
+        "missing_spawn_admission_api:getSpawnAdmissionFence",
+      ).toBe("function");
+      const fence = getSpawnAdmissionFence!();
+      fence.reopen();
+      // A fresh process-global counter. A lease left outstanding by an earlier
+      // case would make every count below meaningless.
+      expect(
+        fence.inFlight(),
+        "fence_must_start_with_no_outstanding_leases",
+      ).toBe(0);
+
+      // Park the run in the middle of the vulnerable window. The wrapper
+      // DELEGATES to the real `enterAdmission` FIRST, so the process-global
+      // counter is genuinely raised. This is the whole point of the shape: with
+      // a gate counted only at the post-spawn barrier, a fake could replace it
+      // here, `inFlight()` would read 0, and every assertion below would pass
+      // vacuously while the production bug stayed unfixed.
+      const realEnterAdmission = fence.enterAdmission;
+      let inFlightAtEnter = -1;
+      const atSpawnWindow = deferred<{
+        pid: number;
+        processGroupId: number | null;
+      }>();
+      const releaseAdmit = deferred();
+      restoreSpawnAdmissionEnter = () => {
+        fence.enterAdmission = realEnterAdmission;
+      };
+      fence.enterAdmission = () => {
+        const ticket = realEnterAdmission.call(fence);
+        // Sampled at the PRE-spawn instant, by the real fence.
+        inFlightAtEnter = fence.inFlight();
+        const realAdmit = ticket.admit;
+        ticket.admit = async (meta) => {
+          atSpawnWindow.resolve({
+            pid: meta.pid,
+            processGroupId: meta.processGroupId,
+          });
+          await releaseAdmit.promise;
+          return realAdmit.call(ticket, meta);
+        };
+        return ticket;
+      };
+
+      const runId = randomUUID();
+      const fixtureDir = await fs.mkdtemp(
+        path.join(os.tmpdir(), "spa-11948-spawn-fence-"),
+      );
+      const pidFile = path.join(fixtureDir, "agent.pid");
+      let durableSpawnRecord: { pid: number } | null = null;
+      const runPromise = runChildProcess(
+        runId,
+        process.execPath,
+        [
+          "-e",
+          [
+            "const fs = require('node:fs');",
+            "const t = setInterval(() => {}, 1000);",
+            // The agent reports its OWN pid, then stays alive. On Linux the pid
+            // `runChildProcess` sees is the systemd-run wrapper, so the pid file
+            // is the only way to name the real process that must die.
+            `fs.writeFileSync(${JSON.stringify(pidFile)}, String(process.pid));`,
+            // An independent bound on the fixture's lifetime: if both cleanup
+            // paths are skipped, the scope's cgroup still empties and the
+            // `--collect` unit is reaped rather than lingering on the host.
+            "setTimeout(() => { clearInterval(t); process.exit(0); }, 20000);",
+          ].join(" "),
+        ],
+        {
+          cwd: process.cwd(),
+          env: {},
+          // No timeout: nothing but the fence may end this run.
+          timeoutSec: 0,
+          graceSec: 1,
+          onLog: async () => {},
+          onSpawn: async (meta) => {
+            durableSpawnRecord = { pid: meta.pid };
+          },
+        },
+      );
+      // Never leave the rejection unhandled while the test is arranging state.
+      const settled = runPromise.then(
+        (value) => ({ ok: true as const, value }),
+        (error: unknown) => ({ ok: false as const, error }),
+      );
+
+      try {
+        const parked = await Promise.race([
+          atSpawnWindow.promise,
+          new Promise<never>((_, reject) =>
+            setTimeout(
+              () => reject(new Error("spawn_window_never_reached")),
+              5_000,
+            ),
+          ),
+        ]);
+        // The wrapper pid is tracked too: if the fence ever kills only the
+        // wrapper, the group kill below must still clean the agent.
+        trackSpawnFenceFixturePid(parked.pid);
+        trackSpawnFenceFixturePid(parked.processGroupId);
+
+        // Resolve the REAL agent pid before asserting anything about it.
+        const agentPid = await waitForAgentPidFile(pidFile);
+        expect(
+          agentPid,
+          "agent_pid_file_never_written:spawn_fixture_failed_to_report_its_pid",
+        ).not.toBeNull();
+        trackSpawnFenceFixturePid(agentPid);
+
+        // The precondition R2 depends on: a real agent process exists, and it
+        // is not yet registered anywhere a shutdown drain would consult.
+        expect(isPidAlive(agentPid!)).toBe(true);
+        expect(runningProcesses.has(runId)).toBe(false);
+        expect(durableSpawnRecord).toBe(null);
+        // On Linux `child.pid` is the systemd-run wrapper and the agent is a
+        // descendant of it, which is exactly why the wrapper pid alone cannot
+        // prove the agent died.
+        expect(agentPid).not.toBe(parked.pid);
+
+        // The load-bearing timing fact of this card: the lease was counted at the
+        // PRE-spawn instant, so a drain has something to see even though nothing
+        // is registered and no durable spawn record exists yet.
+        expect(
+          inFlightAtEnter,
+          "admission_lease_must_be_counted_before_spawn",
+        ).toBeGreaterThanOrEqual(1);
+
+        // Shutdown starts: admission closes, then the drain begins.
+        fence.close();
+        expect(fence.isClosed()).toBe(true);
+        let drainResolved = false;
+        const drain = fence
+          .drain({ timeoutMs: 5_000 })
+          .then((outcome) => {
+            drainResolved = true;
+            return outcome;
+          });
+
+        // The outstanding lease is counted, so the drain must not report clean.
+        expect(fence.inFlight()).toBeGreaterThanOrEqual(1);
+        const earlyDrain = await Promise.race([
+          drain.then(() => "drained" as const),
+          new Promise<"still_open">((resolve) =>
+            setTimeout(() => resolve("still_open"), 150),
+          ),
+        ]);
+        expect(earlyDrain, "drain_resolved_while_spawn_still_in_flight").toBe(
+          "still_open",
+        );
+        expect(drainResolved).toBe(false);
+
+        // Let the parked spawn reach the now-closed fence.
+        releaseAdmit.resolve();
+
+        const outcome = await Promise.race([
+          settled,
+          new Promise<never>((_, reject) =>
+            setTimeout(() => reject(new Error("run_never_settled")), 10_000),
+          ),
+        ]);
+        // A refused spawn rejects rather than resolving with a bogus result.
+        expect(outcome.ok, "run_resolved_instead_of_rejecting").toBe(false);
+        const error = (outcome as { ok: false; error: unknown }).error;
+        expect(error).toBeInstanceOf(Error);
+        expect((error as Error).message).toContain("spawn_admission_closed");
+
+        // The real descendant agent dies, not merely the systemd-run wrapper.
+        expect(
+          await waitForPidExit(agentPid!, 5_000),
+          "agent_descendant_survived_a_refused_spawn",
+        ).toBe(true);
+
+        // Refused before registration, so no half-registered entry survives.
+        expect(runningProcesses.has(runId)).toBe(false);
+
+        // Only now, with the refused lease settled, is the drain allowed to
+        // report clean. A refusal that never settled would wedge it forever.
+        expect(await drain).toBe("drained");
+        expect(fence.inFlight()).toBe(0);
+      } finally {
+        // Never strand the fixture process if an assertion above threw first.
+        // Killing the tracked pids (agent + wrapper + group) is idempotent, so
+        // this is safe whether the refusal already killed them or not.
+        releaseAdmit.resolve();
+        restoreSpawnAdmissionEnter?.();
+        restoreSpawnAdmissionEnter = null;
+        fence.reopen();
+        runningProcesses.delete(runId);
+        await Promise.race([
+          settled.catch(() => undefined),
+          new Promise((resolve) => setTimeout(resolve, 5_000)),
+        ]);
+        forceKillSpawnFenceFixtures();
+        await fs.rm(fixtureDir, { recursive: true, force: true });
+      }
+    },
+    30_000,
   );
 });
 

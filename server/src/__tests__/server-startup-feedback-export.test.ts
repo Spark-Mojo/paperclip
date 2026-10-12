@@ -68,6 +68,8 @@ const {
       blockedRunIds: [],
     })),
     reconcileHotRestartAdoption: vi.fn(async () => ({ mode: "none" })),
+    // SPA-11948: stale `paperclip-agent-*.scope` reconciliation at boot.
+    reconcileStaleRunScopes: vi.fn(async () => ({ units: [], detachedRunIds: [] })),
     reapOrphanedRuns: vi.fn(async () => ({ reaped: 0, runIds: [] })),
     promoteDueScheduledRetries: vi.fn(async () => ({ promoted: 0, runIds: [] })),
     resumeQueuedRuns: vi.fn(async () => undefined),
@@ -169,6 +171,26 @@ const {
     routineServiceMock,
   };
 });
+
+/**
+ * Installs a temporary implementation and returns an undo that restores the
+ * previous one. `vi.clearAllMocks()` in `beforeEach` resets call history but
+ * leaves implementations in place, so an override that a test never reaches
+ * would otherwise leak into every later test in the file.
+ */
+function restoreImpl<T extends (...args: never[]) => unknown>(
+  mock: {
+    mockImplementation(fn: T): unknown;
+    getMockImplementation(): T | undefined;
+  },
+  impl: T,
+) {
+  const previous = mock.getMockImplementation() as T | undefined;
+  mock.mockImplementation(impl);
+  return () => {
+    if (previous) mock.mockImplementation(previous);
+  };
+}
 
 function buildTestConfig(overrides: Record<string, unknown> = {}) {
   return {
@@ -672,6 +694,64 @@ describe("startServer feedback export wiring", () => {
       expect(environmentCustomImagesServiceMock.cleanupExpiredSetupSessions).not.toHaveBeenCalled();
     } finally {
       setIntervalSpy.mockRestore();
+    }
+  });
+
+  // SPA-11948. Startup ordering is load-bearing, not incidental. Each step is
+  // gated on the previous one's durable result:
+  //
+  //   hot-restart adoption  -> marks the runs this engine genuinely still owns
+  //   stale-scope reconcile  -> reaps `paperclip-agent-*.scope` units left by a
+  //                             previous engine, skipping the adopted ones
+  //   orphan reaper          -> clears `running` rows with no live process
+  //   queued admission       -> only now may queued work be admitted
+  //
+  // Reap-before-adopt would kill adopted live work; admit-before-reconcile
+  // would admit queued runs while a foreign scope still holds a cap slot.
+  it("reconciles stale run scopes after hot-restart adoption and before queued admission", async () => {
+    loadConfigMock.mockReturnValue(buildTestConfig({
+      heartbeatSchedulerEnabled: true,
+      heartbeatSchedulerIntervalMs: 30000,
+    }));
+
+    const order: string[] = [];
+    // `vi.clearAllMocks()` clears calls but NOT implementations, so an
+    // unconsumed `mockImplementationOnce` would survive into the next test and
+    // in the RED state `reconcileStaleRunScopes` is never called at all. Use
+    // `mockImplementation` with an explicit restore instead.
+    const restore = [
+      restoreImpl(heartbeatServiceMock.reconcileHotRestartAdoption, async () => {
+        order.push("hot_restart_adoption");
+        return { mode: "reported" };
+      }),
+      restoreImpl(heartbeatServiceMock.reconcileStaleRunScopes, async () => {
+        order.push("stale_scope_reconciliation");
+        return { units: [], detachedRunIds: [] };
+      }),
+      restoreImpl(heartbeatServiceMock.reapOrphanedRuns, async () => {
+        order.push("orphan_reaper");
+        return { reaped: 0, runIds: [] };
+      }),
+      restoreImpl(heartbeatServiceMock.resumeQueuedRuns, async () => {
+        order.push("queued_admission");
+        return undefined;
+      }),
+    ];
+
+    try {
+      await startServer();
+
+      // Every step ran, in the one order that keeps adopted work alive and
+      // stops a foreign scope from holding a cap slot during admission.
+      expect(order).toEqual([
+        "hot_restart_adoption",
+        "stale_scope_reconciliation",
+        "orphan_reaper",
+        "queued_admission",
+      ]);
+      expect(heartbeatServiceMock.reconcileStaleRunScopes).toHaveBeenCalledTimes(1);
+    } finally {
+      for (const undo of restore) undo();
     }
   });
 

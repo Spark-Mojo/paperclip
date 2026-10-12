@@ -449,6 +449,108 @@ async function spawnOrphanedProcessGroup() {
   };
 }
 
+/**
+ * SPA-11948 R1. A scope whose leader has already exited — what systemd reports
+ * as `MainPID=0` — while TWO descendants survive in the detached process group.
+ *
+ * Two survivors rather than one so "the COMPLETE cgroup membership was
+ * signalled" is distinguishable from "some member of it was signalled", which is
+ * the difference a representative-pid reaper would make. The leader is spawned
+ * detached (so it leads its own group exactly like `scopedRunCommand`'s payload)
+ * and both descendants are spawned WITHOUT `detached`, so they inherit that
+ * group and outlive it. Nothing is stubbed: the pids come back over the leader's
+ * own stdout, because after the leader exits they are the only surviving truth.
+ */
+async function spawnLeaderlessScopeTree() {
+  const leader = spawn(
+    process.execPath,
+    [
+      "-e",
+      [
+        "const { spawn } = require('node:child_process');",
+        "const a = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore' });",
+        "const b = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore' });",
+        "process.stdout.write(JSON.stringify([a.pid, b.pid]));",
+        "setTimeout(() => process.exit(0), 25);",
+      ].join(" "),
+    ],
+    {
+      detached: true,
+      stdio: ["ignore", "pipe", "ignore"],
+    },
+  );
+
+  let stdout = "";
+  leader.stdout?.on("data", (chunk) => {
+    stdout += String(chunk);
+  });
+
+  await new Promise<void>((resolve, reject) => {
+    leader.once("error", reject);
+    leader.once("exit", () => resolve());
+  });
+
+  let survivorPids: number[];
+  try {
+    survivorPids = (JSON.parse(stdout.trim()) as unknown[]).map((pid) =>
+      Number.parseInt(String(pid), 10),
+    );
+  } catch {
+    throw new Error(`failed_to_capture_scope_survivor_pids:${stdout}`);
+  }
+  if (
+    survivorPids.length !== 2 ||
+    survivorPids.some((pid) => !Number.isInteger(pid) || pid <= 0)
+  ) {
+    throw new Error(`failed_to_capture_scope_survivor_pids:${stdout}`);
+  }
+
+  return {
+    leaderPid: leader.pid ?? null,
+    groupId: leader.pid ?? null,
+    survivorPids,
+  };
+}
+
+/**
+ * SPA-11948 R1. The truthful `readProcessIdentity` seam, answered through the
+ * same process-start reader production hot-restart adoption uses. A pid with no
+ * live process answers `null`; a live pid returns its real start identity.
+ */
+async function readLiveProcessIdentity(
+  pid: number,
+): Promise<{ startedAt: string } | null> {
+  try {
+    return { startedAt: await readProcessStartedAt(pid) };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * SPA-11948 R1. The truthful `listGroupMembers` seam: the live members of a
+ * process group, read from the REAL process table (`/proc/<pid>/stat`, field
+ * `pgrp`). The leader-dead fixture can only claim to exercise the group
+ * correlation if the group really still holds the survivors.
+ */
+async function listProcGroupMembers(pgid: number): Promise<number[]> {
+  const entries = await fs.readdir("/proc").catch(() => [] as string[]);
+  const members: number[] = [];
+  for (const entry of entries) {
+    if (!/^\d+$/.test(entry)) continue;
+    const raw = await fs.readFile(`/proc/${entry}/stat`, "utf8").catch(() => null);
+    if (raw === null) continue;
+    const commEnd = raw.lastIndexOf(")");
+    if (commEnd < 0) continue;
+    // `pgrp` is the third field after state (field 5 of the line).
+    if (Number.parseInt(raw.slice(commEnd + 2).split(" ")[2] ?? "", 10) !== pgid) {
+      continue;
+    }
+    members.push(Number.parseInt(entry, 10));
+  }
+  return members;
+}
+
 describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
   let db!: ReturnType<typeof createDb>;
   let tempDb: Awaited<
@@ -674,6 +776,12 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     runStatus?: "running" | "queued" | "failed" | "interrupted";
     processPid?: number | null;
     processGroupId?: number | null;
+    /**
+     * SPA-11948 R1. The start instant persisted alongside `processPid`; a pid on
+     * its own is not an identity across a restart, because the pid may since
+     * have been recycled by an unrelated process.
+     */
+    processStartedAt?: string | null;
     processLossRetryCount?: number;
     runtimeMode?: "legacy" | "native";
     includeIssue?: boolean;
@@ -736,6 +844,10 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
           : { ...(input?.contextSnapshot ?? {}), issueId },
       processPid: input?.processPid ?? null,
       processGroupId: input?.processGroupId ?? null,
+      processStartedAt:
+        input?.processStartedAt === undefined || input?.processStartedAt === null
+          ? null
+          : new Date(input.processStartedAt),
       processLossRetryCount: input?.processLossRetryCount ?? 0,
       ...(input?.runtimeMode ? { runtimeMode: input.runtimeMode } : {}),
       errorCode: input?.runErrorCode ?? null,
@@ -3720,6 +3832,310 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
         });
       });
     },
+  );
+
+  // SPA-11948 R1. The boot reconciliation entrypoint does not exist yet, so it
+  // is read off the service through a `Record<string, unknown>` cast rather than
+  // a named call. A missing method on a typed object would be a compile error
+  // that takes the whole file's typecheck down; the cast keeps this tests-only
+  // commit collecting and turns the gap into one precise assertion failure.
+  //
+  // systemd scope units are a Linux-only concept, hence the platform gate.
+  type StaleRunScopeUnit = {
+    unit: string;
+    mainPid: number;
+    controlGroupPids: number[];
+  };
+
+  /**
+   * The boot contract under test (R1, server side):
+   *
+   *   - the systemd seams are injected (`listUnits` / `stopUnit` /
+   *     `killProcessTree` / `readProcessIdentity` / `listGroupMembers`), so
+   *     nothing real is ever stopped or signalled by the code under test, and
+   *     neither seam can be quietly stubbed into a vacuous pass;
+   *   - a scope is STALE when its run is neither adopted across this restart nor
+   *     present in the live process registry, and it must then be stopped and
+   *     its run row moved out of `running` with a durable reason;
+   *   - an adopted run and a currently-running run must survive untouched.
+   *
+   * The unit → run correlation, the `runs` / `ownedRunIds` fan-out and the
+   * `{ units, detachedRunIds }` return shape are owned by the sibling adapter
+   * test (`packages/adapter-utils/src/run-resource-scope.test.ts`); this test
+   * pins only the server half — which runs count as owned, and the durable
+   * transition of the ones that do not.
+   */
+  type StaleRunScopeReconciler = (deps: {
+    listUnits: () => Promise<StaleRunScopeUnit[]>;
+    stopUnit: (unit: string) => Promise<void> | void;
+    killProcessTree: (pids: number[]) => Promise<void> | void;
+    /**
+     * The start instant of a LIVE pid, or `null` when no such process exists.
+     * `null` never authorizes a kill on its own — it only means the pid path
+     * does not apply, and correlation falls back to the recorded process group.
+     */
+    readProcessIdentity: (pid: number) => Promise<{ startedAt: string } | null>;
+    /** Live members of a process group, for a unit whose leader already exited. */
+    listGroupMembers: (pgid: number) => Promise<number[]>;
+  }) => Promise<{ units: string[]; detachedRunIds: string[] }>;
+
+  it.skipIf(process.platform !== "linux")(
+    "SPA-11948 reaps stale agent run scopes at boot without touching adopted or current runs",
+    async () => {
+      const pidOf = (child: ChildProcess) => {
+        if (typeof child.pid !== "number" || child.pid <= 0) {
+          throw new Error("stale_scope_fixture_not_started");
+        }
+        return child.pid;
+      };
+
+      // A scope left across a restart: its leader has already exited, but TWO
+      // real descendants remain in the detached process group. This is the
+      // incident shape that a MainPID-only or representative-pid reaper misses.
+      const staleGroup = await spawnLeaderlessScopeTree();
+      if (staleGroup.groupId === null || staleGroup.leaderPid === null) {
+        throw new Error("stale_scope_fixture_missing_process_group");
+      }
+      for (const pid of staleGroup.survivorPids) cleanupPids.add(pid);
+      // A run this engine ADOPTED across the restart. Reaping it kills live work.
+      const adoptedChild = spawnAliveProcess();
+      childProcesses.add(adoptedChild);
+      // A run this engine is running RIGHT NOW — the live registry is the signal.
+      // Detached gives it a private process group, so even an incorrect group-
+      // signalling implementation cannot touch the vitest worker's own group.
+      const currentChild = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], {
+        detached: true,
+        stdio: "ignore",
+      });
+      currentChild.unref();
+      childProcesses.add(currentChild);
+      // A non-Paperclip unit sharing the user manager, with no run row at all.
+      const foreignChild = spawnAliveProcess();
+      childProcesses.add(foreignChild);
+
+      const stalePid = staleGroup.leaderPid;
+      const staleDescendantPids = staleGroup.survivorPids;
+      const adoptedPid = pidOf(adoptedChild);
+      const currentPid = pidOf(currentChild);
+      const foreignPid = pidOf(foreignChild);
+      const adoptedIdentity = await readLiveProcessIdentity(adoptedPid);
+      const currentIdentity = await readLiveProcessIdentity(currentPid);
+      if (!adoptedIdentity || !currentIdentity) {
+        throw new Error("live_scope_fixture_missing_process_identity");
+      }
+      expect(await waitForPidExit(stalePid)).toBe(true);
+      for (const pid of staleDescendantPids) expect(isPidAlive(pid)).toBe(true);
+      expect(await listProcGroupMembers(staleGroup.groupId)).toEqual(
+        expect.arrayContaining(staleDescendantPids),
+      );
+
+      const agentScopeUnit = () =>
+        `paperclip-agent-${randomUUID().replace(/-/g, "")}.scope`;
+      const staleUnit = agentScopeUnit();
+      const adoptedUnit = agentScopeUnit();
+      const currentUnit = agentScopeUnit();
+      const foreignUnit = `session-${randomUUID().replace(/-/g, "")}.scope`;
+
+      // Seeded `queued` FIRST, and flipped to `running` only after the hot-restart
+      // snapshot: `prepareHotRestartShutdown` records every `running` row, so a run
+      // that must NOT be adopted has to be invisible to that snapshot. An adopted
+      // run is seeded `running` so adoption genuinely takes place.
+      const stale = await seedRunFixture({ runStatus: "queued" });
+      const current = await seedRunFixture({ runStatus: "queued" });
+      const adopted = await seedRunFixture({
+        agentStatus: "running",
+        runStatus: "running",
+        processPid: adoptedPid,
+        processGroupId: null,
+        processStartedAt: adoptedIdentity.startedAt,
+        contextSnapshot: {
+          executionEngine: "cli",
+          processTopology: "detached",
+        },
+      });
+
+      await withTempPaperclipHome(async () => {
+        await writeHotRestartIntent({
+          previousServerPid: process.pid,
+          previousServerVersion: "old-version",
+          requestedAt: new Date("2026-03-19T00:05:00.000Z"),
+        });
+
+        // The ambient environment is a worktree (PAPERCLIP_IN_WORKTREE=true),
+        // which suppresses the run engine and would make this test fail for a
+        // reason that has nothing to do with scope reconciliation. Neutralize it
+        // explicitly, matching the established pattern in this file.
+        const heartbeat = heartbeatService(db, {
+          runtimeEnv: { ...process.env, PAPERCLIP_IN_WORKTREE: "false" },
+        });
+        await heartbeat.prepareHotRestartShutdown(
+          "SIGTERM",
+          new Date("2026-03-19T00:06:00.000Z"),
+        );
+        const adoption = await heartbeat.reconcileHotRestartAdoption(
+          new Date("2026-03-19T00:07:00.000Z"),
+        );
+        // Precondition: only the seeded-running run was adopted. Without this,
+        // "adopted survives the reaper" would pass vacuously.
+        expect(adoption.adoptedRunIds).toEqual([adopted.runId]);
+        expect(adoption.adoptedRunIds).not.toContain(stale.runId);
+        expect(adoption.adoptedRunIds).not.toContain(current.runId);
+
+        // Both un-owned runs are now `running`. The stale row records the dead
+        // leader and its still-live group but predates process-start persistence;
+        // the current row records a truthful live pid identity. The latter is
+        // protected by the live registry, not by fixture fiction about its pgid.
+        const updatedAt = new Date("2026-03-19T00:08:00.000Z");
+        await db
+          .update(heartbeatRuns)
+          .set({
+            status: "running",
+            processPid: stalePid,
+            processGroupId: staleGroup.groupId,
+            processStartedAt: null,
+            updatedAt,
+          })
+          .where(eq(heartbeatRuns.id, stale.runId));
+        await db
+          .update(heartbeatRuns)
+          .set({
+            status: "running",
+            processPid: currentPid,
+            processGroupId: null,
+            processStartedAt: new Date(currentIdentity.startedAt),
+            updatedAt,
+          })
+          .where(eq(heartbeatRuns.id, current.runId));
+
+        // `runningProcesses` is the live-registry Map heartbeat.ts itself reads,
+        // so this entry is what makes `current` a run this engine owns.
+        runningProcesses.set(current.runId, {
+          child: currentChild,
+          graceSec: 1,
+          processGroupId: null,
+        });
+
+        const reconcileStaleRunScopes = (
+          heartbeat as unknown as Record<string, unknown>
+        ).reconcileStaleRunScopes as StaleRunScopeReconciler | undefined;
+        expect(
+          typeof reconcileStaleRunScopes,
+          "missing_reconciliation_api:heartbeatService.reconcileStaleRunScopes",
+        ).toBe("function");
+
+        const stoppedUnits: string[] = [];
+        const killedPids: number[] = [];
+        const reconciliation = await reconcileStaleRunScopes!({
+          listUnits: async () => [
+            {
+              unit: staleUnit,
+              mainPid: 0,
+              controlGroupPids: staleDescendantPids,
+            },
+            { unit: adoptedUnit, mainPid: adoptedPid, controlGroupPids: [adoptedPid] },
+            { unit: currentUnit, mainPid: currentPid, controlGroupPids: [currentPid] },
+            { unit: foreignUnit, mainPid: foreignPid, controlGroupPids: [foreignPid] },
+          ],
+          readProcessIdentity: readLiveProcessIdentity,
+          listGroupMembers: listProcGroupMembers,
+          stopUnit: (unit) => {
+            stoppedUnits.push(unit);
+          },
+          killProcessTree: (pids) => {
+            killedPids.push(...pids);
+            for (const pid of pids) {
+              try {
+                process.kill(-pid, "SIGKILL");
+                continue;
+              } catch {
+                // Not a live process-group leader; try the direct pid below.
+              }
+              try {
+                process.kill(pid, "SIGKILL");
+              } catch {
+                // Already dead.
+              }
+            }
+          },
+        });
+
+        // Only the stale agent scope is reaped.
+        expect(reconciliation.units).toEqual([staleUnit]);
+        expect(stoppedUnits).toEqual([staleUnit]);
+        expect(reconciliation.detachedRunIds).toEqual([stale.runId]);
+
+        // The orphan process tree is really gone, not just its already-dead
+        // leader and not just the DB row. BOTH surviving descendants are the
+        // oracle, and the kill seam receives the complete reported membership.
+        expect([...killedPids].sort((a, b) => a - b)).toEqual(
+          [...staleDescendantPids].sort((a, b) => a - b),
+        );
+        for (const pid of staleDescendantPids) {
+          expect(
+            await waitForPidExit(pid),
+            `stale_scope_descendant_${pid}_survived_the_reaper`,
+          ).toBe(true);
+        }
+
+        // The adopted run, the currently-running run and the foreign unit are
+        // untouched: no stop, no kill, no detached id.
+        expect(killedPids).not.toContain(adoptedPid);
+        expect(killedPids).not.toContain(currentPid);
+        expect(killedPids).not.toContain(foreignPid);
+        expect(reconciliation.detachedRunIds).not.toContain(adopted.runId);
+        expect(reconciliation.detachedRunIds).not.toContain(current.runId);
+        expect(isPidAlive(adoptedPid)).toBe(true);
+        expect(isPidAlive(currentPid)).toBe(true);
+        expect(isPidAlive(foreignPid)).toBe(true);
+
+        const readRun = (runId: string) =>
+          db
+            .select()
+            .from(heartbeatRuns)
+            .where(eq(heartbeatRuns.id, runId))
+            .then((rows) => rows[0] ?? null);
+
+        // The stale run leaves `running` with a DURABLE reason, so the next boot
+        // and the UI can both explain why it died.
+        const staleRow = await readRun(stale.runId);
+        expect(staleRow?.status).toBe("interrupted");
+        expect(staleRow?.errorCode).toBe("process_detached");
+
+        // The adopted and current runs keep their live state.
+        const adoptedRow = await readRun(adopted.runId);
+        expect(adoptedRow?.status).toBe("running");
+        expect(adoptedRow?.processPid).toBe(adoptedPid);
+        const currentRow = await readRun(current.runId);
+        expect(currentRow?.status).toBe("running");
+        expect(currentRow?.processPid).toBe(currentPid);
+
+        // Close the loop with the NEXT boot step: the orphan reaper (the order
+        // pinned by the startup-feedback-export test is hot-restart adoption →
+        // stale-scope reconciliation → orphan reaper → queued admission). The
+        // cap slot is only provably released once the sweep that FOLLOWS
+        // reconciliation has run, so the binding assertion is on the post-reap
+        // state, never on the intermediate one — a stale `running` row left
+        // here is exactly the leaked slot this card is about.
+        const reap = await heartbeat.reapOrphanedRuns();
+        expect(reap.runIds).not.toContain(stale.runId);
+        expect(reap.runIds).not.toContain(adopted.runId);
+        expect(reap.runIds).not.toContain(current.runId);
+
+        const reapedStaleRow = await readRun(stale.runId);
+        expect(
+          reapedStaleRow?.status,
+          "stale_run_still_holds_a_cap_slot_after_the_boot_sweep",
+        ).not.toBe("running");
+
+        // The adopted control survives BOTH sweeps end to end: row still
+        // `running`, pid still recorded, process still untouched.
+        const survivedAdoptedRow = await readRun(adopted.runId);
+        expect(survivedAdoptedRow?.status).toBe("running");
+        expect(survivedAdoptedRow?.processPid).toBe(adoptedPid);
+        expect(isPidAlive(adoptedPid)).toBe(true);
+      });
+    },
+    20_000,
   );
 
   it("terminalizes an unsupported legacy session on shutdown without speculative replay", async () => {
