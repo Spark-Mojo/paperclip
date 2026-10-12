@@ -189,6 +189,7 @@ import {
   patchInstanceGeneralSettingsSchema,
   patchInstanceExperimentalSettingsSchema,
   patchInstanceSettingsSchema,
+  patchFleetMaxConcurrentRunsSchema,
   startTaskDrainRequestSchema,
   // Resource memberships
   updateDocumentResourceMembershipSchema,
@@ -1344,7 +1345,7 @@ const BOARD_ONLY_PREFIXES = [
   "/api/instance/",
 ];
 
-const BOARD_ONLY_OPERATIONS = new Set([
+export const BOARD_ONLY_OPERATIONS = new Set([
   "GET /api/companies/{companyId}/ai-connections",
   "POST /api/companies/{companyId}/ai-connections",
   "POST /api/companies/{companyId}/ai-connections/local",
@@ -1421,11 +1422,8 @@ const BOARD_ONLY_OPERATIONS = new Set([
   "GET /api/issues/{issueId}/file-resources/content",
   "GET /api/issues/{issueId}/file-resources/list",
   "GET /api/issues/{issueId}/file-resources/resolve",
-  "POST /api/issues/{id}/interactions/{interactionId}/accept",
-  "POST /api/issues/{id}/interactions/{interactionId}/reject",
-  "POST /api/issues/{id}/interactions/{interactionId}/respond",
+  "POST /api/issues/{id}/interactions/{interactionId}/cancel",
   "POST /api/issues/{id}/interactions/{interactionId}/skip",
-  "POST /api/issues/{id}/interactions/{interactionId}/withdraw",
   "GET /api/companies/{companyId}/tools/gallery",
   "GET /api/companies/{companyId}/tools/apps/{galleryKey}/preflight",
   "POST /api/companies/{companyId}/tools/apps/connect",
@@ -6024,6 +6022,23 @@ registry.registerPath({
   summary: "Update experimental instance settings",
   request: { body: jsonBody(patchInstanceExperimentalSettingsSchema) },
   responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized },
+});
+
+registry.registerPath({
+  method: "get",
+  path: "/api/instance/settings/fleet-max-concurrent-runs",
+  tags: ["instance"],
+  summary: "Get the fleet-wide max concurrent runs setting and source",
+  responses: { 200: r.ok(), 401: r.unauthorized },
+});
+
+registry.registerPath({
+  method: "patch",
+  path: "/api/instance/settings/fleet-max-concurrent-runs",
+  tags: ["instance"],
+  summary: "Update the fleet-wide max concurrent runs setting",
+  request: { body: jsonBody(patchFleetMaxConcurrentRunsSchema) },
+  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden },
 });
 
 registry.registerPath({
