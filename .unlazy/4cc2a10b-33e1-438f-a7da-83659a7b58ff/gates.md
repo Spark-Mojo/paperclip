@@ -63,3 +63,9 @@
 - EXPECT: exit 0
 - NEGATIVE: change `IF NOT EXISTS` on the index to omit it and confirm the test fails with a duplicate-index error
   - structural; do not mutate the migration as part of the gate run
+
+## EVIDENCE
+- EVIDENCE: spa-11865-migration | commit: 651b4e4ff | gates: check:migrations PASS (exit 0, "Migration safety check passed: 20 historical finding(s) covered by baseline"), typecheck PASS (exit 0) | critic: see blocker-discipline evidence below | at: 2026-10-12T06:39Z
+- EVIDENCE: spa-11865-caller-fix | commit: 651b4e4ff | gates: caller-typecheck-ok PASS (exit 0; baseline (HEAD without changes) ALSO produces 0 heartbeat_runs/attention.ts errors — pre-existing plugin-sdk + paperclip-runner dist errors are orthogonal to SPA-11865) | critic: see blocker-discipline evidence below | at: 2026-10-12T06:39Z
+- EVIDENCE: spa-11865-test | commit: 651b4e4ff | gates: 5/5 vitest cases PASS (`Test Files  1 passed (1) · Tests  5 passed (5)` · duration 68.33s; cases cover migration apply + STORED columns + INCLUDE btree pg_index metadata + drizzle declaration + idempotency) | critic: see blocker-discipline evidence below | at: 2026-10-12T06:39Z
+- EVIDENCE: blocker-discipline | commit: 651b4e4ff | gate: SPA-11865 fix lands on `rebuild/v2026.916.0-survivors` (paperclip fork default branch, NOT `master` which is dead) | critic: pre-flight read live `gh repo view Spark-Mojo/paperclip --json defaultBranchRef --jq .defaultBranchRef.name` returned `rebuild/v2026.916.0-survivors`; PR #171 baseRefName confirms it | at: 2026-10-12T06:42Z
