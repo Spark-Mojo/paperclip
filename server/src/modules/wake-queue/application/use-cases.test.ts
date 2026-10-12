@@ -115,7 +115,7 @@ function createFakeTransaction(overrides: Partial<WakeQueueTransaction> = {}): W
       reason: null,
       releasePolicy: null,
     })),
-    getCommentSelfAuthorship: vi.fn(async () => ({ allSelfAuthored: false })),
+    getCommentSelfAuthorship: vi.fn(async () => ({ allSelfAuthored: false, allAuthoredByFinishingRunAgent: false })),
     getDeferredCommentCreatedAt: vi.fn(async () => []),
     isCompletedDelegationMention: vi.fn(async () => false),
     reopenIssue: vi.fn(async () => null),
@@ -559,6 +559,7 @@ describe("releaseIssueExecution", () => {
       wakeReason?: string;
       agentAuthored?: boolean;
       selfAuthored?: boolean;
+      authoredByFinishingRunAgent?: boolean;
       resumeIntent?: boolean;
     }) {
       const commentIds = input.commentTimes.map((_, index) => `comment-${index}`);
@@ -579,7 +580,10 @@ describe("releaseIssueExecution", () => {
         })),
         getDeferredCommentCreatedAt: vi.fn(async ({ commentIds }: { commentIds: string[] }) =>
           commentIds.map((commentId, index) => ({ commentId, createdAt: input.commentTimes[index] }))),
-        getCommentSelfAuthorship: vi.fn(async () => ({ allSelfAuthored: input.selfAuthored === true })),
+        getCommentSelfAuthorship: vi.fn(async () => ({
+          allSelfAuthored: input.selfAuthored === true,
+          allAuthoredByFinishingRunAgent: input.authoredByFinishingRunAgent === true,
+        })),
         reopenIssue: vi.fn(async () => ({ ...ISSUE, status: "todo" })),
       });
       const release = createReleaseIssueExecution({
@@ -653,6 +657,113 @@ describe("releaseIssueExecution", () => {
         commentTimes: [AFTER],
         actorType: "agent",
         selfAuthored: true,
+      });
+
+      expect(transaction.reopenIssue).not.toHaveBeenCalled();
+    });
+
+    // SPA-11805 / GH #1178 residual, first cycle of the reopen loop. The
+    // closing receipt is posted AFTER the close by a PRIOR run of the same
+    // agent, so `createdByRunId === finishingRunId` is false and the
+    // run-keyed `allSelfAuthored` check is inert. Authorship is still the
+    // finishing agent's own, which is what makes the receipt a report of
+    // finished work rather than new input.
+    //
+    // The `wakeReason: "issue_reopened_via_comment"` arm is what makes these
+    // discriminating: with a plain `issue_commented` reason and an `agent`
+    // requester, the reopen expression is false on its own (no branch
+    // matches), so the test would pass with or without the new guard and
+    // prove nothing. Asserting on the arming path that actually reopens is
+    // what makes the negative control fail when the guard is removed.
+    it.each(["done", "cancelled"] as const)(
+      "suppresses a prior-run closing receipt from the same agent (%s)",
+      async (status) => {
+        const { transaction } = await runCase({
+          status,
+          commentTimes: [AFTER],
+          actorType: "agent",
+          wakeReason: "issue_reopened_via_comment",
+          authoredByFinishingRunAgent: true,
+        });
+
+        expect(transaction.reopenIssue).not.toHaveBeenCalled();
+      },
+    );
+
+    // The OTHER arming path: a board user requests the wake (`actorType: "user"`,
+    // which satisfies the reopen expression on its own) while the only comment
+    // in the wake is the finishing agent's own closing receipt. James's SPA-10460
+    // log shows the receipt posted as `agent` and the promotion attributed to
+    // `system`, so the requester recorded on a deferred wake is not reliable
+    // evidence that a human asked for new work. This pins that arm separately
+    // from the `issue_reopened_via_comment` arm above: both must be suppressed,
+    // and a fix that only closes one of them leaves the loop alive.
+    it.each(["done", "cancelled"] as const)(
+      "suppresses a board-requested wake whose only comment is the finishing agent's own receipt (%s)",
+      async (status) => {
+        const { transaction } = await runCase({
+          status,
+          commentTimes: [AFTER],
+          actorType: "user",
+          wakeReason: "issue_commented",
+          authoredByFinishingRunAgent: true,
+        });
+
+        expect(transaction.reopenIssue).not.toHaveBeenCalled();
+      },
+    );
+
+    // Guard the over-suppression boundary: authorship by the finishing agent
+    // is not a licence to swallow a genuine human reopen of the same card.
+    it("keeps a human comment from reopening even when a sibling comment carries agent authorship", async () => {
+      const commentIds = ["agent-receipt", "human-follow-up"];
+      const queue = [wakeCandidate({
+        agentId: ISSUE.assigneeAgentId!,
+        requestedByActorType: "user",
+        queuedCommentIds: commentIds,
+        deferredCommentIds: commentIds,
+      })];
+      const transaction = createFakeTransaction({
+        findNextDeferredWake: vi.fn(async () => queue.shift() ?? null),
+        getQueuedCommentLiveness: vi.fn(async () => ({
+          liveNonSelfCommentIds: commentIds,
+          containedSelfAuthoredComment: false,
+        })),
+        getDeferredCommentCreatedAt: vi.fn(async () => commentIds.map((commentId) => ({
+          commentId,
+          createdAt: AFTER,
+        }))),
+        // NOT all authored by the finishing agent: the human comment is not.
+        getCommentSelfAuthorship: vi.fn(async () => ({
+          allSelfAuthored: false,
+          allAuthoredByFinishingRunAgent: false,
+        })),
+        reopenIssue: vi.fn(async () => ({ ...ISSUE, status: "todo" })),
+      });
+      const release = createReleaseIssueExecution({
+        issueLock: createFakeIssueLock(createFakeHost(), transaction, {
+          ...ISSUE, status: "done", completedAt: CLOSED_AT, cancelledAt: null,
+        }),
+        recovery: createFakeRecovery(),
+      });
+
+      const result = await release({ companyId: RUN.companyId, runId: RUN.id, now: new Date() });
+
+      expect(transaction.reopenIssue).toHaveBeenCalledTimes(1);
+      expect(result.outcome.kind).toBe("promoted");
+    });
+
+    // Same boundary for the explicit agent-resume clause, which PR #168
+    // deliberately exempts at the close instant. A prior-run receipt from the
+    // finishing agent carrying `resumeIntent` is still its own closing
+    // receipt; it must not be revived by that exemption.
+    it("keeps the agent resumeIntent clause inert for the finishing agent's own prior-run receipt", async () => {
+      const { transaction } = await runCase({
+        status: "done",
+        commentTimes: [AFTER],
+        actorType: "agent",
+        resumeIntent: true,
+        authoredByFinishingRunAgent: true,
       });
 
       expect(transaction.reopenIssue).not.toHaveBeenCalled();
@@ -739,7 +850,10 @@ describe("releaseIssueExecution", () => {
         liveNonSelfCommentIds: scenario === "done_missing" || scenario === "done_self" ? [] : commentIds,
         containedSelfAuthoredComment: scenario === "done_self",
       })),
-      getCommentSelfAuthorship: vi.fn(async () => ({ allSelfAuthored: scenario === "done_self" })),
+      getCommentSelfAuthorship: vi.fn(async () => ({
+        allSelfAuthored: scenario === "done_self",
+        allAuthoredByFinishingRunAgent: false,
+      })),
       reopenIssue: vi.fn(async () => ({ ...ISSUE, status: "todo" })),
     });
     const release = createReleaseIssueExecution({

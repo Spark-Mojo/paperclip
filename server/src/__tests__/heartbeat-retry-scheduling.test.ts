@@ -2066,6 +2066,56 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
     );
   });
 
+  it("schedules bounded retries for model_stream_stalled and re-runs under a fresh attempt (SPA-11981)", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const runId = randomUUID();
+    const now = new Date(2026, 9, 12, 14, 0, 0);
+    const retryNotBefore = new Date(2026, 9, 12, 14, 5, 0);
+
+    await seedRetryFixture({
+      runId,
+      companyId,
+      agentId,
+      now,
+      // NOTE: errorCode is the closed-class constant from packages/adapter-utils'
+      // MODEL_STREAM_STALLED_ERROR_CODE. No errorFamily is persisted; the run's
+      // errorCode must drive the transient classification on its own.
+      errorCode: "model_stream_stalled",
+      errorFamily: null,
+      adapterType: "opencode_local",
+      retryNotBefore: retryNotBefore.toISOString(),
+    });
+
+    // The detector's contract — nothing about transient retry classification lives
+    // in adapter-utils or in the stream-stall-detector file. It lives here, in
+    // the heartbeat error-family allowlist. If `model_stream_stalled` were not
+    // on the allowlist, the run would be marked failed and never retried, which
+    // is the regression SPA-11981 was opened to prevent.
+    const scheduled = await heartbeat.scheduleBoundedRetry(runId, {
+      now,
+      random: () => 0.5,
+    });
+
+    expect(scheduled.outcome).toBe("scheduled");
+    if (scheduled.outcome !== "scheduled") return;
+    expect(scheduled.dueAt.getTime()).toBe(retryNotBefore.getTime());
+
+    const retryRun = await db
+      .select({
+        contextSnapshot: heartbeatRuns.contextSnapshot,
+        scheduledRetryAt: heartbeatRuns.scheduledRetryAt,
+        wakeupRequestId: heartbeatRuns.wakeupRequestId,
+      })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, scheduled.run.id))
+      .then((rows) => rows[0] ?? null);
+
+    expect(retryRun?.scheduledRetryAt?.getTime()).toBe(retryNotBefore.getTime());
+    const contextSnapshot = (retryRun?.contextSnapshot as Record<string, unknown> | null) ?? {};
+    expect(contextSnapshot.transientRetryNotBefore).toBe(retryNotBefore.toISOString());
+  });
+
   describe("run-dispatch module transactions", () => {
     it("promotes a due scheduled retry exactly once under concurrent promotion attempts", async () => {
       const companyId = randomUUID();

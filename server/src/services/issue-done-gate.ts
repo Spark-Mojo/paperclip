@@ -1,6 +1,7 @@
-import { and, desc, eq, isNull } from "drizzle-orm";
+import { and, desc, eq, isNotNull, isNull } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
+  executionWorkspaces,
   issueComments,
   issueWorkProducts,
   issues,
@@ -33,6 +34,13 @@ import {
  * only linked in a comment, and agents usually link PRs in comments, so the
  * work-product-only key missed the common case.
  *
+ * SPA-9981 (2026-10-12): historical and foreign citations were wedging cards
+ * even after the actual deliverable PR merged. Real instances: SPA-9808
+ * (deliverable internal#1029 merged; abandoned internal#1011
+ * `ty/SPA-9808-verifier-order` still cited in the card text → permanent
+ * 409), SPA-10557 (deliverable platform#1412 merged; foreign platform#1394
+ * `dex/spa-10485-actionlint-cap` quoted as evidence in a comment → 409).
+ *
  * Detection (fail-closed, but scoped so a foreign mention never wedges us):
  *   - Binding signals are (a) `pull_request` work products on the card
  *     (any repo) and (b) GitHub PR URLs/`owner/repo#N` shorthands found in
@@ -56,6 +64,40 @@ import {
  *     (private repo, cross-account token, typo) stays `unknown` and blocks.
  *   - A card with zero binding references passes untouched — docs,
  *     judgment, audit cards close exactly as before.
+ *
+ * SPA-9981 — prose-reference classification. Product references (work
+ * products) ALWAYS bind — unchanged. Prose references (description/comments)
+ * bind by class, computed from the resolved PR's `headRef` and two card
+ * signals (the issue's identifier and its execution-workspace branches):
+ *   1. `workspace-deliverable` — the reference's repo matches an execution
+ *      workspace of the issue (`execution_workspaces` joined on
+ *      `sourceIssueId` = issue id and `companyId`) AND the resolved
+ *      `headRef` equals that workspace's `branchName`. Binds unconditionally
+ *      until merged — the CURRENT deliverable (the same equality
+ *      `execution-workspaces.ts` uses to derive `merged_via_pr`) is never
+ *      supersessable by anything else that landed in the repo.
+ *   2. `card-lane` — the resolved `headRef` contains the issue identifier
+ *      as a delimited token (case-insensitive; `SPA-9808` matches
+ *      `ty/SPA-9808-verifier-order` but NOT `spa-98081-hotfix`, a different
+ *      card that merely shares the digit prefix). Binds UNLESS superseded:
+ *      some OTHER bound reference in the SAME repo (owner/repo,
+ *      case-insensitive) that is deliverable-class (product,
+ *      workspace-deliverable, or card-lane) resolves to state "merged".
+ *      Supersession retires abandoned prior attempts of THIS card; it is
+ *      computed from a different reference than the one being muted — a
+ *      merged ref never needs muting, and a ref must not supersede itself.
+ *   3. `foreign` — a resolved `headRef` (non-null) matching neither
+ *      workspace-deliverable nor card-lane. NEVER binds, and is excluded
+ *      from the refusal payload entirely.
+ *   4. `fail-closed` — a prose reference whose resolution yields NO
+ *      `headRef` (state "unknown", or `headRef` null/empty). Binds, because
+ *      we cannot classify what we cannot resolve. A state of "merged"
+ *      passes regardless of `headRef`; the SPA-9323 `notAPullRequest`
+ *      mapping to "closed" is unchanged and non-blocking.
+ *
+ * Muted (non-binding) refs are excluded from the refusal `pullRequests`
+ * list. The unresolved-relative-route refusal path
+ * (`unresolvedPaperclipPullRoutes`) is unchanged.
  *
  * The refused transition returns 409 with the offending PR list and the two
  * sanctioned escapes: wait for the merge sha on main, or an explicit
@@ -99,8 +141,31 @@ const SPARK_MOJO_ORG = "spark-mojo";
 /** How many recent comments to scan for PR mentions (SPA-9038 bindings). */
 const COMMENT_SCAN_LIMIT = 200;
 
+/**
+ * SPA-9981: execution-workspace rows scanned per gate evaluation. The
+ * `company_source_issue_idx` index covers `(companyId, sourceIssueId)`, so
+ * this stays an indexed lookup even with ~5.6k rows in production.
+ */
+const EXECUTION_WORKSPACE_LOOKUP_LIMIT = 200;
+
 function isSparkMojoRepo(reference: GitHubPullRequestReference): boolean {
   return reference.owner.toLowerCase() === SPARK_MOJO_ORG;
+}
+
+/**
+ * SPA-9981: local twin of `parseGitHubRepository` in `execution-workspaces.ts`.
+ * Kept module-local because the two parsers must stay in lockstep but the
+ * done-gate must not import the execution-workspaces service module (a
+ * service-to-service import would couple the gate to the workspace
+ * lifecycle's re-exports). If the canonical parser changes, mirror the
+ * change here. The regex shape is the only thing that matters; nothing
+ * else in the workspace service is touched.
+ */
+function parseGitHubRepositoryForGate(repoUrl: string | null): { owner: string; repo: string } | null {
+  if (!repoUrl) return null;
+  const match = /^(?:https?:\/\/(?:www\.)?github\.com\/|ssh:\/\/git@github\.com\/|git@github\.com:)([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+?)(?:\.git)?\/?$/i.exec(repoUrl.trim());
+  if (!match) return null;
+  return { owner: match[1]!.toLowerCase(), repo: match[2]!.toLowerCase() };
 }
 
 export type DoneGatePullRequestReference = GitHubPullRequestReference;
@@ -169,24 +234,64 @@ export function issueDoneGateService(db: Db, opts: IssueDoneGateServiceOptions =
     : createPullRequestMergeDetailsResolver(db);
   const pullRequestStateCache = new Map<
     string,
-    { state: "merged" | "open" | "closed" | "unknown"; checkedAtMs: number }
+    { state: "merged" | "open" | "closed" | "unknown"; headRef: string | null; checkedAtMs: number }
   >();
   const cacheTtlMs = 60_000;
 
   async function resolvePullRequestState(
     companyId: string,
     reference: GitHubPullRequestReference,
-  ): Promise<"merged" | "open" | "closed" | "unknown"> {
+  ): Promise<{ state: "merged" | "open" | "closed" | "unknown"; headRef: string | null }> {
     if (opts.resolvePullRequestDetails) {
-      return gateStateFromDetails(await opts.resolvePullRequestDetails(companyId, reference));
+      const details = await opts.resolvePullRequestDetails(companyId, reference);
+      return { state: gateStateFromDetails(details), headRef: details.headRef ?? null };
     }
     const key = `${companyId}:${formatReference(reference).toLowerCase()}`;
     const cached = pullRequestStateCache.get(key);
-    if (cached && Date.now() - cached.checkedAtMs < cacheTtlMs) return cached.state;
+    if (cached && Date.now() - cached.checkedAtMs < cacheTtlMs) {
+      return { state: cached.state, headRef: cached.headRef };
+    }
     const details = await defaultResolver!(companyId, reference);
     const state = gateStateFromDetails(details);
-    setBoundedPullRequestCacheEntry(pullRequestStateCache, key, { state, checkedAtMs: Date.now() });
-    return state;
+    const headRef = details.headRef ?? null;
+    setBoundedPullRequestCacheEntry(pullRequestStateCache, key, {
+      state,
+      headRef,
+      checkedAtMs: Date.now(),
+    });
+    return { state, headRef };
+  }
+
+  /**
+   * SPA-9981: resolve the issue's execution-workspace branches, grouped by
+   * repo. The result is the workspace-deliverable signal: a prose PR ref is
+   * `workspace-deliverable` iff its repo matches and its resolved `headRef`
+   * equals one of the listed branch names.
+   */
+  async function listExecutionWorkspaceBranches(
+    issue: { id: string; companyId: string },
+  ): Promise<Map<string, Set<string>>> {
+    const byRepo = new Map<string, Set<string>>();
+    const rows = await db
+      .select({ repoUrl: executionWorkspaces.repoUrl, branchName: executionWorkspaces.branchName })
+      .from(executionWorkspaces)
+      .where(and(
+        eq(executionWorkspaces.companyId, issue.companyId),
+        eq(executionWorkspaces.sourceIssueId, issue.id),
+        isNotNull(executionWorkspaces.repoUrl),
+        isNotNull(executionWorkspaces.branchName),
+      ))
+      .limit(EXECUTION_WORKSPACE_LOOKUP_LIMIT);
+    for (const row of rows) {
+      if (!row.repoUrl || !row.branchName) continue;
+      const repository = parseGitHubRepositoryForGate(row.repoUrl);
+      if (!repository) continue;
+      const key = `${repository.owner}/${repository.repo}`;
+      const branches = byRepo.get(key) ?? new Set<string>();
+      branches.add(row.branchName);
+      byRepo.set(key, branches);
+    }
+    return byRepo;
   }
 
   /**
@@ -198,6 +303,12 @@ export function issueDoneGateService(db: Db, opts: IssueDoneGateServiceOptions =
    *   2. GitHub PR URLs and `owner/repo#N` shorthands parsed from the card's
    *      description and its most recent comments, restricted to Spark-Mojo
    *      repos. Deleted comments never bind.
+   *
+   * First-source-wins keying: products are inserted into the dedup Map
+   * before prose, so a reference present in BOTH is recorded as a product
+   * (always binding). The returned `productReferences` array is the
+   * authoritative source list; the prose array holds only refs that did
+   * not collide with a product.
    */
   async function listBoundPullRequests(
     issue: { id: string; companyId: string; description?: string | null },
@@ -205,6 +316,7 @@ export function issueDoneGateService(db: Db, opts: IssueDoneGateServiceOptions =
     const references = new Map<string, GitHubPullRequestReference>();
     const unresolved = new Set<number>();
     const productReferences: GitHubPullRequestReference[] = [];
+    const proseReferences: GitHubPullRequestReference[] = [];
     const addProse = (body: string) => {
       addExtracted(extractGitHubPullRequestReferences([body]).filter(isSparkMojoRepo));
       for (const number of unresolvedPaperclipPullRoutes(body)) {
@@ -216,13 +328,19 @@ export function issueDoneGateService(db: Db, opts: IssueDoneGateServiceOptions =
     const addReferences = (values: readonly unknown[]) => {
       for (const reference of extractGitHubPullRequestReferences(values)) {
         const key = formatReference(reference).toLowerCase();
-        if (!references.has(key)) references.set(key, reference);
+        if (!references.has(key)) {
+          references.set(key, reference);
+          productReferences.push(reference);
+        }
       }
     };
     const addExtracted = (extracted: readonly GitHubPullRequestReference[]) => {
       for (const reference of extracted) {
         const key = formatReference(reference).toLowerCase();
-        if (!references.has(key)) references.set(key, reference);
+        if (!references.has(key)) {
+          references.set(key, reference);
+          proseReferences.push(reference);
+        }
       }
     };
 
@@ -251,7 +369,6 @@ export function issueDoneGateService(db: Db, opts: IssueDoneGateServiceOptions =
         product.summary,
         product.metadata ? JSON.stringify(product.metadata) : null,
       ];
-      productReferences.push(...extractGitHubPullRequestReferences(values));
       addReferences(values);
     }
 
@@ -272,32 +389,192 @@ export function issueDoneGateService(db: Db, opts: IssueDoneGateServiceOptions =
     for (const row of commentBodies) {
       addProse(row.body);
     }
-    return { references: [...references.values()], unresolved: [...unresolved] };
+    return {
+      references: [...references.values()],
+      productReferences,
+      proseReferences,
+      unresolved: [...unresolved],
+    };
+  }
+
+  /**
+   * SPA-9981: classify one prose reference. The caller passes the
+   * already-resolved `headRef` and the workspace + identifier context needed
+   * to walk the four prose classes. A `null` headRef (or state `unknown`) is
+   * `fail-closed` — the reference binds, because we cannot classify what we
+   * cannot resolve.
+   *
+   * The class drives two different questions and must not be flattened into
+   * one flag:
+   *   - binding: workspace-deliverable, card-lane and fail-closed bind;
+   *     foreign never does.
+   *   - supersession: ONLY `card-lane` may be muted (by a deliverable-class
+   *     merged ref in the same repo). A `workspace-deliverable` ref is the
+   *     CURRENT deliverable by the engine's own definition (headRef ===
+   *     workspace branchName — the same equality execution-workspaces.ts
+   *     uses for `merged_via_pr`), so it binds until it merges no matter
+   *     what else landed; muting it would let a card close with its actual
+   *     deliverable unmerged. `fail-closed` refs carry no classification to
+   *     supersede.
+   */
+  type ProseReferenceClass = "workspace-deliverable" | "card-lane" | "foreign" | "fail-closed";
+
+  /**
+   * SPA-9981: true when `identifier` ("SPA-9808") appears in `headRef`
+   * ("ty/SPA-9808-verifier-order") as a delimited token — bounded by
+   * non-alphanumerics or string edges on both sides, case-insensitive.
+   * A plain substring test would let SPA-9808 match a SPA-98081 branch
+   * (a different card whose identifier shares the digit prefix).
+   */
+  function identifierTokenMatch(headRef: string, identifier: string): boolean {
+    const escaped = identifier.toLowerCase().replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    return new RegExp(`(?:^|[^a-z0-9])${escaped}(?:[^a-z0-9]|$)`).test(headRef.toLowerCase());
+  }
+
+  function classifyProseReference(input: {
+    reference: GitHubPullRequestReference;
+    state: "merged" | "open" | "closed" | "unknown";
+    headRef: string | null;
+    workspaceBranchesByRepo: Map<string, Set<string>>;
+    identifier: string | null;
+  }): ProseReferenceClass {
+    const { reference, state, headRef, workspaceBranchesByRepo, identifier } = input;
+    const repoKey = `${reference.owner.toLowerCase()}/${reference.repo.toLowerCase()}`;
+    const workspaceBranches = workspaceBranchesByRepo.get(repoKey);
+
+    // (4) fail-closed: no headRef to classify from. Binds, never superseded.
+    if (state === "unknown" || !headRef || headRef.length === 0) {
+      return "fail-closed";
+    }
+
+    // (1) workspace-deliverable: headRef equals a workspace branch in this
+    // repo. Binds unconditionally until merged.
+    if (workspaceBranches && workspaceBranches.has(headRef)) {
+      return "workspace-deliverable";
+    }
+
+    // (2) card-lane: headRef contains the issue identifier as a delimited
+    // token. Binds, subject to supersession by another deliverable-class
+    // merged ref in the same repo (an abandoned earlier attempt of this
+    // card). The delimiters matter: SPA-9981 must NOT classify a
+    // `spa-99810-hotfix` branch (a different card's identifier that merely
+    // shares a digit prefix) as this card's lane.
+    if (identifier && identifier.length > 0 && identifierTokenMatch(headRef, identifier)) {
+      return "card-lane";
+    }
+
+    // (3) foreign: a resolved headRef that is neither workspace-deliverable
+    // nor card-lane. Never binds.
+    return "foreign";
   }
 
   async function evaluateDoneGate(
-    issue: { id: string; companyId: string; description?: string | null },
+    issue: { id: string; companyId: string; description?: string | null; identifier?: string | null },
   ): Promise<DoneGateDecision> {
-    const { references, unresolved } = await listBoundPullRequests(issue);
+    const { productReferences, proseReferences, unresolved } = await listBoundPullRequests(issue);
     if (unresolved.length > 0) {
       return { outcome: "refuse", reason: { kind: "unresolved_pull_request_reference", numbers: unresolved } };
     }
-    if (references.length === 0) return { outcome: "allow" };
-
-    const states: DoneGatePullRequestState[] = [];
-    for (const reference of references) {
-      states.push({ reference, state: await resolvePullRequestState(issue.companyId, reference) });
+    if (productReferences.length === 0 && proseReferences.length === 0) {
+      return { outcome: "allow" };
     }
-    // `closed` (refused PR) is a human signal — never blocks the close.
-    const open = states.filter((entry) => entry.state === "open" || entry.state === "unknown");
-    if (open.length === 0) return { outcome: "allow" };
 
-    const unknownOnly = open.every((entry) => entry.state === "unknown");
+    const identifier = typeof issue.identifier === "string" && issue.identifier.length > 0
+      ? issue.identifier
+      : null;
+    const workspaceBranchesByRepo = await listExecutionWorkspaceBranches(issue);
+
+    // Resolve every reference once, in insertion order. Product refs are
+    // inserted first, so they are resolved first; a merged product closes
+    // the gate without needing the prose resolves (cheap path). For the
+    // general case every ref's (state, headRef) is needed.
+    const allReferences: GitHubPullRequestReference[] = [...productReferences, ...proseReferences];
+    // Set-keyed (lowercased) source lookup — O(1) per reference, and robust
+    // to case-variant duplicates that dedup merged into one object.
+    const productKeys = new Set(productReferences.map((reference) => formatReference(reference).toLowerCase()));
+    const resolved = new Map<
+      string,
+      { reference: GitHubPullRequestReference; source: "product" | "prose"; state: "merged" | "open" | "closed" | "unknown"; headRef: string | null }
+    >();
+    for (const reference of allReferences) {
+      const key = formatReference(reference).toLowerCase();
+      const source: "product" | "prose" = productKeys.has(key) ? "product" : "prose";
+      const { state, headRef } = await resolvePullRequestState(issue.companyId, reference);
+      resolved.set(key, { reference, source, state, headRef });
+    }
+
+    // SPA-9981 supersession pre-pass: a card-lane ref is muted when some
+    // OTHER bound reference in the same repo (owner/repo, case-insensitive)
+    // is deliverable-class AND resolves to state "merged". The pre-pass
+    // walks only refs that have ALREADY been classified as deliverable +
+    // merged, and records the repo set against which card-lane refs are
+    // superseded. "Other" means a different key — a ref never supersedes
+    // itself.
+    const deliverableMergedRepos = new Set<string>();
+    for (const entry of resolved.values()) {
+      if (entry.source !== "prose") {
+        // Product refs are always deliverable; merged product → supersedes
+        // same-repo card-lane prose refs.
+        if (entry.state === "merged") {
+          deliverableMergedRepos.add(`${entry.reference.owner.toLowerCase()}/${entry.reference.repo.toLowerCase()}`);
+        }
+        continue;
+      }
+      const classification = classifyProseReference({
+        reference: entry.reference,
+        state: entry.state,
+        headRef: entry.headRef,
+        workspaceBranchesByRepo,
+        identifier,
+      });
+      if (
+        (classification === "workspace-deliverable" || classification === "card-lane")
+        && entry.state === "merged"
+      ) {
+        deliverableMergedRepos.add(`${entry.reference.owner.toLowerCase()}/${entry.reference.repo.toLowerCase()}`);
+      }
+    }
+
+    // Build the refusal list. Product refs: always binding. Prose refs:
+    // classify, then mute if (foreign) or (card-lane AND superseded by
+    // deliverable-merged in the same repo). Merged state is a pass
+    // regardless of classification and never contributes to the refusal.
+    // workspace-deliverable and fail-closed prose refs are NEVER muted —
+    // the current deliverable binds until it merges, and an unclassifiable
+    // reference has nothing to supersede it with.
+    const refusal: DoneGatePullRequestState[] = [];
+    for (const entry of resolved.values()) {
+      if (entry.state === "merged" || entry.state === "closed") continue;
+      if (entry.source === "product") {
+        refusal.push({ reference: entry.reference, state: entry.state });
+        continue;
+      }
+      const classification = classifyProseReference({
+        reference: entry.reference,
+        state: entry.state,
+        headRef: entry.headRef,
+        workspaceBranchesByRepo,
+        identifier,
+      });
+      if (classification === "foreign") continue; // excluded from refusal
+      if (classification === "card-lane") {
+        // An abandoned prior attempt of this card — mute when a
+        // deliverable-class ref in the same repo already resolved to
+        // "merged". The deliverable-merged signal is by construction a
+        // different ref than this one (merged refs were filtered above).
+        const repoKey = `${entry.reference.owner.toLowerCase()}/${entry.reference.repo.toLowerCase()}`;
+        if (deliverableMergedRepos.has(repoKey)) continue;
+      }
+      refusal.push({ reference: entry.reference, state: entry.state });
+    }
+    if (refusal.length === 0) return { outcome: "allow" };
+
+    const unknownOnly = refusal.every((entry) => entry.state === "unknown");
     return {
       outcome: "refuse",
       reason: unknownOnly
-        ? { kind: "unknown_pull_request_state", pullRequests: open }
-        : { kind: "open_pull_requests", pullRequests: open },
+        ? { kind: "unknown_pull_request_state", pullRequests: refusal }
+        : { kind: "open_pull_requests", pullRequests: refusal },
     };
   }
 
