@@ -45,6 +45,7 @@ const mockInteractionService = vi.hoisted(() => ({
   recordSecretProposalExecutionResult: vi.fn(),
 }));
 
+const mockAgentCompany = vi.hoisted(() => ({ value: "company-1" }));
 const mockHeartbeatService = vi.hoisted(() => ({
   wakeup: vi.fn(async () => undefined),
   cancelRun: vi.fn(async () => null),
@@ -172,7 +173,7 @@ function registerModuleMocks() {
       hasPermission: vi.fn(async () => true),
     }),
     agentService: () => ({
-      getById: vi.fn(async () => ({ id: CREATED_AGENT_ID, companyId: "company-1", permissions: null })),
+      getById: vi.fn(async () => ({ id: CREATED_AGENT_ID, companyId: mockAgentCompany.value, permissions: null })),
       resolveByReference: vi.fn(async (_companyId: string, raw: string) => ({
         ambiguous: false,
         agent: { id: raw },
@@ -334,6 +335,7 @@ describe.sequential("issue thread interaction routes", () => {
       agentId: CREATED_AGENT_ID,
       responsibleUserId: null,
     };
+    mockAgentCompany.value = "company-1";
     mockQuestionResponseDeliveries.deliver.mockResolvedValue(null);
     mockRequestNativeQuestionRunCancellation.mockResolvedValue(null);
     mockResolveTaskWatchdogMutationScope.mockResolvedValue({ kind: "none" });
@@ -801,6 +803,45 @@ describe.sequential("issue thread interaction routes", () => {
     );
   });
 
+  it("user-assigned creator wake routes confirmation answers to the interaction author without reassigning", async () => {
+    const issue = createIssue({ assigneeAgentId: null, assigneeUserId: "local-board", status: "todo" });
+    mockIssueService.getById.mockResolvedValue(issue);
+    mockInteractionService.acceptInteraction.mockResolvedValue({
+      interaction: {
+        id: "interaction-1", companyId: "company-1", issueId: ISSUE_ID,
+        kind: "request_confirmation", status: "accepted", continuationPolicy: "none",
+        createdByAgentId: CREATED_AGENT_ID, result: { outcome: "accepted" },
+      },
+      createdIssues: [], continuationIssue: null,
+    });
+    const app = await createApp();
+    const res = await request(app).post(`/api/issues/${ISSUE_ID}/interactions/interaction-1/accept`).send({});
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(mockHeartbeatService.wakeup).toHaveBeenCalledTimes(1);
+    expect(mockHeartbeatService.wakeup).toHaveBeenCalledWith(CREATED_AGENT_ID, expect.objectContaining({
+      payload: expect.objectContaining({ issueId: ISSUE_ID, interactionId: "interaction-1", interactionStatus: "accepted" }),
+    }));
+    expect(issue.assigneeAgentId).toBeNull();
+    expect(issue.assigneeUserId).toBe("local-board");
+  });
+
+  it("user-assigned creator wake refuses a cross-company interaction author", async () => {
+    mockIssueService.getById.mockResolvedValue(createIssue({ assigneeAgentId: null, assigneeUserId: "local-board" }));
+    mockInteractionService.acceptInteraction.mockResolvedValue({
+      interaction: {
+        id: "interaction-1", companyId: "company-1", issueId: ISSUE_ID,
+        kind: "request_confirmation", status: "accepted", continuationPolicy: "none",
+        createdByAgentId: CREATED_AGENT_ID, result: { outcome: "accepted" },
+      },
+      createdIssues: [], continuationIssue: null,
+    });
+    mockAgentCompany.value = "other-company";
+    const app = await createApp();
+    const res = await request(app).post(`/api/issues/${ISSUE_ID}/interactions/interaction-1/accept`).send({});
+    expect(res.status).toBe(200);
+    expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
+  });
+
   it("answers questions through the durable delivery service", async () => {
     const app = await createApp();
 
@@ -815,7 +856,19 @@ describe.sequential("issue thread interaction routes", () => {
     expect(mockQuestionResponseDeliveries.deliver).toHaveBeenCalledWith(
       "interaction-2",
     );
-    expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
+    // SPA-11242: the respond path queues the same continuation wake as
+    // accept/reject/verdicts so the assignee receives the answer.
+    expect(mockHeartbeatService.wakeup).toHaveBeenCalledWith(
+      ASSIGNEE_AGENT_ID,
+      expect.objectContaining({
+        idempotencyKey: "interaction:interaction-2:answered",
+        payload: expect.objectContaining({
+          interactionId: "interaction-2",
+          interactionKind: "ask_user_questions",
+          interactionStatus: "answered",
+        }),
+      }),
+    );
     expect(mockLogActivity).toHaveBeenCalledWith(
       expect.anything(),
       expect.objectContaining({
@@ -845,7 +898,14 @@ describe.sequential("issue thread interaction routes", () => {
 
     expect(res.status).toBe(200);
     expect(mockQuestionResponseDeliveries.deliver).toHaveBeenCalledWith("interaction-2");
-    expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
+    // SPA-11242: wake_assignee_on_accept treats an authoritative answer as the
+    // positive resolution, so the respond path wakes the assignee here.
+    expect(mockHeartbeatService.wakeup).toHaveBeenCalledWith(
+      ASSIGNEE_AGENT_ID,
+      expect.objectContaining({
+        idempotencyKey: "interaction:interaction-2:answered",
+      }),
+    );
   });
 
   it("submits item verdicts and emits one continuation wake with resolved item ids", async () => {
@@ -2340,7 +2400,13 @@ describe.sequential("issue thread interaction routes", () => {
       expect.objectContaining({ agentId: ASSIGNEE_AGENT_ID, runId: RUN_2, userId: null }),
     );
     expect(mockQuestionResponseDeliveries.deliver).toHaveBeenCalledWith("interaction-2");
-    expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
+    // SPA-11242: the respond path wakes the assignee just like accept/reject.
+    expect(mockHeartbeatService.wakeup).toHaveBeenCalledWith(
+      ASSIGNEE_AGENT_ID,
+      expect.objectContaining({
+        idempotencyKey: "interaction:interaction-2:answered",
+      }),
+    );
     expect(mockLogActivity).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
       actorType: "agent",
       agentId: ASSIGNEE_AGENT_ID,

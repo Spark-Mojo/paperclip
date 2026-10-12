@@ -69,6 +69,7 @@ import {
   lt,
   lte,
   ne,
+  not,
   notInArray,
   or,
   sql,
@@ -385,6 +386,8 @@ import {
   WORKTREE_INSTANCE_ROOT_METADATA_KEY,
 } from "./workspace-instance-cleanup.js";
 import { issueService } from "./issues.js";
+import { issueThreadInteractionService } from "./issue-thread-interactions.js";
+import { settleSettledAwaitingYouIssues } from "./awaiting-you-settlement.js";
 import {
   blockRunnerGoalRecovery,
   failRunnerGoalAction,
@@ -401,7 +404,7 @@ import {
 import { createToolGatewayService } from "./tool-gateway.js";
 import { toolAccessService } from "./tool-access.js";
 import { visibleIssueCondition } from "./issue-visibility.js";
-import { ISSUE_BLOCKERS_RESOLVED_WAKE_REASON } from "./issue-dependency-wakeups.js";
+import { ISSUE_BLOCKERS_RESOLVED_WAKE_REASON, buildIssueBlockersResolvedWakeStateKey } from "./issue-dependency-wakeups.js";
 import {
   buildIssueMonitorClearedPatch,
   buildIssueMonitorTriggeredPatch,
@@ -695,6 +698,35 @@ export const FLEET_RUN_LIVENESS_WINDOW_ENV_VAR =
 export const FLEET_RUN_LIVENESS_WINDOW_DEFAULT_MS = 10 * 60 * 1000;
 const FLEET_RUN_LIVENESS_WINDOW_MIN_MS = 60 * 1000;
 const FLEET_RUN_LIVENESS_WINDOW_MAX_MS = 24 * 60 * 60 * 1000;
+
+// SPA-10513 slice 1 canary. Idle agents pull their own assigned `todo` cards.
+// Default OFF: unset or unrecognized values dispatch nothing. Reversible by
+// unsetting the var or emptying the allowlist, with no schema or UI change.
+// The allowlist is a comma/space/whitespace separated list of agent ids, agent
+// names, or the literal `*` for the whole instance. An empty allowlist means
+// nothing is eligible even when the switch is on, so arming the switch alone
+// never widens the fleet.
+export const IDLE_TODO_PULL_ENV_VAR = "PAPERCLIP_IDLE_TODO_PULL";
+export const IDLE_TODO_PULL_WAKE_REASON = "idle_todo_pull";
+export const IDLE_TODO_PULL_IDEMPOTENCY_PREFIX = `${IDLE_TODO_PULL_WAKE_REASON}:`;
+const IDLE_TODO_PULL_CANDIDATE_LIMIT = 500;
+
+// SPA-10513 slice 2 revert switch. The cross-agent queued-run sweep admits by
+// card priority, then by queue age, so a flood of releases cannot hold a slot
+// ahead of critical work. Setting this var to `fifo` restores the previous
+// oldest-ticket-first sweep ordering for the whole instance. The per-agent
+// ordering inside startNextQueuedRunForAgentUnderLocks (continuation readiness,
+// then priority, then age) is not affected by either ordering. Any other value,
+// including unset, keeps priority ordering: only an explicit recognized value
+// reverts, so a typo cannot silently change admission order. No schema change,
+// no restart: the var is read per sweep through this service's runtimeEnv.
+export const QUEUED_RUN_PRIORITY_ORDER_ENV_VAR = "PAPERCLIP_QUEUED_RUN_ORDER";
+
+export function isQueuedRunPriorityOrderEnabled(raw: string | undefined): boolean {
+  const normalized = (typeof raw === "string" ? raw : "").trim().toLowerCase();
+  if (normalized === "") return true;
+  return normalized !== "fifo";
+}
 
 // Env values always arrive as strings, which `asNumber` treats as absent.
 // Parse both shapes here.
@@ -3905,6 +3937,10 @@ interface WakeupOptions {
   issueStateGuard?: {
     statuses: string[];
     assigneeAgentId: string;
+    stageId?: string;
+    participantAgentId?: string;
+    lastDecisionId?: string | null;
+    stageEnteredAt?: string;
   };
   /** Keep causally distinct external chat continuations out of an existing run. */
   allowRunCoalescing?: boolean;
@@ -4092,6 +4128,15 @@ export function applyProjectWorkspaceDefaultRefToWorktreeStrategy(
     return { ...config, workspaceStrategy: { ...strategy, preferRemoteDefaultBranch: true } };
   }
   return { ...config, workspaceStrategy: { ...strategy, baseRef: defaultRef } };
+}
+
+export function requireSelectedProjectWorkspace<T extends ProjectWorkspaceCandidate>(
+  rows: T[], selectedWorkspaceId: string | null | undefined,
+): T[] {
+  if (!selectedWorkspaceId) return rows;
+  const selected = rows.find((row) => row.id === selectedWorkspaceId);
+  if (!selected) throw new Error(`Selected project workspace "${selectedWorkspaceId}" is not available on this project.`);
+  return [selected];
 }
 
 export function prioritizeProjectWorkspaceCandidatesForRun<
@@ -6230,6 +6275,25 @@ export type AllocatorExecutionWorkspaceReuseDecision = {
  * `resolveExecutionWorkspaceReuseRequestForIssue` so callers cannot forget to
  * apply it before handing off to `provisionExecutionWorkspaceForFreshnessDecision`.
  */
+export function assertPinnedExecutionWorkspaceMatchesProjectWorkspace(input: {
+  selectedProjectWorkspaceId?: string | null;
+  requestedExecutionWorkspaceId?: string | null;
+  executionWorkspacePreference?: string | null;
+  existingExecutionWorkspace?: { id: string; projectWorkspaceId: string | null } | null;
+}): void {
+  if (
+    input.selectedProjectWorkspaceId &&
+    input.existingExecutionWorkspace &&
+    input.requestedExecutionWorkspaceId === input.existingExecutionWorkspace.id &&
+    input.existingExecutionWorkspace.projectWorkspaceId !== input.selectedProjectWorkspaceId &&
+    input.executionWorkspacePreference === "reuse_existing"
+  ) {
+    throw new Error(
+      `Selected project workspace ${input.selectedProjectWorkspaceId} differs from pinned execution workspace ${input.existingExecutionWorkspace.id}. Clear the issue's executionWorkspaceId and executionWorkspacePreference through PATCH before retrying; the existing worktree is not changed.`,
+    );
+  }
+}
+
 export function resolveAllocatorExecutionWorkspaceReuseDecision(input: {
   issueExecutionWorkspaceId?: string | null;
   issueExecutionWorkspacePreference?: string | null;
@@ -9788,6 +9852,24 @@ export function resolveHeartbeatSchedulingSuppression(
   return { suppressed: false, reason: null };
 }
 
+export function resolveIdleTodoPullCanary(raw: string | undefined): {
+  enabled: boolean;
+  allowAll: boolean;
+  allowlist: Set<string>;
+} {
+  const tokens = (typeof raw === "string" ? raw : "")
+    .split(/[\s,]+/)
+    .filter(Boolean);
+  const allowlist = new Set(tokens.filter((token) => !isTruthyRuntimeEnvValue(token)));
+  const explicitAll = allowlist.delete("*");
+  const enabled = explicitAll || tokens.some((token) => isTruthyRuntimeEnvValue(token));
+  if (!enabled) return { enabled: false, allowAll: false, allowlist };
+  // Arming the switch with no allowlist is an explicit instance-wide canary;
+  // naming agents narrows it to exactly those agents. Unsetting the var, or
+  // setting a falsy switch, disables the feature outright either way.
+  return { enabled: true, allowAll: allowlist.size === 0 || explicitAll, allowlist };
+}
+
 export function heartbeatService(
   db: Db,
   options: HeartbeatServiceOptions = {},
@@ -9855,6 +9937,10 @@ export function heartbeatService(
     const override = await resolveWorktreeRunExecutionOverride();
     return override.allowed ? override.cutoff : null;
   };
+  const resolveIdleTodoPullGate = () =>
+    resolveIdleTodoPullCanary(runtimeEnv[IDLE_TODO_PULL_ENV_VAR]);
+  const queuedRunPriorityOrderEnabled = () =>
+    isQueuedRunPriorityOrderEnabled(runtimeEnv[QUEUED_RUN_PRIORITY_ORDER_ENV_VAR]);
 
   const runLogStore = getRunLogStore();
   const traceStore = providerTraceStore(db);
@@ -12778,6 +12864,10 @@ export function heartbeatService(
       repoRef: readNonEmptyString(workspace.repoRef),
     }));
 
+    if (workspaceProjectId && preferredProjectWorkspaceId) {
+      requireSelectedProjectWorkspace(projectWorkspaceRows, preferredProjectWorkspaceId);
+    }
+
     if (projectWorkspaceRows.length > 0) {
       const preferredWorkspace = preferredProjectWorkspaceId
         ? (projectWorkspaceRows.find(
@@ -12791,7 +12881,7 @@ export function heartbeatService(
       if (preferredProjectWorkspaceId && !preferredWorkspace) {
         preferredWorkspaceWarning = `Selected project workspace "${preferredProjectWorkspaceId}" is not available on this project.`;
       }
-      for (const workspace of projectWorkspaceRows) {
+      for (const workspace of requireSelectedProjectWorkspace(projectWorkspaceRows, preferredProjectWorkspaceId)) {
         let projectCwd: string;
         let managedWorkspaceWarning: string | null = null;
         try {
@@ -12851,6 +12941,11 @@ export function heartbeatService(
         missingProjectCwds.push(projectCwd);
       }
 
+      if (preferredProjectWorkspaceId) {
+        throw new Error(
+          preferredWorkspaceWarning ?? `Selected project workspace "${preferredProjectWorkspaceId}" is unavailable.`,
+        );
+      }
       const fallbackCwd = resolveDefaultAgentWorkspaceDir(agent.id);
       await fs.mkdir(fallbackCwd, { recursive: true });
       const warnings = buildAnchorFallbackWorkspaceNotes({
@@ -18188,8 +18283,25 @@ export function heartbeatService(
     }
     const claimed = queuedCommentClaim
       ? queuedCommentClaim.run
-      : await withChatControlRecoveryGate(run, "claim", async (tx) =>
-          tx
+      : await withChatControlRecoveryGate(run, "claim", async (tx) => {
+          if (context.source === "issue.execution_review_recovery" && context.reviewStageEntryRecovery === true) {
+            const [stageIssue] = await tx.select({ status: issues.status, executionState: issues.executionState })
+              .from(issues).where(and(eq(issues.companyId, run.companyId), eq(issues.id, issueId!))).limit(1);
+            const stage = parseIssueExecutionState(stageIssue?.executionState);
+            if (!context.stageEnteredAt || stageIssue?.status !== "in_review" || stage?.status !== "pending" ||
+              stage.currentStageId !== context.currentStageId || stage.stageEnteredAt !== context.stageEnteredAt ||
+              stage.currentParticipant?.type !== "agent" || stage.currentParticipant.agentId !== run.agentId) {
+              const now = new Date();
+              await tx.update(heartbeatRuns).set({ status: "cancelled", errorCode: "review_stage_changed", error: "Review stage changed before recovery wake claim", finishedAt: now, updatedAt: now })
+                .where(and(eq(heartbeatRuns.id, run.id), eq(heartbeatRuns.status, "queued")));
+              if (run.wakeupRequestId) {
+                await tx.update(agentWakeupRequests).set({ status: "cancelled", finishedAt: now, updatedAt: now })
+                  .where(and(eq(agentWakeupRequests.id, run.wakeupRequestId), eq(agentWakeupRequests.status, "queued")));
+              }
+              return null;
+            }
+          }
+          return tx
             .update(heartbeatRuns)
             .set({
               status: "running",
@@ -18206,8 +18318,8 @@ export function heartbeatService(
               ),
             )
             .returning()
-            .then((rows) => rows[0] ?? null),
-        );
+            .then((rows) => rows[0] ?? null);
+        });
     if (!claimed) return null;
 
     publishLiveEvent({
@@ -19769,9 +19881,16 @@ export function heartbeatService(
     }
 
     const queuedRunsQuery = db
-      .select({ agentId: heartbeatRuns.agentId })
+      .select({ agentId: heartbeatRuns.agentId, createdAt: heartbeatRuns.createdAt, id: heartbeatRuns.id, issuePriority: issues.priority })
       .from(heartbeatRuns)
       .innerJoin(companies, eq(companies.id, heartbeatRuns.companyId))
+      .leftJoin(
+        issues,
+        and(
+          eq(issues.companyId, heartbeatRuns.companyId),
+          sql`${issues.id}::text = ${heartbeatRuns.contextSnapshot}->>'issueId'`,
+        ),
+      )
       .where(
         and(
           eq(heartbeatRuns.status, "queued"),
@@ -19779,20 +19898,50 @@ export function heartbeatService(
           cutoff ? gte(heartbeatRuns.createdAt, cutoff) : undefined,
         ),
       );
-    // With a fleet ceiling the sweep decides which waiting ticket gets a freed
-    // slot, so visit agents oldest-ticket first; otherwise agents that sort late
-    // could starve. Without a ceiling every agent is admitted anyway, so the
-    // query is left exactly as before.
-    const queuedRuns =
-      (await fleetMaxConcurrentRuns()) === null
-        ? await queuedRunsQuery
-        : await queuedRunsQuery.orderBy(
-            asc(heartbeatRuns.createdAt),
-            asc(heartbeatRuns.id),
-          );
+    const queuedRuns = await queuedRunsQuery;
+    // The sweep, not the per-agent admission, decides which waiting ticket gets
+    // a freed slot, so it orders every queued ticket in the instance: critical
+    // before high before medium before low, then oldest first inside a priority
+    // band. Without that a flood of releases can hold every slot ahead of
+    // critical work. Each agent is then admitted in turn from that one shared
+    // order, so the first slot freed goes to the highest-priority pending
+    // ticket rather than to whichever agent sorted first.
+    //
+    // Both orderings read the same rows through one query shape: an agent with
+    // several queued tickets must appear once per ticket, not once, or it would
+    // be admitted at most once per sweep and a slot could be withheld from an
+    // idle agent.
+    //
+    // Left join: a ticket whose card is missing (deleted issue, or a snapshot
+    // issueId from another company) sorts last, exactly like an unknown
+    // priority in the per-agent order, instead of dropping out of the sweep.
+    //
+    // Reversible to the previous oldest-ticket-first sweep by
+    // QUEUED_RUN_PRIORITY_ORDER_ENV_VAR=fifo. Without a ceiling every agent is
+    // admitted anyway, so the ordering cannot change what runs; the query is
+    // read unbounded exactly as before, which keeps a long waiting backlog fully
+    // visible instead of truncating it.
+    const orderedAgentIds = [
+      ...new Set(
+        [...queuedRuns]
+          .sort((left, right) => {
+            const byAge = left.createdAt.getTime() - right.createdAt.getTime();
+            if (!queuedRunPriorityOrderEnabled()) {
+              if (byAge !== 0) return byAge;
+              return left.id < right.id ? -1 : left.id > right.id ? 1 : 0;
+            }
+            const byPriorityRank =
+              issueRunPriorityRank(left.issuePriority) -
+              issueRunPriorityRank(right.issuePriority);
+            if (byPriorityRank !== 0) return byPriorityRank;
+            if (byAge !== 0) return byAge;
+            return left.id < right.id ? -1 : left.id > right.id ? 1 : 0;
+          })
+          .map(({ agentId }) => agentId),
+      ),
+    ];
 
-    const agentIds = [...new Set(queuedRuns.map((r) => r.agentId))];
-    for (const agentId of agentIds) {
+    for (const agentId of orderedAgentIds) {
       await startNextQueuedRunForAgent(agentId);
     }
   }
@@ -19962,6 +20111,375 @@ export function heartbeatService(
     return recovery.reconcileStrandedAssignedIssues({
       issueCreatedAtGte: await getWorktreeExecutionCutoff(),
     });
+  }
+
+  function idleTodoPullIdempotencyKey(issueId: string, updatedAt: Date) {
+    return `${IDLE_TODO_PULL_IDEMPOTENCY_PREFIX}${issueId}:${updatedAt.toISOString()}`;
+  }
+
+  function idleTodoPullCandidateEligible(agent: typeof agents.$inferSelect) {
+    const gate = resolveIdleTodoPullGate();
+    if (!gate.enabled) return false;
+    if (gate.allowAll) return true;
+    return gate.allowlist.has(agent.id) || gate.allowlist.has(agent.name);
+  }
+
+  /**
+   * SPA-10513 slice 1. Dispatch one eligible assigned `todo` card per idle
+   * agent, highest priority then oldest, metered by the same per-agent and
+   * fleet caps that gate queued-run admission. Default OFF and allowlist-gated.
+   *
+   * Only `todo` cards are candidates, so a `backlog` card is never pulled (the
+   * backlog is a human parking surface), a `blocked` card is never pulled (an
+   * open blocker owns it), and a card with any open blocker edge is skipped
+   * even if something reset its status. Human-owned work is excluded by the
+   * `assigneeUserId IS NULL` predicate, conversation containers are excluded
+   * because their turn lifecycle is authoritative, and hidden/harness rows are
+   * excluded by the shared visibility condition.
+   *
+   * Admission is metered before the enqueue, and enqueueWakeup itself routes
+   * through startNextQueuedRunForAgent, so the fleet cap is enforced twice: the
+   * pre-check avoids burning a wake receipt when no slot exists, and admission
+   * is authoritative if the fleet changes underneath us.
+   *
+   * Idempotence: the wake key binds the issue to its `updatedAt` dispatch epoch
+   * (mirrors the blocked-cycle stamp in issue-dependency-wakeups.ts). Any card
+   * touch mints a new epoch, so a card that returns to `todo` after a run is
+   * pullable again, while an untouched card keeps one key forever. In-flight
+   * suppression is the shared hasActiveExecutionPath guard. NOTE: that check is
+   * not atomic with the enqueue, so two sweeps racing in the same process
+   * window can both pass it. Single-process canary only; a cross-process
+   * duplicate guard needs a DB unique index on this key prefix (unresolved).
+   */
+  async function pullIdleAgentTodoIssues() {
+    const gate = resolveIdleTodoPullGate();
+    const result = {
+      enabled: gate.enabled,
+      checked: 0,
+      pulled: 0,
+      capExhausted: 0,
+      notInvokable: 0,
+      notDependencyReady: 0,
+      livePathSkipped: 0,
+      ineligibleCardSkipped: 0,
+      duplicateSkipped: 0,
+      wakeOnDemandDisabled: 0,
+      deferredOrFailed: 0,
+      enqueueFailed: 0,
+      agentIds: [] as string[],
+      issueIds: [] as string[],
+    };
+    if (!gate.enabled) return result;
+    if ((await getSchedulingSuppression()).suppressed) return result;
+
+    const cutoff = await getWorktreeExecutionCutoff();
+    const candidates = await db
+      .select({
+        id: issues.id,
+        companyId: issues.companyId,
+        assigneeAgentId: issues.assigneeAgentId,
+        priority: issues.priority,
+        createdAt: issues.createdAt,
+        updatedAt: issues.updatedAt,
+      })
+      .from(issues)
+      .where(
+        and(
+          eq(issues.status, "todo"),
+          sql`${issues.assigneeAgentId} is not null`,
+          isNull(issues.assigneeUserId),
+          isNull(issues.conversationAgentId),
+          visibleIssueCondition(),
+          not(unadmittedChatWakeupCondition(issues.id, issues.companyId)),
+          cutoff ? gte(issues.createdAt, cutoff) : undefined,
+        ),
+      )
+      .orderBy(
+        sql`case ${issues.priority} when 'critical' then 0 when 'high' then 1 when 'medium' then 2 when 'low' then 3 else 4 end`,
+        asc(issues.createdAt),
+        asc(issues.id),
+      )
+      .limit(IDLE_TODO_PULL_CANDIDATE_LIMIT);
+    result.checked = candidates.length;
+    if (candidates.length === 0) return result;
+
+    const readinessByCompany = new Map<string, Map<string, Awaited<ReturnType<typeof issuesSvc.getDependencyReadiness>>>>();
+    for (const companyId of new Set(candidates.map((c) => c.companyId))) {
+      readinessByCompany.set(
+        companyId,
+        await issuesSvc.listDependencyReadiness(
+          companyId,
+          candidates.filter((c) => c.companyId === companyId).map((c) => c.id),
+        ),
+      );
+    }
+
+    const fleetCeiling = await fleetMaxConcurrentRuns();
+    const agentIds = [
+      ...new Set(
+        candidates
+          .map((c) => c.assigneeAgentId)
+          .filter((id): id is string => Boolean(id)),
+      ),
+    ];
+    const agentRows = await db
+      .select({ id: agents.id, companyId: agents.companyId })
+      .from(agents)
+      .where(inArray(agents.id, agentIds));
+    const companyByAgentId = new Map(
+      agentRows.map((row) => [row.id, row.companyId]),
+    );
+
+    const byAgent = new Map<string, typeof candidates>();
+    for (const candidate of candidates) {
+      if (!candidate.assigneeAgentId) continue;
+      if (!companyByAgentId.has(candidate.assigneeAgentId)) continue;
+      const list = byAgent.get(candidate.assigneeAgentId) ?? [];
+      list.push(candidate);
+      byAgent.set(candidate.assigneeAgentId, list);
+    }
+    const rankedByAgent = new Map<string, typeof candidates>();
+    for (const [agentId, list] of byAgent.entries()) {
+      rankedByAgent.set(
+        agentId,
+        [...list].sort((left, right) => {
+          const byPriority =
+            issueRunPriorityRank(left.priority) -
+            issueRunPriorityRank(right.priority);
+          if (byPriority !== 0) return byPriority;
+          const byAge = left.createdAt.getTime() - right.createdAt.getTime();
+          if (byAge !== 0) return byAge;
+          return left.id < right.id ? -1 : left.id > right.id ? 1 : 0;
+        }),
+      );
+    }
+
+    for (const [agentId, ranked] of rankedByAgent.entries()) {
+      const agent = await getAgent(agentId);
+      if (!agent) continue;
+      if (!idleTodoPullCandidateEligible(agent)) {
+        result.ineligibleCardSkipped += ranked.length;
+        continue;
+      }
+      const invokability = await getAgentInvokability(agent);
+      if (!invokability.invokable) {
+        result.notInvokable += ranked.length;
+        continue;
+      }
+      const policy = parseHeartbeatPolicy(agent);
+      if (!policy.wakeOnDemand) {
+        result.wakeOnDemandDisabled += ranked.length;
+        continue;
+      }
+      const slots = computeAvailableRunSlots({
+        agentMaxConcurrentRuns: policy.maxConcurrentRuns,
+        agentRunningRuns: await countRunningRunsForAgent(agentId),
+        fleetMaxConcurrentRuns: fleetCeiling,
+        fleetRunningRuns: await countRunningRunsGlobal(),
+      });
+      if (slots <= 0) {
+        result.capExhausted += ranked.length;
+        continue;
+      }
+
+      const readiness = readinessByCompany.get(agent.companyId);
+      let dispatchedForAgent = false;
+      for (const candidate of ranked) {
+        if (dispatchedForAgent) {
+          result.capExhausted += 1;
+          continue;
+        }
+        const candidateReadiness = readiness?.get(candidate.id);
+        if (candidateReadiness && !candidateReadiness.isDependencyReady) {
+          result.notDependencyReady += 1;
+          continue;
+        }
+        if (
+          await treeControlSvc.getActivePauseHoldGate(
+            candidate.companyId,
+            candidate.id,
+          )
+        ) {
+          result.notDependencyReady += 1;
+          continue;
+        }
+        if (
+          await hasIssueLiveExecutionPath(
+            candidate.companyId,
+            candidate.id,
+            agentId,
+          )
+        ) {
+          result.livePathSkipped += 1;
+          continue;
+        }
+        const idempotencyKey = idleTodoPullIdempotencyKey(
+          candidate.id,
+          candidate.updatedAt,
+        );
+        if (await hasIdleTodoPullWakeForEpoch(agent.companyId, idempotencyKey)) {
+          result.duplicateSkipped += 1;
+          continue;
+        }
+        try {
+          const wake = await enqueueWakeup(agentId, {
+            source: "automation",
+            triggerDetail: "system",
+            reason: IDLE_TODO_PULL_WAKE_REASON,
+            payload: { issueId: candidate.id },
+            idempotencyKey,
+            requestedByActorType: "system",
+            requestedByActorId: "idle_todo_pull",
+            contextSnapshot: {
+              issueId: candidate.id,
+              taskId: candidate.id,
+              wakeReason: IDLE_TODO_PULL_WAKE_REASON,
+              source: "idle_todo_pull",
+            },
+          });
+          if (!wake) {
+            result.deferredOrFailed += 1;
+            continue;
+          }
+          dispatchedForAgent = true;
+          result.pulled += 1;
+          result.agentIds.push(agentId);
+          result.issueIds.push(candidate.id);
+        } catch (err) {
+          result.deferredOrFailed += 1;
+          result.enqueueFailed += 1;
+          logger.warn(
+            { err, err_issueId: candidate.id, agentId, idempotencyKey },
+            "idle todo pull failed to enqueue an assigned todo dispatch",
+          );
+        }
+      }
+    }
+
+    if (result.pulled > 0) {
+      logger.info(
+        {
+          pulled: result.pulled,
+          checked: result.checked,
+          agentIds: result.agentIds,
+          issueIds: result.issueIds,
+          fleetCeiling,
+        },
+        "idle todo pull dispatched assigned todo cards",
+      );
+    }
+    return result;
+  }
+
+  async function hasIssueLiveExecutionPath(
+    companyId: string,
+    issueId: string,
+    agentId: string,
+  ) {
+    const [run, deferredWake] = await Promise.all([
+      db
+        .select({ id: heartbeatRuns.id })
+        .from(heartbeatRuns)
+        .where(
+          and(
+            eq(heartbeatRuns.companyId, companyId),
+            inArray(heartbeatRuns.status, [
+              "queued",
+              "running",
+              "scheduled_retry",
+            ]),
+            sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${issueId}`,
+            eq(heartbeatRuns.agentId, agentId),
+          ),
+        )
+        .limit(1)
+        .then((rows) => Boolean(rows[0])),
+      db
+        .select({ id: agentWakeupRequests.id })
+        .from(agentWakeupRequests)
+        .where(
+          and(
+            eq(agentWakeupRequests.companyId, companyId),
+            eq(agentWakeupRequests.agentId, agentId),
+            eq(agentWakeupRequests.status, "deferred_issue_execution"),
+            sql`${agentWakeupRequests.payload} ->> 'issueId' = ${issueId}`,
+          ),
+        )
+        .limit(1)
+        .then((rows) => Boolean(rows[0])),
+    ]);
+    return run || deferredWake;
+  }
+
+  async function hasIdleTodoPullWakeForEpoch(
+    companyId: string,
+    idempotencyKey: string,
+  ) {
+    return db
+      .select({ id: agentWakeupRequests.id })
+      .from(agentWakeupRequests)
+      .where(
+        and(
+          eq(agentWakeupRequests.companyId, companyId),
+          eq(agentWakeupRequests.idempotencyKey, idempotencyKey),
+        ),
+      )
+      .limit(1)
+      .then((rows) => Boolean(rows[0]));
+  }
+
+  // SPA-11242: periodic sweep settling fully-answered user-owned cards
+  // (hand back to live filer, else auto-close + wake dependents), keeping
+  // requiresManualAction cards open.
+  async function sweepSettledAwaitingYouIssues() {
+    const interactionSvc = issueThreadInteractionService(db);
+    return settleSettledAwaitingYouIssues(
+      db,
+      {
+        issuesSvc: {
+          update: (id, data) => issuesSvc.update(id, data),
+          addComment: (issueId, body) =>
+            issuesSvc.addComment(issueId, body, {}, { authorType: "system" }),
+        },
+        listInteractionsForIssue: (issueId) =>
+          interactionSvc.listForIssue(issueId),
+        enqueueWakeupFn: (agentId, opts) =>
+          enqueueWakeup(agentId, opts as WakeupOptions),
+        unblockDependentsFn: (blockerIssueId) =>
+          autoUnblockReadyDependents(blockerIssueId),
+        logFn: (obj, msg) => logger.warn(obj, msg),
+      },
+    );
+  }
+
+  async function autoUnblockReadyDependents(blockerIssueId: string) {
+    const enabled = resolveIdleTodoPullCanary(runtimeEnv.PAPERCLIP_AUTO_UNBLOCK_READY_DEPENDENTS).enabled && resolveIdleTodoPullGate().enabled;
+    const result = { enabled, checked: 0, unblocked: 0, notReadySkipped: 0, deferredOrFailed: 0, issueIds: [] as string[] };
+    if (!enabled || (await getSchedulingSuppression()).suppressed) return result;
+    const candidates = await issuesSvc.listBlockedDependentsReadyForAutoUnblock(blockerIssueId);
+    result.checked = candidates.length;
+    for (const candidate of candidates) {
+      const transitioned = await issuesSvc.autoUnblockReadyDependent(candidate);
+      if (!transitioned?.agentId) {
+        result.notReadySkipped += 1;
+        continue;
+      }
+      result.unblocked += 1;
+      result.issueIds.push(candidate.id);
+      try {
+        await enqueueWakeup(transitioned.agentId, {
+          source: "automation", triggerDetail: "system", reason: ISSUE_BLOCKERS_RESOLVED_WAKE_REASON,
+          payload: { issueId: candidate.id, resolvedBlockerIssueId: blockerIssueId, blockerIssueIds: transitioned.blockerIssueIds },
+          idempotencyKey: buildIssueBlockersResolvedWakeStateKey({ dependentIssueId: candidate.id, blockerIssueIds: transitioned.blockerIssueIds, blockedTransitionAt: transitioned.blockedTransitionAt }),
+          requestedByActorType: "system",
+          contextSnapshot: { issueId: candidate.id, taskId: candidate.id, wakeReason: ISSUE_BLOCKERS_RESOLVED_WAKE_REASON },
+        });
+      } catch (err) {
+        result.deferredOrFailed += 1;
+        logger.warn({ err, issueId: candidate.id }, "failed to wake auto-unblocked dependent");
+      }
+    }
+    return result;
   }
 
   async function sweepStaleIssueLocks() {
@@ -21394,6 +21912,14 @@ export function heartbeatService(
       // locally before any downstream policy/provisioning decision sees it, so the
       // provisioning path always falls through to realizeWorkspace() rather than
       // hitting the `inherited_workspace_reuse_unavailable` throw.
+      assertPinnedExecutionWorkspaceMatchesProjectWorkspace({
+        selectedProjectWorkspaceId: issueRef?.projectWorkspaceId,
+        requestedExecutionWorkspaceId,
+        executionWorkspacePreference: nativeRecoveryExecutionWorkspaceId
+          ? "reuse_existing"
+          : issueRef?.executionWorkspacePreference,
+        existingExecutionWorkspace,
+      });
       const allocatorDecision = resolveAllocatorExecutionWorkspaceReuseDecision({
         issueExecutionWorkspaceId: requestedExecutionWorkspaceId,
         issueExecutionWorkspacePreference: nativeRecoveryExecutionWorkspaceId
@@ -27542,6 +28068,7 @@ export function heartbeatService(
               conversationUserId: issues.conversationUserId,
               conversationState: issues.conversationState,
               status: issues.status,
+              executionState: issues.executionState,
               projectId: issues.projectId,
               projectWorkspaceId: issues.projectWorkspaceId,
               executionWorkspaceId: issues.executionWorkspaceId,
@@ -27765,7 +28292,16 @@ export function heartbeatService(
           if (
             issueStateGuard &&
             (!issueStateGuard.statuses.includes(issue.status) ||
-              issue.assigneeAgentId !== issueStateGuard.assigneeAgentId)
+              issue.assigneeAgentId !== issueStateGuard.assigneeAgentId ||
+              (issueStateGuard.stageId !== undefined && (() => {
+                const stage = parseIssueExecutionState(issue.executionState);
+                return stage?.status !== "pending" ||
+                  stage.currentStageId !== issueStateGuard.stageId ||
+                  stage.currentParticipant?.type !== "agent" ||
+                  stage.currentParticipant.agentId !== issueStateGuard.participantAgentId ||
+                  stage.lastDecisionId !== issueStateGuard.lastDecisionId ||
+                  stage.stageEnteredAt !== issueStateGuard.stageEnteredAt;
+              })()))
           ) {
             await tx.insert(agentWakeupRequests).values({
               ...durableReceiptFields,
@@ -30262,6 +30798,9 @@ export function heartbeatService(
     },
 
     reconcileStrandedAssignedIssues,
+    pullIdleAgentTodoIssues,
+    autoUnblockReadyDependents,
+    sweepSettledAwaitingYouIssues,
     recoverPendingSessionGoalActions,
     recoverActiveSessionGoals,
 

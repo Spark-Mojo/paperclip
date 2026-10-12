@@ -7,11 +7,14 @@ import {
 } from "./constants.js";
 import {
   acceptIssueThreadInteractionSchema,
+  askUserQuestionsPayloadSchema,
   askUserQuestionsResultSchema,
   createIssueThreadInteractionSchema,
   paperclipQuestionSetPayloadSchema,
+  requestCheckboxConfirmationPayloadSchema,
   requestConfirmationPayloadSchema,
   requestConfirmationResultSchema,
+  requestItemVerdictsPayloadSchema,
   requestItemVerdictsResultSchema,
   submitIssueThreadInteractionVerdictsSchema,
 } from "./validators/issue.js";
@@ -567,5 +570,76 @@ describe("issue thread interaction schemas", () => {
         { id: "api", verdict: "reject", reason: "Needs revision" },
       ],
     })).toThrow("verdict item ids must be unique");
+  });
+
+  it("parses manual-action payloads without the flag (backward compat)", () => {
+    const questions = [{
+      id: "scope",
+      prompt: "Which scope?",
+      selectionMode: "single" as const,
+      options: [{ id: "small", label: "Small" }],
+    }];
+    expect(askUserQuestionsPayloadSchema.parse({ version: 1, questions }).requiresManualAction)
+      .toBeUndefined();
+    expect(requestConfirmationPayloadSchema.parse({ version: 1, prompt: "Proceed?" }).requiresManualAction)
+      .toBeUndefined();
+    expect(requestCheckboxConfirmationPayloadSchema.parse({
+      version: 1,
+      prompt: "Which items?",
+      options: [{ id: "item-1", label: "Draft" }],
+    }).requiresManualAction).toBeUndefined();
+    expect(requestItemVerdictsPayloadSchema.parse({
+      version: 1,
+      prompt: "Review items.",
+      items: [{ id: "api", label: "API route" }],
+    }).requiresManualAction).toBeUndefined();
+  });
+
+  it("parses requiresManualAction true/false on all manual-action payloads", () => {
+    const questions = [{
+      id: "scope",
+      prompt: "Which scope?",
+      selectionMode: "single" as const,
+      options: [{ id: "small", label: "Small" }],
+    }];
+    for (const value of [true, false]) {
+      expect(askUserQuestionsPayloadSchema.parse({ version: 1, questions, requiresManualAction: value }).requiresManualAction).toBe(value);
+      expect(requestConfirmationPayloadSchema.parse({ version: 1, prompt: "Proceed?", requiresManualAction: value }).requiresManualAction).toBe(value);
+      expect(requestCheckboxConfirmationPayloadSchema.parse({
+        version: 1,
+        prompt: "Which items?",
+        options: [{ id: "item-1", label: "Draft" }],
+        requiresManualAction: value,
+      }).requiresManualAction).toBe(value);
+      expect(requestItemVerdictsPayloadSchema.parse({
+        version: 1,
+        prompt: "Review items.",
+        items: [{ id: "api", label: "API route" }],
+        requiresManualAction: value,
+      }).requiresManualAction).toBe(value);
+    }
+  });
+
+  it("rejects requiresManualAction as a string on all manual-action payloads", () => {
+    const questions = [{
+      id: "scope",
+      prompt: "Which scope?",
+      selectionMode: "single" as const,
+      options: [{ id: "small", label: "Small" }],
+    }];
+    expect(() => askUserQuestionsPayloadSchema.parse({ version: 1, questions, requiresManualAction: "yes" })).toThrow();
+    expect(() => requestConfirmationPayloadSchema.parse({ version: 1, prompt: "Proceed?", requiresManualAction: "yes" })).toThrow();
+    expect(() => requestCheckboxConfirmationPayloadSchema.parse({
+      version: 1,
+      prompt: "Which items?",
+      options: [{ id: "item-1", label: "Draft" }],
+      requiresManualAction: "yes",
+    })).toThrow();
+    expect(() => requestItemVerdictsPayloadSchema.parse({
+      version: 1,
+      prompt: "Review items.",
+      items: [{ id: "api", label: "API route" }],
+      requiresManualAction: "yes",
+    })).toThrow();
   });
 });

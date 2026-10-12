@@ -1048,7 +1048,7 @@ async function startServerWithDatabaseTeardown(
   // 168-worktree HDD load. Periodic re-runs are out of scope for this
   // change — startup is sufficient for the steady-state contract; a
   // scheduler is a follow-up.
-  void reconcileEphemeralWorktreesOnStartup(db as any)
+  void reconcileEphemeralWorktreesOnStartup({ db })
     .then((result) => {
       if (result.reaper.removed > 0 || result.sweep.archived > 0) {
         logger.warn(
@@ -1813,6 +1813,18 @@ async function startServerWithDatabaseTeardown(
               const reconciled = await heartbeat.reconcileResolvedDependencyWakes();
               if (reconciled.healed > 0) {
                 logger.warn({ ...reconciled }, "periodic dependency-wake reconciliation restored task execution paths");
+              }
+            })
+            .then(async () => {
+              const settled = await heartbeat.sweepSettledAwaitingYouIssues();
+              if (settled.handedBack > 0 || settled.autoClosed > 0) {
+                logger.warn({ ...settled }, "periodic awaiting-you settlement settled fully-answered user-owned cards");
+              }
+            })
+            .then(async () => {
+              const pulled = await heartbeat.pullIdleAgentTodoIssues();
+              if (pulled.pulled > 0) {
+                logger.warn({ ...pulled }, "periodic idle todo pull dispatched assigned todo cards");
               }
             })
             .then(async () => {

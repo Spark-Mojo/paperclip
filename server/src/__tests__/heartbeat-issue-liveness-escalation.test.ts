@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
-import { and, eq } from "drizzle-orm";
-import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
+import { spawn } from "node:child_process";
+import { and, eq, inArray } from "drizzle-orm";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   activityLog,
   agents,
@@ -94,6 +95,10 @@ describeEmbeddedPostgres("heartbeat resolved dependency wake reconciliation", ()
     db = createDb(tempDb.connectionString);
   }, 30_000);
 
+  beforeEach(() => {
+    vi.stubEnv("PAPERCLIP_IN_WORKTREE", "false");
+  });
+
   afterEach(async () => {
     // Dependency reconciliation heals missing wakes by enqueuing an
     // on-demand wake, which dispatches a heartbeat run fire-and-forget (see
@@ -105,6 +110,7 @@ describeEmbeddedPostgres("heartbeat resolved dependency wake reconciliation", ()
     // trip the run_events → runs foreign key.
     await heartbeatService(db).drainActiveRunExecutions();
     vi.clearAllMocks();
+    vi.unstubAllEnvs();
     runningProcesses.clear();
     await db.delete(activityLog);
     await db.delete(heartbeatRunEvents);
@@ -471,6 +477,138 @@ describeEmbeddedPostgres("heartbeat resolved dependency wake reconciliation", ()
       entityId: blockedIssueId,
       details: expect.objectContaining({ source: "issue_graph_liveness.backstop" }),
     });
+  });
+
+  it("replays a crash-window todo dependent past 501 earlier dependency candidates exactly once", async () => {
+    const { companyId, blockedIssueId, blockerIssueId } =
+      await seedResolvedDependencyBackstopFixture({ workspaceState: "none" });
+    const earlierIds = Array.from({ length: 501 }, (_, index) =>
+      `00000000-0000-4000-8000-${(index + 1).toString(16).padStart(12, "0")}`);
+    const deferredAgentId = randomUUID();
+    await db.insert(agents).values({
+      id: deferredAgentId, companyId, name: "Deferred agent", role: "engineer",
+      status: "idle", adapterType: "test_adapter", adapterConfig: {},
+      runtimeConfig: { heartbeat: { wakeOnDemand: false } }, permissions: {},
+    });
+    await db.insert(issues).values(earlierIds.map((id, index) => ({
+      id, companyId, title: `Earlier todo ${index}`, status: "todo",
+      priority: "medium", assigneeAgentId: deferredAgentId, issueNumber: index + 4,
+      identifier: `R-EARLIER-${index + 4}`,
+    })));
+    await db.insert(issueRelations).values(earlierIds.map((id) => ({
+      companyId, issueId: blockerIssueId, relatedIssueId: id, type: "blocks" as const,
+    })));
+    const child = spawn(process.execPath, [
+      "--import", "tsx", "--input-type=module", "-e",
+      `import { createDb, issues } from '@paperclipai/db';
+       import { eq } from 'drizzle-orm';
+       const db = createDb(process.env.REPLAY_DATABASE_URL);
+       await db.update(issues).set({ status: 'todo', blockedTransitionAt: new Date() }).where(eq(issues.id, process.env.REPLAY_ISSUE_ID));
+       process.stdout.write('TRANSITION_COMMITTED\\n');
+       setInterval(() => {}, 1000);`,
+    ], {
+      cwd: new URL("../../", import.meta.url).pathname,
+      env: { ...process.env, REPLAY_DATABASE_URL: tempDb!.connectionString, REPLAY_ISSUE_ID: blockedIssueId },
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    const childExit = new Promise<void>((resolve) => child.once("exit", () => resolve()));
+    let errors = "";
+    child.stderr.on("data", (chunk: Buffer) => { errors += chunk.toString(); });
+    const barrier = new Promise<void>((resolve, reject) => {
+      let output = "";
+      child.stdout.on("data", (chunk: Buffer) => {
+        output += chunk.toString();
+        if (output.includes("TRANSITION_COMMITTED\n")) resolve();
+      });
+      child.on("error", reject);
+      child.on("exit", (code) => reject(new Error(`transition process exited before barrier (${code}): ${errors}`)));
+    });
+    const bounded = async <T>(promise: Promise<T>, label: string) => {
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      try {
+        return await Promise.race([
+          promise,
+          new Promise<never>((_, reject) => {
+            timer = setTimeout(() => reject(new Error(`${label} timed out: ${errors}`)), 20_000);
+          }),
+        ]);
+      } finally {
+        clearTimeout(timer);
+      }
+    };
+    try {
+      await bounded(barrier, "transition barrier");
+    } finally {
+      child.kill("SIGKILL");
+      await bounded(childExit, "transition process exit");
+    }
+    expect((await db.select().from(issues).where(eq(issues.id, blockedIssueId)))[0]?.status).toBe("todo");
+    expect(await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, companyId))).toHaveLength(0);
+    expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, companyId))).toHaveLength(0);
+
+    const heartbeat = heartbeatService(db);
+    const firstPass = await heartbeat.reconcileResolvedDependencyWakes();
+    expect(firstPass.checked).toBe(500);
+    expect(firstPass.candidateLimitSkipped).toBeGreaterThan(0);
+    expect(firstPass.issueIds).not.toContain(blockedIssueId);
+    const restartedHeartbeat = heartbeatService(db);
+    const restartedFirstPass = await restartedHeartbeat.reconcileResolvedDependencyWakes();
+    expect(restartedFirstPass.issueIds).not.toContain(blockedIssueId);
+    const passes = await Promise.all([
+      restartedHeartbeat.reconcileResolvedDependencyWakes(),
+      restartedHeartbeat.reconcileResolvedDependencyWakes(),
+    ]);
+    expect(passes.flatMap((pass) => pass.issueIds)).toContain(blockedIssueId);
+    await heartbeatService(db).drainActiveRunExecutions();
+    const wakes = await db.select().from(agentWakeupRequests)
+      .where(and(eq(agentWakeupRequests.companyId, companyId), eq(agentWakeupRequests.reason, "issue_blockers_resolved")));
+    expect(wakes.filter((wake) => (wake.payload as { issueId?: string }).issueId === blockedIssueId)).toHaveLength(1);
+    expect(wakes[0]?.runId).not.toBeNull();
+    const runs = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, companyId));
+    expect(runs.filter((run) => run.wakeupRequestId === wakes[0]?.id)).toHaveLength(1);
+    expect(runs.filter((run) => (run.contextSnapshot as { wakeReason?: string })?.wakeReason === "issue_blockers_resolved")).toHaveLength(1);
+    expect(runs.filter((run) => (run.contextSnapshot as { wakeReason?: string })?.wakeReason === "finish_successful_run_handoff")).toHaveLength(1);
+    expect(mockAdapterExecute).toHaveBeenCalledTimes(runs.length);
+    expect(wakes[0]?.idempotencyKey).toBe(buildIssueBlockersResolvedWakeStateKey({
+      dependentIssueId: blockedIssueId, blockerIssueIds: [blockerIssueId],
+      blockedTransitionAt: (await db.select().from(issues).where(eq(issues.id, blockedIssueId)))[0]?.blockedTransitionAt,
+    }));
+  }, 60_000);
+
+  it("replays a todo dependent only after its blocker workspace finalizes", async () => {
+    const { companyId, blockedIssueId, blockerIssueId, executionWorkspaceId } =
+      await seedResolvedDependencyBackstopFixture({ workspaceState: "not_finalized" });
+    await db.update(issues).set({ status: "todo" }).where(eq(issues.id, blockedIssueId));
+    expect((await heartbeatService(db).reconcileResolvedDependencyWakes()).healed).toBe(0);
+    expect(await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, companyId))).toHaveLength(0);
+    await db.insert(workspaceOperations).values({
+      companyId, executionWorkspaceId, issueId: blockerIssueId,
+      phase: "workspace_finalize", status: "succeeded", startedAt: new Date(),
+    });
+    expect((await heartbeatService(db).reconcileResolvedDependencyWakes()).issueIds).toContain(blockedIssueId);
+  });
+
+  it("rechecks reassignment and re-block before replaying a todo dependent", async () => {
+    const { companyId, agentId, blockedIssueId, blockerIssueId } =
+      await seedResolvedDependencyBackstopFixture({ workspaceState: "none" });
+    await db.update(issues).set({ status: "todo", assigneeAgentId: null }).where(eq(issues.id, blockedIssueId));
+    expect((await heartbeatService(db).reconcileResolvedDependencyWakes()).healed).toBe(0);
+    await db.update(issues).set({ assigneeAgentId: agentId }).where(eq(issues.id, blockedIssueId));
+    await db.update(issues).set({ status: "todo" }).where(eq(issues.id, blockerIssueId));
+    expect((await heartbeatService(db).reconcileResolvedDependencyWakes()).healed).toBe(0);
+    expect(await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, companyId))).toHaveLength(0);
+    await db.update(issues).set({ status: "done" }).where(eq(issues.id, blockerIssueId));
+    expect((await heartbeatService(db).reconcileResolvedDependencyWakes()).issueIds).toContain(blockedIssueId);
+  });
+
+  it.each(["todo", "cancelled"] as const)("does not replay a todo dependent with a %s blocker", async (status) => {
+    const { companyId, blockedIssueId, blockerIssueId } =
+      await seedResolvedDependencyBackstopFixture({ workspaceState: "none" });
+    await db.update(issues).set({ status: "todo" }).where(eq(issues.id, blockedIssueId));
+    await db.update(issues).set({ status }).where(eq(issues.id, blockerIssueId));
+    const result = await heartbeatService(db).reconcileResolvedDependencyWakes();
+    expect(result.healed).toBe(0);
+    expect(await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, companyId))).toHaveLength(0);
   });
 
   it("heals a blocked dependent whose done blocker has no workspace finalize obligation", async () => {
@@ -996,6 +1134,901 @@ describeEmbeddedPostgres("heartbeat resolved dependency wake reconciliation", ()
     expect(skippedWake).toMatchObject({
       status: "skipped",
       reason: "heartbeat.wakeOnDemand.disabled",
+    });
+  });
+
+  // SPA-10513, slice 1. An idle agent with an assigned `todo` card should pull
+  // it instead of sitting on it until a human nudges the board. The pull is
+  // metered by the fleet cap, is idempotent per dispatch state, and must never
+  // reach parked/backlog, blocked, user-assigned, or already-running work.
+  describe("idle todo pull (SPA-10513)", () => {
+    const CANARY_ENV_VAR = "PAPERCLIP_IDLE_TODO_PULL";
+
+    async function seedIdleTodoPullFixture(opts: {
+      wakeOnDemand?: boolean;
+      maxConcurrentRuns?: number;
+      fleetMaxConcurrentRuns?: number;
+    } = {}) {
+      const companyId = randomUUID();
+      const ownerUserId = randomUUID();
+      const idleAgentId = randomUUID();
+      const issuePrefix = `P${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+
+      await db.insert(companies).values({
+        id: companyId,
+        name: "Paperclip",
+        issuePrefix,
+        requireBoardApprovalForNewAgents: false,
+        fleetMaxConcurrentRuns: opts.fleetMaxConcurrentRuns ?? null,
+      });
+      await db.insert(companyMemberships).values({
+        companyId,
+        principalType: "user",
+        principalId: ownerUserId,
+        membershipRole: "owner",
+        status: "active",
+      });
+      await db.insert(agents).values({
+        id: idleAgentId,
+        companyId,
+        name: "Idle Worker",
+        role: "engineer",
+        status: "idle",
+        adapterType: "test_adapter",
+        adapterConfig: {},
+        runtimeConfig: {
+          heartbeat: {
+            wakeOnDemand: opts.wakeOnDemand ?? true,
+            maxConcurrentRuns: opts.maxConcurrentRuns ?? 1,
+          },
+        },
+        permissions: {},
+      });
+
+      return { companyId, ownerUserId, idleAgentId, issuePrefix };
+    }
+
+    // Priority then age: a `high` card must beat an older `medium` one, and two
+    // same-priority cards are taken oldest-first. One test asserts the whole
+    // ordering because the card requirement is a single ordered rule.
+    it("idle todo pull takes the highest-priority then oldest eligible assigned card", async () => {
+      const { companyId, idleAgentId, issuePrefix } = await seedIdleTodoPullFixture();
+      const mediumOldId = randomUUID();
+      const mediumNewId = randomUUID();
+      const highOldId = randomUUID();
+      const mediumOldCreatedAt = new Date("2026-01-01T00:00:00.000Z");
+      const mediumNewCreatedAt = new Date("2026-02-01T00:00:00.000Z");
+
+      await db.insert(issues).values([
+        {
+          id: mediumOldId,
+          companyId,
+          title: "Older medium card",
+          status: "todo",
+          priority: "medium",
+          assigneeAgentId: idleAgentId,
+          issueNumber: 1,
+          identifier: `${issuePrefix}-1`,
+          createdAt: mediumOldCreatedAt,
+          updatedAt: mediumOldCreatedAt,
+        },
+        {
+          id: mediumNewId,
+          companyId,
+          title: "Newer medium card",
+          status: "todo",
+          priority: "medium",
+          assigneeAgentId: idleAgentId,
+          issueNumber: 2,
+          identifier: `${issuePrefix}-2`,
+          createdAt: mediumNewCreatedAt,
+          updatedAt: mediumNewCreatedAt,
+        },
+        {
+          id: highOldId,
+          companyId,
+          title: "Old but high priority card",
+          status: "todo",
+          priority: "high",
+          assigneeAgentId: idleAgentId,
+          issueNumber: 3,
+          identifier: `${issuePrefix}-3`,
+          createdAt: new Date("2025-12-01T00:00:00.000Z"),
+          updatedAt: mediumOldCreatedAt,
+        },
+      ]);
+
+      const result = await heartbeatService(db, {
+        runtimeEnv: { [CANARY_ENV_VAR]: "true" },
+      }).pullIdleAgentTodoIssues();
+
+      expect(result.pulled).toBe(1);
+      expect(result.issueIds).toEqual([highOldId]);
+
+      const pulledWake = await db
+        .select({
+          status: agentWakeupRequests.status,
+          payload: agentWakeupRequests.payload,
+        })
+        .from(agentWakeupRequests)
+        .where(
+          and(
+            eq(agentWakeupRequests.companyId, companyId),
+            eq(agentWakeupRequests.agentId, idleAgentId),
+            eq(agentWakeupRequests.reason, "idle_todo_pull"),
+          ),
+        )
+        .then((rows) => rows[0] ?? null);
+      expect(pulledWake).not.toBeNull();
+      expect(pulledWake?.payload).toMatchObject({ issueId: highOldId });
+
+      // Exactly one card is pulled per idle agent per sweep: the agent has one
+      // free slot, so the remaining todo cards stay queued for later sweeps.
+      const allPullWakes = await db
+        .select({ id: agentWakeupRequests.id })
+        .from(agentWakeupRequests)
+        .where(
+          and(
+            eq(agentWakeupRequests.companyId, companyId),
+            eq(agentWakeupRequests.agentId, idleAgentId),
+            eq(agentWakeupRequests.reason, "idle_todo_pull"),
+          ),
+        );
+      expect(allPullWakes).toHaveLength(1);
+
+      // Re-running the sweep while the pull is still live must not dispatch a
+      // second run for the same card (idempotence on the live dispatch path).
+      // The agent's single slot is now consumed by the first pull, so the
+      // second pass stands down on the meter rather than dispatching again.
+      const secondPass = await heartbeatService(db, {
+        runtimeEnv: { [CANARY_ENV_VAR]: "true" },
+      }).pullIdleAgentTodoIssues();
+      expect(secondPass.pulled).toBe(0);
+      expect(
+        secondPass.capExhausted +
+          secondPass.livePathSkipped +
+          secondPass.duplicateSkipped,
+      ).toBeGreaterThanOrEqual(1);
+
+      const afterSecondPass = await db
+        .select({ id: agentWakeupRequests.id })
+        .from(agentWakeupRequests)
+        .where(
+          and(
+            eq(agentWakeupRequests.companyId, companyId),
+            eq(agentWakeupRequests.agentId, idleAgentId),
+            eq(agentWakeupRequests.reason, "idle_todo_pull"),
+          ),
+        );
+      expect(afterSecondPass).toHaveLength(1);
+    });
+
+    it("idle todo pull is default-off and reversible when the canary env is unset", async () => {
+      const { companyId, idleAgentId, issuePrefix } = await seedIdleTodoPullFixture();
+      const todoIssueId = randomUUID();
+      await db.insert(issues).values({
+        id: todoIssueId,
+        companyId,
+        title: "Unclaimed todo card",
+        status: "todo",
+        priority: "medium",
+        assigneeAgentId: idleAgentId,
+        issueNumber: 1,
+        identifier: `${issuePrefix}-1`,
+      });
+
+      const result = await heartbeatService(db).pullIdleAgentTodoIssues();
+
+      expect(result.enabled).toBe(false);
+      expect(result.pulled).toBe(0);
+      expect(result.checked).toBe(0);
+
+      const wakes = await db
+        .select({ id: agentWakeupRequests.id })
+        .from(agentWakeupRequests)
+        .where(eq(agentWakeupRequests.companyId, companyId));
+      expect(wakes).toHaveLength(0);
+    });
+
+    it("idle todo pull skips parked backlog, blocked, user-assigned and active-run cards", async () => {
+      const { companyId, ownerUserId, idleAgentId, issuePrefix } =
+        await seedIdleTodoPullFixture({ maxConcurrentRuns: 2 });
+      const backlogParkedId = randomUUID();
+      const blockedId = randomUUID();
+      const userAssignedId = randomUUID();
+      const activeRunId = randomUUID();
+      const activeRunTodoId = randomUUID();
+      const eligibleId = randomUUID();
+      const blockerId = randomUUID();
+
+      await db.insert(issues).values([
+        {
+          id: backlogParkedId,
+          companyId,
+          title: "Parked in backlog",
+          status: "backlog",
+          priority: "critical",
+          assigneeAgentId: idleAgentId,
+          issueNumber: 1,
+          identifier: `${issuePrefix}-1`,
+        },
+        {
+          id: blockedId,
+          companyId,
+          title: "Blocked by an open blocker",
+          status: "blocked",
+          priority: "critical",
+          assigneeAgentId: idleAgentId,
+          issueNumber: 2,
+          identifier: `${issuePrefix}-2`,
+        },
+        {
+          id: userAssignedId,
+          companyId,
+          title: "Owned by a human",
+          status: "todo",
+          priority: "critical",
+          assigneeUserId: ownerUserId,
+          issueNumber: 3,
+          identifier: `${issuePrefix}-3`,
+        },
+        {
+          id: activeRunId,
+          companyId,
+          title: "Already running",
+          status: "in_progress",
+          priority: "critical",
+          assigneeAgentId: idleAgentId,
+          issueNumber: 4,
+          identifier: `${issuePrefix}-4`,
+        },
+        {
+          id: activeRunTodoId,
+          companyId,
+          title: "Todo card already covered by a live run",
+          status: "todo",
+          priority: "high",
+          assigneeAgentId: idleAgentId,
+          issueNumber: 5,
+          identifier: `${issuePrefix}-5`,
+        },
+        {
+          id: eligibleId,
+          companyId,
+          title: "Genuinely idle todo card",
+          status: "todo",
+          priority: "low",
+          assigneeAgentId: idleAgentId,
+          issueNumber: 6,
+          identifier: `${issuePrefix}-6`,
+        },
+        {
+          id: blockerId,
+          companyId,
+          title: "Open blocker for the blocked card",
+          status: "todo",
+          priority: "medium",
+          assigneeAgentId: null,
+          issueNumber: 7,
+          identifier: `${issuePrefix}-7`,
+        },
+      ]);
+      await db.insert(issueRelations).values({
+        companyId,
+        issueId: blockerId,
+        relatedIssueId: blockedId,
+        type: "blocks",
+      });
+      // A live `running` run naming a `todo` card is the active-run duplicate
+      // guard: the card looks idle by status alone but already has an
+      // execution path, so it must never be pulled again.
+      await db.insert(heartbeatRuns).values({
+        companyId,
+        agentId: idleAgentId,
+        invocationSource: "automation",
+        status: "running",
+        contextSnapshot: { issueId: activeRunTodoId },
+      });
+
+      const result = await heartbeatService(db, {
+        runtimeEnv: { [CANARY_ENV_VAR]: "true" },
+      }).pullIdleAgentTodoIssues();
+
+      // Backlog, blocked, human-owned and already-running cards are all skipped,
+      // and only the low-priority genuinely idle card is pulled.
+      expect(result.pulled).toBe(1);
+      expect(result.issueIds).toEqual([eligibleId]);
+      expect(result.livePathSkipped).toBe(1);
+      // The backlog, blocked and human-owned cards never reach the candidate
+      // set at all, and the unassigned blocker is not an agent's work, so the
+      // only candidates are the live-run card and the genuinely idle card.
+      expect(result.checked).toBe(2);
+
+      const pulledPayloads = await db
+        .select({ payload: agentWakeupRequests.payload })
+        .from(agentWakeupRequests)
+        .where(
+          and(
+            eq(agentWakeupRequests.companyId, companyId),
+            eq(agentWakeupRequests.reason, "idle_todo_pull"),
+          ),
+        );
+      expect(pulledPayloads).toHaveLength(1);
+      expect(pulledPayloads[0]?.payload).toMatchObject({ issueId: eligibleId });
+    });
+
+    it("idle todo pull respects per-agent concurrency and the fleet cap", async () => {
+      const { companyId, idleAgentId, issuePrefix } = await seedIdleTodoPullFixture({
+        maxConcurrentRuns: 1,
+      });
+      const runningIssueId = randomUUID();
+      const todoIssueId = randomUUID();
+      await db.insert(issues).values([
+        {
+          id: runningIssueId,
+          companyId,
+          title: "Card consuming the agent's only slot",
+          status: "in_progress",
+          priority: "medium",
+          assigneeAgentId: idleAgentId,
+          issueNumber: 1,
+          identifier: `${issuePrefix}-1`,
+        },
+        {
+          id: todoIssueId,
+          companyId,
+          title: "Todo card with no free slot",
+          status: "todo",
+          priority: "medium",
+          assigneeAgentId: idleAgentId,
+          issueNumber: 2,
+          identifier: `${issuePrefix}-2`,
+        },
+      ]);
+      // A live running run fills the agent's single concurrency slot, so the
+      // metered pull must stand down even though a todo card is eligible.
+      await db.insert(heartbeatRuns).values({
+        companyId,
+        agentId: idleAgentId,
+        invocationSource: "automation",
+        status: "running",
+        contextSnapshot: { issueId: runningIssueId },
+      });
+
+      const result = await heartbeatService(db, {
+        runtimeEnv: { [CANARY_ENV_VAR]: "true" },
+      }).pullIdleAgentTodoIssues();
+
+      expect(result.pulled).toBe(0);
+      expect(result.capExhausted).toBe(1);
+
+      const wakes = await db
+        .select({ id: agentWakeupRequests.id })
+        .from(agentWakeupRequests)
+        .where(eq(agentWakeupRequests.companyId, companyId));
+      expect(wakes).toHaveLength(0);
+    });
+  });
+
+  // SPA-10513, slice 3. Closing the LAST blocker of a blocked dependent must
+  // hand that dependent back to the queue: the card moves blocked -> todo and
+  // its assignee is woken exactly once. The wake alone was not enough — a
+  // dependent left in `blocked` with every blocker done is invisible to the
+  // idle-pull sweep (which only reads `todo`), so the card silently never
+  // drains. The transition must be narrow: an open blocker, an unfinished
+  // workspace finalize obligation, a backlog park, a conversation container, a
+  // terminal card, and a non-agent assignee all keep their current status.
+  describe("last blocker auto-unblock (SPA-10513)", () => {
+    const CANARY_ENV_VAR = "PAPERCLIP_AUTO_UNBLOCK_READY_DEPENDENTS";
+
+    async function seedAutoUnblockFixture(opts: {
+      workspaceState?: "none" | "not_finalized";
+      dependentStatus?: string;
+      dependentAssignee?: "agent" | null;
+    } = {}) {
+      const workspaceState = opts.workspaceState ?? "none";
+      const companyId = randomUUID();
+      const agentId = randomUUID();
+      const ownerUserId = randomUUID();
+      const blockedIssueId = randomUUID();
+      const blockerIssueId = randomUUID();
+      const projectId = randomUUID();
+      const projectWorkspaceId = randomUUID();
+      const executionWorkspaceId = randomUUID();
+      const issuePrefix = `U${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+
+      await db.insert(companies).values({
+        id: companyId,
+        name: "Paperclip",
+        issuePrefix,
+        requireBoardApprovalForNewAgents: false,
+      });
+      await db.insert(companyMemberships).values({
+        companyId,
+        principalType: "user",
+        principalId: ownerUserId,
+        membershipRole: "owner",
+        status: "active",
+      });
+      await db.insert(agents).values({
+        id: agentId,
+        companyId,
+        name: "Priya",
+        role: "engineer",
+        status: "idle",
+        adapterType: "test_adapter",
+        adapterConfig: {},
+        runtimeConfig: { heartbeat: { wakeOnDemand: true, maxConcurrentRuns: 1 } },
+        permissions: {},
+      });
+
+      if (workspaceState !== "none") {
+        await db.insert(projects).values({
+          id: projectId,
+          companyId,
+          name: "Synthetic auto-unblock project",
+          status: "in_progress",
+        });
+        await db.insert(projectWorkspaces).values({
+          id: projectWorkspaceId,
+          companyId,
+          projectId,
+          name: "Synthetic workspace",
+          sourceType: "git_worktree",
+        });
+        await db.insert(executionWorkspaces).values({
+          id: executionWorkspaceId,
+          companyId,
+          projectId,
+          projectWorkspaceId,
+          mode: "isolated_workspace",
+          strategyType: "git_worktree",
+          name: "Synthetic execution workspace",
+          providerType: "git_worktree",
+        });
+      }
+
+      await db.insert(issues).values([
+        {
+          id: blockedIssueId,
+          companyId,
+          projectId: workspaceState === "none" ? null : projectId,
+          title: "Synthetic blocked dependent",
+          status: opts.dependentStatus ?? "blocked",
+          priority: "medium",
+          unblockDescriptor: { owner: { agentId }, action: "Wait for the blocker" },
+          assigneeAgentId: opts.dependentAssignee === null ? null : agentId,
+          issueNumber: 1,
+          identifier: `${issuePrefix}-1`,
+        },
+        {
+          id: blockerIssueId,
+          companyId,
+          projectId: workspaceState === "none" ? null : projectId,
+          title: "Synthetic completed blocker",
+          status: "done",
+          priority: "medium",
+          executionWorkspaceId: workspaceState === "none" ? null : executionWorkspaceId,
+          issueNumber: 2,
+          identifier: `${issuePrefix}-2`,
+        },
+      ]);
+      await db.insert(issueRelations).values({
+        companyId,
+        issueId: blockerIssueId,
+        relatedIssueId: blockedIssueId,
+        type: "blocks",
+      });
+
+      if (workspaceState === "not_finalized") {
+        await db.insert(workspaceOperations).values({
+          companyId,
+          executionWorkspaceId,
+          issueId: blockerIssueId,
+          phase: "adapter_execute",
+          status: "succeeded",
+          startedAt: new Date(Date.now() - 60_000),
+        });
+      }
+
+      return {
+        companyId,
+        agentId,
+        ownerUserId,
+        blockedIssueId,
+        blockerIssueId,
+        executionWorkspaceId,
+        issuePrefix,
+      };
+    }
+
+    function autoUnblockHeartbeat() {
+      return heartbeatService(db, { runtimeEnv: { [CANARY_ENV_VAR]: "true", PAPERCLIP_IDLE_TODO_PULL: "true" } });
+    }
+
+    async function dependentStatusById(issueIds: string[]) {
+      const rows = await db
+        .select({ id: issues.id, status: issues.status })
+        .from(issues)
+        .where(inArray(issues.id, issueIds));
+      return new Map(rows.map((row) => [row.id, row.status]));
+    }
+
+    it("last blocker auto-unblock moves a blocked dependent to todo and wakes it once", async () => {
+      const { companyId, agentId, blockedIssueId, blockerIssueId } =
+        await seedAutoUnblockFixture();
+
+      const result = await autoUnblockHeartbeat().autoUnblockReadyDependents(blockerIssueId);
+
+      expect(result.enabled).toBe(true);
+      expect(result.unblocked).toBe(1);
+      expect(result.issueIds).toEqual([blockedIssueId]);
+      expect(result.deferredOrFailed).toBe(0);
+
+      const flipped = await db
+        .select({ status: issues.status, blockedTransitionAt: issues.blockedTransitionAt, unblockDescriptor: issues.unblockDescriptor })
+        .from(issues)
+        .where(eq(issues.id, blockedIssueId))
+        .then((rows) => rows[0] ?? null);
+      expect(flipped?.status).toBe("todo");
+      // Leaving `blocked` clears the blocked-cycle stamp, which is the epoch the
+      // wake idempotency key binds to.
+      expect(flipped?.blockedTransitionAt).toBeNull();
+      expect(flipped?.unblockDescriptor).toBeNull();
+
+      const wakes = await db
+        .select({
+          reason: agentWakeupRequests.reason,
+          idempotencyKey: agentWakeupRequests.idempotencyKey,
+          payload: agentWakeupRequests.payload,
+        })
+        .from(agentWakeupRequests)
+        .where(
+          and(
+            eq(agentWakeupRequests.companyId, companyId),
+            eq(agentWakeupRequests.agentId, agentId),
+          ),
+        );
+      expect(wakes).toHaveLength(1);
+      expect(wakes[0]?.reason).toBe("issue_blockers_resolved");
+      expect(wakes[0]?.idempotencyKey).toBe(
+        buildIssueBlockersResolvedWakeStateKey({
+          dependentIssueId: blockedIssueId,
+          blockerIssueIds: [blockerIssueId],
+        }),
+      );
+      expect(wakes[0]?.payload).toMatchObject({
+        issueId: blockedIssueId,
+        resolvedBlockerIssueId: blockerIssueId,
+      });
+
+      // A second sweep over the same final blocker state is a no-op: the card is
+      // already `todo`, so there is nothing to transition and the level-keyed
+      // wake already covers this ready state.
+      const repeat = await autoUnblockHeartbeat().autoUnblockReadyDependents(blockerIssueId);
+      expect(repeat.unblocked).toBe(0);
+      expect(repeat.issueIds).toEqual([]);
+
+      const wakesAfterRepeat = await db
+        .select({ id: agentWakeupRequests.id })
+        .from(agentWakeupRequests)
+        .where(eq(agentWakeupRequests.companyId, companyId));
+      expect(wakesAfterRepeat).toHaveLength(1);
+
+      const statusAfterRepeat = await db
+        .select({ status: issues.status })
+        .from(issues)
+        .where(eq(issues.id, blockedIssueId))
+        .then((rows) => rows[0] ?? null);
+      expect(statusAfterRepeat?.status).toBe("todo");
+    });
+
+    it("last blocker auto-unblock leaves open blockers, backlog parks, terminal, conversation and non-agent dependents unchanged", async () => {
+      const {
+        companyId,
+        agentId,
+        ownerUserId,
+        blockedIssueId,
+        blockerIssueId,
+        issuePrefix,
+      } = await seedAutoUnblockFixture();
+      const eligibleId = randomUUID();
+      const openBlockerDependentId = randomUUID();
+      const cancelledBlockerDependentId = randomUUID();
+      const cancelledBlockerId = randomUUID();
+      const backlogParkDependentId = randomUUID();
+      const terminalDependentId = randomUUID();
+      const conversationDependentId = randomUUID();
+      const userOwnedDependentId = randomUUID();
+      const unassignedDependentId = randomUUID();
+      const openBlockerId = randomUUID();
+      const conversationBlockerId = randomUUID();
+
+      await db.insert(issues).values([
+        {
+          id: eligibleId,
+          companyId,
+          title: "Another blocked dependent on the same done blocker",
+          status: "blocked",
+          priority: "medium",
+          assigneeAgentId: agentId,
+          issueNumber: 3,
+          identifier: `${issuePrefix}-3`,
+        },
+        {
+          id: openBlockerDependentId,
+          companyId,
+          title: "Dependent with one blocker still open",
+          status: "blocked",
+          priority: "medium",
+          assigneeAgentId: agentId,
+          issueNumber: 4,
+          identifier: `${issuePrefix}-4`,
+        },
+        {
+          id: openBlockerId,
+          companyId,
+          title: "Still-open blocker",
+          status: "in_progress",
+          priority: "medium",
+          issueNumber: 5,
+          identifier: `${issuePrefix}-5`,
+        },
+        {
+          id: cancelledBlockerDependentId,
+          companyId,
+          title: "Dependent with a cancelled blocker",
+          status: "blocked",
+          priority: "medium",
+          assigneeAgentId: agentId,
+          issueNumber: 12,
+          identifier: `${issuePrefix}-12`,
+        },
+        {
+          id: cancelledBlockerId,
+          companyId,
+          title: "Cancelled blocker",
+          status: "cancelled",
+          priority: "medium",
+          issueNumber: 13,
+          identifier: `${issuePrefix}-13`,
+        },
+        {
+          id: backlogParkDependentId,
+          companyId,
+          title: "Dependent parked in backlog",
+          status: "backlog",
+          priority: "medium",
+          assigneeAgentId: agentId,
+          issueNumber: 6,
+          identifier: `${issuePrefix}-6`,
+        },
+        {
+          id: terminalDependentId,
+          companyId,
+          title: "Terminal dependent on a done blocker",
+          status: "done",
+          priority: "medium",
+          assigneeAgentId: agentId,
+          issueNumber: 7,
+          identifier: `${issuePrefix}-7`,
+        },
+        {
+          id: conversationDependentId,
+          companyId,
+          title: "Conversation container blocked by the done blocker",
+          status: "blocked",
+          priority: "medium",
+          assigneeAgentId: agentId,
+          conversationAgentId: agentId,
+          conversationUserId: ownerUserId,
+          conversationState: "waiting",
+          issueNumber: 8,
+          identifier: `${issuePrefix}-8`,
+        },
+        {
+          id: userOwnedDependentId,
+          companyId,
+          title: "Human-owned dependent",
+          status: "blocked",
+          priority: "medium",
+          assigneeUserId: ownerUserId,
+          issueNumber: 9,
+          identifier: `${issuePrefix}-9`,
+        },
+        {
+          id: unassignedDependentId,
+          companyId,
+          title: "Unassigned dependent",
+          status: "blocked",
+          priority: "medium",
+          issueNumber: 10,
+          identifier: `${issuePrefix}-10`,
+        },
+        {
+          id: conversationBlockerId,
+          companyId,
+          title: "Second completed blocker for the conversation container",
+          status: "done",
+          priority: "medium",
+          issueNumber: 11,
+          identifier: `${issuePrefix}-11`,
+        },
+      ]);
+      await db.insert(issueRelations).values([
+        {
+          companyId,
+          issueId: blockerIssueId,
+          relatedIssueId: eligibleId,
+          type: "blocks",
+        },
+        {
+          companyId,
+          issueId: openBlockerId,
+          relatedIssueId: openBlockerDependentId,
+          type: "blocks",
+        },
+        {
+          companyId,
+          issueId: blockerIssueId,
+          relatedIssueId: cancelledBlockerDependentId,
+          type: "blocks",
+        },
+        {
+          companyId,
+          issueId: cancelledBlockerId,
+          relatedIssueId: cancelledBlockerDependentId,
+          type: "blocks",
+        },
+        {
+          companyId,
+          issueId: blockerIssueId,
+          relatedIssueId: backlogParkDependentId,
+          type: "blocks",
+        },
+        {
+          companyId,
+          issueId: blockerIssueId,
+          relatedIssueId: terminalDependentId,
+          type: "blocks",
+        },
+        {
+          companyId,
+          issueId: blockerIssueId,
+          relatedIssueId: conversationDependentId,
+          type: "blocks",
+        },
+        {
+          companyId,
+          issueId: blockerIssueId,
+          relatedIssueId: userOwnedDependentId,
+          type: "blocks",
+        },
+        {
+          companyId,
+          issueId: blockerIssueId,
+          relatedIssueId: unassignedDependentId,
+          type: "blocks",
+        },
+        {
+          companyId,
+          issueId: conversationBlockerId,
+          relatedIssueId: conversationDependentId,
+          type: "blocks",
+        },
+      ]);
+
+      const result = await autoUnblockHeartbeat().autoUnblockReadyDependents(blockerIssueId);
+
+      expect(result.unblocked).toBe(2);
+      expect(result.issueIds.sort()).toEqual([blockedIssueId, eligibleId].sort());
+
+      const statuses = await dependentStatusById([
+        blockedIssueId,
+        eligibleId,
+        openBlockerDependentId,
+        cancelledBlockerDependentId,
+        backlogParkDependentId,
+        terminalDependentId,
+        conversationDependentId,
+        userOwnedDependentId,
+        unassignedDependentId,
+      ]);
+      expect(["todo", "in_progress"]).toContain(statuses.get(blockedIssueId));
+      expect(["todo", "in_progress"]).toContain(statuses.get(eligibleId));
+      // An open blocker still owns its dependent.
+      expect(statuses.get(openBlockerDependentId)).toBe("blocked");
+      expect(statuses.get(cancelledBlockerDependentId)).toBe("blocked");
+      // A backlog park is a human parking surface, never auto-released.
+      expect(statuses.get(backlogParkDependentId)).toBe("backlog");
+      // A terminal card is never reopened by a dependency edge.
+      expect(statuses.get(terminalDependentId)).toBe("done");
+      // A conversation container's turn lifecycle is authoritative.
+      expect(statuses.get(conversationDependentId)).toBe("blocked");
+      // Human-owned and unassigned cards have no agent to hand work back to.
+      expect(statuses.get(userOwnedDependentId)).toBe("blocked");
+      expect(statuses.get(unassignedDependentId)).toBe("blocked");
+
+      const wakes = await db
+        .select({ payload: agentWakeupRequests.payload })
+        .from(agentWakeupRequests)
+        .where(eq(agentWakeupRequests.companyId, companyId));
+      const wokenIssueIds = wakes.map((wake) =>
+        (wake.payload as { issueId?: unknown } | null)?.issueId,
+      );
+      expect(wokenIssueIds.sort()).toEqual([blockedIssueId, eligibleId].sort());
+    });
+
+    it("last blocker auto-unblock waits for workspace finalize before flipping status", async () => {
+      const { companyId, agentId, blockedIssueId, blockerIssueId, executionWorkspaceId } =
+        await seedAutoUnblockFixture({ workspaceState: "not_finalized" });
+
+      const beforeFinalize = await autoUnblockHeartbeat().autoUnblockReadyDependents(
+        blockerIssueId,
+      );
+
+      expect(beforeFinalize.unblocked).toBe(0);
+      expect(beforeFinalize.checked).toBe(0);
+
+      const beforeStatuses = await dependentStatusById([blockedIssueId]);
+      expect(beforeStatuses.get(blockedIssueId)).toBe("blocked");
+      expect(
+        await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, companyId)),
+      ).toHaveLength(0);
+
+      await db.insert(workspaceOperations).values({
+        companyId,
+        executionWorkspaceId,
+        issueId: blockerIssueId,
+        phase: "workspace_finalize",
+        status: "succeeded",
+        startedAt: new Date(),
+      });
+
+      const afterFinalize = await autoUnblockHeartbeat().autoUnblockReadyDependents(
+        blockerIssueId,
+      );
+
+      expect(afterFinalize.unblocked).toBe(1);
+      expect(afterFinalize.issueIds).toEqual([blockedIssueId]);
+
+      const afterStatuses = await dependentStatusById([blockedIssueId]);
+      expect(afterStatuses.get(blockedIssueId)).toBe("todo");
+
+      const wakes = await db
+        .select({ reason: agentWakeupRequests.reason })
+        .from(agentWakeupRequests)
+        .where(eq(agentWakeupRequests.agentId, agentId));
+      expect(wakes).toHaveLength(1);
+      expect(wakes[0]?.reason).toBe("issue_blockers_resolved");
+    });
+
+    it("last blocker auto-unblock refuses to transition without the idle todo recovery gate", async () => {
+      const { companyId, blockedIssueId, blockerIssueId } = await seedAutoUnblockFixture();
+      const result = await heartbeatService(db, {
+        runtimeEnv: { [CANARY_ENV_VAR]: "true" },
+      }).autoUnblockReadyDependents(blockerIssueId);
+
+      expect(result.enabled).toBe(false);
+      expect((await dependentStatusById([blockedIssueId])).get(blockedIssueId)).toBe("blocked");
+      expect(await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, companyId))).toHaveLength(0);
+    });
+
+    it("last blocker auto-unblock is default-off and reversible when the canary env is unset", async () => {
+      const { companyId, blockedIssueId, blockerIssueId } = await seedAutoUnblockFixture();
+
+      const result = await heartbeatService(db).autoUnblockReadyDependents(blockerIssueId);
+
+      expect(result.enabled).toBe(false);
+      expect(result.unblocked).toBe(0);
+      expect(result.checked).toBe(0);
+      expect(result.issueIds).toEqual([]);
+
+      const statuses = await dependentStatusById([blockedIssueId]);
+      expect(statuses.get(blockedIssueId)).toBe("blocked");
+      expect(
+        await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, companyId)),
+      ).toHaveLength(0);
     });
   });
 

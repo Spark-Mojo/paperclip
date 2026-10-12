@@ -1791,9 +1791,50 @@ describe("agent issue mutation checkout ownership", () => {
     });
   });
 
+  it("allows an agent to name the board as unblock owner when entering blocked", async () => {
+    mockIssueService.getById.mockResolvedValue(makeIssue({ status: "in_progress" }));
+    mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+      ...makeIssue({ status: "in_progress" }),
+      ...patch,
+    }));
+
+    const unblockDescriptor = { owner: "board", action: "Review the blocker" } as const;
+    const res = await request(await createApp(ownerActor())).patch(`/api/issues/${issueId}`).send({
+      status: "blocked",
+      unblockDescriptor,
+    });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(mockIssueService.update).toHaveBeenCalledWith(
+      issueId,
+      expect.objectContaining({ status: "blocked", unblockDescriptor }),
+    );
+    expect(res.body.unblockDescriptor).toEqual(unblockDescriptor);
+  });
+
+  it("allows an agent to name the board as unblock owner on an already-blocked issue", async () => {
+    mockIssueService.getById.mockResolvedValue(makeIssue({ status: "blocked" }));
+    mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+      ...makeIssue({ status: "blocked" }),
+      ...patch,
+    }));
+
+    const unblockDescriptor = { owner: "board", action: "Review the blocker" } as const;
+    const res = await request(await createApp(ownerActor())).patch(`/api/issues/${issueId}`).send({
+      unblockDescriptor,
+    });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(mockIssueService.update).toHaveBeenCalledWith(
+      issueId,
+      expect.objectContaining({ unblockDescriptor }),
+    );
+    expect(res.body.unblockDescriptor).toEqual(unblockDescriptor);
+  });
+
   it.each([
-    ["board", "board"],
     ["a company user", { userId: "board-user" }],
+    ["another company agent", { agentId: peerAgentId }],
   ])("rejects an agent naming %s as unblock owner", async (_label, unblockOwner) => {
     mockIssueService.getById.mockResolvedValue(makeIssue({ status: "in_progress" }));
 
@@ -1803,13 +1844,15 @@ describe("agent issue mutation checkout ownership", () => {
     });
 
     expect(res.status, JSON.stringify(res.body)).toBe(403);
-    expect(res.body.error).toBe("Agents may only name themselves as an unblock owner");
+    expect(res.body.error).toBe(
+      'Agents may only name themselves or use owner: "board" for a board-owned hold',
+    );
     expect(mockIssueService.update).not.toHaveBeenCalled();
   });
 
   it.each([
-    ["board", "board"],
     ["a company user", { userId: "board-user" }],
+    ["another company agent", { agentId: peerAgentId }],
   ])("rejects an agent changing an already-blocked issue owner to %s", async (_label, unblockOwner) => {
     mockIssueService.getById.mockResolvedValue(makeIssue({ status: "blocked" }));
 
@@ -1818,7 +1861,9 @@ describe("agent issue mutation checkout ownership", () => {
     });
 
     expect(res.status, JSON.stringify(res.body)).toBe(403);
-    expect(res.body.error).toBe("Agents may only name themselves as an unblock owner");
+    expect(res.body.error).toBe(
+      'Agents may only name themselves or use owner: "board" for a board-owned hold',
+    );
     expect(mockIssueService.update).not.toHaveBeenCalled();
   });
 
@@ -3055,6 +3100,14 @@ describe("SPA-5916 — terminal re-complete guard", () => {
       expect(res.status, JSON.stringify(res.body)).toBe(409);
       expect(res.body.details?.code).toBe("issue_write_terminal_recomplete");
       expect(res.body.details?.boundary).toBe("Terminal status");
+      // SPA-10721 / GitHub #1288: the retry of a PATCH whose response was lost
+      // is exactly a done -> done (or cancelled -> cancelled) re-assertion. The
+      // response must hand the caller the persisted outcome so the ambiguity
+      // between "applied, response dropped" and "refused" is resolved without
+      // a second round trip.
+      expect(res.body.details?.terminalStatusAlreadySet).toBe(true);
+      expect(res.body.details?.currentStatus).toBe(requestedStatus);
+      expect(res.body.error).toContain("already landed");
       expect(res.body.error).toContain(
         existingStatus === "done" ? "already done" : "already cancelled",
       );
@@ -3080,6 +3133,10 @@ describe("SPA-5916 — terminal re-complete guard", () => {
 
     expect(res.status, JSON.stringify(res.body)).toBe(200);
     expect(mockIssueService.update).toHaveBeenCalled();
+    // NEGATIVE CONTROL for SPA-10721: a genuinely new terminal transition must
+    // NOT be mislabeled as an already-applied read-back.
+    expect(res.body.details?.terminalStatusAlreadySet).toBeUndefined();
+    expect(res.body.details?.currentStatus).toBeUndefined();
   });
 
   it("allows non-status PATCH (title) on a done card — terminal guard is status-only", async () => {
@@ -3107,5 +3164,12 @@ describe("SPA-5916 — terminal re-complete guard", () => {
     expect(res.status, JSON.stringify(res.body)).toBe(409);
     expect(mockIssueService.addComment).not.toHaveBeenCalled();
     expect(mockIssueService.update).not.toHaveBeenCalled();
+    // The read-back is scoped to the STATUS: the comment that accompanied this
+    // PATCH did NOT land, so the response must not claim the whole request was
+    // applied. `terminalStatusAlreadySet` is truthful; a blanket `alreadyApplied`
+    // would be a lie here.
+    expect(res.body.details?.terminalStatusAlreadySet).toBe(true);
+    expect(res.body.details?.currentStatus).toBe("done");
+    expect(res.body.details?.alreadyApplied).toBeUndefined();
   });
 });

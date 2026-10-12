@@ -584,6 +584,13 @@ function buildPendingState(input: {
     currentStageId: input.stage.id,
     currentStageIndex: input.stageIndex,
     currentStageType: input.stage.type,
+    stageEnteredAt: input.previous?.status === PENDING_STATUS &&
+      input.previous.currentStageId === input.stage.id &&
+      principalsEqual(input.previous.currentParticipant, input.participant) &&
+      input.previous.lastDecisionOutcome !== "changes_requested" &&
+      input.previous.stageEnteredAt
+      ? input.previous.stageEnteredAt
+      : new Date().toISOString(),
     currentParticipant: input.participant,
     returnAssignee: input.returnAssignee,
     reviewRequest: input.reviewRequest ?? null,
@@ -981,9 +988,18 @@ function applyIssueExecutionStageTransition(input: TransitionInput): TransitionR
 
   const shouldStartWorkflow =
     requestedStatus === "done" ||
-    requestedStatus === "in_review";
+    requestedStatus === "in_review" ||
+    (requestedStatus === undefined &&
+      input.issue.status === "in_progress" &&
+      !(input.previousPolicy ?? normalizeIssueExecutionPolicy(input.issue.executionPolicy ?? null))?.stages.length &&
+      input.policy.stages.length > 0 &&
+      existingState?.status !== COMPLETED_STATUS);
 
   if (!shouldStartWorkflow) {
+    if (requestedStatus === "blocked" && input.policy.stages.some((stage) => stage.type === "review") &&
+      !existingState?.currentStageId && existingState?.status !== COMPLETED_STATUS) {
+      throw unprocessable("Cannot block an issue with an unactivated review stage; enter in_review to record the review verdict first");
+    }
     return { patch };
   }
 

@@ -302,7 +302,11 @@ export function describeIssueWriteDenial(
           `state immutable to routine updates. A PATCH that asks for the same ` +
           `terminal status the card already holds would silently re-stamp the ` +
           `completion timestamp and replay the stored decision text, which is ` +
-          `how a misrouted PATCH recently corrupted an unrelated closed card.`,
+          `how a misrouted PATCH recently corrupted an unrelated closed card. ` +
+          `The requested terminal status is already in effect, so this PATCH ` +
+          `changed nothing: a caller retrying a write whose response was lost ` +
+          `can read the outcome here instead of resending it — the write ` +
+          `already landed.`,
         whoCanAct:
           `${assignee} (or any board member) if the work actually needs to move.`,
         sanctionedPath:

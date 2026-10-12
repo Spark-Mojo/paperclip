@@ -2565,6 +2565,7 @@ async function queueResolvedInteractionContinuationWakeup(input: {
     id: string;
     companyId: string;
     assigneeAgentId: string | null;
+    assigneeUserId?: string | null;
     status: string;
   };
   interaction: {
@@ -2572,6 +2573,7 @@ async function queueResolvedInteractionContinuationWakeup(input: {
     kind: string;
     status: string;
     continuationPolicy: string;
+    createdByAgentId?: string | null;
     sourceCommentId?: string | null;
     sourceRunId?: string | null;
     payload?: unknown;
@@ -2584,8 +2586,13 @@ async function queueResolvedInteractionContinuationWakeup(input: {
   newlyResolvedItemIds?: string[];
   idempotencyKey?: string | null;
 }) {
-  if (!input.issue.assigneeAgentId || isClosedIssueStatus(input.issue.status))
-    return;
+  if (isClosedIssueStatus(input.issue.status)) return;
+  let wakeAgentId = input.issue.assigneeAgentId;
+  if (!wakeAgentId && input.issue.assigneeUserId && input.interaction.createdByAgentId) {
+    const creator = await agentService(input.db).getById(input.interaction.createdByAgentId);
+    wakeAgentId = creator?.companyId === input.issue.companyId ? creator.id : null;
+  }
+  if (!wakeAgentId) return;
 
   const reviewPathLost =
     input.issue.status === "in_review" &&
@@ -2600,6 +2607,8 @@ async function queueResolvedInteractionContinuationWakeup(input: {
         return false;
       }));
   const continuationPolicyAllowsWake =
+    (!input.issue.assigneeAgentId && Boolean(input.issue.assigneeUserId) && Boolean(input.interaction.createdByAgentId) &&
+      ["accepted", "rejected", "answered"].includes(input.interaction.status)) ||
     input.interaction.continuationPolicy === "wake_assignee" ||
     (input.interaction.continuationPolicy === "wake_assignee_on_accept" &&
       // Question interactions resolve as `answered`, not `accepted`. An
@@ -2721,7 +2730,7 @@ async function queueResolvedInteractionContinuationWakeup(input: {
       `interaction:${input.interaction.id}:${publication.endpointId}`,
   );
   void input.heartbeat
-    .wakeup(input.issue.assigneeAgentId, {
+    .wakeup(wakeAgentId, {
       source: "automation",
       triggerDetail: "system",
       reason: "issue_commented",
@@ -2780,7 +2789,7 @@ async function queueResolvedInteractionContinuationWakeup(input: {
           err,
           issueId: input.issue.id,
           interactionId: input.interaction.id,
-          agentId: input.issue.assigneeAgentId,
+          agentId: wakeAgentId,
         },
         "failed to wake assignee on issue interaction resolution",
       ),
@@ -12952,7 +12961,17 @@ export function issueRoutes(
           res,
           existing,
           "issue_write_terminal_recomplete",
-          {},
+          // SPA-10721 (GitHub #1288): a write can commit server-side while its
+          // response is lost (client sees HTTP 000). Without a read-back the
+          // caller cannot tell "applied, response dropped" from "refused", and
+          // retries burn on the ambiguity. Carry the persisted outcome in the
+          // response so a single retry resolves it: the requested terminal
+          // status is already the stored state (`terminalStatusAlreadySet`),
+          // and `currentStatus` is the state the caller should observe. The
+          // name is scoped to the *status* on purpose — a PATCH that also
+          // carried a comment was refused wholesale, so the comment did not
+          // land and a blanket `alreadyApplied` would be a lie.
+          { terminalStatusAlreadySet: true, currentStatus: existing.status },
           { terminalStatus },
         );
         return;
@@ -13294,13 +13313,14 @@ export function issueRoutes(
       const descriptor = updateFields.unblockDescriptor ?? null;
       if (descriptor && typeof descriptor === "object") {
         const owner = descriptor.owner;
+        const invalidAgentUnblockOwnerMessage =
+          'Agents may only name themselves or use owner: "board" for a board-owned hold';
         if (
           req.actor.type === "agent" &&
-          (owner === "board" || "userId" in owner)
+          owner !== "board" &&
+          "userId" in owner
         ) {
-          throw forbidden(
-            "Agents may only name themselves as an unblock owner",
-          );
+          throw forbidden(invalidAgentUnblockOwnerMessage);
         }
         if (owner !== "board" && "agentId" in owner) {
           const target = await db
@@ -13322,9 +13342,7 @@ export function issueRoutes(
             req.actor.type === "agent" &&
             req.actor.agentId !== owner.agentId
           ) {
-            throw forbidden(
-              "Agents may only name themselves as an unblock owner",
-            );
+            throw forbidden(invalidAgentUnblockOwnerMessage);
           }
         } else if (owner !== "board" && "userId" in owner) {
           const member = await db
@@ -13491,7 +13509,17 @@ export function issueRoutes(
         }
       }
 
-      if (assigneeWillChange && existing.assigneeAgentId) {
+      const attachingMidFlightReview =
+        req.body.executionPolicy !== undefined &&
+        existing.status === "in_progress" &&
+        !previousExecutionPolicy?.stages.length &&
+        !!nextExecutionPolicy?.stages.length &&
+        transition.workflowControlledAssignment === true &&
+        updateFields.status === "in_review" &&
+        parseIssueExecutionState(updateFields.executionState)?.status === "pending" &&
+        assigneeWillChange &&
+        !!existing.assigneeAgentId;
+      if (assigneeWillChange && existing.assigneeAgentId && !attachingMidFlightReview) {
         await stopRunnerGoalForOwnershipChange({
           companyId: existing.companyId,
           issueId: existing.id,
@@ -13594,24 +13622,89 @@ export function issueRoutes(
       } = { value: null };
       const postCommitActivityPublications: ActivityPublication[] = [];
       const postCommitIssueActions: IssuePostCommitAction[] = [];
-      const issueUpdateData = {
+      // SPA-10357 / SPA-10429 ownership-transfer CAS, board-actor mandatory
+      // boundary. The observed harm was an *ownership transfer*: the
+      // 2026-09-28 sweep moved eight DEPLOY-GATE cards off `local-board`
+      // (assigneeUserId -> null, assigneeAgentId -> an agent) with no
+      // caller-observed expected value. Mandatory enforcement therefore
+      // covers the ownership-transmit fields only.
+      //
+      // `status` CAS is provided but OPT-IN: a caller that supplies
+      // `expectedStatus` gets the locked-snapshot comparison, but a
+      // status-only write is not required to supply it. This is deliberate
+      // and load-bearing. Under `deploymentMode: local_trusted` the board
+      // UI (browser, headerless) and the offending monitor sweep are the
+      // SAME actor class — both `type: "board"`, `source: "local_implicit"` —
+      // so a mandatory `expectedStatus` cannot separate the interactive
+      // writer from the sweep; it would 409 every human status change in
+      // the in-repo board UI. The threat is ownership departure, and that is
+      // what is gated here. See SPA-10859 for the no-discriminator probe and
+      // the caller-migration follow-ups.
+      const boardActorRequest = req.actor.type === "board";
+      if (boardActorRequest) {
+        const casRequiredFieldsForBoardActor: Array<{
+          targetKey: "assigneeUserId" | "assigneeAgentId";
+          expectedKey: "expectedAssigneeUserId" | "expectedAssigneeAgentId";
+        }> = [
+          {
+            targetKey: "assigneeUserId",
+            expectedKey: "expectedAssigneeUserId",
+          },
+          {
+            targetKey: "assigneeAgentId",
+            expectedKey: "expectedAssigneeAgentId",
+          },
+        ];
+        for (const { targetKey, expectedKey } of casRequiredFieldsForBoardActor) {
+          if (req.body[targetKey] === undefined) continue;
+          // Transfer-only trigger (SPA-10859): an unchanged value is not an
+          // ownership departure. The board UI's comment/reply flow re-sends
+          // the issue's current assignee values on every post; requiring
+          // expected* on mere presence would 409 every human comment. The
+          // sweep shape — a value that DIFFERS from the row — is what gates.
+          // A supplied-but-wrong expected is still validated by the service
+          // against the locked snapshot, so callers that opt in get full CAS.
+          if (req.body[targetKey] === existing[targetKey as keyof typeof existing]) continue;
+          if (req.body[expectedKey] === undefined) {
+            res.status(409).json({
+              error: `Issue write rejected: board actor did not supply expected value for ${expectedKey}; ownership-transfer CAS is required when changing this field (SPA-10357)`,
+              code: "issue_write_ownership_cas_missing",
+              field: expectedKey,
+            });
+            return;
+          }
+        }
+      }
+      const issueUpdateData: Record<string, unknown> = {
         ...updateFields,
         actorAgentId: actor.agentId ?? null,
         actorUserId: actor.actorType === "user" ? actor.actorId : null,
         // SPA-8957: route-minted override reaches the service only for
         // user/board actors (agents were rejected above).
-        ...(doneOverrideRequested
-          ? {
-            doneGateOverride: {
-              reason: doneOverrideRequested.reason,
-              actorType: actor.actorType,
-              actorId: actor.actorId,
-              agentId: actor.agentId ?? null,
-              runId: actor.runId ?? null,
-            },
-          }
-          : {}),
       };
+      // SPA-10357 / SPA-10429 ownership-transfer CAS expectations. Only
+      // forward keys the caller actually supplied — `undefined` here would
+      // make the service-side `hasOwnProperty` check always return true and
+      // collapse the helper into a no-op cas-missing rejection. Forwarding
+      // a literal `undefined` is therefore a defect, not a no-op.
+      if (req.body.expectedStatus !== undefined) {
+        issueUpdateData.expectedStatus = req.body.expectedStatus;
+      }
+      if (req.body.expectedAssigneeUserId !== undefined) {
+        issueUpdateData.expectedAssigneeUserId = req.body.expectedAssigneeUserId;
+      }
+      if (req.body.expectedAssigneeAgentId !== undefined) {
+        issueUpdateData.expectedAssigneeAgentId = req.body.expectedAssigneeAgentId;
+      }
+      if (doneOverrideRequested) {
+        issueUpdateData.doneGateOverride = {
+          reason: doneOverrideRequested.reason,
+          actorType: actor.actorType,
+          actorId: actor.actorId,
+          agentId: actor.agentId ?? null,
+          runId: actor.runId ?? null,
+        };
+      }
       const shouldCollectCompletionPublication =
         actor.actorType === "user" &&
         existing.status !== "done" &&
@@ -13855,6 +13948,47 @@ export function issueRoutes(
       for (const publication of postCommitActivityPublications)
         publishActivity(publication);
       await flushIssuePostCommitActions(postCommitIssueActions);
+
+      if (attachingMidFlightReview) {
+        try {
+          await stopRunnerGoalForOwnershipChange({
+            companyId: existing.companyId,
+            issueId: existing.id,
+            agentId: existing.assigneeAgentId!,
+          });
+          const runToStopForReassignment = await resolveActiveIssueRun(existing);
+          if (runToStopForReassignment) {
+            const cancelled = await heartbeat.cancelRun(
+              runToStopForReassignment.id,
+              "Cancelled after review stage activation",
+              {
+                errorCode: "issue_reassigned",
+                resultJson: { reassignmentStopConfirmed: true },
+                eventMessage: "run cancelled after review stage activation",
+                eventPayload: { issueId: existing.id },
+              },
+            );
+            if (!cancelled || cancelled.status !== "cancelled") {
+              throw new Error("The active agent run could not be stopped after review activation");
+            }
+            interruptedRunId = cancelled.id;
+          }
+        } catch (err) {
+          logger.warn({ err, issueId: existing.id }, "failed to stop builder after review activation");
+          await logActivity(db, {
+            companyId: existing.companyId,
+            actorType: actor.actorType,
+            actorId: actor.actorId,
+            agentId: actor.agentId,
+            runId: actor.runId,
+            action: "heartbeat.cancel_failed",
+            entityType: "heartbeat_run",
+            entityId: existing.executionRunId ?? existing.id,
+            issueId: existing.id,
+            details: { source: "mid_flight_review_activation", issueId: existing.id },
+          });
+        }
+      }
 
       if (enteringBlocked) {
         const blockedIssue = issue;
@@ -14858,6 +14992,7 @@ export function issueRoutes(
         const becameDone =
           existing.status !== "done" && issue.status === "done";
         if (becameDone) {
+          await heartbeat.autoUnblockReadyDependents(issue.id);
           const dependents = await svc.listWakeableBlockedDependents(issue.id);
           for (const dependent of dependents) {
             await addDependencyResolvedWakeup({
@@ -16574,6 +16709,15 @@ export function issueRoutes(
         );
       });
 
+      await queueResolvedInteractionContinuationWakeup({
+        db,
+        heartbeat,
+        issue,
+        interaction,
+        actor,
+        source: "issue.interaction.respond",
+      });
+
       res.json(interaction);
     },
   );
@@ -18271,6 +18415,7 @@ export function issueRoutes(
           issueBeforeCommentDecision.status !== "done" &&
           currentIssue.status === "done";
         if (becameDone) {
+          await heartbeat.autoUnblockReadyDependents(currentIssue.id);
           const dependents = await svc.listWakeableBlockedDependents(
             currentIssue.id,
           );

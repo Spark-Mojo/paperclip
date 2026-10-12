@@ -3,6 +3,7 @@ import { and, eq, inArray, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { heartbeatRuns } from "@paperclipai/db";
 import { REDACTED_EVENT_VALUE } from "../redaction.js";
+import { HEARTBEAT_QUERY_DIAGNOSTIC_TAGS, measureHeartbeatQuery } from "./heartbeat-query-diagnostics.js";
 import { getSecretProvider } from "../secrets/provider-registry.js";
 import type { StoredSecretVersionMaterial } from "../secrets/types.js";
 
@@ -79,15 +80,16 @@ export function createRunSecretRedactionRegistry(db: Db) {
   }
 
   async function valuesForIssue(companyId: string, issueId: string) {
-    const rows = await db.select({ contextSnapshot: registrySnapshot })
-      .from(heartbeatRuns)
-      .where(and(
-        eq(heartbeatRuns.companyId, companyId),
-        or(
-          sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${issueId}`,
-          sql`${heartbeatRuns.contextSnapshot} -> 'paperclipIssue' ->> 'id' = ${issueId}`,
-        ),
-      ));
+    const rows = await measureHeartbeatQuery(HEARTBEAT_QUERY_DIAGNOSTIC_TAGS[2], () =>
+      db.select({ contextSnapshot: registrySnapshot })
+        .from(heartbeatRuns)
+        .where(and(
+          eq(heartbeatRuns.companyId, companyId),
+          or(
+            sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${issueId}`,
+            sql`${heartbeatRuns.contextSnapshot} -> 'paperclipIssue' ->> 'id' = ${issueId}`,
+          ),
+        )));
     return valuesForRuns(rows);
   }
 

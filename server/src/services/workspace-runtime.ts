@@ -2870,29 +2870,69 @@ async function inspectReusableWorktreeLock(worktreePath: string): Promise<void> 
     const gitProcesses = await executeProcess({ command: "pgrep", args: ["-x", "git"], cwd: worktreePath });
     if (gitProcesses.code !== 0 && gitProcesses.code !== 1) throw new Error("live Git writer detection failed");
     if (gitProcesses.stderr.trim() || gitProcesses.stdoutTruncated || gitProcesses.stderrTruncated) throw new Error("live Git writer detection failed");
+    let skippedPids = 0;
     for (const pid of gitProcesses.stdout.trim().split(/\s+/)) {
       if (!/^\d+$/.test(pid) || Number(pid) === process.pid) continue;
       const base = path.join("/proc", pid);
       try {
-        const cwd = await fs.realpath(path.join(base, "cwd"));
-        if (cwd === worktree || cwd.startsWith(`${worktree}${path.sep}`) || cwd === gitDir || cwd.startsWith(`${gitDir}${path.sep}`)) {
-          throw new Error(`live Git writer in ${worktreePath}`);
-        }
-        const handles = await fs.readdir(path.join(base, "fd"));
-        for (const handle of handles) {
-          const target = await fs.readlink(path.join(base, "fd", handle)).catch((error: NodeJS.ErrnoException) => {
-            if (error.code === "ENOENT") return null;
+        let permissionDenied = false;
+        const readable = async <T>(read: () => Promise<T>): Promise<T | null> => {
+          try {
+            return await read();
+          } catch (error) {
+            const code = (error as NodeJS.ErrnoException).code;
+            if (code === "EACCES" || code === "EPERM") {
+              permissionDenied = true;
+              return null;
+            }
+            if (code === "ENOENT" || code === "ESRCH") return null;
             throw error;
-          });
+          }
+        };
+        const pointsIntoWorktree = (target: string) => target === worktree || target.startsWith(`${worktree}${path.sep}`)
+          || target === gitDir || target.startsWith(`${gitDir}${path.sep}`);
+        const cwd = await readable(() => fs.realpath(path.join(base, "cwd")));
+        if (cwd && pointsIntoWorktree(cwd)) throw new Error(`live Git writer in ${worktreePath}`);
+        const cmdline = await readable(() => fs.readFile(path.join(base, "cmdline"), "utf8"));
+        const args = cmdline?.split("\0") ?? [];
+        let commandCwd = cwd;
+        for (let i = 1; i < args.length; i++) {
+          const arg = args[i];
+          let value: string | undefined;
+          if (arg === "-c" || arg === "--config-env") { i++; continue; }
+          if (arg === "-C" || arg === "--git-dir" || arg === "--work-tree") value = args[++i];
+          else if (arg.startsWith("--git-dir=") || arg.startsWith("--work-tree=")) value = arg.slice(arg.indexOf("=") + 1);
+          else if (!arg.startsWith("-")) break;
+          if (!value) continue;
+          const resolved = path.isAbsolute(value) ? path.resolve(value) : commandCwd ? path.resolve(commandCwd, value) : null;
+          if (!resolved) continue;
+          const physical = await readable(() => fs.realpath(resolved));
+          if (pointsIntoWorktree(physical ?? resolved)) throw new Error(`live Git writer in ${worktreePath}`);
+          if (arg === "-C") commandCwd = physical ?? resolved;
+        }
+        const handles = await readable(() => fs.readdir(path.join(base, "fd")));
+        for (const handle of handles ?? []) {
+          const target = await readable(() => fs.readlink(path.join(base, "fd", handle)));
           if (target && (target === lockPath || target === gitDir || target.startsWith(`${gitDir}${path.sep}`) || target === worktree || target.startsWith(`${worktree}${path.sep}`))) {
             throw new Error(`live Git writer in ${worktreePath}`);
           }
         }
+        if (permissionDenied) {
+          await fs.stat(base);
+          const currentCwd = await readable(() => fs.realpath(path.join(base, "cwd")));
+          if (currentCwd && pointsIntoWorktree(currentCwd)) throw new Error(`live Git writer in ${worktreePath}`);
+          skippedPids++;
+        }
       } catch (error) {
-        if (["ENOENT", "ESRCH"].includes((error as NodeJS.ErrnoException).code ?? "")) continue;
+        const code = (error as NodeJS.ErrnoException).code;
+        if (code === "ENOENT" || code === "ESRCH" || code === "EACCES" || code === "EPERM") {
+          skippedPids++;
+          continue;
+        }
         throw error;
       }
     }
+    if (skippedPids > 0) console.warn(`[workspace-runtime] skipped ${skippedPids} inaccessible Git process(es) during worktree reuse scan`);
   };
   await probe();
   const lock = await fs.lstat(lockPath).catch((error: NodeJS.ErrnoException) => {
