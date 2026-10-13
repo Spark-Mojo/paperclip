@@ -102,7 +102,7 @@ function deadPid() {
 }
 
 describe("fleet run ceiling helpers", () => {
-  it("defaults to no ceiling and clamps configured values to 1..50", () => {
+  it("defaults to no ceiling and clamps configured values to 0..50", () => {
     expect(FLEET_MAX_CONCURRENT_RUNS_DEFAULT).toBeNull();
     expect(FLEET_MAX_CONCURRENT_RUNS_ENV_VAR).toBe("PAPERCLIP_MAX_CONCURRENT_AGENT_RUNS");
     expect(normalizeFleetMaxConcurrentRuns(undefined)).toBeNull();
@@ -116,10 +116,10 @@ describe("fleet run ceiling helpers", () => {
     expect(normalizeFleetMaxConcurrentRuns(" 8 ")).toBe(8);
     expect(normalizeFleetMaxConcurrentRuns("1.7")).toBe(1);
     expect(normalizeFleetMaxConcurrentRuns("1e3")).toBe(50);
-    expect(normalizeFleetMaxConcurrentRuns("0")).toBe(1);
-    expect(normalizeFleetMaxConcurrentRuns(0)).toBe(1);
-    expect(normalizeFleetMaxConcurrentRuns("-1")).toBe(1);
-    expect(normalizeFleetMaxConcurrentRuns(-4)).toBe(1);
+    expect(normalizeFleetMaxConcurrentRuns("0")).toBe(0);
+    expect(normalizeFleetMaxConcurrentRuns(0)).toBe(0);
+    expect(normalizeFleetMaxConcurrentRuns("-1")).toBe(0);
+    expect(normalizeFleetMaxConcurrentRuns(-4)).toBe(0);
     expect(normalizeFleetMaxConcurrentRuns(500)).toBe(50);
   });
 
@@ -146,13 +146,13 @@ describe("fleet run ceiling helpers", () => {
     });
   });
 
-  it("clamps a DB value to 1..50, same as the env var", () => {
+  it("clamps a DB value to 0..50, same as the env var", () => {
     expect(resolveFleetMaxConcurrentRuns({ dbValue: 500, envValue: undefined })).toEqual({
       value: 50,
       source: "db",
     });
     expect(resolveFleetMaxConcurrentRuns({ dbValue: 0, envValue: undefined })).toEqual({
-      value: 1,
+      value: 0,
       source: "db",
     });
     expect(resolveFleetMaxConcurrentRuns({ dbValue: 1.9, envValue: undefined })).toEqual({
@@ -228,6 +228,42 @@ describe("fleet run ceiling helpers", () => {
         fleetRunningRuns: 7,
       }),
     ).toBe(0);
+  });
+
+  it("cap 0 pauses admissions: 2 queued + 1 running -> 0 admitted, running finishes; raise admits queued", () => {
+    // Pause: cap 0 yields 0 slots regardless of running count.
+    expect(
+      computeAvailableRunSlots({
+        agentMaxConcurrentRuns: 20,
+        agentRunningRuns: 0,
+        fleetMaxConcurrentRuns: 0,
+        fleetRunningRuns: 0,
+      }),
+    ).toBe(0);
+    // 2 queued + 1 running: the one running run stays running (never killed
+    // by the pause) but no new admission is possible.
+    expect(
+      computeAvailableRunSlots({
+        agentMaxConcurrentRuns: 20,
+        agentRunningRuns: 1,
+        fleetMaxConcurrentRuns: 0,
+        fleetRunningRuns: 1,
+      }),
+    ).toBe(0);
+    // Raising the cap admits the queued work again.
+    expect(
+      computeAvailableRunSlots({
+        agentMaxConcurrentRuns: 20,
+        agentRunningRuns: 1,
+        fleetMaxConcurrentRuns: 2,
+        fleetRunningRuns: 1,
+      }),
+    ).toBe(1);
+    // The paused value resolves through the DB path too.
+    expect(resolveFleetMaxConcurrentRuns({ dbValue: 0, envValue: undefined })).toEqual({
+      value: 0,
+      source: "db",
+    });
   });
 
   it("counts a running row only with live evidence (stale-run guard)", () => {
@@ -1322,6 +1358,82 @@ describeEmbeddedPostgres("fleet-wide agent run ceiling", () => {
       expect(after.running.sort()).toEqual(before.running.sort());
       expect(after.queued).toHaveLength(2);
       expect(after.other).toHaveLength(0);
+    }, 120_000);
+
+    it("cap 0 pauses admissions: 2 queued + 1 running -> running finishes, 0 admitted; raise to 2 admits queued", async () => {
+      // 3 seeded agents: the sweep admits only the 2 the raised-later cap
+      // allows, so pause->raise->admit is observable on the same fixture.
+      await setDbFleetCap(4);
+      invalidateFleetMaxConcurrentRunsCache();
+
+      const { seeded } = await seedCompanyWithQueuedRuns(3);
+      const seededRunIds = seeded.map((s) => s.runId);
+
+      await heartbeat.resumeQueuedRuns();
+      expect(await waitForExecutionsOf(seededRunIds, 3)).toBe(true);
+      await settle();
+
+      // Park one execution so its run stays running across the pause.
+      const parkedRunId = seeded[0]!.runId;
+      blockExecutions = true;
+      await releaseExecution(seeded[1]!.runId);
+      await releaseExecution(seeded[2]!.runId);
+      await waitForCondition(async () => {
+        const statuses = await seededStatuses(seededRunIds);
+        return statuses.running.length === 1 && statuses.queued.length === 0;
+      }, 30_000);
+
+      // Pause: cap 0. No new admission, and the parked running run is
+      // never killed.
+      await setDbFleetCap(0);
+      invalidateFleetMaxConcurrentRunsCache();
+      expect(await heartbeat.getFleetMaxConcurrentRunsStatus()).toEqual({
+        value: 0,
+        source: "db",
+      });
+      await heartbeat.resumeQueuedRuns();
+      await settle();
+      let paused = await seededStatuses(seededRunIds);
+      expect(paused.running.sort()).toEqual([parkedRunId]);
+      expect(paused.queued).toHaveLength(0);
+      // The two completed runs are terminal; the parked one is untouched.
+      expect(paused.other.map((row) => row.id).sort()).toEqual(
+        [seeded[1]!.runId, seeded[2]!.runId].sort(),
+      );
+
+      // A fresh queued card arriving during the pause stays queued.
+      blockExecutions = false;
+      const { seeded: pausedSeeded } = await seedCompanyWithQueuedRuns(1);
+      const pausedRunId = pausedSeeded[0]!.runId;
+      await heartbeat.resumeQueuedRuns();
+      await settle();
+      paused = await seededStatuses([...seededRunIds, pausedRunId]);
+      expect(paused.running.sort()).toEqual([parkedRunId]);
+      expect(paused.queued).toEqual([pausedRunId]);
+
+      // Finish the parked run: with cap 0 the freed slot admits NOTHING.
+      blockExecutions = true;
+      await releaseExecution(parkedRunId);
+      await waitForCondition(
+        async () => (await seededStatuses(seededRunIds)).other.some((row) => row.id === parkedRunId),
+        30_000,
+      );
+      await heartbeat.resumeQueuedRuns();
+      await settle();
+      paused = await seededStatuses([...seededRunIds, pausedRunId]);
+      expect(paused.queued).toEqual([pausedRunId]);
+
+      // Raise to 2: the queued wake is admitted in one pass.
+      await setDbFleetCap(2);
+      invalidateFleetMaxConcurrentRunsCache();
+      blockExecutions = false;
+      await heartbeat.resumeQueuedRuns();
+      expect(await waitForExecutionsOf([pausedRunId], 1)).toBe(true);
+      await settle();
+      const raised = await seededStatuses([...seededRunIds, pausedRunId]);
+      // The queued run was admitted (executed); nothing is stranded queued.
+      expect(raised.queued).toHaveLength(0);
+      expect(executionsOf([pausedRunId]).length).toBe(1);
     }, 120_000);
 
     it("falls back to the env var when the DB value is unparseable (never silently no-ceiling)", async () => {
