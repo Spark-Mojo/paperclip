@@ -680,7 +680,7 @@ const HEARTBEAT_MAX_CONCURRENT_RUNS_MAX = 50;
 // exactly the per-agent behaviour: no fleet count, no fleet lock, no ordering
 // change. `heartbeat.maxConcurrentRuns` is per agent, so with N agents at a
 // per-agent cap of 1 the instance can still run N at once; this knob bounds
-// the instance on a constrained host. Clamped to 1..50 when set; unparseable
+// the instance on a constrained host. Clamped to 0..50 when set (0 = pause); unparseable
 // values mean "no ceiling" (for the env var — see resolveFleetMaxConcurrentRuns
 // for the DB value, which never falls back to "no ceiling" on a bad write).
 //
@@ -694,7 +694,7 @@ const HEARTBEAT_MAX_CONCURRENT_RUNS_MAX = 50;
 // pass immediately (see the instance-settings route); lowering it never kills
 // a running run, it only withholds new admissions until the count falls back
 // under the new ceiling.
-const HEARTBEAT_FLEET_MAX_CONCURRENT_RUNS_MIN = 1;
+const HEARTBEAT_FLEET_MAX_CONCURRENT_RUNS_MIN = 0;
 const HEARTBEAT_FLEET_MAX_CONCURRENT_RUNS_MAX = 50;
 
 /** No ceiling. The fleet term is skipped unless an operator opts in. */
@@ -778,7 +778,7 @@ export function normalizeFleetMaxConcurrentRuns(value: unknown): number | null {
  *   env var.
  * - `dbValue === null` -- an explicit DB "no ceiling" override. Wins over the
  *   env var even if the env var is set, because it is a deliberate choice.
- * - `dbValue` parses to a finite number -- clamped 1..50, wins over the env
+ * - `dbValue` parses to a finite number -- clamped 0..50, wins over the env
  *   var.
  * - `dbValue` is anything else (a string, object, boolean, NaN, ...) -- an
  *   unparseable/malformed DB value. This must never be silently read as "no
