@@ -20239,7 +20239,36 @@ export function heartbeatService(
       ),
     ];
 
-    for (const agentId of orderedAgentIds) {
+    // SPA-11872: an agent whose deferred wake stranded behind a since-freed
+    // issue lock has no queued run, so the sweep above cannot see it. Append
+    // those agents (same candidate gate as the slot-free drain) so the
+    // public sweep drains them too.
+    const strandedWakeAgentIds = (
+      await db
+        .selectDistinct({ agentId: agentWakeupRequests.agentId })
+        .from(agentWakeupRequests)
+        .innerJoin(
+          issues,
+          and(
+            eq(issues.companyId, agentWakeupRequests.companyId),
+            sql`${issues.id}::text = ${agentWakeupRequests.payload}->>'issueId'`,
+            eq(issues.assigneeAgentId, agentWakeupRequests.agentId),
+          ),
+        )
+        .innerJoin(
+          companies,
+          and(eq(companies.id, issues.companyId), eq(companies.status, "active")),
+        )
+        .where(
+          and(
+            eq(agentWakeupRequests.status, "deferred_issue_execution"),
+            isNull(agentWakeupRequests.runId),
+            isNull(issues.executionRunId),
+            sql`${agentWakeupRequests.payload}->>'issueId' is not null`,
+          ),
+        )
+    ).map((row) => row.agentId);
+    for (const agentId of [...new Set([...orderedAgentIds, ...strandedWakeAgentIds])]) {
       await startNextQueuedRunForAgent(agentId);
     }
   }
@@ -20925,6 +20954,98 @@ export function heartbeatService(
     }
   }
 
+  // SPA-11872: a wake parked in `deferred_issue_execution` behind an issue
+  // execution lock is only revisited by the cancel-time release drain. If the
+  // wake parked after that drain ran (the SPA-11657 strand: cancel at
+  // 04:48:22, wake parked 04:48:24), nothing re-fires it. Re-admit those
+  // wakes here at slot-free. MUST run outside withAgentStartLock: the promote
+  // emits a run_queued post-commit effect that calls back into
+  // startNextQueuedRunForAgent, and withAgentStartLock is a sequence barrier,
+  // not a mutex — re-entry inside it deadlocks for the 30s stale window.
+  const drainingStrandedWakesForAgent = new Set<string>();
+
+  async function drainStrandedDeferredWakesForAgent(agentId: string) {
+    if (drainingStrandedWakesForAgent.has(agentId)) return;
+    drainingStrandedWakesForAgent.add(agentId);
+    try {
+      const agent = await getAgent(agentId);
+      if (!agent) return;
+      const invokability = await getAgentInvokability(agent);
+      if (!invokability.invokable) return;
+      const policy = parseHeartbeatPolicy(agent);
+      const runningCount = await countRunningRunsForAgent(agentId);
+      if (runningCount >= policy.maxConcurrentRuns) return;
+
+      // Oldest first, bounded. Same candidate gate as the strandedQueues
+      // sweep in resumeQueuedRuns, minus its legacy-runtimeMode gate (native
+      // runs must drain too — that gate is the SPA-11657 hole).
+      const candidates = await db
+        .select({ wake: agentWakeupRequests })
+        .from(agentWakeupRequests)
+        .innerJoin(
+          issues,
+          and(
+            eq(issues.companyId, agentWakeupRequests.companyId),
+            sql`${issues.id}::text = ${agentWakeupRequests.payload}->>'issueId'`,
+            eq(issues.assigneeAgentId, agentWakeupRequests.agentId),
+          ),
+        )
+        .innerJoin(
+          companies,
+          and(eq(companies.id, issues.companyId), eq(companies.status, "active")),
+        )
+        .where(
+          and(
+            eq(agentWakeupRequests.status, "deferred_issue_execution"),
+            eq(agentWakeupRequests.agentId, agentId),
+            isNull(agentWakeupRequests.runId),
+            isNull(issues.executionRunId),
+          ),
+        )
+        .orderBy(asc(agentWakeupRequests.requestedAt))
+        .limit(10);
+
+      for (const { wake } of candidates) {
+        const issueId = String(wake.payload?.issueId ?? "");
+        if (!issueId) continue;
+        // Re-read the lock immediately before the release: a concurrent
+        // claim may have taken it between the candidate query and here.
+        const [issue] = await db
+          .select({ executionRunId: issues.executionRunId })
+          .from(issues)
+          .where(and(eq(issues.id, issueId), eq(issues.companyId, agent.companyId)));
+        if (!issue || issue.executionRunId) continue;
+        // Release source: the issue's latest run on ANY agent (the SPA-8631
+        // promote passes the cancelled old-assignee run as source). The
+        // wake-queue promote owns every guard: terminal retirement,
+        // execution blockers, pause holds, and the CAS wake claim that
+        // makes re-admission idempotent.
+        const [latestRun] = await db
+          .select({ id: heartbeatRuns.id, companyId: heartbeatRuns.companyId })
+          .from(heartbeatRuns)
+          .where(
+            and(
+              eq(heartbeatRuns.companyId, agent.companyId),
+              sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${issueId}`,
+            ),
+          )
+          .orderBy(desc(heartbeatRuns.createdAt), desc(heartbeatRuns.id))
+          .limit(1);
+        if (!latestRun) continue;
+        await releaseIssueExecutionAndPromote(latestRun, {
+          suppressImmediateRecovery: true,
+        }).catch((err) => {
+          logger.warn(
+            { err, wakeId: wake.id, issueId, agentId },
+            "failed to re-admit stranded deferred wake at slot-free",
+          );
+        });
+      }
+    } finally {
+      drainingStrandedWakesForAgent.delete(agentId);
+    }
+  }
+
   async function startNextQueuedRunForAgent(
     agentId: string,
   ): Promise<Array<typeof heartbeatRuns.$inferSelect>> {
@@ -20935,6 +21056,8 @@ export function heartbeatService(
     // Running it inline would claim slots the owner's budget never saw and wait
     // on per-agent locks while holding the fleet lock.
     if (deferFleetRunAdmission(agentId)) return [];
+
+    await drainStrandedDeferredWakesForAgent(agentId);
 
     // Read once per admission; null (the default) keeps admission exactly as
     // before: per-agent cap only, no fleet count, no fleet lock.
@@ -31090,6 +31213,11 @@ export function heartbeatService(
     retryScheduledRetryNow,
 
     resumeQueuedRuns,
+
+    // SPA-11872: the per-agent slot-free admission entry (what run completion
+    // and the wake paths call). Exposed so the stranded-wake regression can
+    // drive the exact production admission seam.
+    startNextQueuedRunForAgent,
 
     // SPA-10137: live fleet-cap read + the matching cache invalidation. The
     // instance-settings route calls these so a cap write takes effect

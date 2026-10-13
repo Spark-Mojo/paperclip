@@ -1,11 +1,14 @@
 import { randomUUID } from "node:crypto";
-import { and, eq } from "drizzle-orm";
+import { and, eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
+  activityLog,
   agents,
   agentRuntimeState,
   agentWakeupRequests,
+  budgetPolicies,
   companies,
+  companySkills,
   createDb,
   heartbeatRunEvents,
   heartbeatRuns,
@@ -53,18 +56,46 @@ describeEmbeddedPostgres("heartbeat lock release on cross-agent reassignment", (
   beforeAll(async () => {
     tempDb = await startEmbeddedPostgresTestDatabase("heartbeat-lock-release-on-reassignment-");
     db = createDb(tempDb.connectionString);
-    heartbeat = heartbeatService(db);
+    // The engine suppresses ALL scheduling (wakeup writes a
+    // "heartbeat.scheduling_suppressed" skipped receipt and returns null)
+    // when PAPERCLIP_IN_WORKTREE is truthy — which it is inside this repo's
+    // own engine worktrees. Sibling suites pass an explicit runtimeEnv for
+    // the same reason; without it every admission test here tests the
+    // suppression door, not the reassignment path.
+    heartbeat = heartbeatService(db, {
+      runtimeEnv: { PAPERCLIP_IN_WORKTREE: "false" },
+    });
   }, 60_000);
 
   afterEach(async () => {
+    // Promoted runs are claimed and EXECUTED by the admission path; their
+    // execution writes (activity_log, company_skills, ...) land
+    // asynchronously after the test body. Cancel synthetic running rows,
+    // then drain and tear down with the retry ladder the executing suites
+    // use (heartbeat-workspace-busy cleanupFixture pattern).
+    await db
+      .update(heartbeatRuns)
+      .set({ status: "cancelled", finishedAt: new Date() })
+      .where(eq(heartbeatRuns.status, "running"));
     await drainHeartbeatRunsToQuiescence(db, heartbeat);
-    await db.delete(heartbeatRunEvents);
-    await db.delete(heartbeatRuns);
-    await db.delete(agentWakeupRequests);
-    await db.delete(issues);
-    await db.delete(agentRuntimeState);
-    await db.delete(agents);
-    await db.delete(companies);
+    for (let attempt = 0; attempt < 5; attempt += 1) {
+      try {
+        await db.delete(activityLog);
+        await db.delete(heartbeatRunEvents);
+        await db.delete(heartbeatRuns);
+        await db.delete(agentWakeupRequests);
+        await db.delete(issues);
+        await db.delete(agentRuntimeState);
+        await db.delete(companySkills);
+        await db.delete(budgetPolicies);
+        await db.delete(agents);
+        await db.delete(companies);
+        break;
+      } catch (error) {
+        if (attempt === 4) throw error;
+        await new Promise((resolve) => setTimeout(resolve, 50));
+      }
+    }
     vi.clearAllMocks();
   });
 
@@ -161,7 +192,9 @@ describeEmbeddedPostgres("heartbeat lock release on cross-agent reassignment", (
     const { coderAgentId, reviewerAgentId, issueId, holderRunId, wakeupRequestId } =
       await seedCrossAgentScenario({ holderStatus: "running" });
 
-    const heartbeat = heartbeatService(db);
+    const heartbeat = heartbeatService(db, {
+      runtimeEnv: { PAPERCLIP_IN_WORKTREE: "false" },
+    });
     const followupRun = await heartbeat.wakeup(reviewerAgentId, {
       source: "automation",
       triggerDetail: "system",
@@ -320,7 +353,9 @@ describeEmbeddedPostgres("heartbeat lock release on cross-agent reassignment", (
       startedAt: new Date(),
     });
 
-    const heartbeat = heartbeatService(db);
+    const heartbeat = heartbeatService(db, {
+      runtimeEnv: { PAPERCLIP_IN_WORKTREE: "false" },
+    });
     const newAssigneeRun = await heartbeat.wakeup(reviewerAgentId, {
       source: "automation",
       triggerDetail: "system",
@@ -359,4 +394,255 @@ describeEmbeddedPostgres("heartbeat lock release on cross-agent reassignment", (
       );
     });
   });
+
+  // ---------------------------------------------------------------------------
+  // SPA-11872 stranded deferred-wake regression.
+  //
+  // Production-grounded mechanism (SPA-11657 strand, 2026-10-12, read live via
+  // GET /api/issues/{id}/runs + /api/issues/{id}/diagnostics/wakes):
+  //  - 04:48:22Z the holder run was cancelled on reassignment, and the
+  //    issue-scoped release drain (runReleaseDrain) fired AT CANCEL TIME.
+  //  - 04:48:24Z — two seconds later — the new assignee's wake parked in
+  //    agentWakeupRequests with status "deferred_issue_execution" (admitted
+  //    behind the still-visible execution lock). Nothing re-fires the
+  //    issue-scoped drain after that point, so the wake strands.
+  //  - The strandedQueues sweep in resumeQueuedRuns would revisit such wakes,
+  //    but it skips unless the issue's latest run is runtimeMode "legacy";
+  //    every native-era run is stamped "native" (schema default is "legacy",
+  //    which is all the SPA-8631 suite exercises).
+  //  - The card sat 3h14m until a manual wake created a run that ADOPTED the
+  //    parked wake (status -> "coalesced", runId back-filled).
+  //
+  // Contract pinned here (re-admission at slot-free):
+  //  - T1 slot-free: when the agent's slot frees (busy run terminal,
+  //    issue execution lock already cleared), startNextQueuedRunForAgent
+  //    re-admits the parked wake: exactly one run for the issue, the SAME
+  //    wake row linked to it (runId), promoted off "deferred_issue_execution".
+  //  - T2 at-cap guard: no free slot -> wake untouched, no run.
+  //  - T3 lock-held guard: issue execution lock still held -> wake untouched.
+  //  - T4 terminal-issue guard: issue done -> no run, wake retired in place.
+  //  - T5 idempotency: driving admission twice admits exactly one run.
+  // ---------------------------------------------------------------------------
+
+  async function seedStrandedScenario() {
+    const seed = await seedCrossAgentScenario({ holderStatus: "queued" });
+    const { companyId, reviewerAgentId, issueId, holderRunId } = seed;
+
+    // Reviewer at per-agent cap 1 with the one slot occupied by an unrelated
+    // running run (no issueId in its snapshot — never matches the stranded
+    // issue's query).
+    await db
+      .update(agents)
+      .set({ runtimeConfig: { heartbeat: { wakeOnDemand: true, maxConcurrentRuns: 1 } } })
+      .where(eq(agents.id, reviewerAgentId));
+    await db.insert(heartbeatRuns).values({
+      id: randomUUID(),
+      companyId,
+      agentId: reviewerAgentId,
+      invocationSource: "automation",
+      triggerDetail: "system",
+      status: "running",
+      contextSnapshot: { wakeReason: "test_busy_slot" },
+      startedAt: new Date(),
+    });
+
+    // The reassignment stale-cancel already ran, SPA-11657 shape: holder run
+    // cancelled and the issue execution lock cleared. The wake parked two
+    // seconds AFTER the cancel-time drain, which is the gap under test.
+    await db
+      .update(heartbeatRuns)
+      .set({ status: "cancelled", finishedAt: new Date(), errorCode: "issue_reassigned" })
+      .where(eq(heartbeatRuns.id, holderRunId));
+    await db
+      .update(issues)
+      .set({ executionRunId: null, executionAgentNameKey: null, executionLockedAt: null })
+      .where(eq(issues.id, issueId));
+
+    // The new assignee's wake, parked in `deferred_issue_execution` — the
+    // exact row shape the SPA-8631 suite seeds for the promote path.
+    await db.insert(agentWakeupRequests).values({
+      companyId,
+      agentId: reviewerAgentId,
+      source: "assignment",
+      status: "deferred_issue_execution",
+      payload: {
+        issueId,
+        wakeReason: "issue_assigned",
+        _paperclipWakeContext: { issueId, taskId: issueId, wakeReason: "issue_assigned" },
+      },
+    });
+
+    return seed;
+  }
+
+  function strandedWakeCount(reviewerAgentId: string, issueId: string) {
+    return db
+      .select({ id: agentWakeupRequests.id, status: agentWakeupRequests.status, runId: agentWakeupRequests.runId })
+      .from(agentWakeupRequests)
+      .where(
+        and(
+          eq(agentWakeupRequests.agentId, reviewerAgentId),
+          sql`(${agentWakeupRequests.payload} ->> 'issueId') = ${issueId}`,
+        ),
+      )
+      .then((rows) => rows);
+  }
+
+  function reviewerRunsForIssue(reviewerAgentId: string, issueId: string) {
+    return db
+      .select({
+        id: heartbeatRuns.id,
+        status: heartbeatRuns.status,
+        snapshotIssueId: sql<string | null>`(${heartbeatRuns.contextSnapshot} ->> 'issueId')`,
+      })
+      .from(heartbeatRuns)
+      .where(
+        and(
+          eq(heartbeatRuns.agentId, reviewerAgentId),
+          sql`(${heartbeatRuns.contextSnapshot} ->> 'issueId') = ${issueId}`,
+        ),
+      )
+      .then((rows) => rows);
+  }
+
+  async function freeReviewerSlot(reviewerAgentId: string) {
+    await db
+      .update(heartbeatRuns)
+      .set({ status: "succeeded", finishedAt: new Date() })
+      .where(
+        and(
+          eq(heartbeatRuns.agentId, reviewerAgentId),
+          eq(heartbeatRuns.status, "running"),
+        ),
+      );
+  }
+
+  it("stranded: re-admits the parked deferred wake when the agent's slot frees", async () => {
+    const { reviewerAgentId, issueId } = await seedStrandedScenario();
+
+    const parked = await strandedWakeCount(reviewerAgentId, issueId);
+    expect(parked).toHaveLength(1);
+    const parkedWakeId = parked[0]?.id;
+
+    await freeReviewerSlot(reviewerAgentId);
+    await heartbeat.startNextQueuedRunForAgent(reviewerAgentId);
+
+    const admitted = await vi.waitFor(
+      async () => {
+        const rows = await reviewerRunsForIssue(reviewerAgentId, issueId);
+        expect(rows).toHaveLength(1);
+        return rows;
+      },
+      { timeout: 10_000 },
+    );
+    // Exactly one run, for the stranded issue itself (never the busy slot's
+    // phantom issue — the query is keyed on the snapshot issueId). The
+    // same-pass claim may execute the run to a terminal state before this
+    // read, so the status is not pinned — admission + linkage is the
+    // contract.
+    expect(admitted[0]?.snapshotIssueId).toBe(issueId);
+
+    // The parked wake is consumed in place, not duplicated: same row count,
+    // and the SAME row now links to the admitted run and has left
+    // "deferred_issue_execution".
+    const wakesAfter = await strandedWakeCount(reviewerAgentId, issueId);
+    expect(wakesAfter).toHaveLength(parked.length);
+    const promoted = wakesAfter.find((wake) => wake.id === parkedWakeId);
+    expect(promoted).toBeDefined();
+    expect(promoted?.runId).toBe(admitted[0]?.id);
+    expect(promoted?.status).not.toBe("deferred_issue_execution");
+  }, 60_000);
+
+  it("stranded: leaves the parked wake alone while the agent has no free slot", async () => {
+    const { reviewerAgentId, issueId } = await seedStrandedScenario();
+
+    const parked = await strandedWakeCount(reviewerAgentId, issueId);
+    expect(parked).toHaveLength(1);
+
+    await heartbeat.startNextQueuedRunForAgent(reviewerAgentId);
+
+    const runsForIssue = await reviewerRunsForIssue(reviewerAgentId, issueId);
+    expect(runsForIssue).toHaveLength(0);
+
+    const wakesAfter = await strandedWakeCount(reviewerAgentId, issueId);
+    expect(wakesAfter).toHaveLength(1);
+    expect(wakesAfter[0]?.status).toBe("deferred_issue_execution");
+  }, 60_000);
+
+  it("stranded: leaves the parked wake alone while the issue execution lock is held", async () => {
+    const { reviewerAgentId, issueId, holderRunId } = await seedStrandedScenario();
+
+    const parked = await strandedWakeCount(reviewerAgentId, issueId);
+    expect(parked).toHaveLength(1);
+
+    // The lock was NOT yet cleared when the wake parked — the pre-cancel
+    // race shape. Re-admission must not steal the lock or double-run.
+    await db
+      .update(issues)
+      .set({ executionRunId: holderRunId, executionAgentNameKey: "coder", executionLockedAt: new Date() })
+      .where(eq(issues.id, issueId));
+
+    await freeReviewerSlot(reviewerAgentId);
+    await heartbeat.startNextQueuedRunForAgent(reviewerAgentId);
+
+    const runsForIssue = await reviewerRunsForIssue(reviewerAgentId, issueId);
+    expect(runsForIssue).toHaveLength(0);
+
+    const wakesAfter = await strandedWakeCount(reviewerAgentId, issueId);
+    expect(wakesAfter).toHaveLength(1);
+    expect(wakesAfter[0]?.status).toBe("deferred_issue_execution");
+  }, 60_000);
+
+  it("stranded: retires the parked wake when the target issue is terminal", async () => {
+    const { reviewerAgentId, issueId } = await seedStrandedScenario();
+
+    const parked = await strandedWakeCount(reviewerAgentId, issueId);
+    expect(parked).toHaveLength(1);
+
+    await db.update(issues).set({ status: "done" }).where(eq(issues.id, issueId));
+
+    await freeReviewerSlot(reviewerAgentId);
+    await heartbeat.startNextQueuedRunForAgent(reviewerAgentId);
+
+    const runsForIssue = await reviewerRunsForIssue(reviewerAgentId, issueId);
+    expect(runsForIssue).toHaveLength(0);
+
+    // The wake must be retired in place — not deleted, not duplicated, not
+    // left promotable. Any non-live status is acceptable (the promote path's
+    // terminal retirement writes "cancelled"); a wake still sitting on a
+    // promotable status after a terminal close fails here.
+    const wakesAfter = await strandedWakeCount(reviewerAgentId, issueId);
+    expect(wakesAfter).toHaveLength(parked.length);
+    const liveStatuses = ["queued", "claimed", "deferred_issue_execution", "running"];
+    expect(liveStatuses).not.toContain(wakesAfter[0]?.status);
+  }, 60_000);
+
+  it("stranded: draining admission twice admits exactly one run", async () => {
+    const { reviewerAgentId, issueId } = await seedStrandedScenario();
+
+    const parked = await strandedWakeCount(reviewerAgentId, issueId);
+    expect(parked).toHaveLength(1);
+    const parkedWakeId = parked[0]?.id;
+
+    await freeReviewerSlot(reviewerAgentId);
+    await heartbeat.startNextQueuedRunForAgent(reviewerAgentId);
+    await heartbeat.startNextQueuedRunForAgent(reviewerAgentId);
+
+    const admitted = await vi.waitFor(
+      async () => {
+        const rows = await reviewerRunsForIssue(reviewerAgentId, issueId);
+        expect(rows).toHaveLength(1);
+        return rows;
+      },
+      { timeout: 10_000 },
+    );
+    expect(admitted[0]?.snapshotIssueId).toBe(issueId);
+
+    const wakesAfter = await strandedWakeCount(reviewerAgentId, issueId);
+    expect(wakesAfter).toHaveLength(parked.length);
+    const promoted = wakesAfter.find((wake) => wake.id === parkedWakeId);
+    expect(promoted).toBeDefined();
+    expect(promoted?.runId).toBe(admitted[0]?.id);
+    expect(promoted?.status).not.toBe("deferred_issue_execution");
+  }, 60_000);
 });
