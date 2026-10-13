@@ -31,6 +31,7 @@ const mockInteractionService = vi.hoisted(() => ({
   listForIssue: vi.fn(),
   getForIssue: vi.fn(),
   create: vi.fn(),
+  listPendingSiblingInteractions: vi.fn(),
   acceptInteraction: vi.fn(),
   acceptSuggestedTasks: vi.fn(),
   rejectInteraction: vi.fn(),
@@ -349,6 +350,7 @@ describe.sequential("issue thread interaction routes", () => {
     mockIssueService.getById.mockResolvedValue(createIssue());
     mockIssueService.listReviewAttention.mockResolvedValue(new Map());
     mockInteractionService.listForIssue.mockResolvedValue([]);
+    mockInteractionService.listPendingSiblingInteractions.mockResolvedValue([]);
     mockInteractionService.expireRequestConfirmationsSupersededByHistoricalComments.mockResolvedValue([]);
     mockInteractionService.expirePendingInteractionsForTerminalIssue.mockResolvedValue([]);
     mockInteractionService.getForIssue.mockResolvedValue({
@@ -612,6 +614,113 @@ describe.sequential("issue thread interaction routes", () => {
         }),
       }),
     );
+  }, 10_000);
+
+  // A second pending card on the same thread is the duplicate-author signal the
+  // creating agent needs before it waits on an answer nobody owes: the create
+  // response ships the still-pending siblings so the author can coordinate or
+  // withdraw instead of stacking one more card on the pile. Additive response
+  // field only - the 201 and the persisted row are unchanged.
+  it("returns pending sibling interactions of the same issue and kind on create", async () => {
+    mockInteractionService.create.mockResolvedValueOnce({
+      id: "interaction-sibling-new",
+      companyId: "company-1",
+      issueId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      kind: "ask_user_questions",
+      status: "pending",
+      continuationPolicy: "wake_assignee",
+      createdByAgentId: CREATED_AGENT_ID,
+      requestedResolverPolicy: "anyone",
+      effectiveResolverPolicy: "anyone",
+      idempotencyKey: null,
+      sourceCommentId: null,
+      sourceRunId: RUN_1,
+      payload: { version: 1, questions: [] },
+      result: null,
+      createdAt: "2026-07-25T12:05:00.000Z",
+      updatedAt: "2026-07-25T12:05:00.000Z",
+    });
+    const sibling = {
+      id: "interaction-sibling-older",
+      kind: "ask_user_questions",
+      createdByAgentId: UNRELATED_AGENT_ID,
+      createdAt: "2026-07-25T12:00:00.000Z",
+    };
+    mockInteractionService.listPendingSiblingInteractions.mockResolvedValue([sibling]);
+    const app = await createApp();
+
+    const res = await request(app)
+      .post("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/interactions")
+      .send({
+        kind: "ask_user_questions",
+        payload: { version: 1, questions: [{ id: "q1", prompt: "Proceed?", selectionMode: "single", options: [{ id: "yes", label: "Yes" }] }] },
+      });
+
+    expect(res.status).toBe(201);
+    expect(res.body.id).toBe("interaction-sibling-new");
+    expect(res.body.siblingPendingInteractions).toEqual([sibling]);
+    expect(mockInteractionService.listPendingSiblingInteractions).toHaveBeenCalledWith(
+      "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      "ask_user_questions",
+      "interaction-sibling-new",
+    );
+  }, 10_000);
+
+  // The same-agent supersede in the service only expires the author's OWN older
+  // cards. A second agent's pending question on the same thread must still
+  // create cleanly (201, row persisted) and surface as a sibling, never be
+  // blocked by a naive cross-agent guard.
+  it("second cross-agent ask_user_questions on the same issue still creates and returns the sibling", async () => {
+    mockRunAttribution.value = {
+      companyId: "company-1",
+      agentId: UNRELATED_AGENT_ID,
+      responsibleUserId: null,
+    };
+    mockInteractionService.create.mockResolvedValueOnce({
+      id: "interaction-cross-agent-new",
+      companyId: "company-1",
+      issueId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      kind: "ask_user_questions",
+      status: "pending",
+      continuationPolicy: "wake_assignee",
+      createdByAgentId: UNRELATED_AGENT_ID,
+      requestedResolverPolicy: "anyone",
+      effectiveResolverPolicy: "anyone",
+      idempotencyKey: null,
+      sourceCommentId: null,
+      sourceRunId: RUN_2,
+      payload: { version: 1, questions: [] },
+      result: null,
+      createdAt: "2026-07-25T12:06:00.000Z",
+      updatedAt: "2026-07-25T12:06:00.000Z",
+    });
+    mockInteractionService.listPendingSiblingInteractions.mockResolvedValue([
+      {
+        id: "interaction-cross-agent-older",
+        kind: "ask_user_questions",
+        createdByAgentId: CREATED_AGENT_ID,
+        createdAt: "2026-07-25T12:00:00.000Z",
+      },
+    ]);
+    const app = await createApp();
+
+    const res = await request(app)
+      .post("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/interactions")
+      .send({
+        kind: "ask_user_questions",
+        payload: { version: 1, questions: [{ id: "q1", prompt: "Which region?", selectionMode: "single", options: [{ id: "us", label: "US" }] }] },
+      });
+
+    expect(res.status).toBe(201);
+    expect(res.body.id).toBe("interaction-cross-agent-new");
+    expect(res.body.siblingPendingInteractions).toEqual([
+      {
+        id: "interaction-cross-agent-older",
+        kind: "ask_user_questions",
+        createdByAgentId: CREATED_AGENT_ID,
+        createdAt: "2026-07-25T12:00:00.000Z",
+      },
+    ]);
   }, 10_000);
 
   it("does not run historical-comment catch-up or queue recovery from the interaction read path", async () => {
