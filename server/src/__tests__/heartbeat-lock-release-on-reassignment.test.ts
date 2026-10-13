@@ -2,10 +2,13 @@ import { randomUUID } from "node:crypto";
 import { and, eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
+  activityLog,
   agents,
   agentRuntimeState,
   agentWakeupRequests,
+  budgetPolicies,
   companies,
+  companySkills,
   createDb,
   heartbeatRunEvents,
   heartbeatRuns,
@@ -65,14 +68,34 @@ describeEmbeddedPostgres("heartbeat lock release on cross-agent reassignment", (
   }, 60_000);
 
   afterEach(async () => {
+    // Promoted runs are claimed and EXECUTED by the admission path; their
+    // execution writes (activity_log, company_skills, ...) land
+    // asynchronously after the test body. Cancel synthetic running rows,
+    // then drain and tear down with the retry ladder the executing suites
+    // use (heartbeat-workspace-busy cleanupFixture pattern).
+    await db
+      .update(heartbeatRuns)
+      .set({ status: "cancelled", finishedAt: new Date() })
+      .where(eq(heartbeatRuns.status, "running"));
     await drainHeartbeatRunsToQuiescence(db, heartbeat);
-    await db.delete(heartbeatRunEvents);
-    await db.delete(heartbeatRuns);
-    await db.delete(agentWakeupRequests);
-    await db.delete(issues);
-    await db.delete(agentRuntimeState);
-    await db.delete(agents);
-    await db.delete(companies);
+    for (let attempt = 0; attempt < 5; attempt += 1) {
+      try {
+        await db.delete(activityLog);
+        await db.delete(heartbeatRunEvents);
+        await db.delete(heartbeatRuns);
+        await db.delete(agentWakeupRequests);
+        await db.delete(issues);
+        await db.delete(agentRuntimeState);
+        await db.delete(companySkills);
+        await db.delete(budgetPolicies);
+        await db.delete(agents);
+        await db.delete(companies);
+        break;
+      } catch (error) {
+        if (attempt === 4) throw error;
+        await new Promise((resolve) => setTimeout(resolve, 50));
+      }
+    }
     vi.clearAllMocks();
   });
 
@@ -504,20 +527,24 @@ describeEmbeddedPostgres("heartbeat lock release on cross-agent reassignment", (
     await freeReviewerSlot(reviewerAgentId);
     await heartbeat.startNextQueuedRunForAgent(reviewerAgentId);
 
-    const admitted = await reviewerRunsForIssue(reviewerAgentId, issueId);
+    const admitted = await vi.waitFor(
+      async () => {
+        const rows = await reviewerRunsForIssue(reviewerAgentId, issueId);
+        expect(rows).toHaveLength(1);
+        return rows;
+      },
+      { timeout: 10_000 },
+    );
     // Exactly one run, for the stranded issue itself (never the busy slot's
-    // phantom issue — the query is keyed on the snapshot issueId). Status
-    // "running" covers the same-pass claim; "queued" covers a deferred claim.
-    expect(admitted).toHaveLength(1);
-    expect(["queued", "running"]).toContain(admitted[0]?.status);
+    // phantom issue — the query is keyed on the snapshot issueId). The
+    // same-pass claim may execute the run to a terminal state before this
+    // read, so the status is not pinned — admission + linkage is the
+    // contract.
     expect(admitted[0]?.snapshotIssueId).toBe(issueId);
 
     // The parked wake is consumed in place, not duplicated: same row count,
     // and the SAME row now links to the admitted run and has left
-    // "deferred_issue_execution". The promote path parks it at "queued"
-    // until the run claims ("claimed") — both are promoted states, so the
-    // assertion is the deferred-status exit plus the runId link, not a
-    // terminal status.
+    // "deferred_issue_execution".
     const wakesAfter = await strandedWakeCount(reviewerAgentId, issueId);
     expect(wakesAfter).toHaveLength(parked.length);
     const promoted = wakesAfter.find((wake) => wake.id === parkedWakeId);
@@ -601,9 +628,14 @@ describeEmbeddedPostgres("heartbeat lock release on cross-agent reassignment", (
     await heartbeat.startNextQueuedRunForAgent(reviewerAgentId);
     await heartbeat.startNextQueuedRunForAgent(reviewerAgentId);
 
-    const admitted = await reviewerRunsForIssue(reviewerAgentId, issueId);
-    expect(admitted).toHaveLength(1);
-    expect(["queued", "running"]).toContain(admitted[0]?.status);
+    const admitted = await vi.waitFor(
+      async () => {
+        const rows = await reviewerRunsForIssue(reviewerAgentId, issueId);
+        expect(rows).toHaveLength(1);
+        return rows;
+      },
+      { timeout: 10_000 },
+    );
     expect(admitted[0]?.snapshotIssueId).toBe(issueId);
 
     const wakesAfter = await strandedWakeCount(reviewerAgentId, issueId);
