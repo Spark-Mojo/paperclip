@@ -19,6 +19,7 @@ import {
   buildNativeRunnerPreparePayload,
   executeNativeCodexRunner,
 } from "./native-codex-runner.js";
+import { getSpawnAdmissionFence } from "@paperclipai/adapter-utils/server-utils";
 
 describe("native runner scope cleanup", () => {
   it.skipIf(process.platform !== "linux")("releases the prepared PRP registration when the resource limit is malformed", async () => {
@@ -47,6 +48,180 @@ describe("native runner scope cleanup", () => {
       await rm(root, { recursive: true, force: true });
     }
   });
+});
+
+describe("native runner spawn admission (SPA-11948 R2)", () => {
+  it.skipIf(process.platform !== "linux")(
+    "refuses a native runner spawned after shutdown closed the admission gate",
+    async () => {
+      // The native codex runner spawns its own `paperclip-agent-*.scope`
+      // directly instead of going through the adapter `runChildProcess`
+      // path, so the spawn-during-shutdown fence must be taken HERE too:
+      // a runner spawned between the shutdown close and the durable
+      // `onSpawn` registration would otherwise survive the restart as an
+      // orphan holding a cap slot. The oracle: with the gate closed, the
+      // run rejects with `spawn_admission_closed`, the scope's cgroup is
+      // signalled by the fence, `onSpawn` never fires, the PRP lease is
+      // released, and no admission lease is left outstanding.
+      const getFence = getSpawnAdmissionFence as unknown as
+        | (() => {
+            reopen(): void;
+            close(): void;
+            isClosed(): boolean;
+            inFlight(): number;
+          })
+        | undefined;
+      expect(
+        typeof getFence,
+        "missing_spawn_admission_api:getSpawnAdmissionFence",
+      ).toBe("function");
+      const fence = getFence!();
+      fence.reopen();
+      expect(fence.inFlight()).toBe(0);
+
+      const root = await mkdtemp(join(tmpdir(), "native-spawn-fence-"));
+      const onSpawn = vi.fn(async () => {});
+      release.mockClear();
+      prepare.mockClear();
+      try {
+        fence.close();
+        expect(fence.isClosed()).toBe(true);
+
+        await expect(
+          executeNativeCodexRunner({
+            db: {} as Parameters<typeof executeNativeCodexRunner>[0]["db"],
+            companyId: randomUUID(),
+            issueId: randomUUID(),
+            runId: randomUUID(),
+            agentId: randomUUID(),
+            runnerInstanceId: randomUUID(),
+            environmentLeaseId: "lease-1",
+            normalizedSessionId: randomUUID(),
+            turnId: "turn-1",
+            // NUL byte carried through to the spawn argv for the
+            // sync-spawn-throw sibling test; harmless for the
+            // admit-refusal sibling (it never reaches the spawn argv
+            // because the gate is closed first).
+            itemId: process.env.PAPERCLIP_TEST_SPA_NUL_ITEMID === "1" ? "item-1\u0000" : "item-1",
+            cwd: root,
+            prompt: "test",
+            model: null,
+            resumeProviderSessionId: null,
+            completionContract: { revision: "1", criterionIds: [] },
+            timeoutMs: 5_000,
+            environment: {},
+            // A real executable: the spawn must succeed so the refusal is
+            // the fence's, not an OS spawn error.
+            runnerBinary: process.execPath,
+            runtimeRoot: root,
+            onLog: async () => {},
+            onSpawn,
+          }),
+        ).rejects.toThrow("spawn_admission_closed");
+
+        expect(onSpawn).not.toHaveBeenCalled();
+        expect(
+          fence.inFlight(),
+          "native_runner_spawn_left_an_admission_lease_outstanding",
+        ).toBe(0);
+        expect(release).toHaveBeenCalledOnce();
+      } finally {
+        fence.reopen();
+        await rm(root, { recursive: true, force: true });
+      }
+    },
+    20_000,
+  );
+
+  it.skipIf(process.platform !== "linux")(
+    "settles the admission lease and releases the PRP registration when spawn throws synchronously",
+    async () => {
+      // Companion to the refusal oracle above: a SYNCHRONOUS `spawn()` throw
+      // (here: a NUL byte in the binary path, `ERR_INVALID_ARG_VALUE`)
+      // happens after the admission lease is taken but before the outer run
+      // try owns `prepared.release()`. The catch must settle the admission
+      // lease AND release the environment lease, or the fence drain wedges
+      // and the PRP registration leaks.
+      const getFence = getSpawnAdmissionFence as unknown as
+        | (() => {
+            reopen(): void;
+            close(): void;
+            isClosed(): boolean;
+            inFlight(): number;
+          })
+        | undefined;
+      expect(
+        typeof getFence,
+        "missing_spawn_admission_api:getSpawnAdmissionFence",
+      ).toBe("function");
+      const fence = getFence!();
+      fence.reopen();
+      expect(fence.inFlight()).toBe(0);
+
+      const root = await mkdtemp(join(tmpdir(), "native-spawn-sync-throw-"));
+      const onSpawn = vi.fn(async () => {});
+      release.mockClear();
+      prepare.mockClear();
+      const priorNulFlag = process.env.PAPERCLIP_TEST_SPA_NUL_ITEMID;
+      process.env.PAPERCLIP_TEST_SPA_NUL_ITEMID = "1";
+      try {
+        expect(fence.isClosed()).toBe(false);
+
+        await expect(
+          executeNativeCodexRunner({
+            db: {} as Parameters<typeof executeNativeCodexRunner>[0]["db"],
+            companyId: randomUUID(),
+            issueId: randomUUID(),
+            runId: randomUUID(),
+            agentId: randomUUID(),
+            runnerInstanceId: randomUUID(),
+            environmentLeaseId: "lease-1",
+            normalizedSessionId: randomUUID(),
+            turnId: "turn-1",
+            // NUL byte carried through to the spawn argv for the
+            // sync-spawn-throw sibling test; harmless for the
+            // admit-refusal sibling (it never reaches the spawn argv
+            // because the gate is closed first).
+            itemId: process.env.PAPERCLIP_TEST_SPA_NUL_ITEMID === "1" ? "item-1\u0000" : "item-1",
+            cwd: root,
+            prompt: "test",
+            model: null,
+            resumeProviderSessionId: null,
+            completionContract: { revision: "1", criterionIds: [] },
+            timeoutMs: 5_000,
+            environment: {},
+            // A clean binary (digest + prepare must succeed) with a NUL byte
+            // in an argument value: `spawn()` itself throws synchronously --
+            // the exact window between `enterAdmission()` and the outer
+            // run try that owns `prepared.release()`. itemId flows verbatim
+            // into the spawn argv (see `buildNativeRunnerArguments` -- it
+            // becomes `--item-id <itemId>`), so the NUL rides into the
+            // synchronous `spawn()` arg-validation step.
+            runnerBinary: process.execPath,
+            runtimeRoot: root,
+            onLog: async () => {},
+            onSpawn,
+          }),
+        ).rejects.toThrow();
+
+        expect(onSpawn).not.toHaveBeenCalled();
+        expect(
+          fence.inFlight(),
+          "sync_spawn_throw_left_an_admission_lease_outstanding",
+        ).toBe(0);
+        expect(
+          release,
+          "sync_spawn_throw_leaked_the_prp_registration",
+        ).toHaveBeenCalledOnce();
+      } finally {
+        fence.reopen();
+        if (priorNulFlag === undefined) delete process.env.PAPERCLIP_TEST_SPA_NUL_ITEMID;
+        else process.env.PAPERCLIP_TEST_SPA_NUL_ITEMID = priorNulFlag;
+        await rm(root, { recursive: true, force: true });
+      }
+    },
+    20_000,
+  );
 });
 
 describe("buildNativeRunnerArguments", () => {
