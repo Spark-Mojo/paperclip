@@ -2848,7 +2848,7 @@ describeEmbeddedPostgres("issueService.list participantAgentId", () => {
   });
 });
 
-describeEmbeddedPostgres("issueService.findOpenAncestorCreatedByAgent", () => {
+describeEmbeddedPostgres("issueService.findOpenDelegationCycleAncestor", () => {
   let db!: ReturnType<typeof createDb>;
   let svc!: ReturnType<typeof issueService>;
   let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
@@ -2870,26 +2870,40 @@ describeEmbeddedPostgres("issueService.findOpenAncestorCreatedByAgent", () => {
     await tempDb?.cleanup();
   });
 
-  async function seedChain() {
+  /**
+   * `delegatorId` created `mid` AND assigned it to `holderId` — the live
+   * delegation edge the guard refuses. `thirdId` is an unrelated agent.
+   */
+  async function seedChain(opts: { assignedTo?: "holder" | "third" | "none" } = {}) {
     const companyId = randomUUID();
     const delegatorId = randomUUID();
+    const holderId = randomUUID();
+    const thirdId = randomUUID();
     await db.insert(companies).values({
       id: companyId,
       name: "Chain Co",
       issuePrefix: `C${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
       requireBoardApprovalForNewAgents: false,
     });
-    await db.insert(agents).values({
-      id: delegatorId,
-      companyId,
-      name: "Delegator",
-      role: "engineer",
-      status: "idle",
-      adapterType: "codex_local",
-      adapterConfig: {},
-      runtimeConfig: {},
-      permissions: {},
-    });
+    await db.insert(agents).values(
+      [delegatorId, holderId, thirdId].map((id, index) => ({
+        id,
+        companyId,
+        name: `Agent ${index}`,
+        role: "engineer",
+        status: "idle",
+        adapterType: "codex_local",
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+      })),
+    );
+    const assignedTo =
+      opts.assignedTo === "third"
+        ? thirdId
+        : opts.assignedTo === "none"
+          ? null
+          : holderId;
     const rootId = randomUUID();
     const midId = randomUUID();
     await db.insert(issues).values([
@@ -2910,32 +2924,64 @@ describeEmbeddedPostgres("issueService.findOpenAncestorCreatedByAgent", () => {
         priority: "medium",
         parentId: rootId,
         createdByAgentId: delegatorId,
+        assigneeAgentId: assignedTo,
         issueNumber: 2,
         identifier: "CHAIN-2",
       },
     ]);
-    return { companyId, delegatorId, rootId, midId };
+    return { companyId, delegatorId, holderId, thirdId, rootId, midId };
   }
 
-  it("finds an open ancestor created by the agent, at any depth", async () => {
-    const { delegatorId, midId } = await seedChain();
+  it("finds an open ancestor created by and assigned to the delegator's holder, at any depth", async () => {
+    const { delegatorId, holderId, midId } = await seedChain();
 
-    const direct = await svc.findOpenAncestorCreatedByAgent(midId, delegatorId);
+    const direct = await svc.findOpenDelegationCycleAncestor(midId, delegatorId, holderId);
     expect(direct?.id).toBe(midId);
+    expect(direct?.assigneeAgentId).toBe(holderId);
 
-    const other = await svc.findOpenAncestorCreatedByAgent(midId, randomUUID());
+    const other = await svc.findOpenDelegationCycleAncestor(midId, delegatorId, randomUUID());
     expect(other).toBeNull();
   });
 
-  it("ignores closed ancestors created by the agent", async () => {
+  /**
+   * SPA-11956: Dex created the open ancestor and still holds it. That is
+   * standing ownership, not a delegation to the acting agent, so it must not
+   * refuse — this predicate is what keeps a legitimate re-route parented.
+   */
+  it("does not match a creator-only ancestor the acting agent does not hold", async () => {
+    const { delegatorId, holderId, thirdId, midId } = await seedChain({ assignedTo: "third" });
+
+    expect(await svc.findOpenDelegationCycleAncestor(midId, delegatorId, holderId)).toBeNull();
+  });
+
+  it("does not match an unassigned ancestor", async () => {
+    const { delegatorId, holderId, midId } = await seedChain({ assignedTo: "none" });
+
+    expect(await svc.findOpenDelegationCycleAncestor(midId, delegatorId, holderId)).toBeNull();
+  });
+
+  it("returns null when the acting agent cannot be identified", async () => {
     const { delegatorId, midId } = await seedChain();
+
+    expect(await svc.findOpenDelegationCycleAncestor(midId, delegatorId, null)).toBeNull();
+  });
+
+  it("ignores closed ancestors created by and assigned to the delegator's holder", async () => {
+    const { delegatorId, holderId, midId } = await seedChain();
     await db.update(issues).set({ status: "done" }).where(eq(issues.id, midId));
 
-    expect(await svc.findOpenAncestorCreatedByAgent(midId, delegatorId)).toBeNull();
+    expect(await svc.findOpenDelegationCycleAncestor(midId, delegatorId, holderId)).toBeNull();
+  });
+
+  it("ignores a cancelled ancestor assignment", async () => {
+    const { delegatorId, holderId, midId } = await seedChain();
+    await db.update(issues).set({ status: "cancelled" }).where(eq(issues.id, midId));
+
+    expect(await svc.findOpenDelegationCycleAncestor(midId, delegatorId, holderId)).toBeNull();
   });
 
   it("finds the ancestor through an arbitrarily deep chain", async () => {
-    const { companyId, delegatorId, midId } = await seedChain();
+    const { companyId, delegatorId, holderId, midId } = await seedChain();
     // Extend the chain 60 levels below the delegator-created ancestor so the
     // match sits far above the new child's parent.
     let parentId = midId;
@@ -2954,18 +3000,18 @@ describeEmbeddedPostgres("issueService.findOpenAncestorCreatedByAgent", () => {
       parentId = childId;
     }
 
-    const found = await svc.findOpenAncestorCreatedByAgent(parentId, delegatorId);
+    const found = await svc.findOpenDelegationCycleAncestor(parentId, delegatorId, holderId);
     expect(found?.id).toBe(midId);
   });
 
   it("terminates on a corrupted parent-graph cycle", async () => {
-    const { delegatorId, rootId, midId } = await seedChain();
+    const { delegatorId, holderId, rootId, midId } = await seedChain();
     // Corrupt the graph: root's parent points back at mid.
     await db.update(issues).set({ parentId: midId }).where(eq(issues.id, rootId));
 
-    const found = await svc.findOpenAncestorCreatedByAgent(midId, delegatorId);
+    const found = await svc.findOpenDelegationCycleAncestor(midId, delegatorId, holderId);
     expect(found?.id).toBe(midId);
-    expect(await svc.findOpenAncestorCreatedByAgent(midId, randomUUID())).toBeNull();
+    expect(await svc.findOpenDelegationCycleAncestor(midId, delegatorId, randomUUID())).toBeNull();
   });
 });
 
