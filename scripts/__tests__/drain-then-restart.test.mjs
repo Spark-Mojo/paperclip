@@ -102,6 +102,11 @@ test("UI probe fails loudly on a UI-less response (SPA-11913)", () => {
     const out = result.stdout + result.stderr;
     assert.match(out, /probe FAILED: GET \//);
     assert.match(out, /id="root"/);
+    // Abort-safety net: the pause already landed, so the EXIT trap must
+    // restore the recorded cap even on this failure path — admissions must
+    // never stay paused after the command ends.
+    assert.match(out, /restoring the recorded cap before exiting/);
+    assert.match(out, /cap restored to value=8/);
   } finally {
     result.cleanup();
   }
