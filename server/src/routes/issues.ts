@@ -7292,27 +7292,57 @@ export function issueRoutes(
 
   /**
    * Refuse an agent creating a child issue assigned to the agent that created
-   * a still-open ancestor in the same chain. That shape is a delegation cycle
+   * AND assigned to this actor a still-open ancestor in the same chain. That
+   * pair is a live delegation edge, and the shape is a delegation cycle
    * (A delegates to B, B delegates the same work back to A): each agent lacks
    * something the other assumed it had, the chain of blocked issues grows,
-   * and no one tells the human. Humans are unaffected, and closed ancestors
-   * do not count — re-engaging the creator of finished work is normal.
+   * and no one tells the human.
+   *
+   * Creation alone does not refuse. An agent that merely owns a class of work
+   * creates cards in chains without ever delegating them, and a router
+   * decomposes work into cards it assigns to others; refusing those forces
+   * the caller to drop the parent to get past the guard, and the parent is
+   * what carries execution-workspace inheritance. Humans are unaffected, and
+   * closed ancestors do not count — re-engaging the creator of finished work
+   * is normal.
+   *
+   * Create-only by design: the assignee path on PATCH is not guarded, so an
+   * actor that does hold open work from the proposed assignee can still
+   * re-route that work by reassigning the card it holds, or file new work as
+   * a root card and assign it afterwards.
    */
   async function assertNoAgentDelegationCycle(input: {
     actorType: string;
+    actorAgentId: string | null | undefined;
     parentIssueId: string | null | undefined;
     assigneeAgentId: string | null | undefined;
   }) {
     if (input.actorType !== "agent") return;
     if (!input.parentIssueId || !input.assigneeAgentId) return;
-    const ancestor = await svc.findOpenAncestorCreatedByAgent(
+    // Both agent-actor construction sites (middleware/auth.ts:412 and :467)
+    // always carry an agentId, so an agent actor without one is an identity the
+    // chain cannot be attributed to. Refusing outright would block the create
+    // for a caller the predicate cannot reason about, and this guard is a
+    // liveness backstop rather than an authorization control — so it does not
+    // refuse, but it is never silent about skipping.
+    if (!input.actorAgentId) {
+      logger.warn(
+        {
+          parentIssueId: input.parentIssueId,
+          assigneeAgentId: input.assigneeAgentId,
+        },
+        "delegation cycle guard skipped: agent actor has no attributable agent id",
+      );
+    }
+    const ancestor = await svc.findOpenDelegationCycleAncestor(
       input.parentIssueId,
       input.assigneeAgentId,
+      input.actorAgentId ?? null,
     );
     if (!ancestor) return;
     throw conflict(
-      `Delegation cycle: ${ancestor.identifier ?? "an ancestor issue"} in this chain was created by the agent this child would be assigned to. ` +
-        "Complete the remaining work in your own issue, leave the child unassigned, or escalate to a board operator — do not delegate the work back to the agent that delegated it to you.",
+      `Delegation cycle: ${ancestor.identifier ?? "an ancestor issue"} in this chain was created by the agent this child would be assigned to, and is still assigned to you. ` +
+        "Complete the remaining work in your own issue, leave the child unassigned, reassign the issue you already hold, or escalate to a board operator — do not delegate the work back to the agent that delegated it to you.",
       {
         code: "delegation_cycle",
         ancestorIssueId: ancestor.id,
@@ -11752,13 +11782,14 @@ export function issueRoutes(
           rawCreateBody.assigneeAgentId as string | null | undefined,
           { actorType: req.actor.type },
         );
+      const actor = getActorInfo(req);
       await assertNoAgentDelegationCycle({
-        actorType: req.actor.type,
+        actorType: actor.actorType,
+        actorAgentId: actor.agentId,
         parentIssueId:
           typeof effectiveParentId === "string" ? effectiveParentId : null,
         assigneeAgentId: normalizedAssigneeAgentId ?? null,
       });
-      const actor = getActorInfo(req);
       // SPA-8707: a newly created card MUST get its own fresh execution
       // workspace and a branch named for itself. Auto-inheriting the
       // currently-active run's workspace (the PAP-10871 / PAP-10873 behavior)
@@ -12177,8 +12208,10 @@ export function issueRoutes(
           sanitizedBody.assigneeAgentId as string | null | undefined,
           { actorType: req.actor.type },
         );
+      const actor = getActorInfo(req);
       await assertNoAgentDelegationCycle({
-        actorType: req.actor.type,
+        actorType: actor.actorType,
+        actorAgentId: actor.agentId,
         parentIssueId: parent.id,
         assigneeAgentId: normalizedAssigneeAgentId ?? null,
       });
@@ -12207,7 +12240,6 @@ export function issueRoutes(
         createBody.executionWorkspaceSettings?.environmentId,
       );
 
-      const actor = getActorInfo(req);
       const serializationContext =
         await resolveWatchdogFollowUpSerializationContext(req, parent);
       const currentSerializedChild = serializationContext
