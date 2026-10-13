@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { and, eq } from "drizzle-orm";
+import { and, eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   agents,
@@ -359,4 +359,217 @@ describeEmbeddedPostgres("heartbeat lock release on cross-agent reassignment", (
       );
     });
   });
+
+  // ---------------------------------------------------------------------------
+  // SPA-11872 stranded-assignment-wake regression (at-cap strand).
+  //
+  // Probe-pinned base facts (pre-fix engine):
+  //  - heartbeat.wakeup for the new assignee at its run cap returns null and
+  //    lands the wake in agentWakeupRequests with status "skipped"
+  //    (writeSkippedRequest sink — NOT deferred_issue_execution).
+  //  - The issue's execution lock stays held after the wakeup (the stale
+  //    queued holder is NOT cancelled in this path), so the slot-free drive
+  //    clears executionRunId/executionAgentNameKey/executionLockedAt
+  //    explicitly, matching what the stale-cancel path would leave behind.
+  //  - After the busy slot frees and resumeQueuedRuns() drains, the skipped
+  //    wake is never revisited — the card strands. These tests pin the
+  //    contract that re-admission must satisfy.
+  // ---------------------------------------------------------------------------
+
+  async function seedAtCapScenario() {
+    const seed = await seedCrossAgentScenario({ holderStatus: "queued" });
+    const { companyId, reviewerAgentId } = seed;
+
+    await db
+      .update(agents)
+      .set({ runtimeConfig: { heartbeat: { wakeOnDemand: true, maxConcurrentRuns: 1 } } })
+      .where(eq(agents.id, reviewerAgentId));
+    await db.insert(heartbeatRuns).values({
+      id: randomUUID(),
+      companyId,
+      agentId: reviewerAgentId,
+      invocationSource: "automation",
+      triggerDetail: "system",
+      status: "running",
+      contextSnapshot: { wakeReason: "test_busy_slot" },
+      startedAt: new Date(),
+    });
+
+    return seed;
+  }
+
+  async function wakeupIssueAssigned(issueId: string, reviewerAgentId: string) {
+    return heartbeat.wakeup(reviewerAgentId, {
+      source: "automation",
+      triggerDetail: "system",
+      reason: "issue_assigned",
+      payload: { issueId },
+      contextSnapshot: { issueId, taskId: issueId, wakeReason: "issue_assigned" },
+      requestedByActorType: "user",
+      requestedByActorId: "local-board",
+    });
+  }
+
+  function strandedWakeCount(reviewerAgentId: string, issueId: string) {
+    return db
+      .select({ id: agentWakeupRequests.id, status: agentWakeupRequests.status, runId: agentWakeupRequests.runId })
+      .from(agentWakeupRequests)
+      .where(
+        and(
+          eq(agentWakeupRequests.agentId, reviewerAgentId),
+          sql`(${agentWakeupRequests.payload} ->> 'issueId') = ${issueId}`,
+        ),
+      )
+      .then((rows) => rows);
+  }
+
+  function reviewerRunsForIssue(reviewerAgentId: string, issueId: string) {
+    return db
+      .select({
+        id: heartbeatRuns.id,
+        status: heartbeatRuns.status,
+        snapshotIssueId: sql<string | null>`(${heartbeatRuns.contextSnapshot} ->> 'issueId')`,
+      })
+      .from(heartbeatRuns)
+      .where(
+        and(
+          eq(heartbeatRuns.agentId, reviewerAgentId),
+          sql`(${heartbeatRuns.contextSnapshot} ->> 'issueId') = ${issueId}`,
+        ),
+      )
+      .then((rows) => rows);
+  }
+
+  async function freeReviewerSlot(reviewerAgentId: string, issueId: string) {
+    await db
+      .update(heartbeatRuns)
+      .set({ status: "succeeded", finishedAt: new Date() })
+      .where(
+        and(
+          eq(heartbeatRuns.agentId, reviewerAgentId),
+          eq(heartbeatRuns.status, "running"),
+        ),
+      );
+    // The stale-cancel path of the engine would have left the issue lock
+    // clear; in this sink the lock survives the wakeup, so clear it the way
+    // the engine's stale-cancel leaves it.
+    await db
+      .update(issues)
+      .set({ executionRunId: null, executionAgentNameKey: null, executionLockedAt: null })
+      .where(eq(issues.id, issueId));
+  }
+
+  it("stranded: re-admits the parked assignment wake when the agent's slot frees", async () => {
+    const { reviewerAgentId, issueId } = await seedAtCapScenario();
+
+    const wakeupReturn = await wakeupIssueAssigned(issueId, reviewerAgentId);
+    expect(wakeupReturn).toBeNull();
+
+    const parked = await strandedWakeCount(reviewerAgentId, issueId);
+    expect(parked).toHaveLength(1);
+    const parkedWakeId = parked[0]?.id;
+    // Single-park scope (advisor guardrail): this test seeds exactly one
+    // parked wake for the issue, so run<->wake linkage below is by
+    // exclusion — the admitted run's wakeupRequestId must name the parked
+    // wake id. Concurrent multi-park per issueId would need FK-level
+    // linkage instead.
+
+    await freeReviewerSlot(reviewerAgentId, issueId);
+    await heartbeat.resumeQueuedRuns();
+
+    const admitted = await reviewerRunsForIssue(reviewerAgentId, issueId);
+    // Exactly one run, for the stranded issue itself (never the busy slot's
+    // phantom issue — the query is keyed on the snapshot issueId).
+    expect(admitted).toHaveLength(1);
+    expect(["queued", "running"]).toContain(admitted[0]?.status);
+    expect(admitted[0]?.snapshotIssueId).toBe(issueId);
+
+    // The parked wake is consumed in place, not duplicated and not left
+    // parked: same row count, and the SAME row now links to the admitted
+    // run and sits off every live status. A fix that admits a fresh run
+    // while leaving the wake parked (or duplicating it) fails here.
+    const wakesAfter = await strandedWakeCount(reviewerAgentId, issueId);
+    expect(wakesAfter).toHaveLength(parked.length);
+    const consumed = wakesAfter.find((wake) => wake.id === parkedWakeId);
+    expect(consumed).toBeDefined();
+    expect(consumed?.runId).toBe(admitted[0]?.id);
+    const liveParkedStatuses = ["queued", "claimed", "deferred_issue_execution", "skipped", "running"];
+    expect(liveParkedStatuses).not.toContain(consumed?.status);
+  }, 60_000);
+
+  it("stranded: leaves the parked wake alone while the agent has no free slot", async () => {
+    const { reviewerAgentId, issueId } = await seedAtCapScenario();
+
+    const wakeupReturn = await wakeupIssueAssigned(issueId, reviewerAgentId);
+    expect(wakeupReturn).toBeNull();
+
+    const parked = await strandedWakeCount(reviewerAgentId, issueId);
+    expect(parked).toHaveLength(1);
+
+    await heartbeat.resumeQueuedRuns();
+
+    const runsForIssue = await reviewerRunsForIssue(reviewerAgentId, issueId);
+    expect(runsForIssue).toHaveLength(0);
+
+    // Whatever sink holds the wake is unchanged — still parked, not
+    // promoted, not dropped.
+    const wakesAfter = await strandedWakeCount(reviewerAgentId, issueId);
+    expect(wakesAfter).toHaveLength(1);
+    expect(wakesAfter[0]?.status).toBe(parked[0]?.status);
+  }, 60_000);
+
+  it("stranded: retires the parked wake when the target issue is terminal", async () => {
+    const { reviewerAgentId, issueId } = await seedAtCapScenario();
+
+    const wakeupReturn = await wakeupIssueAssigned(issueId, reviewerAgentId);
+    expect(wakeupReturn).toBeNull();
+
+    const parked = await strandedWakeCount(reviewerAgentId, issueId);
+    expect(parked).toHaveLength(1);
+
+    await db.update(issues).set({ status: "done" }).where(eq(issues.id, issueId));
+
+    await freeReviewerSlot(reviewerAgentId, issueId);
+    await heartbeat.resumeQueuedRuns();
+
+    const runsForIssue = await reviewerRunsForIssue(reviewerAgentId, issueId);
+    expect(runsForIssue).toHaveLength(0);
+
+    // The wake must be retired in place to the exact terminal status —
+    // not deleted, not duplicated, not left on any live status. The
+    // retirement mirrors cancelDeferredWake ("cancelled"); a fix that
+    // retires to any other status, deletes the row, or leaves it parked
+    // fails here.
+    const wakesAfter = await strandedWakeCount(reviewerAgentId, issueId);
+    expect(wakesAfter).toHaveLength(parked.length);
+    expect(wakesAfter[0]?.status).toBe("cancelled");
+  }, 60_000);
+
+  it("stranded: draining twice admits exactly one run", async () => {
+    const { reviewerAgentId, issueId } = await seedAtCapScenario();
+
+    const wakeupReturn = await wakeupIssueAssigned(issueId, reviewerAgentId);
+    expect(wakeupReturn).toBeNull();
+
+    const parked = await strandedWakeCount(reviewerAgentId, issueId);
+    expect(parked).toHaveLength(1);
+    const parkedWakeId = parked[0]?.id;
+
+    await freeReviewerSlot(reviewerAgentId, issueId);
+    await heartbeat.resumeQueuedRuns();
+    await heartbeat.resumeQueuedRuns();
+
+    const admitted = await reviewerRunsForIssue(reviewerAgentId, issueId);
+    expect(admitted).toHaveLength(1);
+    expect(["queued", "running"]).toContain(admitted[0]?.status);
+    expect(admitted[0]?.snapshotIssueId).toBe(issueId);
+
+    const wakesAfter = await strandedWakeCount(reviewerAgentId, issueId);
+    expect(wakesAfter).toHaveLength(parked.length);
+    const consumed = wakesAfter.find((wake) => wake.id === parkedWakeId);
+    expect(consumed).toBeDefined();
+    expect(consumed?.runId).toBe(admitted[0]?.id);
+    const liveParkedStatuses = ["queued", "claimed", "deferred_issue_execution", "skipped", "running"];
+    expect(liveParkedStatuses).not.toContain(consumed?.status);
+  }, 60_000);
 });
