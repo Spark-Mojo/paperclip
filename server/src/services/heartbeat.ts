@@ -20440,6 +20440,17 @@ export function heartbeatService(
     });
   }
 
+  /**
+   * SPA-12218: re-wake issues left `in_progress` with no live execution path
+   * because the startup backstop terminalized their run as
+   * `orphaned_running_run`. Startup-only, so unlike the stranded sweep it takes
+   * no worktree cutoff: every orphan the backstop just wrote is in scope,
+   * including cards older than the cutoff.
+   */
+  async function reconcileOrphanedRunIssues() {
+    return recovery.reconcileOrphanedRunIssues();
+  }
+
   function idleTodoPullIdempotencyKey(issueId: string, updatedAt: Date) {
     return `${IDLE_TODO_PULL_IDEMPOTENCY_PREFIX}${issueId}:${updatedAt.toISOString()}`;
   }
@@ -31244,6 +31255,7 @@ export function heartbeatService(
     },
 
     reconcileStrandedAssignedIssues,
+    reconcileOrphanedRunIssues,
     pullIdleAgentTodoIssues,
     autoUnblockReadyDependents,
     sweepSettledAwaitingYouIssues,

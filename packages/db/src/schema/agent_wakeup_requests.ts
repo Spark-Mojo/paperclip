@@ -63,6 +63,21 @@ export const agentWakeupRequests = pgTable(
       .where(
         sql`${table.idempotencyKey} LIKE 'issue_review_path_lost:%' AND ${table.status} <> 'skipped'`,
       ),
+    // SPA-12218: the startup orphan re-wake claims "at most one wake per
+    // orphaned run, ever". The sweep's own read-then-write check is not atomic,
+    // so two boots (or a boot racing a live restart) can both observe no receipt
+    // and both emit a wake. This partial unique index makes the claim a database
+    // invariant instead of a hopeful read: the second INSERT collides and the
+    // sweep degrades to a skip. Same shape as the recovery-prefix indexes above.
+    // `status <> 'skipped'` keeps the retry semantics intact — a wake that was
+    // recorded but skipped never became a wake, so a later boot may still try.
+    orphanedRunRewakeIdempotencyUq: uniqueIndex(
+      "agent_wakeup_requests_orphaned_run_rewake_idempotency_uq",
+    )
+      .on(table.companyId, table.idempotencyKey)
+      .where(
+        sql`${table.idempotencyKey} LIKE 'issue_orphaned_run_rewake:%' AND ${table.status} <> 'skipped'`,
+      ),
     dispositionRepairIdempotencyUq: uniqueIndex(
       "agent_wakeup_requests_disposition_repair_idempotency_uq",
     )
