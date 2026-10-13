@@ -6562,8 +6562,74 @@ export function recoveryService(
           ),
           isNull(issues.hiddenAt),
           not(unadmittedChatWakeupCondition(issues.id, issues.companyId)),
+          // SPA-12218: restrict the candidate set to TRUE orphans in SQL, BEFORE
+          // the per-boot cap below is applied.
+          //
+          // This ordering is load-bearing, and getting it wrong is a starvation
+          // bug, not a cosmetic one. If the cap were applied to the UNFILTERED
+          // active-issue set, then once a live board held more than CAP active
+          // issues (overwhelmingly already-handled), every subsequent boot would
+          // deterministically select the SAME first CAP rows, skip each as
+          // already re-woken, and never reach a genuine orphan past the cut —
+          // permanently, on every boot. The cap must bound the work we DO, so
+          // the work has to be identified first.
+          //
+          // "Latest run" is decided with the same binding the terminalizer uses
+          // (`issueIdFromRunContext`): `issueId`, or `taskId`, and a context
+          // where the two disagree is NOT bound to this issue at all. The
+          // NOT EXISTS arm rejects a newer run that is not an orphan, so an
+          // issue whose latest run merely CONTAINS an old orphaned run is not
+          // a candidate.
+          sql`EXISTS (
+            SELECT 1 FROM "heartbeat_runs" orphan_run
+            WHERE orphan_run."company_id" = ${issues.companyId}
+              AND (
+                orphan_run."context_snapshot" ->> 'issueId' = ${issues.id}::text
+                OR orphan_run."context_snapshot" ->> 'taskId' = ${issues.id}::text
+              )
+              AND NOT (
+                orphan_run."context_snapshot" ->> 'issueId' IS NOT NULL
+                AND orphan_run."context_snapshot" ->> 'taskId' IS NOT NULL
+                AND orphan_run."context_snapshot" ->> 'issueId' <> orphan_run."context_snapshot" ->> 'taskId'
+              )
+              AND orphan_run."error_code" = ${ORPHANED_RUNNING_RUN_ERROR_CODE}
+              -- Already re-woken? Then this orphan is finished business and must
+              -- not re-enter the candidate set. Without this arm the cap would
+              -- re-select the same already-handled prefix on every boot and the
+              -- deferred tail would starve forever: the sweep would skip each of
+              -- the first CAP rows as already-done and never reach the orphans
+              -- past the cut. Excluding them here makes the cap drain by
+              -- construction -- each boot's candidate set is exactly the orphans
+              -- that still need a wake.
+              AND NOT EXISTS (
+                SELECT 1 FROM "agent_wakeup_requests" orphan_receipt
+                WHERE orphan_receipt."company_id" = orphan_run."company_id"
+                  AND orphan_receipt."idempotency_key" =
+                    ${ORPHANED_RUN_REWAKE_IDEMPOTENCY_PREFIX} || orphan_run."id"
+                  AND orphan_receipt."status" <> 'skipped'
+              )
+              AND NOT EXISTS (
+                SELECT 1 FROM "heartbeat_runs" newer_run
+                WHERE newer_run."company_id" = ${issues.companyId}
+                  AND (
+                    newer_run."context_snapshot" ->> 'issueId' = ${issues.id}::text
+                    OR newer_run."context_snapshot" ->> 'taskId' = ${issues.id}::text
+                  )
+                  AND (
+                    newer_run."created_at" > orphan_run."created_at"
+                    OR (
+                      newer_run."created_at" = orphan_run."created_at"
+                      AND newer_run."id" > orphan_run."id"
+                    )
+                  )
+              )
+          )`,
         ),
-      );
+      )
+      // Oldest first, so when the cap truncates, what gets dropped is the newest
+      // work — the cards most likely to still be under active attention — and
+      // the next boot drains them in the order they were deferred.
+      .orderBy(asc(issues.createdAt));
 
     const result = {
       scanned: candidates.length,
@@ -6580,6 +6646,10 @@ export function recoveryService(
     // a total: the leftover candidates stay untouched, and the next boot (or the
     // periodic caller) picks up where this one stopped, because the dedupe below
     // is durable and already-committed wakes are never repeated.
+    //
+    // `candidates` is already narrowed to true orphans and ordered oldest-first
+    // (see the query above), so the slice can only ever drop genuine work that is
+    // genuinely newer, and the next boot reaches it.
     const candidatesWithinCap = candidates.slice(0, ORPHANED_RUN_REWAKE_MAX_PER_SWEEP);
     result.deferredForNextBoot = candidates.length - candidatesWithinCap.length;
 
@@ -6614,13 +6684,15 @@ export function recoveryService(
         continue;
       }
 
-      // Match the terminalization backstop's OWN notion of run->issue binding.
-      // `getLatestIssueRun` matches on `contextSnapshot->>'issueId'` alone, but
-      // the backstop associates a run via `issueIdFromRunContext`, which also
-      // accepts `taskId` (and rejects a context where the two disagree). An
-      // orphan terminalized from a taskId-only context would therefore be
-      // invisible to this query and its card would never be re-woken — the
-      // precise failure this card exists to fix. Mirror the same predicate.
+      // Match the terminalization backstop's OWN notion of run->issue binding,
+      // in full. `getLatestIssueRun` matches on `contextSnapshot->>'issueId'`
+      // alone, but the backstop associates a run via `issueIdFromRunContext`,
+      // which (a) also accepts `taskId`, and (b) REJECTS a context where issueId
+      // and taskId are both present and disagree, returning null so the run is
+      // not bound to this issue at all. This query mirrors both arms. Matching
+      // only `issueId` would miss every taskId-only orphan — the precise failure
+      // this card exists to fix — and OR-ing without the disagreement guard
+      // would let a context naming two different issues wake the wrong card.
       const latestRun = await db
         .select({
           id: heartbeatRuns.id,
@@ -6638,6 +6710,12 @@ export function recoveryService(
               sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${issue.id}`,
               sql`${heartbeatRuns.contextSnapshot} ->> 'taskId' = ${issue.id}`,
             ),
+            // Parity with `issueIdFromRunContext`'s disagreement rejection.
+            sql`NOT (
+              ${heartbeatRuns.contextSnapshot} ->> 'issueId' IS NOT NULL
+              AND ${heartbeatRuns.contextSnapshot} ->> 'taskId' IS NOT NULL
+              AND ${heartbeatRuns.contextSnapshot} ->> 'issueId' <> ${heartbeatRuns.contextSnapshot} ->> 'taskId'
+            )`,
           ),
         )
         .orderBy(desc(heartbeatRuns.createdAt), desc(heartbeatRuns.id))

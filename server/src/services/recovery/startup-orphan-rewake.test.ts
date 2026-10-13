@@ -151,11 +151,15 @@ describeEmbeddedPostgres("recovery reconcileOrphanedRunIssues (SPA-12218 startup
     status: string;
     errorCode?: string | null;
     createdAt: Date;
-    /** SPA-12218: bind the run by `taskId` instead of `issueId`. */
-    contextIssueKey?: "issueId" | "taskId";
+    /** SPA-12218: bind the run by `issueId`, by `taskId`, or with a disagreeing pair. */
+    contextIssueKey?: "issueId" | "taskId" | "disagreeing";
   }) {
     const runId = randomUUID();
     const contextKey = input.contextIssueKey ?? "issueId";
+    const contextSnapshot =
+      contextKey === "disagreeing"
+        ? { issueId: input.issueId, taskId: randomUUID() }
+        : { [contextKey]: input.issueId };
     await db.insert(heartbeatRuns).values({
       id: runId,
       companyId: input.companyId,
@@ -163,7 +167,7 @@ describeEmbeddedPostgres("recovery reconcileOrphanedRunIssues (SPA-12218 startup
       status: input.status,
       errorCode: input.errorCode ?? null,
       invocationSource: "manual",
-      contextSnapshot: { [contextKey]: input.issueId },
+      contextSnapshot,
       createdAt: input.createdAt,
       startedAt: input.createdAt,
       finishedAt: input.status === "running" || input.status === "queued" ? null : input.createdAt,
@@ -727,11 +731,15 @@ describeEmbeddedPostgres("recovery reconcileOrphanedRunIssues (SPA-12218 startup
     const { service } = recoveryServiceForTest();
     const result = await service.reconcileOrphanedRunIssues();
 
-    // scanned counts the candidates considered; rewoken only the orphan.
-    expect(result.scanned).toBe(3);
+    // `scanned` counts TRUE orphans — the candidate query filters to issues whose
+    // latest run ended `orphaned_running_run`. The healthy card is not a
+    // candidate at all and never consumes the per-boot cap; the paused card IS a
+    // true orphan but is excluded later by the pause gate, so it is scanned and
+    // then skipped.
+    expect(result.scanned).toBe(2);
     expect(result.rewoken).toBe(1);
     expect(result.issueIds).toEqual([orphanedIssueId]);
-    expect(result.skipped).toBe(2);
+    expect(result.skipped).toBe(1);
   });
 
   it("re-wakes an orphan whose issue is unassigned to an agent only when an agent exists", async () => {
@@ -934,6 +942,7 @@ describeEmbeddedPostgres("recovery reconcileOrphanedRunIssues (SPA-12218 startup
   it("bounds one boot's re-wakes and reports the remainder for the next", async () => {
     // Seed more orphans than a single boot should ever wake at once.
     const { companyId, agentId } = await seedCompany();
+    const seeded: string[] = [];
     for (let i = 0; i < 120; i += 1) {
       const issueId = await seedIssue({
         companyId,
@@ -941,6 +950,7 @@ describeEmbeddedPostgres("recovery reconcileOrphanedRunIssues (SPA-12218 startup
         status: "in_progress",
         title: `Backlog orphan ${i}`,
       });
+      seeded.push(issueId);
       await seedRun({
         companyId,
         agentId,
@@ -952,11 +962,92 @@ describeEmbeddedPostgres("recovery reconcileOrphanedRunIssues (SPA-12218 startup
     }
 
     const { service, enqueueWakeup } = recoveryServiceForTest();
-    const result = await service.reconcileOrphanedRunIssues();
+    const first = await service.reconcileOrphanedRunIssues();
 
     // The cap holds the blast radius; the rest is deferred, never dropped.
     expect(enqueueWakeup.mock.calls.length).toBeLessThanOrEqual(100);
-    expect(result.rewoken).toBeLessThanOrEqual(100);
-    expect(result.rewoken + result.deferredForNextBoot).toBe(120);
+    expect(first.rewoken).toBeLessThanOrEqual(100);
+    expect(first.rewoken + first.deferredForNextBoot).toBe(120);
+    const afterFirstBoot = enqueueWakeup.mock.calls.length;
+
+    // The deferred remainder must actually DRAIN on a later boot. A cap that
+    // starves — re-selecting the same already-handled prefix every boot and
+    // never reaching the true orphans — would pass every assertion above and
+    // still leave cards idle forever. This is the assertion that closes it.
+    const second = await service.reconcileOrphanedRunIssues();
+    expect(second.rewoken).toBeGreaterThan(0);
+    expect(enqueueWakeup.mock.calls.length).toBeGreaterThan(afterFirstBoot);
+
+    // And a third boot finishes the backlog without ever re-waking a card twice.
+    await service.reconcileOrphanedRunIssues();
+    const wokenIssues = new Set(
+      enqueueWakeup.mock.calls.map((call) => {
+        const options = call[1] as { payload?: Record<string, unknown> | null };
+        return String((options.payload as { issueId?: string })?.issueId ?? "");
+      }),
+    );
+    expect(wokenIssues.size).toBe(seeded.length);
+  });
+
+  it("does NOT re-wake an issue whose run context names a DIFFERENT issue as its taskId", async () => {
+    // Parity with `issueIdFromRunContext`: a context carrying BOTH keys with
+    // different values is not bound to either issue. An OR-only match would let
+    // such a run wake the wrong card.
+    const { companyId, agentId } = await seedCompany();
+    const issueId = await seedIssue({
+      companyId,
+      agentId,
+      status: "in_progress",
+      title: "Run context disagrees — not bound to this issue",
+    });
+    await seedRun({
+      companyId,
+      agentId,
+      issueId,
+      status: "interrupted",
+      errorCode: ORPHANED_RUN_ERROR_CODE,
+      createdAt: new Date("2026-10-13T14:46:35.000Z"),
+      contextIssueKey: "disagreeing",
+    });
+
+    const { service, enqueueWakeup } = recoveryServiceForTest();
+    const result = await service.reconcileOrphanedRunIssues();
+
+    expect(result.rewoken).toBe(0);
+    expect(enqueueWakeup).not.toHaveBeenCalled();
+  });
+
+  it("does not treat an issue as an orphan when a NEWER non-orphan run exists", async () => {
+    // The latest run is authoritative. An old orphaned run sitting underneath a
+    // newer successful run is history, not a lost execution path.
+    const { companyId, agentId } = await seedCompany();
+    const issueId = await seedIssue({
+      companyId,
+      agentId,
+      status: "in_progress",
+      title: "Old orphan superseded by a newer successful run",
+    });
+    await seedRun({
+      companyId,
+      agentId,
+      issueId,
+      status: "interrupted",
+      errorCode: ORPHANED_RUN_ERROR_CODE,
+      createdAt: new Date("2026-10-13T14:46:35.000Z"),
+    });
+    await seedRun({
+      companyId,
+      agentId,
+      issueId,
+      status: "succeeded",
+      errorCode: null,
+      createdAt: new Date("2026-10-13T15:00:00.000Z"),
+    });
+
+    const { service, enqueueWakeup } = recoveryServiceForTest();
+    const result = await service.reconcileOrphanedRunIssues();
+
+    expect(result.rewoken).toBe(0);
+    expect(enqueueWakeup).not.toHaveBeenCalled();
   });
 });
