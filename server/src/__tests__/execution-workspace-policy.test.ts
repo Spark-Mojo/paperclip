@@ -10,6 +10,7 @@ import {
   gateProjectExecutionWorkspacePolicy,
   hasReusableExecutionWorkspaceBinding,
   isUnrunnableWorktreeCombo,
+  isRepoRequiredButAgentHomeCwd,
   issueExecutionWorkspaceModeForPersistedWorkspace,
   parseIssueExecutionWorkspaceSettings,
   parseProjectExecutionWorkspacePolicy,
@@ -693,6 +694,89 @@ describe("operator default isolated execution workspaces", () => {
         },
         resolvedMode: mode,
         resolvedStrategy: resolveEffectiveWorkspaceStrategyType(mode, config),
+      }),
+    ).toBe(false);
+  });
+});
+
+describe("isRepoRequiredButAgentHomeCwd", () => {
+  const base = {
+    requestedExecutionWorkspaceMode: "agent_default" as const,
+    resolvedWorkspaceRepoUrl: null as string | null,
+    persistedExecutionWorkspaceRepoUrl: null as string | null,
+    effectiveCwd: "/home/agent/workspaces/agent-1",
+    cwdIsAgentFallback: true,
+    cwdHasGitMetadata: false as boolean | null,
+  };
+
+  it("rejects a repo-bound agent_default card resolved to the agent fallback cwd", () => {
+    expect(
+      isRepoRequiredButAgentHomeCwd({
+        ...base,
+        resolvedWorkspaceRepoUrl: "https://github.com/example/repo.git",
+      }),
+    ).toBe(true);
+  });
+
+  it("rejects on the persisted workspace repo binding alone", () => {
+    expect(
+      isRepoRequiredButAgentHomeCwd({
+        ...base,
+        resolvedWorkspaceRepoUrl: null,
+        persistedExecutionWorkspaceRepoUrl: "https://github.com/example/persisted-only.git",
+      }),
+    ).toBe(true);
+  });
+
+  it("rejects a repo-bound card that landed in a non-git cwd that is not the fallback dir", () => {
+    expect(
+      isRepoRequiredButAgentHomeCwd({
+        ...base,
+        resolvedWorkspaceRepoUrl: "https://github.com/example/repo.git",
+        effectiveCwd: "/srv/scratch/not-a-repo",
+        cwdIsAgentFallback: false,
+        cwdHasGitMetadata: false,
+      }),
+    ).toBe(true);
+  });
+
+  it("leaves a non-code agent_default card (no repo binding on any surface) alone", () => {
+    expect(isRepoRequiredButAgentHomeCwd({ ...base })).toBe(false);
+  });
+
+  it("ignores the fallback cwd and git metadata when the mode is not agent_default", () => {
+    expect(
+      isRepoRequiredButAgentHomeCwd({
+        ...base,
+        requestedExecutionWorkspaceMode: "isolated_workspace",
+        resolvedWorkspaceRepoUrl: "https://github.com/example/repo.git",
+      }),
+    ).toBe(false);
+    expect(
+      isRepoRequiredButAgentHomeCwd({
+        ...base,
+        requestedExecutionWorkspaceMode: "shared_workspace",
+        resolvedWorkspaceRepoUrl: "https://github.com/example/repo.git",
+      }),
+    ).toBe(false);
+  });
+
+  it("treats an empty or whitespace repo binding as no binding", () => {
+    expect(
+      isRepoRequiredButAgentHomeCwd({
+        ...base,
+        resolvedWorkspaceRepoUrl: "   ",
+      }),
+    ).toBe(false);
+  });
+
+  it("does not fire on a repo-bound card whose cwd genuinely has git metadata", () => {
+    expect(
+      isRepoRequiredButAgentHomeCwd({
+        ...base,
+        resolvedWorkspaceRepoUrl: "https://github.com/example/repo.git",
+        cwdIsAgentFallback: false,
+        cwdHasGitMetadata: true,
       }),
     ).toBe(false);
   });
