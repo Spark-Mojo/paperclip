@@ -8530,24 +8530,37 @@ export function issueService(db: Db) {
 
     /**
      * Walk the full parent chain from `parentIssueId` (inclusive) looking for
-     * a still-open ancestor created by `agentId`. Used to refuse agent
-     * delegation cycles: an agent assigning a new child to the agent that
-     * created an open ancestor is handing the same work back to its own
-     * delegator (A→B→A hot-potato). One recursive query covers the entire
-     * chain regardless of depth; `UNION` (not `UNION ALL`) deduplicates
-     * revisited rows, so a parent graph corrupted into a loop terminates
-     * instead of recursing forever.
+     * a still-open ancestor that `agentId` created AND assigned to
+     * `actorAgentId`. That pair is a live delegation edge: `agentId`
+     * delegated work to the actor, and the actor is now filing new work
+     * assigned back to `agentId` while still holding it — the hot-potato
+     * shape that grows an unowned blocked chain and tells no human.
+     *
+     * Both conjuncts are load-bearing. A bare creation edge also matches an
+     * agent that merely owns a class of work and files cards in chains
+     * (standing ownership, e.g. the git-ops owner), and intake
+     * decompositions filed by the actor's router — neither is a ping-pong,
+     * and refusing them forces the caller to abandon the parent chain, which
+     * is what carries workspace inheritance.
+     *
+     * One recursive query covers the entire chain regardless of depth;
+     * `UNION` (not `UNION ALL`) deduplicates revisited rows, so a parent
+     * graph corrupted into a loop terminates instead of recursing forever.
+     * An unidentified actor cannot hold an assignment, so it never matches.
      */
-    findOpenAncestorCreatedByAgent: async (
+    findOpenDelegationCycleAncestor: async (
       parentIssueId: string,
       agentId: string,
+      actorAgentId: string | null,
     ): Promise<{
       id: string;
       identifier: string | null;
       parentId: string | null;
       createdByAgentId: string | null;
+      assigneeAgentId: string | null;
       status: string;
     } | null> => {
+      if (!actorAgentId) return null;
       const rows = await db.execute(sql`
         WITH RECURSIVE ancestors(id, parent_id) AS (
           SELECT id, parent_id FROM issues WHERE id = ${parentIssueId}
@@ -8556,10 +8569,11 @@ export function issueService(db: Db) {
           FROM issues parent
           JOIN ancestors ON parent.id = ancestors.parent_id
         )
-        SELECT i.id, i.identifier, i.parent_id, i.created_by_agent_id, i.status
+        SELECT i.id, i.identifier, i.parent_id, i.created_by_agent_id, i.assignee_agent_id, i.status
         FROM issues i
         JOIN ancestors a ON a.id = i.id
         WHERE i.created_by_agent_id = ${agentId}
+          AND i.assignee_agent_id = ${actorAgentId}
           AND i.status NOT IN ('done', 'cancelled')
         LIMIT 1
       `);
@@ -8576,6 +8590,10 @@ export function issueService(db: Db) {
         createdByAgentId:
           typeof first.created_by_agent_id === "string"
             ? first.created_by_agent_id
+            : null,
+        assigneeAgentId:
+          typeof first.assignee_agent_id === "string"
+            ? first.assignee_agent_id
             : null,
         status: String(first.status),
       };
