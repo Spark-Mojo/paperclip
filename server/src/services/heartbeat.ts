@@ -31091,6 +31091,11 @@ export function heartbeatService(
 
     resumeQueuedRuns,
 
+    // SPA-11872: the per-agent slot-free admission entry (what run completion
+    // and the wake paths call). Exposed so the stranded-wake regression can
+    // drive the exact production admission seam.
+    startNextQueuedRunForAgent,
+
     // SPA-10137: live fleet-cap read + the matching cache invalidation. The
     // instance-settings route calls these so a cap write takes effect
     // immediately instead of waiting out the cache TTL.
