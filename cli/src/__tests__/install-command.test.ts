@@ -323,6 +323,52 @@ describe("managed install commands", () => {
       .rejects.toThrow("unsupported workspace dependency");
   });
 
+  it("includes child-process stdout in command failures (SPA-11990)", async () => {
+    // tsc and pnpm -r report build failures on stdout with empty stderr; the
+    // wrapper must surface the captured stdout so the installer's caller sees
+    // the real error instead of a bare argv echo. The diagnostic is read from
+    // a FILE by the child so it can never appear in execFile's argv echo: a
+    // green here proves the captured OUTPUT reached the caller.
+    const markerDir = fs.mkdtempSync(path.join(os.tmpdir(), "spa11990-stdout-"));
+    try {
+      const markerFile = path.join(markerDir, "build-error.txt");
+      const marker = "SPA11990-STDOUT-DEADBEEF";
+      fs.writeFileSync(markerFile, `${marker}: error TS2554: Expected 0 arguments, but got 1.\n`);
+      const child = `const fs=require("fs");process.stdout.write(fs.readFileSync(${JSON.stringify(markerFile)},"utf8"));process.exit(2);`;
+      await expect(runCommandWithDiagnostics(process.execPath, ["-e", child])).rejects.toThrow(marker);
+    } finally {
+      fs.rmSync(markerDir, { recursive: true, force: true });
+    }
+  });
+
+  it("includes child-process stdout when the child also writes stderr (SPA-11990)", async () => {
+    // The common pnpm -r failure shape: tsc diagnostics on stdout plus
+    // ELIFECYCLE progress on stderr. Both must reach the caller.
+    const markerDir = fs.mkdtempSync(path.join(os.tmpdir(), "spa11990-both-"));
+    try {
+      const markerFile = path.join(markerDir, "build-error.txt");
+      const marker = "SPA11990-BOTH-CAFEF00D";
+      fs.writeFileSync(markerFile, `${marker}: error TS2554: Expected 0 arguments, but got 1.\n`);
+      const child = `const fs=require("fs");process.stdout.write(fs.readFileSync(${JSON.stringify(markerFile)},"utf8"));process.stderr.write("ELIFECYCLE Command failed\\n");process.exit(1);`;
+      const failure = await runCommandWithDiagnostics(process.execPath, ["-e", child]).then(
+        () => null,
+        (error: unknown) => (error instanceof Error ? error.message : String(error)),
+      );
+      expect(failure).toContain(marker);
+      expect(failure).toContain("ELIFECYCLE");
+    } finally {
+      fs.rmSync(markerDir, { recursive: true, force: true });
+    }
+  });
+
+  it("truncates huge captured stdout in command failures (SPA-11990)", async () => {
+    const big = await runCommandWithDiagnostics(process.execPath, ["-e", "for(let i=0;i<2000;i++) process.stdout.write('noise line '+i+'\\n'); process.stdout.write('REAL-TAIL-ERROR\\n'); process.exit(1)"]).catch((error: unknown) => error);
+    const message = big instanceof Error ? big.message : String(big);
+    expect(message).toContain("REAL-TAIL-ERROR");
+    expect(message).toContain("truncated");
+    expect(message.length).toBeLessThan(32 * 1024);
+  });
+
   it("installs through the shim, reports provenance, and uninstalls without deleting user data", async () => {
     const version = "2026.720.0";
     const runCommand = vi.fn(async (file: string, args: string[], _options?: unknown) => {

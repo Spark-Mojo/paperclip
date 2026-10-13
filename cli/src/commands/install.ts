@@ -37,6 +37,24 @@ export type CommandRunner = (
 
 type ReleasePackageEntry = { dir: string; name: string };
 
+export const DIAGNOSTIC_OUTPUT_LIMIT = 16 * 1024;
+
+export function truncateDiagnosticOutput(output: string, limit = DIAGNOSTIC_OUTPUT_LIMIT): string {
+  if (output.length <= limit) return output;
+  // SPA-11990: for build output the failure is at the END, so keep mostly
+  // tail. Cut on newline boundaries so no fragment line reads as a real
+  // diagnostic; prefix the tail fragment with its own ellipsis marker.
+  const tailBudget = Math.floor((limit * 3) / 4);
+  const headBudget = limit - tailBudget;
+  const head = output.slice(0, headBudget);
+  const headCut = head.lastIndexOf("\n");
+  const headPart = headCut > 0 ? head.slice(0, headCut) : head;
+  const tailRaw = output.slice(output.length - tailBudget);
+  const tailCut = tailRaw.indexOf("\n");
+  const tailPart = tailCut >= 0 ? tailRaw.slice(tailCut + 1) : tailRaw;
+  return `${headPart}\n... [truncated ${output.length - headPart.length - tailPart.length} chars] ...\n... ${tailPart}`;
+}
+
 export async function runCommandWithDiagnostics(
   file: string,
   args: string[],
@@ -45,11 +63,23 @@ export async function runCommandWithDiagnostics(
   try {
     return await execFileAsync(file, args, { ...options, encoding: "utf8" });
   } catch (error) {
-    const stderr = error && typeof error === "object" && "stderr" in error && typeof error.stderr === "string"
+    const base = error instanceof Error ? error.message : String(error);
+    const rawStdout = error && typeof error === "object" && "stdout" in error && typeof error.stdout === "string"
+      ? error.stdout.trim()
+      : "";
+    const rawStderr = error && typeof error === "object" && "stderr" in error && typeof error.stderr === "string"
       ? error.stderr.trim()
       : "";
-    if (!stderr || (error instanceof Error && error.message.includes(stderr))) throw error;
-    throw new Error(`${error instanceof Error ? error.message : String(error)}\n${stderr}`, { cause: error });
+    // SPA-11990: build tools (tsc, pnpm -r) report failures on stdout while
+    // stderr may carry unrelated progress noise, so a stderr-only diagnostic
+    // silently drops the real error. Surface the captured stdout as well.
+    // Each stream is appended only when it is not already in the message, so
+    // the two appends are independent: a child writing to BOTH streams keeps
+    // both diagnostics (the common pnpm -r shape).
+    const stdout = rawStdout && !base.includes(rawStdout) ? truncateDiagnosticOutput(rawStdout) : "";
+    const stderr = rawStderr && !base.includes(rawStderr) ? truncateDiagnosticOutput(rawStderr) : "";
+    if (!stdout && !stderr) throw error;
+    throw new Error(`${base}${stdout ? `\n${stdout}` : ""}${stderr ? `\n${stderr}` : ""}`, { cause: error });
   }
 }
 
