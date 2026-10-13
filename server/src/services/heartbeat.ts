@@ -3578,11 +3578,14 @@ export async function assertGitSensitiveAdapterWorkspaceValid(input: {
   // (SPA-8036 / SPA-8019 Option A), so this predicate stays false and the
   // deliberate bypass is unchanged (pinned by the tests directly below and the
   // SPA-9139 cases above).
+  // The repo binding itself is the discriminator, and the predicate owns the
+  // whole decision: the outer condition here is only a cheap pre-filter (mode
+  // + a cwd to inspect), never a second repo test — otherwise a persisted row
+  // carrying a repoUrl but no persisted cwd would be silently skipped while
+  // the predicate claims to cover it.
   if (
     input.requestedExecutionWorkspaceMode === "agent_default" &&
-    effectiveCwd &&
-    (readNonEmptyString(input.resolvedWorkspace.repoUrl) ||
-      readNonEmptyString(persistedCwd ? input.persistedExecutionWorkspace?.repoUrl : null))
+    effectiveCwd
   ) {
     const cwdIsAgentFallback = sameResolvedPath(effectiveCwd, agentFallbackCwd);
     const cwdHasGitMetadata = cwdIsAgentFallback ? false : await hasGitMetadata(effectiveCwd);
