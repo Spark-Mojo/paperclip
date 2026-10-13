@@ -471,6 +471,7 @@ import {
   gateProjectExecutionWorkspacePolicy,
   issueExecutionWorkspaceModeForPersistedWorkspace,
   isUnrunnableWorktreeCombo,
+  isRepoRequiredButAgentHomeCwd,
   parseIssueExecutionWorkspaceSettings,
   parseProjectExecutionWorkspacePolicy,
   resolveEffectiveWorkspaceStrategyType,
@@ -3562,6 +3563,49 @@ export async function assertGitSensitiveAdapterWorkspaceValid(input: {
       "missing_git_metadata",
       `Issue ${issue.identifier ?? issue.id} expected a git workspace for ${input.adapterType}, but "${effectiveCwd}" has no .git metadata.`,
     );
+  }
+
+  // SPA-11739: a repo-bound `agent_default` card is the miscategorised-code-card
+  // shape, and none of the guards above can see it — `workspaceExpectation` is
+  // computed from project/strategy binding only (so it is false on the exact
+  // project-less shape this card reports), and `agentDefaultBypassRequested` is
+  // true for ANY explicit `agent_default` request, deliberate or miscategorised.
+  // Distinguish the two by the repo binding itself, which neither the project
+  // binding nor the bypass can fake away: a run whose issue or persisted
+  // workspace carries a repo URL cannot usefully run from a non-git cwd, so it
+  // must fail with a named remediation instead of launching in silence. A
+  // genuinely non-code `agent_default` card carries no repo URL on any surface
+  // (SPA-8036 / SPA-8019 Option A), so this predicate stays false and the
+  // deliberate bypass is unchanged (pinned by the tests directly below and the
+  // SPA-9139 cases above).
+  if (
+    input.requestedExecutionWorkspaceMode === "agent_default" &&
+    effectiveCwd &&
+    (readNonEmptyString(input.resolvedWorkspace.repoUrl) ||
+      readNonEmptyString(persistedCwd ? input.persistedExecutionWorkspace?.repoUrl : null))
+  ) {
+    const cwdIsAgentFallback = sameResolvedPath(effectiveCwd, agentFallbackCwd);
+    const cwdHasGitMetadata = cwdIsAgentFallback ? false : await hasGitMetadata(effectiveCwd);
+    if (
+      isRepoRequiredButAgentHomeCwd({
+        requestedExecutionWorkspaceMode: input.requestedExecutionWorkspaceMode,
+        resolvedWorkspaceRepoUrl: input.resolvedWorkspace.repoUrl,
+        persistedExecutionWorkspaceRepoUrl: input.persistedExecutionWorkspace?.repoUrl ?? null,
+        effectiveCwd,
+        cwdIsAgentFallback,
+        cwdHasGitMetadata,
+      })
+    ) {
+      const boundRepoUrl =
+        readNonEmptyString(input.resolvedWorkspace.repoUrl) ??
+        readNonEmptyString(input.persistedExecutionWorkspace?.repoUrl) ??
+        null;
+      fail(
+        "repo_required_but_agent_home_cwd",
+        `Issue ${issue.identifier ?? issue.id} is bound to repository "${boundRepoUrl}" but its executionWorkspaceSettings.mode is "agent_default", which resolves no git workspace — ${input.adapterType} would launch from the non-git cwd "${effectiveCwd}". Repair: file a workspace-repair card to re-bind the issue to an isolated git_worktree of that repository (git-ops owner), or, if this card genuinely needs no repository, clear the repo binding / set executionWorkspaceSettings.mode to a project workspace.`,
+        { repoRequiredButAgentHomeCwd: { boundRepoUrl } },
+      );
+    }
   }
 
   const expectedManagedBranchName =

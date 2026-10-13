@@ -409,6 +409,246 @@ describe("assertGitSensitiveAdapterWorkspaceValid", () => {
     ).resolves.toBeUndefined();
   });
 
+  // ---------------------------------------------------------------------------
+  // SPA-11739: a MISCATEGORISED CODE card born `agent_default`.
+  //
+  // The two tests above are the deliberate-bypass proof and stay green. They are
+  // also the boundary that pins how narrow the new guard below must be: they
+  // carry `issue.projectWorkspaceId: "workspace-1"` with NO repo URL on any of
+  // the three bindings, so a `projectWorkspaceId` ALONE is not "this run is
+  // bound to a repo". Every new case here therefore states an explicit repo
+  // binding, and the project-less cases carry none — that is the whole delta.
+  //
+  // Shape under test: `workspaceExpectation` is false (no project workspace id,
+  // no resolved workspace id, not a git worktree strategy) AND the mode is
+  // `agent_default`, which disables the two git guards outright. Today every
+  // expectation-gated guard is inert on exactly this shape, so a code card
+  // launches from the agent fallback cwd — which is not a git repository — in
+  // silence. New reason: `repo_required_but_agent_home_cwd`.
+  // ---------------------------------------------------------------------------
+
+  it("rejects a repo-bound agent_default card that resolved to the agent fallback cwd", async () => {
+    const input = buildWorkspaceValidationInput();
+    const fallbackCwd = resolveDefaultAgentWorkspaceDir("agent-1");
+
+    // Repo binding #1: the resolved workspace carries the repo URL.
+    await expectWorkspaceValidationFailure(
+      buildWorkspaceValidationInput({
+        issue: {
+          id: "issue-1",
+          identifier: "PAP-1",
+          projectId: "project-1",
+          projectWorkspaceId: null,
+        },
+        resolvedWorkspace: buildResolvedWorkspace({
+          cwd: fallbackCwd,
+          source: "agent_home",
+          workspaceId: null,
+          repoUrl: "https://github.com/example/repo.git",
+          repoRef: "origin/main",
+        }),
+        executionWorkspace: {
+          ...input.executionWorkspace,
+          source: "agent_home",
+          workspaceId: null,
+          repoUrl: "https://github.com/example/repo.git",
+          repoRef: "origin/main",
+          cwd: fallbackCwd,
+        },
+        persistedExecutionWorkspace: {
+          ...input.persistedExecutionWorkspace!,
+          projectWorkspaceId: null,
+          cwd: fallbackCwd,
+        },
+        requestedExecutionWorkspaceMode: "agent_default",
+      }),
+      "repo_required_but_agent_home_cwd",
+      // The remediation must name the miscategorised mode that has to change.
+      "agent_default",
+    );
+  });
+
+  it("rejects a repo-bound agent_default card whose only repo binding is the persisted execution workspace", async () => {
+    const input = buildWorkspaceValidationInput();
+    const fallbackCwd = resolveDefaultAgentWorkspaceDir("agent-1");
+
+    // Repo binding #3: `resolvedWorkspace.repoUrl` is null and the issue has no
+    // project workspace id, so the persisted row is the ONLY evidence the run is
+    // bound to a repo. Covers that disjunct on its own.
+    await expectWorkspaceValidationFailure(
+      buildWorkspaceValidationInput({
+        issue: {
+          id: "issue-1",
+          identifier: "PAP-1",
+          projectId: "project-1",
+          projectWorkspaceId: null,
+        },
+        resolvedWorkspace: buildResolvedWorkspace({
+          cwd: fallbackCwd,
+          source: "agent_home",
+          workspaceId: null,
+          repoUrl: null,
+        }),
+        executionWorkspace: {
+          ...input.executionWorkspace,
+          source: "agent_home",
+          workspaceId: null,
+          cwd: fallbackCwd,
+        },
+        persistedExecutionWorkspace: {
+          ...input.persistedExecutionWorkspace!,
+          mode: "agent_default",
+          strategyType: "adapter_managed",
+          projectWorkspaceId: null,
+          cwd: fallbackCwd,
+          repoUrl: "https://github.com/example/persisted-only.git",
+        },
+        requestedExecutionWorkspaceMode: "agent_default",
+      }),
+      "repo_required_but_agent_home_cwd",
+      // The remediation must name the repo the run is bound to and cannot reach.
+      "https://github.com/example/persisted-only.git",
+    );
+  });
+
+  it("rejects a repo-bound agent_default card whose cwd is neither the fallback dir nor a git checkout", async () => {
+    const input = buildWorkspaceValidationInput();
+    // Not the agent fallback dir, and no `.git` inside it — the second arm of
+    // "the run cannot reach the repo it is bound to". Today `missing_git_metadata`
+    // is inert here because `workspaceExpectation` is false, so the code card
+    // launches from a non-repository directory in silence.
+    const nonGitCwd = "/tmp/paperclip-spa-11739-agent-default-no-git";
+
+    await expectWorkspaceValidationFailure(
+      buildWorkspaceValidationInput({
+        issue: {
+          id: "issue-1",
+          identifier: "PAP-1",
+          projectId: "project-1",
+          projectWorkspaceId: null,
+        },
+        resolvedWorkspace: buildResolvedWorkspace({
+          cwd: nonGitCwd,
+          source: "agent_home",
+          workspaceId: null,
+          repoUrl: "https://github.com/example/repo.git",
+          repoRef: "origin/main",
+        }),
+        executionWorkspace: {
+          ...input.executionWorkspace,
+          source: "agent_home",
+          workspaceId: null,
+          repoUrl: "https://github.com/example/repo.git",
+          cwd: nonGitCwd,
+        },
+        persistedExecutionWorkspace: {
+          ...input.persistedExecutionWorkspace!,
+          mode: "agent_default",
+          strategyType: "adapter_managed",
+          projectWorkspaceId: null,
+          cwd: nonGitCwd,
+          repoUrl: "https://github.com/example/repo.git",
+        },
+        requestedExecutionWorkspaceMode: "agent_default",
+      }),
+      "repo_required_but_agent_home_cwd",
+      "agent_default",
+    );
+  });
+
+  it("allows a genuinely project-less non-code agent_default card to launch from the agent fallback cwd", async () => {
+    const input = buildWorkspaceValidationInput();
+    const fallbackCwd = resolveDefaultAgentWorkspaceDir("agent-1");
+
+    // The SPA-8036 / SPA-8019 Option A bypass, in its purest form: NO repo
+    // binding on any of the three disjuncts (no resolvedWorkspace.repoUrl, no
+    // persisted repoUrl, no issue.projectWorkspaceId). Identical to the
+    // rejecting case above on mode, adapter and cwd — the absence of a repo is
+    // the only thing that keeps it legal, so the guard must key on that and not
+    // on the fallback cwd alone.
+    await expect(
+      assertGitSensitiveAdapterWorkspaceValid(
+        buildWorkspaceValidationInput({
+          issue: {
+            id: "issue-1",
+            identifier: "PAP-1",
+            projectId: null,
+            projectWorkspaceId: null,
+          },
+          resolvedWorkspace: buildResolvedWorkspace({
+            cwd: fallbackCwd,
+            source: "agent_home",
+            projectId: null,
+            workspaceId: null,
+            repoUrl: null,
+            repoRef: null,
+          }),
+          executionWorkspace: {
+            ...input.executionWorkspace,
+            source: "agent_home",
+            projectId: null,
+            workspaceId: null,
+            repoUrl: null,
+            repoRef: null,
+            cwd: fallbackCwd,
+          },
+          persistedExecutionWorkspace: {
+            ...input.persistedExecutionWorkspace!,
+            mode: "agent_default",
+            strategyType: "adapter_managed",
+            projectWorkspaceId: null,
+            cwd: fallbackCwd,
+            repoUrl: null,
+          },
+          requestedExecutionWorkspaceMode: "agent_default",
+        }),
+      ),
+    ).resolves.toBeUndefined();
+  });
+
+  it("does not apply the repo-required agent_default guard to a non-git-sensitive adapter", async () => {
+    const input = buildWorkspaceValidationInput();
+    const fallbackCwd = resolveDefaultAgentWorkspaceDir("agent-1");
+
+    // Same shape as the rejecting case, but the adapter is outside
+    // GIT_SENSITIVE_LOCAL_ADAPTER_TYPES: an adapter that never needs a git
+    // checkout must not be blocked by this guard.
+    await expect(
+      assertGitSensitiveAdapterWorkspaceValid(
+        buildWorkspaceValidationInput({
+          adapterType: "some_http_adapter",
+          issue: {
+            id: "issue-1",
+            identifier: "PAP-1",
+            projectId: "project-1",
+            projectWorkspaceId: null,
+          },
+          resolvedWorkspace: buildResolvedWorkspace({
+            cwd: fallbackCwd,
+            source: "agent_home",
+            workspaceId: null,
+            repoUrl: "https://github.com/example/repo.git",
+            repoRef: "origin/main",
+          }),
+          executionWorkspace: {
+            ...input.executionWorkspace,
+            source: "agent_home",
+            workspaceId: null,
+            repoUrl: "https://github.com/example/repo.git",
+            repoRef: "origin/main",
+            cwd: fallbackCwd,
+          },
+          persistedExecutionWorkspace: {
+            ...input.persistedExecutionWorkspace!,
+            projectWorkspaceId: null,
+            cwd: fallbackCwd,
+          },
+          requestedExecutionWorkspaceMode: "agent_default",
+        }),
+      ),
+    ).resolves.toBeUndefined();
+  });
+
   // Regression-proof companion: the `fallback_agent_home_cwd` guard's REAL job is
   // catching a code card that would commit into the agent home. An
   // `isolated_workspace` card with the same inputs MUST still fail.
