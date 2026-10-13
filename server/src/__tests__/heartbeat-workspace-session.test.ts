@@ -511,6 +511,49 @@ describe("assertGitSensitiveAdapterWorkspaceValid", () => {
     );
   });
 
+  it("rejects a repo-bound agent_default card whose persisted row carries a repoUrl but no cwd", async () => {
+    // SPA-11739 review finding: the persisted repoUrl binding must not depend on
+    // a persisted cwd also being present. `resolvedWorkspace.repoUrl` is null,
+    // the issue has no project workspace id, and the persisted row has NO cwd —
+    // the repoUrl is still the only binding, and the guard must fire on it.
+    const input = buildWorkspaceValidationInput();
+    const fallbackCwd = resolveDefaultAgentWorkspaceDir("agent-1");
+
+    await expectWorkspaceValidationFailure(
+      buildWorkspaceValidationInput({
+        issue: {
+          id: "issue-1",
+          identifier: "PAP-1",
+          projectId: "project-1",
+          projectWorkspaceId: null,
+        },
+        resolvedWorkspace: buildResolvedWorkspace({
+          cwd: fallbackCwd,
+          source: "agent_home",
+          workspaceId: null,
+          repoUrl: null,
+        }),
+        executionWorkspace: {
+          ...input.executionWorkspace,
+          source: "agent_home",
+          workspaceId: null,
+          cwd: fallbackCwd,
+        },
+        persistedExecutionWorkspace: {
+          ...input.persistedExecutionWorkspace!,
+          mode: "agent_default",
+          strategyType: "adapter_managed",
+          projectWorkspaceId: null,
+          cwd: null,
+          repoUrl: "https://github.com/example/persisted-no-cwd.git",
+        },
+        requestedExecutionWorkspaceMode: "agent_default",
+      }),
+      "repo_required_but_agent_home_cwd",
+      "https://github.com/example/persisted-no-cwd.git",
+    );
+  });
+
   it("rejects a repo-bound agent_default card whose cwd is neither the fallback dir nor a git checkout", async () => {
     const input = buildWorkspaceValidationInput();
     // Not the agent fallback dir, and no `.git` inside it — the second arm of
