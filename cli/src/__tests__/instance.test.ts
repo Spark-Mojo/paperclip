@@ -26,7 +26,8 @@ function jsonResponse(body: unknown = { ok: true }, init: ResponseInit = { statu
 }
 
 describe("parseFleetMaxConcurrentRunsValue", () => {
-  it("accepts an integer 1..50", () => {
+  it("accepts an integer 0..50 (0 pauses admissions)", () => {
+    expect(parseFleetMaxConcurrentRunsValue("0")).toBe(0);
     expect(parseFleetMaxConcurrentRunsValue("1")).toBe(1);
     expect(parseFleetMaxConcurrentRunsValue("50")).toBe(50);
     expect(parseFleetMaxConcurrentRunsValue(" 22 ")).toBe(22);
@@ -38,8 +39,8 @@ describe("parseFleetMaxConcurrentRunsValue", () => {
     expect(parseFleetMaxConcurrentRunsValue(" None ")).toBeNull();
   });
 
-  it("rejects 0, out-of-range, non-integer, and non-numeric values", () => {
-    for (const bad of ["0", "51", "1.5", "abc", "", "-1"]) {
+  it("rejects out-of-range, non-integer, and non-numeric values", () => {
+    for (const bad of ["51", "1.5", "abc", "", "-1"]) {
       expect(() => parseFleetMaxConcurrentRunsValue(bad)).toThrow();
     }
   });
@@ -124,7 +125,7 @@ describe("instance CLI command", () => {
       throw new Error(`exit:${code ?? 0}`);
     }) as typeof process.exit);
 
-    await expect(run(["instance", "set", "fleet-max-concurrent-runs", "0"])).rejects.toThrow("exit:1");
+    await expect(run(["instance", "set", "fleet-max-concurrent-runs", "51"])).rejects.toThrow("exit:1");
     expect(fetchMock).not.toHaveBeenCalled();
   });
 
