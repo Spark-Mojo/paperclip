@@ -2346,10 +2346,15 @@ export function PipelineItemDetailView({ pipelineId, caseId }: { pipelineId: str
   ) => {
     if (!conversationIssueId) return;
     if (reassignment) {
+      // SPA-10357 / SPA-10859 board-actor ownership-transfer CAS: the
+      // reassignment must carry the caller-observed current values. The
+      // conversation's loaded detail is that observation.
       await issuesApi.update(conversationIssueId, {
         comment: body,
         assigneeAgentId: reassignment.assigneeAgentId,
         assigneeUserId: reassignment.assigneeUserId,
+        expectedAssigneeAgentId: activeConversationIssue?.assigneeAgentId ?? null,
+        expectedAssigneeUserId: activeConversationIssue?.assigneeUserId ?? null,
         ...(reopen ? { status: "todo" } : {}),
       });
     } else {
@@ -2364,7 +2369,7 @@ export function PipelineItemDetailView({ pipelineId, caseId }: { pipelineId: str
       }
     }
     await invalidateConversation();
-  }, [conversationIssueId, conversationRunningRun?.id, invalidateConversation]);
+  }, [conversationIssueId, conversationRunningRun?.id, invalidateConversation, activeConversationIssue]);
 
   const updateConversationWorkMode = useCallback(async (workMode: IssueWorkMode) => {
     if (!conversationIssueId) return;

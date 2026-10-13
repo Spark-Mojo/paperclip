@@ -1,4 +1,4 @@
-import { sql } from "drizzle-orm";
+import { sql, type SQL } from "drizzle-orm";
 import {
   type AnyPgColumn,
   pgTable,
@@ -94,6 +94,19 @@ export const heartbeatRuns = pgTable(
     lastUsefulActionAt: timestamp("last_useful_action_at", { withTimezone: true }),
     nextAction: text("next_action"),
     contextSnapshot: jsonb("context_snapshot").$type<Record<string, unknown>>(),
+    // SPA-11865 — STORED generated columns let the failed-run attention feed
+    // project issueId/taskId without dereferencing the 70 KB JSONB TOAST for
+    // every row in the window. The companion covering btree (declared in
+    // migration 9284 — Drizzle 0.45.2 has no .include() API) INCLUDEs these
+    // two columns and lets the planner satisfy the query with an index-only
+    // scan, eliminating the 2.6 GB de-TOAST stall that backed up the board
+    // API on 2026-10-12.
+    contextIssueId: text("context_issue_id").generatedAlwaysAs(
+      (): SQL => sql`${heartbeatRuns.contextSnapshot} ->> 'issueId'`,
+    ),
+    contextTaskId: text("context_task_id").generatedAlwaysAs(
+      (): SQL => sql`${heartbeatRuns.contextSnapshot} ->> 'taskId'`,
+    ),
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
     updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
   },
@@ -133,6 +146,9 @@ export const heartbeatRuns = pgTable(
       table.livenessState,
       table.createdAt,
     ),
+    companyMissingTerminalLivenessIdx: index("heartbeat_runs_company_missing_terminal_liveness_idx")
+      .on(table.companyId)
+      .where(sql`${table.livenessState} is null and ${table.status} not in ('queued', 'running')`),
     companyStatusLastOutputIdx: index("heartbeat_runs_company_status_last_output_idx").on(
       table.companyId,
       table.status,

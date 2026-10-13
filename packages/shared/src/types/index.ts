@@ -108,6 +108,8 @@ export type {
   ManagedExperimentalFeatureKey,
   ManagedSettingMetadata,
   BackupRetentionPolicy,
+  FleetMaxConcurrentRunsSource,
+  FleetMaxConcurrentRunsStatus,
 } from "./instance.js";
 export type {
   SmokeLabServiceStatus,

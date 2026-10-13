@@ -176,12 +176,23 @@ export function OnboardingChat({
     try {
       // Ensure the task is assigned to the CEO and in_progress before commenting.
       try {
-        await issuesApi.update(taskId, { assigneeUserId: null });
+        // SPA-10357 / SPA-10859 board-actor ownership-transfer CAS: moving
+        // the assignee must carry the caller-observed current values, so
+        // observe the row first. These writes are best-effort (already-done
+        // is fine); a 409 here means someone else moved ownership
+        // concurrently and the assignment step below retries on fresh data.
+        const current = await issuesApi.get(taskId);
+        await issuesApi.update(taskId, {
+          assigneeUserId: null,
+          expectedAssigneeUserId: current.assigneeUserId ?? null,
+        });
       } catch { /* may already be null */ }
       try {
+        const current = await issuesApi.get(taskId);
         await issuesApi.update(taskId, {
           assigneeAgentId: agentId,
           status: "in_progress",
+          expectedAssigneeAgentId: current.assigneeAgentId ?? null,
         });
       } catch { /* may already be assigned */ }
 

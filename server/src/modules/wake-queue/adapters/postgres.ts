@@ -114,6 +114,8 @@ function toIssueSnapshot(row: IssueRow): IssueSnapshot {
     assigneeUserId: row.assigneeUserId,
     hiddenAt: row.hiddenAt,
     originKind: row.originKind,
+    completedAt: row.completedAt,
+    cancelledAt: row.cancelledAt,
     monitorNextCheckAt: row.monitorNextCheckAt,
     executionState: (row.executionState as Record<string, unknown> | null) ?? null,
     responsibleUserId: row.responsibleUserId,
@@ -380,12 +382,60 @@ function buildTransaction(
       };
     },
 
-    async getCommentSelfAuthorship({ companyId, issueId, finishingRunId, commentIds }) {
+    async getCommentSelfAuthorship({ companyId, issueId, finishingRunId, finishingRunAgentId, commentIds }) {
       const rows = await tx
-        .select({ createdByRunId: issueComments.createdByRunId })
+        .select({
+          createdByRunId: issueComments.createdByRunId,
+          authorAgentId: issueComments.authorAgentId,
+        })
         .from(issueComments)
         .where(and(eq(issueComments.companyId, companyId), eq(issueComments.issueId, issueId), inArray(issueComments.id, commentIds)));
-      return { allSelfAuthored: rows.length > 0 && rows.every((row) => row.createdByRunId === finishingRunId) };
+      // Two distinct facts, and they are not interchangeable:
+      //
+      //  - `allSelfAuthored` is run-keyed. It covers a comment written BY the
+      //    finishing run, which is the tightest case but is NOT the SPA-10460
+      //    shape: its closing receipt is a SEPARATE call, so `createdByRunId`
+      //    names a PRIOR run of the same agent.
+      //  - `allAuthoredByFinishingRunAgent` is author-keyed, and catches that
+      //    prior-run receipt.
+      //
+      // Both require a COMPLETE read (`rows.length` equals the distinct ids
+      // asked for): a row the query could not return must never read as
+      // authorship. A board comment authored by an agent carries that
+      // `authorAgentId`, so a comment with no agent author is never
+      // agent-self-authored.
+      const complete = rows.length > 0 && rows.length === new Set(commentIds).size;
+      return {
+        allSelfAuthored: complete && rows.every((row) => row.createdByRunId === finishingRunId),
+        allAuthoredByFinishingRunAgent:
+          complete &&
+          rows.every(
+            (row) => row.authorAgentId !== null && row.authorAgentId === finishingRunAgentId,
+          ),
+      };
+    },
+
+    async getDeferredCommentCreatedAt({ companyId, issueId, commentIds }) {
+      const uniqueIds = [...new Set(commentIds)];
+      if (uniqueIds.length === 0) return [];
+      const rows = await tx
+        .select({ id: issueComments.id, createdAt: issueComments.createdAt })
+        .from(issueComments)
+        .where(and(
+          eq(issueComments.companyId, companyId),
+          eq(issueComments.issueId, issueId),
+          inArray(issueComments.id, uniqueIds),
+        ));
+      // One fact per REQUESTED id, including a `createdAt: null` placeholder for
+      // any id the row read did not return. The caller suppresses a reopen only
+      // on a complete, all-pre-close reading, so an unreadable comment must
+      // surface as a gap rather than silently shortening the array and letting
+      // `.every()` pass vacuously.
+      const byId = new Map(rows.map((row) => [row.id, row.createdAt]));
+      return uniqueIds.map((id) => ({
+        commentId: id,
+        createdAt: byId.get(id) ?? null,
+      }));
     },
 
     async isCompletedDelegationMention({ companyId, issueId, finishingRunId, wakeAgentId, commentIds }) {

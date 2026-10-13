@@ -29,8 +29,8 @@ import {
   cleanupExecutionWorkspaceArtifacts,
   ensurePersistedExecutionWorkspaceAvailable,
   ExecutionWorkspaceNotProvisionableError,
-  ensureServerWorkspaceLinksCurrent,
   ensureRuntimeServicesForRun,
+  ensureServerWorkspaceLinksCurrent,
   listConfiguredRuntimeServiceEntries,
   normalizeAdapterManagedRuntimeServices,
   reapOrphanedRunWorktrees,
@@ -43,6 +43,7 @@ import {
   releaseRunExecutionWorkspaceForHeartbeat,
   releaseRuntimeServicesForRun,
   UnresolvedWorkspaceBaseRefError,
+  WorkspaceRuntimeValidationFailure,
   resetRuntimeServicesForTests,
   MANAGED_RUNTIME_PUBLIC_URL_ENV,
   resolveManagedPaperclipRuntimePublicOrigin,
@@ -58,6 +59,7 @@ import {
   WORKSPACE_RUNTIME_PORT_ALLOCATION_ATTEMPTS,
   type RealizedExecutionWorkspace,
 } from "../services/workspace-runtime.ts";
+import { executionWorkspaceService } from "../services/execution-workspaces.ts";
 import {
   findAdoptableLocalService,
   isLocalServiceRegistryCwdCompatible,
@@ -157,7 +159,35 @@ async function runPnpm(cwd: string, args: string[]) {
 async function writeRegisteredSourceConfig(baseCwd: string, instanceId = "source-instance") {
   const configDir = path.join(baseCwd, ".paperclip");
   await fs.mkdir(configDir, { recursive: true });
-  await fs.writeFile(path.join(configDir, "config.json"), "{}\n", "utf8");
+  await fs.writeFile(path.join(configDir, "config.json"), JSON.stringify({
+    $meta: { version: 1, updatedAt: "2026-03-26T00:00:00.000Z", source: "doctor" },
+    database: {
+      mode: "embedded-postgres",
+      embeddedPostgresDataDir: path.join(configDir, "db"),
+      embeddedPostgresPort: 54329,
+      backup: { enabled: true, intervalMinutes: 60, retentionDays: 30, dir: path.join(configDir, "backups") },
+    },
+    logging: { mode: "file", logDir: path.join(configDir, "logs") },
+    server: {
+      deploymentMode: "local_trusted",
+      exposure: "private",
+      host: "127.0.0.1",
+      port: 3100,
+      allowedHostnames: [],
+      serveUi: true,
+    },
+    auth: { baseUrlMode: "auto", disableSignUp: false },
+    storage: {
+      provider: "local_disk",
+      localDisk: { baseDir: path.join(configDir, "storage") },
+      s3: { bucket: "paperclip", region: "us-east-1", prefix: "", forcePathStyle: false },
+    },
+    secrets: {
+      provider: "local_encrypted",
+      strictMode: false,
+      localEncrypted: { keyFilePath: path.join(configDir, "master.key") },
+    },
+  }, null, 2) + "\n", "utf8");
   await fs.writeFile(
     path.join(configDir, ".env"),
     `PAPERCLIP_INSTANCE_ID=${instanceId}\n`,
@@ -2636,6 +2666,71 @@ describe("realizeExecutionWorkspace", () => {
     expect(actualHead).toBe(expectedHead);
   });
 
+  it("restores a persisted worktree after an aged empty index lock", async () => {
+    const repoRoot = await createTempRepo();
+    const branchName = "PAP-9147-reuse";
+    const worktreePath = path.join(repoRoot, ".paperclip", "worktrees", branchName);
+    await fs.mkdir(path.dirname(worktreePath), { recursive: true });
+    await runGit(repoRoot, ["worktree", "add", "-b", branchName, worktreePath, "HEAD"]);
+    await fs.writeFile(path.join(worktreePath, "README.md"), "changed\n");
+    await fs.writeFile(path.join(worktreePath, "untracked.txt"), "preserve\n");
+    const head = await readGit(worktreePath, ["rev-parse", "HEAD"]);
+    const lockPath = await readGit(worktreePath, ["rev-parse", "--git-path", "index.lock"]);
+    await fs.writeFile(lockPath, "");
+    const old = new Date(Date.now() - 660_000);
+    await fs.utimes(lockPath, old, old);
+
+    const restored = await ensurePersistedExecutionWorkspaceAvailable({
+      base: { baseCwd: repoRoot, source: "project_primary", projectId: "project-1", workspaceId: "workspace-1", repoUrl: null, repoRef: "HEAD" },
+      workspace: {
+        id: "execution-workspace-9147", mode: "isolated_workspace", strategyType: "git_worktree",
+        cwd: worktreePath, providerRef: worktreePath, projectId: "project-1", projectWorkspaceId: "workspace-1",
+        repoUrl: null, baseRef: "HEAD", branchName, metadata: RUNTIME_OWNED_GIT_BRANCH_METADATA,
+      },
+      issue: { id: "issue-9147", identifier: "PAP-9147", title: "Persisted lock recovery" },
+      agent: { id: "agent-1", name: "Test Agent", companyId: "company-1" },
+    });
+
+    expect(restored?.cwd).toBe(worktreePath);
+    expect(restored?.branchName).toBe(branchName);
+    await expect(readGit(worktreePath, ["rev-parse", "HEAD"])).resolves.toBe(head);
+    await expect(fs.readFile(path.join(worktreePath, "README.md"), "utf8")).resolves.toBe("changed\n");
+    await expect(fs.readFile(path.join(worktreePath, "untracked.txt"), "utf8")).resolves.toBe("preserve\n");
+    await expect(fs.stat(lockPath)).rejects.toMatchObject({ code: "ENOENT" });
+  }, 30_000);
+
+  it.each([
+    { label: "recent", contents: "", ageMs: 0 },
+    { label: "nonempty", contents: "writer", ageMs: 660_000 },
+  ])("refuses persisted worktree restore for $label index locks", async ({ contents, ageMs }) => {
+    const repoRoot = await createTempRepo();
+    const branchName = "PAP-9147-refuse";
+    const worktreePath = path.join(repoRoot, ".paperclip", "worktrees", branchName);
+    await fs.mkdir(path.dirname(worktreePath), { recursive: true });
+    await runGit(repoRoot, ["worktree", "add", "-b", branchName, worktreePath, "HEAD"]);
+    const head = await readGit(worktreePath, ["rev-parse", "HEAD"]);
+    const lockPath = await readGit(worktreePath, ["rev-parse", "--git-path", "index.lock"]);
+    await fs.writeFile(lockPath, contents);
+    const mtime = new Date(Date.now() - ageMs);
+    await fs.utimes(lockPath, mtime, mtime);
+
+    await expect(ensurePersistedExecutionWorkspaceAvailable({
+      base: { baseCwd: repoRoot, source: "project_primary", projectId: "project-1", workspaceId: "workspace-1", repoUrl: null, repoRef: "HEAD" },
+      workspace: {
+        id: "execution-workspace-9147", mode: "isolated_workspace", strategyType: "git_worktree",
+        cwd: worktreePath, providerRef: worktreePath, projectId: "project-1", projectWorkspaceId: "workspace-1",
+        repoUrl: null, baseRef: "HEAD", branchName, metadata: RUNTIME_OWNED_GIT_BRANCH_METADATA,
+      },
+      issue: { id: "issue-9147", identifier: "PAP-9147", title: "Persisted lock refusal" },
+      agent: { id: "agent-1", name: "Test Agent", companyId: "company-1" },
+    })).rejects.toMatchObject({
+      code: "workspace_validation_failed",
+      resultJson: { workspaceValidation: { reason: "unsafe_git_index_lock", worktreePath, executionWorkspaceId: "execution-workspace-9147" } },
+    });
+    await expect(fs.readFile(lockPath, "utf8")).resolves.toBe(contents);
+    await expect(readGit(worktreePath, ["rev-parse", "HEAD"])).resolves.toBe(head);
+  }, 30_000);
+
   it("reattaches a missing persisted git worktree before manual control starts it", async () => {
     const repoRoot = await createTempRepo();
     const branchName = "PAP-451-restore-persisted-worktree";
@@ -3201,6 +3296,20 @@ describe("realizeExecutionWorkspace", () => {
     const expectedBranch = "PAP-455-not-registered-worktree";
     const detachedWorktreePath = path.join(repoRoot, ".paperclip", "worktrees", expectedBranch);
     await fs.mkdir(path.dirname(detachedWorktreePath), { recursive: true });
+    // A clone has its own `.git` dir, so its `git rev-parse
+    // --show-toplevel` resolves to the clone — i.e. a different repo than
+    // the project workspace's `baseCwd`. This is the shape SPA-9437's
+    // different-repo guard is written FOR: the path IS a checkout, it IS
+    // clean, and `git worktree remove --force` from the OLD repo's
+    // perspective refuses to delete another repository's directory. So the
+    // guard tears it down as unprovisionable rather than leaving a
+    // guaranteed-`workspace_validation_failed` loop behind.
+    //
+    // The pre-SPA-9437 expectation here was `not_registered`, and it was
+    // ALREADY failing on base: the fixture nests the clone INSIDE the OLD
+    // repo's tree, and `git worktree list` from the OLD repo reports a path
+    // prefix match, so `not_registered` was never actually produced. Do not
+    // read this expectation as a regression the guard introduced.
     await execFileAsync("git", ["clone", repoRoot, detachedWorktreePath]);
     await runGit(detachedWorktreePath, ["checkout", "-B", expectedBranch]);
 
@@ -3239,8 +3348,8 @@ describe("realizeExecutionWorkspace", () => {
       code: "workspace_validation_failed",
       resultJson: {
         workspaceValidation: {
-          reason: "git_worktree_not_reusable",
-          reasonCode: "not_registered",
+          reason: "git_worktree_belongs_to_other_repo",
+          reasonCode: "worktree_remove_failed",
           worktreePath: detachedWorktreePath,
           executionWorkspaceId: "execution-workspace-not-registered",
         },
@@ -5236,7 +5345,6 @@ describeEmbeddedPostgres("ephemeral worktree per run sweep (SPA-9275)", () => {
       const { recorder } = createWorkspaceOperationRecorderDouble();
       const summary = await reconcileEphemeralWorktreesOnStartup({
         db: testDb,
-        liveRunIds: new Set<string>(),
         recorder,
       });
       expect(summary.reposScanned).toBeGreaterThanOrEqual(1);
@@ -7683,12 +7791,8 @@ describeEmbeddedPostgres("workspace dirty quarantine branch repair", () => {
         code: "workspace_validation_failed",
         resultJson: {
           workspaceValidation: expect.objectContaining({
-            cleanliness: "dirty",
-            safeRepair: expect.objectContaining({
-              attempted: true,
-              succeeded: false,
-              reason: expect.stringContaining("index contention"),
-            }),
+            reason: "unsafe_git_index_lock",
+            worktreePath,
           }),
         },
       });
@@ -11231,3 +11335,943 @@ describe("realizeExecutionWorkspace with an exact existing branch", () => {
     });
   });
 });
+
+// SPA-9437: when an issue's `projectWorkspaceId` is corrected after its first
+// run realized a worktree against the OLD repo, the next run must re-realize
+// against the NEW repo's project workspace. Without the SPA-9437 fix the
+// engine throws `workspace_validation_failed` with `reasonCode: not_registered`
+// deterministically; the rebuild's `re-realize` path lives here.
+
+async function createOldRepoWorktree(branchName: string) {
+  const oldRepo = await createTempRepo();
+  const oldWorktreePath = path.join(oldRepo, ".paperclip", "worktrees", branchName);
+  await fs.mkdir(path.dirname(oldWorktreePath), { recursive: true });
+  await runGit(oldRepo, ["worktree", "add", "-b", branchName, oldWorktreePath, "HEAD"]);
+  await runGit(oldRepo, ["update-ref", "refs/remotes/origin/main", "HEAD"]);
+  return { oldRepo, oldWorktreePath };
+}
+
+async function createNewRepo() {
+  return await createTempRepo();
+}
+
+describe("ensurePersistedExecutionWorkspaceAvailable SPA-9437 project workspace rebind", () => {
+  it("tears down a clean persisted git worktree bound to a different repo and signals unprovisionable (SPA-9437)", async () => {
+    const branchName = "PAP-9437-clean-rebind";
+    const { oldRepo, oldWorktreePath } = await createOldRepoWorktree(branchName);
+    const newRepo = await createNewRepo();
+
+    let error: unknown = null;
+    try {
+      await ensurePersistedExecutionWorkspaceAvailable({
+        base: {
+          baseCwd: newRepo,
+          source: "project_primary",
+          projectId: "project-1",
+          workspaceId: "workspace-new",
+          repoUrl: null,
+          repoRef: "HEAD",
+        },
+        workspace: {
+          id: "execution-workspace-spa9437-clean",
+          mode: "isolated_workspace",
+          strategyType: "git_worktree",
+          cwd: oldWorktreePath,
+          providerRef: oldWorktreePath,
+          projectId: "project-1",
+          projectWorkspaceId: "workspace-old",
+          repoUrl: null,
+          baseRef: "HEAD",
+          branchName,
+          metadata: RUNTIME_OWNED_GIT_BRANCH_METADATA,
+        },
+        issue: {
+          id: "issue-spa9437-clean",
+          identifier: "PAP-9437",
+          title: "SPA-9437 clean rebind realizes against the new repo",
+        },
+        agent: {
+          id: "agent-1",
+          name: "Codex Coder",
+          companyId: "company-1",
+        },
+      });
+    } catch (err) {
+      error = err;
+    }
+
+    // SPA-9437 tears down the OLD worktree (clean + runtime-owned branch) and
+    // throws the SPA-9315 typed error so the allocator's freshness-decision
+    // path provisions a fresh workspace against the NEW repo. The error code
+    // matches the existing "unprovisionable binding" signal — the consumer
+    // recognizes it via `isExecutionWorkspaceNotProvisionableError`.
+    expect(error).toBeInstanceOf(ExecutionWorkspaceNotProvisionableError);
+    if (!(error instanceof ExecutionWorkspaceNotProvisionableError)) throw new Error("unreachable");
+    expect(error.code).toBe("workspace_validation_failed");
+    expect(error.executionWorkspaceId).toBe("execution-workspace-spa9437-clean");
+    expect(error.cwd).toBe(oldWorktreePath);
+    expect(error.strategy).toBe("git_worktree");
+    expect(error.resultJson.workspaceValidation).toMatchObject({
+      reason: "execution_workspace_not_provisionable",
+      reasonCode: "missing_on_disk_directory",
+      executionWorkspaceId: "execution-workspace-spa9437-clean",
+      strategy: "git_worktree",
+    });
+    // (a) the OLD repo's worktree list no longer contains the OLD path, AND
+    // (b) the OLD path is absent on disk so a fresh `realizeExecutionWorkspace`
+    //     against the NEW repo can lay down a fresh worktree.
+    await expect(fs.stat(oldWorktreePath)).rejects.toThrow();
+    const listedWorktrees = await readGit(oldRepo, ["worktree", "list", "--porcelain"]);
+    expect(listedWorktrees).not.toContain(oldWorktreePath);
+  }, 20_000);
+
+  it("still tears down a REGISTERED other-repo worktree (SPA-9437 negative control for the clone fall-through)", async () => {
+    // Sibling of "tears down a clean persisted git worktree bound to a
+    // different repo", and its negative control. The clone fall-through
+    // added for verifier finding 6 returns `not_a_registered_worktree`
+    // only when the path is absent from the OLD repo's
+    // `git worktree list`. This test pins the OTHER branch: a genuine
+    // linked worktree of the OLD repo is still removed and still signals
+    // unprovisionable, so the fall-through cannot have blunted the guard.
+    const branchName = "PAP-9437-registered-rebind";
+    const { oldRepo, oldWorktreePath } = await createOldRepoWorktree(branchName);
+    const newRepo = await createNewRepo();
+
+    // Precondition, stated not assumed: the path IS a registered worktree
+    // of the OLD repo. Without this the test would pass for the wrong
+    // reason (the clone fall-through) and prove nothing.
+    const listedBefore = await readGit(oldRepo, ["worktree", "list", "--porcelain"]);
+    expect(listedBefore).toContain(oldWorktreePath);
+
+    let error: unknown = null;
+    try {
+      await ensurePersistedExecutionWorkspaceAvailable({
+        base: {
+          baseCwd: newRepo,
+          source: "project_primary",
+          projectId: "project-1",
+          workspaceId: "workspace-new",
+          repoUrl: null,
+          repoRef: "HEAD",
+        },
+        workspace: {
+          id: "execution-workspace-spa9437-registered",
+          mode: "isolated_workspace",
+          strategyType: "git_worktree",
+          cwd: oldWorktreePath,
+          providerRef: oldWorktreePath,
+          projectId: "project-1",
+          projectWorkspaceId: "workspace-old",
+          repoUrl: null,
+          baseRef: "HEAD",
+          branchName,
+          metadata: RUNTIME_OWNED_GIT_BRANCH_METADATA,
+        },
+        issue: {
+          id: "issue-spa9437-registered",
+          identifier: "PAP-9437",
+          title: "SPA-9437 registered other-repo worktree is still torn down",
+        },
+        agent: {
+          id: "agent-1",
+          name: "Codex Coder",
+          companyId: "company-1",
+        },
+      });
+    } catch (err) {
+      error = err;
+    }
+
+    expect(error).toBeInstanceOf(ExecutionWorkspaceNotProvisionableError);
+    // Torn down, not refused: absent on disk and pruned from the OLD repo.
+    await expect(fs.stat(oldWorktreePath)).rejects.toThrow();
+    const listedAfter = await readGit(oldRepo, ["worktree", "list", "--porcelain"]);
+    expect(listedAfter).not.toContain(oldWorktreePath);
+  }, 20_000);
+
+  it("preserves a clean old-repo worktree with an unpushed runtime-owned commit", async () => {
+    const branchName = "PAP-9437-ahead-rebind";
+    const { oldRepo, oldWorktreePath } = await createOldRepoWorktree(branchName);
+    const newRepo = await createNewRepo();
+    await fs.writeFile(path.join(oldWorktreePath, "committed.txt"), "unpublished\n", "utf8");
+    await runGit(oldWorktreePath, ["add", "committed.txt"]);
+    await runGit(oldWorktreePath, ["-c", "user.name=Fixture", "-c", "user.email=fixture@example.test", "commit", "-m", "unpublished"]);
+    let error: unknown;
+    try {
+      await ensurePersistedExecutionWorkspaceAvailable({
+        base: { baseCwd: newRepo, source: "project_primary", projectId: "project-1", workspaceId: "workspace-new", repoUrl: null, repoRef: "HEAD" },
+        workspace: { id: "ahead-workspace", mode: "isolated_workspace", strategyType: "git_worktree", cwd: oldWorktreePath, providerRef: oldWorktreePath, projectId: "project-1", projectWorkspaceId: "workspace-old", repoUrl: null, baseRef: "HEAD", branchName, metadata: RUNTIME_OWNED_GIT_BRANCH_METADATA },
+        issue: { id: "ahead-issue", identifier: "PAP-9437", title: "Ahead rebind" },
+        agent: { id: "agent-1", name: "Coder", companyId: "company-1" },
+      });
+    } catch (caught) {
+      error = caught;
+    }
+    expect(error).toMatchObject({ resultJson: { workspaceValidation: { reason: "git_worktree_belongs_to_other_repo", reasonCode: "branch_unreachable_in_other_repo" } } });
+    expect(await fs.readFile(path.join(oldWorktreePath, "committed.txt"), "utf8")).toBe("unpublished\n");
+    expect(await readGit(oldRepo, ["worktree", "list", "--porcelain"])).toContain(oldWorktreePath);
+  }, 20_000);
+
+  it("tears down a clean old-repo worktree whose commits are already pushed to origin (SPA-9437)", async () => {
+    // Pins the deliberate boundary of the guard: reachability from an origin
+    // ref is the recoverability test, NOT the existence of a PR. A branch that
+    // was pushed but has no PR behind it is torn down, because the commits
+    // survive on origin and `git fetch` re-attaches them; only commits that
+    // exist nowhere but the worktree are preserved. This is the one behavior a
+    // reviewer can reasonably read as harm, so it is asserted rather than left
+    // to prose: the contract is "nothing unpushed", not "nothing orphaned".
+    const branchName = "PAP-9437-pushed-rebind";
+    const { oldRepo, oldWorktreePath } = await createOldRepoWorktree(branchName);
+    const newRepo = await createNewRepo();
+    await fs.writeFile(path.join(oldWorktreePath, "pushed.txt"), "on origin\n", "utf8");
+    await runGit(oldWorktreePath, ["add", "pushed.txt"]);
+    await runGit(oldWorktreePath, ["-c", "user.name=Fixture", "-c", "user.email=fixture@example.test", "commit", "-m", "pushed"]);
+    // The commits live on the worktree's own branch, not on `main`; record the
+    // tip before the teardown so the recovery assertion below can name it.
+    const pushedTip = await readGit(oldWorktreePath, ["rev-parse", "HEAD"]);
+    // Simulate the push by moving the remote-tracking ref onto the new tip —
+    // the reachability test reads `--remotes=origin`, not a real remote.
+    await runGit(oldWorktreePath, ["update-ref", `refs/remotes/origin/${branchName}`, "HEAD"]);
+
+    let error: unknown;
+    try {
+      await ensurePersistedExecutionWorkspaceAvailable({
+        base: { baseCwd: newRepo, source: "project_primary", projectId: "project-1", workspaceId: "workspace-new", repoUrl: null, repoRef: "HEAD" },
+        workspace: { id: "pushed-workspace", mode: "isolated_workspace", strategyType: "git_worktree", cwd: oldWorktreePath, providerRef: oldWorktreePath, projectId: "project-1", projectWorkspaceId: "workspace-old", repoUrl: null, baseRef: "HEAD", branchName, metadata: RUNTIME_OWNED_GIT_BRANCH_METADATA },
+        issue: { id: "pushed-issue", identifier: "PAP-9437", title: "Pushed rebind" },
+        agent: { id: "agent-1", name: "Coder", companyId: "company-1" },
+      });
+    } catch (caught) {
+      error = caught;
+    }
+
+    // Treated as recoverable: the guard tears the worktree down and signals
+    // unprovisionable so the allocator re-realizes against the NEW repo.
+    expect(error).toBeInstanceOf(ExecutionWorkspaceNotProvisionableError);
+    await expect(fs.stat(oldWorktreePath)).rejects.toThrow();
+    // The commits are NOT lost: the origin ref still names the exact tip.
+    const originSha = await readGit(oldRepo, ["rev-parse", `refs/remotes/origin/${branchName}`]);
+    expect(originSha).toBe(pushedTip);
+  }, 20_000);
+
+  it("refuses and preserves a dirty persisted git worktree whose repo no longer matches the project workspace (SPA-9437)", async () => {
+    const branchName = "PAP-9437-dirty-rebind";
+    const { oldRepo, oldWorktreePath } = await createOldRepoWorktree(branchName);
+    const newRepo = await createNewRepo();
+    // Make the OLD worktree dirty so the guarded teardown must refuse.
+    await fs.writeFile(path.join(oldWorktreePath, "scratch.txt"), "scratch\n", "utf8");
+
+    let error: unknown = null;
+    try {
+      await ensurePersistedExecutionWorkspaceAvailable({
+        base: {
+          baseCwd: newRepo,
+          source: "project_primary",
+          projectId: "project-1",
+          workspaceId: "workspace-new",
+          repoUrl: null,
+          repoRef: "HEAD",
+        },
+        workspace: {
+          id: "execution-workspace-spa9437-dirty",
+          mode: "isolated_workspace",
+          strategyType: "git_worktree",
+          cwd: oldWorktreePath,
+          providerRef: oldWorktreePath,
+          projectId: "project-1",
+          projectWorkspaceId: "workspace-old",
+          repoUrl: null,
+          baseRef: "HEAD",
+          branchName,
+          metadata: RUNTIME_OWNED_GIT_BRANCH_METADATA,
+        },
+        issue: {
+          id: "issue-spa9437-dirty",
+          identifier: "PAP-9437",
+          title: "SPA-9437 dirty rebind refuses and preserves the OLD worktree",
+        },
+        agent: {
+          id: "agent-1",
+          name: "Codex Coder",
+          companyId: "company-1",
+        },
+      });
+    } catch (err) {
+      error = err;
+    }
+
+    expect(error).toMatchObject({
+      code: "workspace_validation_failed",
+      resultJson: {
+        workspaceValidation: expect.objectContaining({
+          reason: "git_worktree_belongs_to_other_repo",
+          reasonCode: "dirty_worktree_in_other_repo",
+          worktreePath: oldWorktreePath,
+          persistedRepoRoot: path.resolve(oldRepo),
+          currentRepoRoot: path.resolve(newRepo),
+        }),
+      },
+    });
+    // The OLD worktree is preserved untouched (no `git worktree remove`
+    // ran) so the operator can recover their changes.
+    expect(await fs.stat(oldWorktreePath)).toBeTruthy();
+    const dirtyFile = path.join(oldWorktreePath, "scratch.txt");
+    const dirtyBody = await fs.readFile(dirtyFile, "utf8");
+    expect(dirtyBody).toBe("scratch\n");
+    const listedWorktrees = await readGit(oldRepo, ["worktree", "list", "--porcelain"]);
+    expect(listedWorktrees).toContain(oldWorktreePath);
+  }, 20_000);
+
+  it("refuses a clean persisted git worktree when the branch ref is gone from BOTH local and origin (SPA-9437)", async () => {
+    const branchName = "PAP-9437-clean-no-upstream";
+    const { oldRepo, oldWorktreePath } = await createOldRepoWorktree(branchName);
+    const newRepo = await createNewRepo();
+    await fs.writeFile(path.join(oldWorktreePath, "unpublished.txt"), "unpublished\n", "utf8");
+    await runGit(oldWorktreePath, ["add", "unpublished.txt"]);
+    await runGit(oldWorktreePath, ["-c", "user.name=Fixture", "-c", "user.email=fixture@example.test", "commit", "-m", "unpublished"]);
+    // Detach HEAD on the OLD worktree, then drop the local ref so neither
+    // local nor origin has the branch. Use `git update-ref -d` so we can
+    // delete the branch ref even while the worktree is checked out on it.
+    await execFileAsync("git", ["-C", oldWorktreePath, "checkout", "--detach"]);
+    await execFileAsync("git", ["-C", oldRepo, "update-ref", "-d", `refs/heads/${branchName}`]);
+    // No remote configured for createTempRepo, so origin does not exist;
+    // the `rev-parse --quiet refs/remotes/origin/<branch>` call returns ""
+    // (no SHA) and the helper classifies the branch as unreachable.
+    let error: unknown = null;
+    try {
+      await ensurePersistedExecutionWorkspaceAvailable({
+        base: {
+          baseCwd: newRepo,
+          source: "project_primary",
+          projectId: "project-1",
+          workspaceId: "workspace-new",
+          repoUrl: null,
+          repoRef: "HEAD",
+        },
+        workspace: {
+          id: "execution-workspace-spa9437-unreachable",
+          mode: "isolated_workspace",
+          strategyType: "git_worktree",
+          cwd: oldWorktreePath,
+          providerRef: oldWorktreePath,
+          projectId: "project-1",
+          projectWorkspaceId: "workspace-old",
+          repoUrl: null,
+          baseRef: "HEAD",
+          branchName,
+          metadata: {
+            // Operator-owned branch: SPA-9437 refuses when neither local
+            // nor origin has a ref, even on a clean worktree.
+            createdByRuntime: false,
+          },
+        },
+        issue: {
+          id: "issue-spa9437-unreachable",
+          identifier: "PAP-9437",
+          title: "SPA-9437 unreachable branch refuses retire",
+        },
+        agent: {
+          id: "agent-1",
+          name: "Codex Coder",
+          companyId: "company-1",
+        },
+      });
+    } catch (err) {
+      error = err;
+    }
+    expect(error).toMatchObject({
+      code: "workspace_validation_failed",
+      resultJson: {
+        workspaceValidation: expect.objectContaining({
+          reason: "git_worktree_belongs_to_other_repo",
+          reasonCode: "branch_unreachable_in_other_repo",
+          worktreePath: oldWorktreePath,
+          persistedRepoRoot: path.resolve(oldRepo),
+          currentRepoRoot: path.resolve(newRepo),
+          branchName,
+        }),
+      },
+    });
+    // The OLD worktree is preserved — refuse path does not delete.
+    expect(await fs.stat(oldWorktreePath)).toBeTruthy();
+    const listedWorktrees = await readGit(oldRepo, ["worktree", "list", "--porcelain"]);
+    expect(listedWorktrees).toContain(oldWorktreePath);
+  }, 20_000);
+
+  // SPA-9437 normalization regression: when the persisted cwd is a worktree
+  // of repo X AND the new `baseCwd` is ALSO a worktree of repo X (different
+  // worktree path, same owning repo), the new comparison must NOT classify
+  // them as different repos. A project workspace that is itself a worktree
+  // must round-trip cleanly through rebind without the engine spuriously
+  // tearing down a valid worktree on every run.
+  it("does not tear down a persisted worktree whose owning repo matches the current project workspace's owning repo (SPA-9437)", async () => {
+    const sharedRepo = await createTempRepo();
+    // Persisted worktree = a worktree of sharedRepo at .paperclip/worktrees/A
+    const persistedBranch = "PAP-9437-same-repo-A";
+    const persistedWorktreePath = path.join(
+      sharedRepo,
+      ".paperclip",
+      "worktrees",
+      "A",
+    );
+    await fs.mkdir(path.dirname(persistedWorktreePath), { recursive: true });
+    await runGit(sharedRepo, [
+      "worktree",
+      "add",
+      "-b",
+      persistedBranch,
+      persistedWorktreePath,
+      "HEAD",
+    ]);
+    // baseCwd = a SECOND worktree of the SAME repo at .paperclip/worktrees/B
+    const baseCwdBranch = "PAP-9437-same-repo-B";
+    const baseCwd = path.join(sharedRepo, ".paperclip", "worktrees", "B");
+    await fs.mkdir(baseCwd, { recursive: true });
+    await runGit(sharedRepo, ["worktree", "add", "-b", baseCwdBranch, baseCwd, "HEAD"]);
+
+    // Persisted cwd stays as-is (same-repo worktree, must NOT be torn down).
+    // baseCwd is itself a worktree of the same repo, so the new
+    // resolveGitOwnerRepoRoot normalization must resolve both to the same
+    // sharedRepo and skip the different-repo tear-down path. The validator
+    // then sees a normal same-repo persisted cwd and proceeds.
+    const restored = await ensurePersistedExecutionWorkspaceAvailable({
+      base: {
+        baseCwd,
+        source: "project_primary",
+        projectId: "project-1",
+        workspaceId: "workspace-same",
+        repoUrl: null,
+        repoRef: "HEAD",
+      },
+      workspace: {
+        id: "execution-workspace-spa9437-same-repo",
+        mode: "isolated_workspace",
+        strategyType: "git_worktree",
+        cwd: persistedWorktreePath,
+        providerRef: persistedWorktreePath,
+        projectId: "project-1",
+        projectWorkspaceId: "workspace-same",
+        repoUrl: null,
+        baseRef: "HEAD",
+        branchName: persistedBranch,
+        metadata: RUNTIME_OWNED_GIT_BRANCH_METADATA,
+      },
+      issue: {
+        id: "issue-spa9437-same-repo",
+        identifier: "PAP-9437",
+        title: "SPA-9437 same-repo worktree must not trigger different-repo tear-down",
+      },
+      agent: {
+        id: "agent-1",
+        name: "Codex Coder",
+        companyId: "company-1",
+      },
+    });
+
+    // Same-repo path: the validator returns the realized workspace (not
+    // null, not a typed throw) and the persisted cwd is untouched on disk.
+    expect(restored).not.toBeNull();
+    expect(restored?.worktreePath).toBe(persistedWorktreePath);
+    const stillThere = await fs.stat(persistedWorktreePath).catch(() => null);
+    expect(stillThere).not.toBeNull();
+    // Branch on the persisted worktree is unchanged (still on the original branch).
+    const branchOnPersistedWorktree = (
+      await execFileAsync("git", [
+        "-C",
+        persistedWorktreePath,
+        "branch",
+        "--show-current",
+      ])
+    ).stdout.trim();
+    expect(branchOnPersistedWorktree).toBe(persistedBranch);
+  }, 20_000);
+});
+
+describe("realizeExecutionWorkspace SPA-11953 shared configured worktree path", () => {
+  it("names the foreign repository that owns a colliding configured worktree path", async () => {
+    const repoA = await createTempRepo();
+    const repoB = await createTempRepo();
+    const sharedParentDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-shared-worktrees-"));
+    const issue = {
+      id: "issue-spa11953-shared-path",
+      identifier: "PAP-11953",
+      title: "Shared Card Path Collides Across Repos",
+    };
+    const agent = {
+      id: "agent-1",
+      name: "Codex Coder",
+      companyId: "company-1",
+    };
+
+    const first = await realizeExecutionWorkspace({
+      base: {
+        baseCwd: repoA,
+        source: "project_primary",
+        projectId: "project-1",
+        workspaceId: "workspace-a",
+        repoUrl: null,
+        repoRef: "HEAD",
+      },
+      config: {
+        workspaceStrategy: {
+          type: "git_worktree",
+          branchTemplate: "{{issue.identifier}}-{{slug}}",
+          worktreeParentDir: sharedParentDir,
+        },
+      },
+      issue,
+      agent,
+    });
+    expect(first.branchName).toBe("PAP-11953-shared-card-path-collides-across-repos");
+    const collidingPath = first.worktreePath!;
+    const canonicalCollidingPath = await fs.realpath(collidingPath);
+    const canonicalRepoA = await fs.realpath(repoA);
+    const canonicalRepoB = await fs.realpath(repoB);
+    const listedCanonicalWorktrees = async (repoRoot: string) => Promise.all(
+      (await readGit(repoRoot, ["worktree", "list", "--porcelain"]))
+        .split(/\r?\n/)
+        .filter((line) => line.startsWith("worktree "))
+        .map((line) => fs.realpath(line.slice("worktree ".length))),
+    );
+    expect(path.resolve(path.dirname(collidingPath))).toBe(path.resolve(sharedParentDir));
+    // Precondition, stated not assumed: repo A owns the colliding path. Compare
+    // canonical paths because os.tmpdir() may be reached through a host symlink.
+    expect(await listedCanonicalWorktrees(repoA)).toContain(canonicalCollidingPath);
+
+    let error: unknown = null;
+    try {
+      await realizeExecutionWorkspace({
+        base: {
+          baseCwd: repoB,
+          source: "project_primary",
+          projectId: "project-1",
+          workspaceId: "workspace-b",
+          repoUrl: null,
+          repoRef: "HEAD",
+        },
+        config: {
+          workspaceStrategy: {
+            type: "git_worktree",
+            branchTemplate: "{{issue.identifier}}-{{slug}}",
+            worktreeParentDir: sharedParentDir,
+          },
+        },
+        issue,
+        agent,
+      });
+    } catch (caught) {
+      error = caught;
+    }
+
+    // R1 oracle: same card/path against repo B must fail closed with the
+    // foreign (occupying) repository named, never succeed or clobber.
+    expect(error).toBeInstanceOf(WorkspaceRuntimeValidationFailure);
+    if (!(error instanceof WorkspaceRuntimeValidationFailure)) throw new Error("unreachable");
+    expect(error.code).toBe("workspace_validation_failed");
+    const validation = (error.resultJson as { workspaceValidation: Record<string, unknown> }).workspaceValidation;
+    expect(validation).toMatchObject({
+      reason: "git_worktree_belongs_to_other_repo",
+      reasonCode: "configured_path_owned_by_other_repo",
+      worktreePath: collidingPath,
+      branchName: first.branchName,
+      currentRepoRoot: canonicalRepoB,
+    });
+    expect(validation["occupyingRepoRoot"]).toBe(canonicalRepoA);
+    expect(validation).not.toHaveProperty("persistedRepoRoot");
+    expect(error.message).toContain(collidingPath);
+    expect(error.message).toContain(canonicalRepoA);
+    expect(error.message).toContain(canonicalRepoB);
+    expect(error.message).toMatch(/other repo|owned by|belongs to/i);
+
+    // Repo A's worktree is preserved untouched and still registered.
+    expect(await fs.stat(collidingPath)).toBeTruthy();
+    expect(await listedCanonicalWorktrees(repoA)).toContain(canonicalCollidingPath);
+    await expect(readGit(collidingPath, ["branch", "--show-current"])).resolves.toBe(first.branchName);
+
+    // Repo B created neither the branch nor a worktree at the shared path.
+    await expect(readGit(repoB, ["branch", "--list", first.branchName!])).resolves.toBe("");
+    expect(await listedCanonicalWorktrees(repoB)).not.toContain(canonicalCollidingPath);
+  }, 20_000);
+
+  it("preserves a foreign worktree before ephemeral stale-path cleanup", async () => {
+    const repoA = await createTempRepo();
+    const repoB = await createTempRepo();
+    const sharedParentDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-shared-ephemeral-"));
+    const issue = {
+      id: "issue-spa11953-ephemeral-collision",
+      identifier: "PAP-11953",
+      title: "Ephemeral Shared Path Must Not Delete Foreign Worktree",
+    };
+    const agent = {
+      id: "agent-1",
+      name: "Codex Coder",
+      companyId: "company-1",
+    };
+    const config = {
+      workspaceStrategy: {
+        type: "git_worktree",
+        branchTemplate: "{{issue.identifier}}-{{slug}}",
+        worktreeParentDir: sharedParentDir,
+      },
+    };
+    const first = await realizeExecutionWorkspace({
+      base: {
+        baseCwd: repoA,
+        source: "project_primary",
+        projectId: "project-1",
+        workspaceId: "workspace-a",
+        repoUrl: null,
+        repoRef: "HEAD",
+      },
+      config,
+      issue,
+      agent,
+      ephemeralLifecycle: true,
+      heartbeatRunId: "same-run-id",
+    });
+    const collidingPath = first.worktreePath!;
+    const canonicalCollidingPath = await fs.realpath(collidingPath);
+    await fs.writeFile(path.join(collidingPath, "foreign-repo-marker.txt"), "preserve me\n", "utf8");
+
+    let error: unknown = null;
+    try {
+      await realizeExecutionWorkspace({
+        base: {
+          baseCwd: repoB,
+          source: "project_primary",
+          projectId: "project-1",
+          workspaceId: "workspace-b",
+          repoUrl: null,
+          repoRef: "HEAD",
+        },
+        config,
+        issue,
+        agent,
+        ephemeralLifecycle: true,
+        heartbeatRunId: "same-run-id",
+      });
+    } catch (caught) {
+      error = caught;
+    }
+
+    expect(error).toBeInstanceOf(WorkspaceRuntimeValidationFailure);
+    expect(error).toMatchObject({
+      resultJson: {
+        workspaceValidation: expect.objectContaining({
+          reasonCode: "configured_path_owned_by_other_repo",
+          worktreePath: collidingPath,
+          occupyingRepoRoot: await fs.realpath(repoA),
+          currentRepoRoot: await fs.realpath(repoB),
+        }),
+      },
+    });
+    expect(await fs.readFile(path.join(collidingPath, "foreign-repo-marker.txt"), "utf8"))
+      .toBe("preserve me\n");
+    const listedRepoA = (await readGit(repoA, ["worktree", "list", "--porcelain"]))
+      .split(/\r?\n/)
+      .filter((line) => line.startsWith("worktree "));
+    expect(await Promise.all(listedRepoA.map((line) => fs.realpath(line.slice("worktree ".length)))))
+      .toContain(canonicalCollidingPath);
+  }, 20_000);
+
+  it("reuses the configured path when baseCwd is another worktree of the same owning repo", async () => {
+    const repo = await createTempRepo();
+    const baseCwd = path.join(repo, ".paperclip", "worktrees", "project-base");
+    const sharedParentDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-same-repo-worktrees-"));
+    await fs.mkdir(path.dirname(baseCwd), { recursive: true });
+    await runGit(repo, ["worktree", "add", "-b", "project-base", baseCwd, "HEAD"]);
+    const input = {
+      base: {
+        baseCwd,
+        source: "project_primary" as const,
+        projectId: "project-1",
+        workspaceId: "workspace-same-repo",
+        repoUrl: null,
+        repoRef: "HEAD",
+      },
+      config: {
+        workspaceStrategy: {
+          type: "git_worktree",
+          branchTemplate: "{{issue.identifier}}-{{slug}}",
+          worktreeParentDir: sharedParentDir,
+        },
+      },
+      issue: {
+        id: "issue-spa11953-same-repo",
+        identifier: "PAP-11953",
+        title: "Same Owner Must Reuse Configured Path",
+      },
+      agent: {
+        id: "agent-1",
+        name: "Codex Coder",
+        companyId: "company-1",
+      },
+    };
+
+    const first = await realizeExecutionWorkspace(input);
+    expect(first.created).toBe(true);
+    const canonicalRepoRoot = await fs.realpath(repo);
+    expect(await fs.realpath(first.worktreePath!)).toBe(await fs.realpath(first.cwd));
+    expect(await readGit(first.worktreePath!, ["rev-parse", "--git-common-dir"]))
+      .toContain(path.basename(repo));
+
+    // The second realization reaches the SPA-11953 existing-path guard with
+    // baseCwd and the occupied path as TWO worktrees of the SAME owning repo.
+    // Owner-root normalization must compare equal and continue to normal reuse.
+    const second = await realizeExecutionWorkspace(input);
+    expect(second.created).toBe(false);
+    expect(second.worktreePath).toBe(first.worktreePath);
+    expect(await fs.realpath(second.worktreePath!)).toBe(await fs.realpath(first.worktreePath!));
+    expect(await readGit(second.worktreePath!, ["branch", "--show-current"]))
+      .toBe(first.branchName);
+    const currentOwner = path.dirname(path.resolve(
+      second.worktreePath!,
+      await readGit(second.worktreePath!, ["rev-parse", "--git-common-dir"]),
+    ));
+    expect(await fs.realpath(currentOwner)).toBe(canonicalRepoRoot);
+  }, 20_000);
+});
+
+// SPA-9437 issue-update guard. The execution-workspaces service exposes
+// `retireExecutionWorkspaceAfterProjectWorkspaceRebind` for the issue
+// transaction to call after `projectWorkspaceId` changes. End-to-end this
+// also tests the wired path: the post-commit action invokes this helper, the
+// row transitions to `archived`, and `issue.executionWorkspaceId` is cleared
+// so the next run's allocator refuses the binding (SPA-7090).
+describeEmbeddedPostgres(
+  "executionWorkspaceService.retireExecutionWorkspaceAfterProjectWorkspaceRebind SPA-9437",
+  () => {
+    it("archives a clean runtime-owned execution workspace on rebind (SPA-9437)", async () => {
+      const support = await startEmbeddedPostgresTestDatabase(
+        "paperclip-spa9437-clean-rebind-",
+      );
+      try {
+        const db = createDb(support.connectionString);
+        const companyId = randomUUID();
+        const projectId = randomUUID();
+        const oldProjectWorkspaceId = randomUUID();
+        const newProjectWorkspaceId = randomUUID();
+        const sourceIssueId = randomUUID();
+        const executionWorkspaceId = randomUUID();
+        const branchName = "PAP-9437-issue-update-clean";
+        const { oldRepo, oldWorktreePath } = await createOldRepoWorktree(branchName);
+        await db.insert(companies).values({
+          id: companyId,
+          name: "spa9437-co",
+        });
+        await db.insert(projects).values({
+          id: projectId,
+          companyId,
+          name: "spa9437-project",
+        });
+        await db.insert(projectWorkspaces).values([
+          {
+            id: oldProjectWorkspaceId,
+            companyId,
+            projectId,
+            name: "old-workspace",
+            cwd: oldRepo,
+            repoUrl: null,
+            repoRef: "refs/heads/main",
+          },
+          {
+            id: newProjectWorkspaceId,
+            companyId,
+            projectId,
+            name: "new-workspace",
+            cwd: oldRepo,
+            repoUrl: null,
+            repoRef: "refs/heads/main",
+          },
+        ]);
+        await db.insert(executionWorkspaces).values({
+          id: executionWorkspaceId,
+          companyId,
+          projectId,
+          projectWorkspaceId: oldProjectWorkspaceId,
+          mode: "isolated_workspace",
+          strategyType: "git_worktree",
+          name: "spa9437-clean",
+          status: "active",
+          cwd: oldWorktreePath,
+          repoUrl: null,
+          baseRef: "refs/heads/main",
+          branchName,
+          providerType: "git_worktree",
+          providerRef: oldWorktreePath,
+          metadata: RUNTIME_OWNED_GIT_BRANCH_METADATA,
+        });
+        await db.insert(issues).values({
+          id: sourceIssueId,
+          companyId,
+          projectId,
+          projectWorkspaceId: oldProjectWorkspaceId,
+          executionWorkspaceId,
+          title: "SPA-9437 clean rebind archives",
+          status: "todo",
+        } as Partial<typeof issues.$inferInsert>);
+        await db
+          .update(executionWorkspaces)
+          .set({ sourceIssueId })
+          .where(eq(executionWorkspaces.id, executionWorkspaceId));
+        const outcome = await executionWorkspaceService(
+          db,
+        ).retireExecutionWorkspaceAfterProjectWorkspaceRebind({
+          companyId,
+          executionWorkspaceId,
+          sourceIssueId,
+          reason: `project workspace rebind ${oldProjectWorkspaceId} -> ${newProjectWorkspaceId}`,
+        });
+        expect(outcome.outcome).toBe("retired");
+        const [archivedRow] = await db
+          .select()
+          .from(executionWorkspaces)
+          .where(eq(executionWorkspaces.id, executionWorkspaceId));
+        expect(archivedRow.status).toBe("archived");
+        expect(archivedRow.closedAt).not.toBeNull();
+        const [updatedIssue] = await db
+          .select()
+          .from(issues)
+          .where(eq(issues.id, sourceIssueId));
+        expect(updatedIssue.executionWorkspaceId).toBeNull();
+      } finally {
+        await support.cleanup();
+      }
+    }, 30_000);
+
+    it("refuses to retire an old worktree with an unpushed runtime-owned commit", async () => {
+      const support = await startEmbeddedPostgresTestDatabase("paperclip-spa9437-ahead-rebind-");
+      try {
+        const db = createDb(support.connectionString);
+        const companyId = randomUUID();
+        const projectId = randomUUID();
+        const projectWorkspaceId = randomUUID();
+        const sourceIssueId = randomUUID();
+        const executionWorkspaceId = randomUUID();
+        const branchName = "PAP-9437-issue-update-ahead";
+        const { oldRepo, oldWorktreePath } = await createOldRepoWorktree(branchName);
+        await fs.writeFile(path.join(oldWorktreePath, "committed.txt"), "unpublished\n", "utf8");
+        await runGit(oldWorktreePath, ["add", "committed.txt"]);
+        await runGit(oldWorktreePath, ["-c", "user.name=Fixture", "-c", "user.email=fixture@example.test", "commit", "-m", "unpublished"]);
+        await db.insert(companies).values({ id: companyId, name: "ahead-co" });
+        await db.insert(projects).values({ id: projectId, companyId, name: "ahead-project" });
+        await db.insert(projectWorkspaces).values({ id: projectWorkspaceId, companyId, projectId, name: "old", cwd: oldRepo, repoUrl: null, repoRef: "refs/heads/main" });
+        await db.insert(executionWorkspaces).values({ id: executionWorkspaceId, companyId, projectId, projectWorkspaceId, mode: "isolated_workspace", strategyType: "git_worktree", name: "ahead-workspace", status: "active", cwd: oldWorktreePath, branchName, providerType: "git_worktree", providerRef: oldWorktreePath, metadata: RUNTIME_OWNED_GIT_BRANCH_METADATA });
+        await db.insert(issues).values({ id: sourceIssueId, companyId, projectId, projectWorkspaceId, executionWorkspaceId, title: "ahead rebind", status: "todo" } as Partial<typeof issues.$inferInsert>);
+        await db.update(executionWorkspaces).set({ sourceIssueId }).where(eq(executionWorkspaces.id, executionWorkspaceId));
+        const outcome = await executionWorkspaceService(db).retireExecutionWorkspaceAfterProjectWorkspaceRebind({ companyId, executionWorkspaceId, sourceIssueId, reason: "rebind" });
+        expect(outcome.outcome).toBe("refused_unpushed");
+        expect((await db.select().from(executionWorkspaces).where(eq(executionWorkspaces.id, executionWorkspaceId)))[0].status).toBe("active");
+        expect((await db.select().from(issues).where(eq(issues.id, sourceIssueId)))[0].executionWorkspaceId).toBe(executionWorkspaceId);
+        expect(await fs.readFile(path.join(oldWorktreePath, "committed.txt"), "utf8")).toBe("unpublished\n");
+      } finally {
+        await support.cleanup();
+      }
+    }, 30_000);
+
+    it("refuses to retire an execution workspace on project workspace rebind when the old worktree is dirty (SPA-9437)", async () => {
+      const support = await startEmbeddedPostgresTestDatabase(
+        "paperclip-spa9437-dirty-rebind-refuse-",
+      );
+      try {
+        const db = createDb(support.connectionString);
+        const companyId = randomUUID();
+        const projectId = randomUUID();
+        const oldProjectWorkspaceId = randomUUID();
+        const newProjectWorkspaceId = randomUUID();
+        const sourceIssueId = randomUUID();
+        const executionWorkspaceId = randomUUID();
+        const branchName = "PAP-9437-issue-update-dirty";
+        const { oldRepo, oldWorktreePath } = await createOldRepoWorktree(branchName);
+        // Make the worktree dirty so retire must refuse.
+        await fs.writeFile(path.join(oldWorktreePath, "scratch.txt"), "scratch\n", "utf8");
+        await db.insert(companies).values({
+          id: companyId,
+          name: "spa9437-co-d",
+        });
+        await db.insert(projects).values({
+          id: projectId,
+          companyId,
+          name: "spa9437-project-d",
+        });
+        await db.insert(projectWorkspaces).values([
+          {
+            id: oldProjectWorkspaceId,
+            companyId,
+            projectId,
+            name: "old-workspace-d",
+            cwd: oldRepo,
+            repoUrl: null,
+            repoRef: "refs/heads/main",
+          },
+          {
+            id: newProjectWorkspaceId,
+            companyId,
+            projectId,
+            name: "new-workspace-d",
+            cwd: oldRepo,
+            repoUrl: null,
+            repoRef: "refs/heads/main",
+          },
+        ]);
+        await db.insert(executionWorkspaces).values({
+          id: executionWorkspaceId,
+          companyId,
+          projectId,
+          projectWorkspaceId: oldProjectWorkspaceId,
+          mode: "isolated_workspace",
+          strategyType: "git_worktree",
+          name: "spa9437-dirty",
+          status: "active",
+          cwd: oldWorktreePath,
+          repoUrl: null,
+          baseRef: "refs/heads/main",
+          branchName,
+          providerType: "git_worktree",
+          providerRef: oldWorktreePath,
+          metadata: RUNTIME_OWNED_GIT_BRANCH_METADATA,
+        });
+        await db.insert(issues).values({
+          id: sourceIssueId,
+          companyId,
+          projectId,
+          projectWorkspaceId: oldProjectWorkspaceId,
+          executionWorkspaceId,
+          title: "SPA-9437 dirty rebind refuses",
+          status: "todo",
+        } as Partial<typeof issues.$inferInsert>);
+        await db
+          .update(executionWorkspaces)
+          .set({ sourceIssueId })
+          .where(eq(executionWorkspaces.id, executionWorkspaceId));
+        const outcome = await executionWorkspaceService(
+          db,
+        ).retireExecutionWorkspaceAfterProjectWorkspaceRebind({
+          companyId,
+          executionWorkspaceId,
+          sourceIssueId,
+          reason: `project workspace rebind ${oldProjectWorkspaceId} -> ${newProjectWorkspaceId}`,
+        });
+        expect(outcome.outcome).toBe("refused_dirty");
+        if (outcome.outcome !== "refused_dirty") throw new Error("unreachable");
+        expect(outcome.executionWorkspaceId).toBe(executionWorkspaceId);
+        expect(outcome.worktreePath).toBe(oldWorktreePath);
+        expect(outcome.dirtyReason).toMatch(/untracked file/i);
+        // Row stays active so the operator can recover the scratch.
+        const [unchangedRow] = await db
+          .select()
+          .from(executionWorkspaces)
+          .where(eq(executionWorkspaces.id, executionWorkspaceId));
+        expect(unchangedRow.status).toBe("active");
+        expect(unchangedRow.closedAt).toBeNull();
+        const [unchangedIssue] = await db
+          .select()
+          .from(issues)
+          .where(eq(issues.id, sourceIssueId));
+        expect(unchangedIssue.executionWorkspaceId).toBe(executionWorkspaceId);
+      } finally {
+        await support.cleanup();
+      }
+    }, 30_000);
+  },
+);

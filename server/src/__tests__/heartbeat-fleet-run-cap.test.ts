@@ -15,10 +15,12 @@ import {
   executionWorkspaces,
   heartbeatRunEvents,
   heartbeatRuns,
+  instanceSettings,
   issueComments,
   issues,
   projects,
 } from "@paperclipai/db";
+import { instanceSettingsService } from "../services/instance-settings.ts";
 import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
@@ -30,9 +32,11 @@ import {
   FLEET_RUN_LIVENESS_WINDOW_ENV_VAR,
   computeAvailableRunSlots,
   heartbeatService,
+  invalidateFleetMaxConcurrentRunsCache,
   isFleetRunningRowLive,
   normalizeFleetMaxConcurrentRuns,
   normalizeFleetRunLivenessWindowMs,
+  resolveFleetMaxConcurrentRuns,
 } from "../services/heartbeat.ts";
 import {
   FLEET_ADMISSION_STALE_MS,
@@ -98,7 +102,7 @@ function deadPid() {
 }
 
 describe("fleet run ceiling helpers", () => {
-  it("defaults to no ceiling and clamps configured values to 1..50", () => {
+  it("defaults to no ceiling and clamps configured values to 0..50", () => {
     expect(FLEET_MAX_CONCURRENT_RUNS_DEFAULT).toBeNull();
     expect(FLEET_MAX_CONCURRENT_RUNS_ENV_VAR).toBe("PAPERCLIP_MAX_CONCURRENT_AGENT_RUNS");
     expect(normalizeFleetMaxConcurrentRuns(undefined)).toBeNull();
@@ -112,11 +116,63 @@ describe("fleet run ceiling helpers", () => {
     expect(normalizeFleetMaxConcurrentRuns(" 8 ")).toBe(8);
     expect(normalizeFleetMaxConcurrentRuns("1.7")).toBe(1);
     expect(normalizeFleetMaxConcurrentRuns("1e3")).toBe(50);
-    expect(normalizeFleetMaxConcurrentRuns("0")).toBe(1);
-    expect(normalizeFleetMaxConcurrentRuns(0)).toBe(1);
-    expect(normalizeFleetMaxConcurrentRuns("-1")).toBe(1);
-    expect(normalizeFleetMaxConcurrentRuns(-4)).toBe(1);
+    expect(normalizeFleetMaxConcurrentRuns("0")).toBe(0);
+    expect(normalizeFleetMaxConcurrentRuns(0)).toBe(0);
+    expect(normalizeFleetMaxConcurrentRuns("-1")).toBe(0);
+    expect(normalizeFleetMaxConcurrentRuns(-4)).toBe(0);
     expect(normalizeFleetMaxConcurrentRuns(500)).toBe(50);
+  });
+
+  it("resolves precedence: an explicit DB value wins over the env var", () => {
+    expect(resolveFleetMaxConcurrentRuns({ dbValue: 5, envValue: "20" })).toEqual({
+      value: 5,
+      source: "db",
+    });
+    // An explicit DB null ("no ceiling") wins over a configured env var too.
+    expect(resolveFleetMaxConcurrentRuns({ dbValue: null, envValue: "20" })).toEqual({
+      value: null,
+      source: "db",
+    });
+  });
+
+  it("falls through to the env var when the DB value is absent (not configured)", () => {
+    expect(resolveFleetMaxConcurrentRuns({ dbValue: undefined, envValue: "7" })).toEqual({
+      value: 7,
+      source: "env",
+    });
+    expect(resolveFleetMaxConcurrentRuns({ dbValue: undefined, envValue: undefined })).toEqual({
+      value: null,
+      source: "none",
+    });
+  });
+
+  it("clamps a DB value to 0..50, same as the env var", () => {
+    expect(resolveFleetMaxConcurrentRuns({ dbValue: 500, envValue: undefined })).toEqual({
+      value: 50,
+      source: "db",
+    });
+    expect(resolveFleetMaxConcurrentRuns({ dbValue: 0, envValue: undefined })).toEqual({
+      value: 0,
+      source: "db",
+    });
+    expect(resolveFleetMaxConcurrentRuns({ dbValue: 1.9, envValue: undefined })).toEqual({
+      value: 1,
+      source: "db",
+    });
+  });
+
+  it("never silently reads a malformed DB value as no-ceiling; falls back to the env var", () => {
+    for (const malformed of ["garbage", "NaN", "Infinity", true, {}, [], "  "]) {
+      expect(resolveFleetMaxConcurrentRuns({ dbValue: malformed, envValue: "4" })).toEqual({
+        value: 4,
+        source: "env",
+      });
+      // ...and to "none" when no env var is set either -- still never "db".
+      expect(resolveFleetMaxConcurrentRuns({ dbValue: malformed, envValue: undefined })).toEqual({
+        value: null,
+        source: "none",
+      });
+    }
   });
 
   it("clamps the liveness window and falls back to the default when invalid", () => {
@@ -172,6 +228,42 @@ describe("fleet run ceiling helpers", () => {
         fleetRunningRuns: 7,
       }),
     ).toBe(0);
+  });
+
+  it("cap 0 pauses admissions: 2 queued + 1 running -> 0 admitted, running finishes; raise admits queued", () => {
+    // Pause: cap 0 yields 0 slots regardless of running count.
+    expect(
+      computeAvailableRunSlots({
+        agentMaxConcurrentRuns: 20,
+        agentRunningRuns: 0,
+        fleetMaxConcurrentRuns: 0,
+        fleetRunningRuns: 0,
+      }),
+    ).toBe(0);
+    // 2 queued + 1 running: the one running run stays running (never killed
+    // by the pause) but no new admission is possible.
+    expect(
+      computeAvailableRunSlots({
+        agentMaxConcurrentRuns: 20,
+        agentRunningRuns: 1,
+        fleetMaxConcurrentRuns: 0,
+        fleetRunningRuns: 1,
+      }),
+    ).toBe(0);
+    // Raising the cap admits the queued work again.
+    expect(
+      computeAvailableRunSlots({
+        agentMaxConcurrentRuns: 20,
+        agentRunningRuns: 1,
+        fleetMaxConcurrentRuns: 2,
+        fleetRunningRuns: 1,
+      }),
+    ).toBe(1);
+    // The paused value resolves through the DB path too.
+    expect(resolveFleetMaxConcurrentRuns({ dbValue: 0, envValue: undefined })).toEqual({
+      value: 0,
+      source: "db",
+    });
   });
 
   it("counts a running row only with live evidence (stale-run guard)", () => {
@@ -286,6 +378,11 @@ describeEmbeddedPostgres("fleet-wide agent run ceiling", () => {
   const gates = new Map<string, () => void>();
   const startedRunIds: string[] = [];
   let blockExecutions = true;
+  // Assigned in the suite's beforeAll, after the DB handle exists, and reused by
+  // the queued-priority block below. Never declared twice at any scope: a
+  // duplicate `let` is a syntax error and a duplicate hoisted `function`
+  // silently replaces the original for the whole suite.
+  let runtimeEnvBaseFromSuite: Record<string, string | undefined> = {};
 
   beforeAll(async () => {
     tempDb = await startEmbeddedPostgresTestDatabase("paperclip-heartbeat-fleet-run-cap-");
@@ -296,6 +393,7 @@ describeEmbeddedPostgres("fleet-wide agent run ceiling", () => {
     };
     delete runtimeEnv[FLEET_MAX_CONCURRENT_RUNS_ENV_VAR];
     delete runtimeEnv[FLEET_RUN_LIVENESS_WINDOW_ENV_VAR];
+    runtimeEnvBaseFromSuite = runtimeEnv;
     heartbeat = heartbeatService(db, { runtimeEnv });
     heartbeatAtCeilingOne = heartbeatService(db, {
       runtimeEnv: { ...runtimeEnv, [FLEET_MAX_CONCURRENT_RUNS_ENV_VAR]: "1" },
@@ -336,12 +434,15 @@ describeEmbeddedPostgres("fleet-wide agent run ceiling", () => {
     blockExecutions = false;
     for (const release of gates.values()) release();
     gates.clear();
-    await heartbeat.drainActiveRunExecutions();
-    await heartbeatAtCeilingOne.drainActiveRunExecutions();
-    await heartbeatAtCeilingTwo.drainActiveRunExecutions();
-    await heartbeatAtCeilingTwoB.drainActiveRunExecutions();
+    // Drain every service in this file, including the ones the queued-priority
+    // block builds, and only now: the drains await parked executions, so they
+    // must run after the gate release above or they hang the suite.
+    await drainAllServices();
     runningProcesses.clear();
     startedRunIds.length = 0;
+    // Any test that set a DB fleet-cap override (or warmed the cache) must not
+    // leak it into the next test, which assumes "no DB override, env only".
+    invalidateFleetMaxConcurrentRunsCache();
     for (let attempt = 0; ; attempt += 1) {
       try {
         await db.delete(environmentLeases);
@@ -358,6 +459,7 @@ describeEmbeddedPostgres("fleet-wide agent run ceiling", () => {
         await db.delete(executionWorkspaces);
         await db.delete(companySkills);
         await db.delete(companies);
+        await db.delete(instanceSettings);
         break;
       } catch (error) {
         if (attempt >= 9) throw error;
@@ -371,6 +473,22 @@ describeEmbeddedPostgres("fleet-wide agent run ceiling", () => {
     gates.clear();
     await tempDb?.cleanup();
   });
+
+  // Every service instance this file constructs, drained as one. Services the
+  // queued-priority block adds are pushed here from its own beforeAll, so a
+  // parked execution can never outlive the test that started it.
+  const allHeartbeatServices: Array<ReturnType<typeof heartbeatService>> = [];
+  function registerHeartbeatService(
+    service: ReturnType<typeof heartbeatService>,
+  ): ReturnType<typeof heartbeatService> {
+    allHeartbeatServices.push(service);
+    return service;
+  }
+  async function drainAllServices() {
+    for (const service of allHeartbeatServices) {
+      await service.drainActiveRunExecutions();
+    }
+  }
 
   function executionsOf(runIds: string[]) {
     return startedRunIds.filter((runId) => runIds.includes(runId));
@@ -414,7 +532,13 @@ describeEmbeddedPostgres("fleet-wide agent run ceiling", () => {
     return agentId;
   }
 
-  async function seedAgentWithQueuedRun(input: { companyId: string; index: number; createdAt: Date }) {
+  async function seedAgentWithQueuedRun(input: {
+    companyId: string;
+    index: number;
+    createdAt: Date;
+    issueStatus?: "todo" | "in_progress";
+    priority?: string;
+  }) {
     const agentId = await seedAgent(input.companyId, input.index);
     const issueId = randomUUID();
     const wakeupRequestId = randomUUID();
@@ -423,8 +547,8 @@ describeEmbeddedPostgres("fleet-wide agent run ceiling", () => {
       id: issueId,
       companyId: input.companyId,
       title: `Fleet issue ${input.index}`,
-      status: "in_progress",
-      priority: "medium",
+      status: input.issueStatus ?? "in_progress",
+      priority: input.priority ?? "medium",
       assigneeAgentId: agentId,
       responsibleUserId: "responsible-user",
     });
@@ -473,6 +597,403 @@ describeEmbeddedPostgres("fleet-wide agent run ceiling", () => {
     }
     return { companyId, seeded };
   }
+
+  async function seedCompany() {
+    const companyId = randomUUID();
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      defaultResponsibleUserId: "responsible-user",
+      requireBoardApprovalForNewAgents: false,
+    });
+    return companyId;
+  }
+
+  // SPA-10513 slice 2 fixtures. One agent per seeded ticket, so the cross-agent
+  // sweep is the only thing that can decide which ticket reaches a freed slot.
+  // Every helper is declared inside the new describe block, so these functions
+  // must never be hoisted into the suite scope above: duplicate `function`
+  // declarations in the same scope silently win by hoist order and would
+  // replace the real `seedCompany` for every other test in this file.
+  describe("queued priority admission", () => {
+    // Default is priority-then-age; this is the documented revert to the
+    // previous oldest-ticket-first sweep ordering, by env var alone.
+    const FIFO_SWITCH = "PAPERCLIP_QUEUED_RUN_ORDER";
+
+    async function seedArchivedCompany() {
+      const companyId = randomUUID();
+      await db.insert(companies).values({
+        id: companyId,
+        name: "Paperclip Archived",
+        issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+        defaultResponsibleUserId: "responsible-user",
+        requireBoardApprovalForNewAgents: false,
+        status: "archived",
+      });
+      return companyId;
+    }
+
+    async function seedCrossAgentBacklog(input: {
+      companyId: string;
+      tickets: Array<{
+        priority: string;
+        ageMinutes: number;
+        issueStatus?: "todo" | "in_progress";
+      }>;
+      indexOffset?: number;
+    }) {
+      const base = Date.now();
+      const seeded = [];
+      for (const [index, ticket] of input.tickets.entries()) {
+        seeded.push(
+          await seedAgentWithQueuedRun({
+            companyId: input.companyId,
+            index: (input.indexOffset ?? 0) + index,
+            createdAt: new Date(base - ticket.ageMinutes * 60_000),
+            issueStatus: ticket.issueStatus,
+            priority: ticket.priority,
+          }),
+        );
+      }
+      return seeded;
+    }
+
+    const runtimeEnvBase = runtimeEnvBaseFromSuite;
+    let priorityHeartbeat!: ReturnType<typeof heartbeatService>;
+    let priorityHeartbeatFifo!: ReturnType<typeof heartbeatService>;
+    let priorityHeartbeatCeilingOne!: ReturnType<typeof heartbeatService>;
+    let priorityHeartbeatNoCeiling!: ReturnType<typeof heartbeatService>;
+    let priorityHeartbeatNoCeilingFifo!: ReturnType<typeof heartbeatService>;
+
+    beforeAll(() => {
+      priorityHeartbeat = registerHeartbeatService(
+        heartbeatService(db, {
+          runtimeEnv: {
+            ...runtimeEnvBase,
+            [FLEET_MAX_CONCURRENT_RUNS_ENV_VAR]: "2",
+          },
+        }),
+      );
+      priorityHeartbeatFifo = registerHeartbeatService(
+        heartbeatService(db, {
+          runtimeEnv: {
+            ...runtimeEnvBase,
+            [FLEET_MAX_CONCURRENT_RUNS_ENV_VAR]: "2",
+            [FIFO_SWITCH]: "fifo",
+          },
+        }),
+      );
+      priorityHeartbeatCeilingOne = registerHeartbeatService(
+        heartbeatService(db, {
+          runtimeEnv: {
+            ...runtimeEnvBase,
+            [FLEET_MAX_CONCURRENT_RUNS_ENV_VAR]: "1",
+          },
+        }),
+      );
+      priorityHeartbeatNoCeiling = registerHeartbeatService(
+        heartbeatService(db, {
+          runtimeEnv: { ...runtimeEnvBase },
+        }),
+      );
+      priorityHeartbeatNoCeilingFifo = registerHeartbeatService(
+        heartbeatService(db, {
+          runtimeEnv: {
+            ...runtimeEnvBase,
+            [FIFO_SWITCH]: "fifo",
+          },
+        }),
+      );
+    });
+
+    it("admits critical before high before medium before low across agents, then oldest first", async () => {
+      const companyId = await seedCompany();
+      // Deliberately anti-correlated with age: the only correct sweep admits
+      // every critical card first, even though each is newer than every low one.
+      const seeded = await seedCrossAgentBacklog({
+        companyId,
+        tickets: [
+          { priority: "low", ageMinutes: 120 },
+          { priority: "medium", ageMinutes: 90 },
+          { priority: "high", ageMinutes: 60 },
+          { priority: "critical", ageMinutes: 30 },
+          { priority: "critical", ageMinutes: 45 },
+          { priority: "low", ageMinutes: 150 },
+        ],
+      });
+      const seededRunIds = seeded.map((s) => s.runId);
+
+      await priorityHeartbeat.resumeQueuedRuns();
+      expect(await waitForExecutionsOf(seededRunIds, 2)).toBe(true);
+      await settle();
+
+      expect(
+        (await seededStatuses(seededRunIds)).running.sort(),
+      ).toEqual([seeded[3]!.runId, seeded[4]!.runId].sort());
+    }, 120_000);
+
+    it("breaks a priority tie by the oldest queued ticket, never by insertion order", async () => {
+      const companyId = await seedCompany();
+      const seeded = await seedCrossAgentBacklog({
+        companyId,
+        tickets: [
+          { priority: "high", ageMinutes: 45 },
+          { priority: "high", ageMinutes: 5 },
+          { priority: "low", ageMinutes: 300 },
+        ],
+      });
+      const seededRunIds = seeded.map((s) => s.runId);
+
+      await priorityHeartbeatCeilingOne.resumeQueuedRuns();
+      expect(await waitForExecutionsOf(seededRunIds, 1)).toBe(true);
+      await settle();
+
+      const statuses = await seededStatuses(seededRunIds);
+      expect(statuses.running).toEqual([seeded[0]!.runId]);
+      expect(statuses.queued.sort()).toEqual([seeded[1]!.runId, seeded[2]!.runId].sort());
+    }, 120_000);
+
+    it("admits a newer critical ahead of older high, medium and low tickets", async () => {
+      const companyId = await seedCompany();
+      const seeded = await seedCrossAgentBacklog({
+        companyId,
+        tickets: [
+          { priority: "low", ageMinutes: 240 },
+          { priority: "medium", ageMinutes: 180 },
+          { priority: "high", ageMinutes: 120 },
+          { priority: "critical", ageMinutes: 1 },
+        ],
+      });
+      const seededRunIds = seeded.map((s) => s.runId);
+
+      await priorityHeartbeatCeilingOne.resumeQueuedRuns();
+      expect(await waitForExecutionsOf(seededRunIds, 1)).toBe(true);
+      await settle();
+
+      expect((await seededStatuses(seededRunIds)).running).toEqual([
+        seeded[3]!.runId,
+      ]);
+    }, 120_000);
+
+    it("routes a freed slot to the highest-priority pending card", async () => {
+      const companyId = await seedCompany();
+      // The oldest critical ticket takes the first slot; its completion
+      // admits the remaining queued ticket.
+      const seeded = await seedCrossAgentBacklog({
+        companyId,
+        tickets: [
+          { priority: "critical", ageMinutes: 240 },
+          { priority: "low", ageMinutes: 200 },
+          { priority: "low", ageMinutes: 160 },
+        ],
+      });
+      const seededRunIds = seeded.map((s) => s.runId);
+
+      await priorityHeartbeat.resumeQueuedRuns();
+      expect(await waitForExecutionsOf(seededRunIds, 2)).toBe(true);
+      await settle();
+      expect(
+        (await seededStatuses(seededRunIds)).running.sort(),
+      ).toEqual([seeded[0]!.runId, seeded[1]!.runId].sort());
+
+      await releaseExecution(seeded[0]!.runId);
+      expect(
+        await waitForCondition(async () => {
+          const [row] = await db
+            .select({ status: heartbeatRuns.status })
+            .from(heartbeatRuns)
+            .where(eq(heartbeatRuns.id, seeded[0]!.runId));
+          return row?.status === "succeeded";
+        }, 30_000),
+      ).toBe(true);
+
+      await priorityHeartbeat.resumeQueuedRuns();
+      expect(await waitForExecutionsOf(seededRunIds, 3)).toBe(true);
+      await settle();
+
+      expect(executionsOf([seeded[2]!.runId])).toEqual([seeded[2]!.runId]);
+      const statuses = await seededStatuses(seededRunIds);
+      expect(statuses.running.sort()).toEqual(
+        [seeded[1]!.runId, seeded[2]!.runId].sort(),
+      );
+      expect(statuses.queued).toEqual([]);
+      expect(statuses.other.map((row) => [row.id, row.status])).toEqual([
+        [seeded[0]!.runId, "succeeded"],
+      ]);
+    }, 120_000);
+
+    it("keeps per-agent continuation readiness ahead of a newer critical card", async () => {
+      const companyId = await seedCompany();
+      // A continuing card keeps precedence over a newer critical card on the
+      // same agent; the other agent's critical ticket wins the first fleet slot.
+      const continuingAgentId = await seedAgent(companyId, 0);
+      const continuingIssueId = randomUUID();
+      const continuingRunId = randomUUID();
+      const continuingWakeupId = randomUUID();
+      await db.insert(issues).values({
+        id: continuingIssueId,
+        companyId,
+        title: "Continuing medium card",
+        status: "in_progress",
+        priority: "medium",
+        assigneeAgentId: continuingAgentId,
+        responsibleUserId: "responsible-user",
+      });
+      await db.insert(agentWakeupRequests).values({
+        id: continuingWakeupId,
+        companyId,
+        agentId: continuingAgentId,
+        source: "assignment",
+        triggerDetail: "system",
+        reason: "issue_assigned",
+        payload: { issueId: continuingIssueId },
+        status: "queued",
+      });
+      await db.insert(heartbeatRuns).values({
+        id: continuingRunId,
+        companyId,
+        agentId: continuingAgentId,
+        invocationSource: "assignment",
+        triggerDetail: "system",
+        status: "queued",
+        wakeupRequestId: continuingWakeupId,
+        contextSnapshot: { issueId: continuingIssueId, wakeReason: "issue_assigned" },
+        createdAt: new Date(Date.now() - 30 * 60_000),
+        updatedAt: new Date(Date.now() - 30 * 60_000),
+      });
+      await db
+        .update(agentWakeupRequests)
+        .set({ runId: continuingRunId })
+        .where(eq(agentWakeupRequests.id, continuingWakeupId));
+      const critical = await seedCrossAgentBacklog({
+        companyId,
+        tickets: [{ priority: "critical", ageMinutes: 1 }],
+        indexOffset: 7,
+      });
+
+      await priorityHeartbeatCeilingOne.resumeQueuedRuns();
+      expect(await waitForExecutionsOf(critical.map((c) => c.runId), 1)).toBe(true);
+      await settle();
+
+      expect((await seededStatuses([continuingRunId])).queued).toEqual([
+        continuingRunId,
+      ]);
+      expect((await seededStatuses(critical.map((c) => c.runId))).running).toEqual([critical[0]!.runId]);
+    }, 120_000);
+
+    it("does not let a company's priority ticket take a slot ahead of an older ticket elsewhere", async () => {
+      const companyA = await seedCompany();
+      const companyB = await seedCompany();
+      const inCompanyA = await seedCrossAgentBacklog({
+        companyId: companyA,
+        tickets: [
+          { priority: "critical", ageMinutes: 1 },
+          { priority: "low", ageMinutes: 10 },
+        ],
+      });
+      const inCompanyB = await seedCrossAgentBacklog({
+        companyId: companyB,
+        tickets: [
+          { priority: "low", ageMinutes: 60 },
+          { priority: "low", ageMinutes: 30 },
+        ],
+        indexOffset: 20,
+      });
+
+      await priorityHeartbeatCeilingOne.resumeQueuedRuns();
+      expect(await waitForExecutionsOf([inCompanyA[0]!.runId], 1)).toBe(true);
+      await settle();
+
+      expect((await seededStatuses([inCompanyA[0]!.runId])).running).toEqual([
+        inCompanyA[0]!.runId,
+      ]);
+      expect(
+        (await seededStatuses(inCompanyB.map((s) => s.runId))).running,
+      ).toEqual([]);
+    }, 120_000);
+
+    it("never admits a ticket whose company is not active", async () => {
+      const archivedCompanyId = await seedArchivedCompany();
+      const activeCompanyId = await seedCompany();
+      const archived = await seedCrossAgentBacklog({
+        companyId: archivedCompanyId,
+        tickets: [{ priority: "critical", ageMinutes: 1 }],
+        indexOffset: 30,
+      });
+      const active = await seedCrossAgentBacklog({
+        companyId: activeCompanyId,
+        tickets: [{ priority: "low", ageMinutes: 120 }],
+        indexOffset: 40,
+      });
+
+      await priorityHeartbeatCeilingOne.resumeQueuedRuns();
+      expect(
+        await waitForExecutionsOf(active.map((s) => s.runId), 1),
+      ).toBe(true);
+      await settle();
+
+      expect(
+        (await seededStatuses(archived.map((s) => s.runId))).queued,
+      ).toEqual(archived.map((s) => s.runId).sort());
+    }, 120_000);
+
+    it("reverts to oldest-ticket-first ordering through the revert env var", async () => {
+      const companyId = await seedCompany();
+      const seeded = await seedCrossAgentBacklog({
+        companyId,
+        tickets: [
+          { priority: "low", ageMinutes: 240 },
+          { priority: "medium", ageMinutes: 180 },
+          { priority: "high", ageMinutes: 120 },
+          { priority: "critical", ageMinutes: 1 },
+        ],
+      });
+      const seededRunIds = seeded.map((s) => s.runId);
+
+      await priorityHeartbeatFifo.resumeQueuedRuns();
+      expect(await waitForExecutionsOf(seededRunIds, 2)).toBe(true);
+      await settle();
+
+      expect((await seededStatuses(seededRunIds)).running.sort()).toEqual([
+        seeded[0]!.runId,
+        seeded[1]!.runId,
+      ].sort());
+    }, 120_000);
+
+    it("claims every slot it can when no ceiling is configured, under both orderings", async () => {
+      const tickets = [
+        { priority: "low", ageMinutes: 240 },
+        { priority: "critical", ageMinutes: 180 },
+        { priority: "medium", ageMinutes: 120 },
+        { priority: "high", ageMinutes: 60 },
+      ];
+
+      const priorityCompanyId = await seedCompany();
+      const underPriority = await seedCrossAgentBacklog({
+        companyId: priorityCompanyId,
+        tickets,
+        indexOffset: 50,
+      });
+      const underPriorityRunIds = underPriority.map((s) => s.runId);
+      await priorityHeartbeatNoCeiling.resumeQueuedRuns();
+      expect(await waitForExecutionsOf(underPriorityRunIds, 4)).toBe(true);
+      await settle();
+      expect((await seededStatuses(underPriorityRunIds)).running).toHaveLength(4);
+
+      const fifoCompanyId = await seedCompany();
+      const underFifo = await seedCrossAgentBacklog({
+        companyId: fifoCompanyId,
+        tickets,
+        indexOffset: 60,
+      });
+      const underFifoRunIds = underFifo.map((s) => s.runId);
+      await priorityHeartbeatNoCeilingFifo.resumeQueuedRuns();
+      expect(await waitForExecutionsOf(underFifoRunIds, 4)).toBe(true);
+      await settle();
+      expect((await seededStatuses(underFifoRunIds)).running).toHaveLength(4);
+    }, 120_000);
+  });
 
   // A pre-existing `running` row owned by a separate agent, to exercise the
   // stale-run guard. Timestamps default to two hours old (outside the window).
@@ -650,6 +1171,44 @@ describeEmbeddedPostgres("fleet-wide agent run ceiling", () => {
     expect(startedRunIds.filter((id) => runs.some((run) => run.id === id))).toHaveLength(2);
   }, 120_000);
 
+  it("SPA-10069 starts a cap-deferred review-stage wake without a comment or monitor after capacity clears", async () => {
+    const companyId = await seedCompany();
+    const holder = await seedAgentWithQueuedRun({ companyId, index: 0, createdAt: new Date(Date.now() - 60_000) });
+    const reviewerId = await seedAgent(companyId, 1);
+    const issueId = randomUUID();
+    const stageId = randomUUID();
+    await db.insert(issues).values({
+      id: issueId, companyId, title: "Cap-deferred review", status: "in_review", priority: "medium",
+      assigneeAgentId: reviewerId, responsibleUserId: "responsible-user",
+      executionState: {
+        status: "pending", currentStageId: stageId, currentStageIndex: 0, currentStageType: "review",
+        stageEnteredAt: new Date(Date.now() - 20 * 60_000).toISOString(),
+        currentParticipant: { type: "agent", agentId: reviewerId, userId: null },
+        returnAssignee: { type: "agent", agentId: holder.agentId, userId: null },
+        reviewRequest: null, completedStageIds: [], lastDecisionId: null, lastDecisionOutcome: null,
+      },
+    });
+    await heartbeatAtCeilingOne.resumeQueuedRuns();
+    expect(await waitForExecutionsOf([holder.runId], 1)).toBe(true);
+    const reviewRun = await heartbeatAtCeilingOne.wakeup(reviewerId, {
+      source: "assignment", reason: "execution_review_requested", payload: { issueId },
+      contextSnapshot: { issueId, wakeReason: "execution_review_requested" },
+      requestedByActorType: "system", requestedByActorId: "test",
+    });
+    expect(reviewRun?.status).toBe("queued");
+    expect((await heartbeatAtCeilingOne.reconcileStrandedAssignedIssues()).reviewParticipantRequeued).toBe(0);
+    expect(executionsOf([reviewRun!.id])).toHaveLength(0);
+    await db.update(issues).set({ status: "done", completedAt: new Date() }).where(eq(issues.id, holder.issueId));
+    await releaseExecution(holder.runId);
+    expect(await waitForCondition(async () => (await heartbeat.getRun(holder.runId))?.status === "succeeded", 30_000)).toBe(true);
+    await heartbeatAtCeilingOne.reconcileStrandedAssignedIssues();
+    await heartbeatAtCeilingOne.resumeQueuedRuns();
+    expect(await waitForExecutionsOf([reviewRun!.id], 1)).toBe(true);
+    expect((await heartbeat.getRun(reviewRun!.id))?.status).toBe("running");
+    expect(await db.select().from(issueComments).where(eq(issueComments.issueId, issueId))).toHaveLength(0);
+    expect((await db.select().from(issues).where(eq(issues.id, issueId)))[0]?.monitorNextCheckAt).toBeNull();
+  }, 120_000);
+
   it("re-admits an over-cap queued run once a slot frees", async () => {
     const { seeded } = await seedCompanyWithQueuedRuns();
     const seededRunIds = seeded.map((s) => s.runId);
@@ -702,6 +1261,196 @@ describeEmbeddedPostgres("fleet-wide agent run ceiling", () => {
     expect(rows.filter((row) => row.status !== "succeeded")).toEqual([]);
     expect(new Set(executionsOf(seededRunIds))).toEqual(new Set(seededRunIds));
   }, 120_000);
+
+  describe("SPA-10137: live DB-backed fleet cap", () => {
+    // Uses `heartbeat` (no env ceiling configured) throughout, so the DB value
+    // is the sole source of truth and these tests cannot cross-talk with the
+    // env-ceiling fixtures (heartbeatAtCeilingOne/Two/TwoB) above.
+    async function setDbFleetCap(value: number | null) {
+      await instanceSettingsService(db).updateGeneral({ fleetMaxConcurrentRuns: value });
+    }
+
+    it("reads the DB override through heartbeatService and caches it until invalidated", async () => {
+      expect(await heartbeat.getFleetMaxConcurrentRunsStatus()).toEqual({
+        value: null,
+        source: "none",
+      });
+
+      await setDbFleetCap(3);
+      // Cache was never warmed yet in this test, but it may be warm from
+      // another `heartbeat.getFleetMaxConcurrentRunsStatus()` call elsewhere
+      // in this run; invalidate first so this read is guaranteed fresh.
+      invalidateFleetMaxConcurrentRunsCache();
+      expect(await heartbeat.getFleetMaxConcurrentRunsStatus()).toEqual({
+        value: 3,
+        source: "db",
+      });
+
+      // Write a new value WITHOUT invalidating: the cached read must still
+      // return the stale value until something invalidates it.
+      await setDbFleetCap(10);
+      expect(await heartbeat.getFleetMaxConcurrentRunsStatus()).toEqual({
+        value: 3,
+        source: "db",
+      });
+
+      invalidateFleetMaxConcurrentRunsCache();
+      expect(await heartbeat.getFleetMaxConcurrentRunsStatus()).toEqual({
+        value: 10,
+        source: "db",
+      });
+    });
+
+    it("raises the cap live and starts queued runs within one admission pass, no restart", async () => {
+      await setDbFleetCap(2);
+      invalidateFleetMaxConcurrentRunsCache();
+
+      const { seeded } = await seedCompanyWithQueuedRuns(4);
+      const seededRunIds = seeded.map((s) => s.runId);
+
+      await heartbeat.resumeQueuedRuns();
+      expect(await waitForExecutionsOf(seededRunIds, 2)).toBe(true);
+      await settle();
+      expect((await seededStatuses(seededRunIds)).running).toHaveLength(2);
+
+      // Raise the cap live, on the SAME heartbeatService instance (no
+      // restart) -- exactly what the instance-settings route does on a PATCH
+      // that raises the value -- then trigger one admission pass.
+      await setDbFleetCap(4);
+      invalidateFleetMaxConcurrentRunsCache();
+      expect(await heartbeat.getFleetMaxConcurrentRunsStatus()).toEqual({
+        value: 4,
+        source: "db",
+      });
+      await heartbeat.resumeQueuedRuns();
+      expect(await waitForExecutionsOf(seededRunIds, 4)).toBe(true);
+      await settle();
+
+      const statuses = await seededStatuses(seededRunIds);
+      expect(statuses.running).toHaveLength(4);
+      expect(statuses.queued).toHaveLength(0);
+      expect(statuses.other).toHaveLength(0);
+    }, 120_000);
+
+    it("lowers the cap live without killing any already-running run", async () => {
+      await setDbFleetCap(4);
+      invalidateFleetMaxConcurrentRunsCache();
+
+      const { seeded } = await seedCompanyWithQueuedRuns(6);
+      const seededRunIds = seeded.map((s) => s.runId);
+
+      await heartbeat.resumeQueuedRuns();
+      expect(await waitForExecutionsOf(seededRunIds, 4)).toBe(true);
+      await settle();
+      const before = await seededStatuses(seededRunIds);
+      expect(before.running).toHaveLength(4);
+      expect(before.queued).toHaveLength(2);
+
+      // Lower the cap below the current running count, then sweep again.
+      await setDbFleetCap(1);
+      invalidateFleetMaxConcurrentRunsCache();
+      await heartbeat.resumeQueuedRuns();
+      await settle();
+
+      // Every run that was already running stays running (none cancelled,
+      // none force-stopped); admission simply withholds the excess.
+      const after = await seededStatuses(seededRunIds);
+      expect(after.running.sort()).toEqual(before.running.sort());
+      expect(after.queued).toHaveLength(2);
+      expect(after.other).toHaveLength(0);
+    }, 120_000);
+
+    it("cap 0 pauses admissions: 2 queued + 1 running -> running finishes, 0 admitted; raise to 2 admits queued", async () => {
+      // 3 seeded agents: the sweep admits only the 2 the raised-later cap
+      // allows, so pause->raise->admit is observable on the same fixture.
+      await setDbFleetCap(4);
+      invalidateFleetMaxConcurrentRunsCache();
+
+      const { seeded } = await seedCompanyWithQueuedRuns(3);
+      const seededRunIds = seeded.map((s) => s.runId);
+
+      await heartbeat.resumeQueuedRuns();
+      expect(await waitForExecutionsOf(seededRunIds, 3)).toBe(true);
+      await settle();
+
+      // Park one execution so its run stays running across the pause.
+      const parkedRunId = seeded[0]!.runId;
+      blockExecutions = true;
+      await releaseExecution(seeded[1]!.runId);
+      await releaseExecution(seeded[2]!.runId);
+      await waitForCondition(async () => {
+        const statuses = await seededStatuses(seededRunIds);
+        return statuses.running.length === 1 && statuses.queued.length === 0;
+      }, 30_000);
+
+      // Pause: cap 0. No new admission, and the parked running run is
+      // never killed.
+      await setDbFleetCap(0);
+      invalidateFleetMaxConcurrentRunsCache();
+      expect(await heartbeat.getFleetMaxConcurrentRunsStatus()).toEqual({
+        value: 0,
+        source: "db",
+      });
+      await heartbeat.resumeQueuedRuns();
+      await settle();
+      let paused = await seededStatuses(seededRunIds);
+      expect(paused.running.sort()).toEqual([parkedRunId]);
+      expect(paused.queued).toHaveLength(0);
+      // The two completed runs are terminal; the parked one is untouched.
+      expect(paused.other.map((row) => row.id).sort()).toEqual(
+        [seeded[1]!.runId, seeded[2]!.runId].sort(),
+      );
+
+      // A fresh queued card arriving during the pause stays queued.
+      blockExecutions = false;
+      const { seeded: pausedSeeded } = await seedCompanyWithQueuedRuns(1);
+      const pausedRunId = pausedSeeded[0]!.runId;
+      await heartbeat.resumeQueuedRuns();
+      await settle();
+      paused = await seededStatuses([...seededRunIds, pausedRunId]);
+      expect(paused.running.sort()).toEqual([parkedRunId]);
+      expect(paused.queued).toEqual([pausedRunId]);
+
+      // Finish the parked run: with cap 0 the freed slot admits NOTHING.
+      blockExecutions = true;
+      await releaseExecution(parkedRunId);
+      await waitForCondition(
+        async () => (await seededStatuses(seededRunIds)).other.some((row) => row.id === parkedRunId),
+        30_000,
+      );
+      await heartbeat.resumeQueuedRuns();
+      await settle();
+      paused = await seededStatuses([...seededRunIds, pausedRunId]);
+      expect(paused.queued).toEqual([pausedRunId]);
+
+      // Raise to 2: the queued wake is admitted in one pass.
+      await setDbFleetCap(2);
+      invalidateFleetMaxConcurrentRunsCache();
+      blockExecutions = false;
+      await heartbeat.resumeQueuedRuns();
+      expect(await waitForExecutionsOf([pausedRunId], 1)).toBe(true);
+      await settle();
+      const raised = await seededStatuses([...seededRunIds, pausedRunId]);
+      // The queued run was admitted (executed); nothing is stranded queued.
+      expect(raised.queued).toHaveLength(0);
+      expect(executionsOf([pausedRunId]).length).toBe(1);
+    }, 120_000);
+
+    it("falls back to the env var when the DB value is unparseable (never silently no-ceiling)", async () => {
+      // Write a well-formed row, then corrupt just this key directly (bypasses
+      // API validation, simulating a manual DB edit / bad restore).
+      await setDbFleetCap(2);
+      await db
+        .update(instanceSettings)
+        .set({ general: sql`jsonb_set(${instanceSettings.general}, '{fleetMaxConcurrentRuns}', '"garbage"')` });
+      invalidateFleetMaxConcurrentRunsCache();
+
+      expect(await heartbeatAtCeilingTwo.getFleetMaxConcurrentRunsStatus()).toEqual({
+        value: 2,
+        source: "env",
+      });
+    });
+  });
 
   it("defers a claim's nested re-admission instead of stalling the fleet lock on it", async () => {
     // Agent A's two queued runs are budget-blocked (their project is paused for

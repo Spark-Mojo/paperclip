@@ -4,6 +4,7 @@ import fs from "node:fs/promises";
 import { setExpensiveWorkspaceGitExecutor } from "@paperclipai/adapter-utils/git-workspace-sync";
 import { HttpError } from "../errors.js";
 import { logger } from "../middleware/logger.js";
+import { withWorktreeGitLease } from "./worktree-git-lease.js";
 
 export const WORKSPACE_GIT_SCAN_ERROR_CODES = {
   saturated: "workspace_git_scan_saturated",
@@ -674,7 +675,7 @@ export class WorkspaceGitOperationScheduler {
     const startedAt = this.now();
     const queueWaitMs = Math.max(0, startedAt - scan.enqueuedAt);
 
-    void this.runner({
+    void withWorktreeGitLease(scan.canonicalWorkspacePath, () => this.runner({
       canonicalWorkspacePath: scan.canonicalWorkspacePath,
       args: scan.args,
       env: scan.env,
@@ -683,7 +684,7 @@ export class WorkspaceGitOperationScheduler {
       killGraceMs: this.killGraceMs,
       maxStdoutBytes: scan.maxStdoutBytes,
       maxStderrBytes: scan.maxStderrBytes,
-    }).then(
+    })).then(
       (result) => this.finishSuccess(scan, result, queueWaitMs, startedAt),
       (error) => this.finishFailure(scan, error, queueWaitMs, startedAt),
     );

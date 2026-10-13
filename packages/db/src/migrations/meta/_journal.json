@@ -1980,7 +1980,42 @@
       "idx": 9283,
       "version": "7",
       "when": 1790649901607,
-      "tag": "9283_stranded_rewake_idempotency",
+      "tag": "9283_missing_terminal_run_liveness_index",
+      "breakpoints": true
+    },
+    {
+      "idx": 9284,
+      "version": "7",
+      "when": 1791784238660,
+      "tag": "9284_heartbeat_context_snapshot_id_columns",
+      "breakpoints": true
+    },
+    {
+      "idx": 9285,
+      "version": "7",
+      "when": 1791784239660,
+      "tag": "9285_wake_loop_guard_index",
+      "breakpoints": true
+    },
+    {
+      "idx": 9286,
+      "version": "7",
+      "when": 1791823000000,
+      "tag": "9286_issue_comment_agent_idempotency",
+      "breakpoints": true
+    },
+    {
+      "idx": 9287,
+      "version": "7",
+      "when": 1791904600000,
+      "tag": "9287_orphaned_run_rewake_idempotency",
+      "breakpoints": true
+    },
+    {
+      "idx": 9288,
+      "version": "7",
+      "when": 1791904600001,
+      "tag": "9288_stranded_rewake_idempotency",
       "breakpoints": true
     }
   ]

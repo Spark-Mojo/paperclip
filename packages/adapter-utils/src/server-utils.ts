@@ -1,5 +1,14 @@
 import type { ExecutionContinuationEnvelope } from "@paperclipai/shared";
 import { spawn, type ChildProcess } from "node:child_process";
+import {
+  killRunScope,
+  scopedRunCommand,
+  stopRunScope,
+} from "./run-resource-scope.js";
+import {
+  createStreamStallDetector,
+  MODEL_STREAM_STALLED_ERROR_CODE,
+} from "./stream-stall-detector.js";
 import { createHash, randomUUID } from "node:crypto";
 import { constants as fsConstants, promises as fs, type Dirent } from "node:fs";
 import os from "node:os";
@@ -147,6 +156,225 @@ export const runningProcesses = new Map<string, RunningProcess>();
 export const MAX_CAPTURE_BYTES = 4 * 1024 * 1024;
 export const MAX_EXCERPT_BYTES = 32 * 1024;
 const TERMINAL_RESULT_SCAN_OVERLAP_CHARS = 64 * 1024;
+
+/**
+ * SPA-11948. The spawn-admission fence closes a window the old
+ * run-registry drain could not see: a child whose `spawn()` has returned
+ * but whose `runningProcesses.set` and the durable `onSpawn` callback have
+ * not run yet. That window is invisible to a registry-only drain, so the
+ * mid-spawn child survives a graceful shutdown as an orphan still holding
+ * a concurrency cap slot.
+ *
+ * The fence covers the whole pre-spawn -> registered window by counting
+ * a lease BEFORE `spawn()` is called. The post-spawn `admit()` call is the
+ * gate: when the fence is closed, `admit()` rejects with
+ * `spawn_admission_closed` and KILLS the admitted tree, so a refused
+ * spawn dies instead of being orphaned. `settle()` is called on BOTH the
+ * admitted and the refused paths so a leaked ticket can never wedge the
+ * drain, and it is idempotent so the teardown can call it defensively.
+ *
+ * `drain()` only reports "drained" once no lease is outstanding, never
+ * merely because the gate is closed.
+ */
+type SpawnAdmissionMeta = {
+  pid: number;
+  processGroupId: number | null;
+  resourceUnit: string | null;
+};
+
+type SpawnAdmissionTicket = {
+  admit(meta: SpawnAdmissionMeta): Promise<void>;
+  settle(): void;
+};
+
+type SpawnAdmissionDrainOutcome = "drained" | "timed_out";
+
+export type SpawnAdmissionFence = {
+  /** Take an admission lease. MUST be called BEFORE `spawn()`. */
+  enterAdmission(): SpawnAdmissionTicket;
+  /** Close the gate. Outstanding leases stay counted; later ones are refused. */
+  close(): void;
+  /** Reopen the gate. Restores the pre-shutdown behaviour. */
+  reopen(): void;
+  isClosed(): boolean;
+  /** Leases taken and not yet settled. Covers the whole pre-spawn -> registered window. */
+  inFlight(): number;
+  /** Resolves "drained" only once no lease is outstanding. */
+  drain(options: { timeoutMs: number }): Promise<SpawnAdmissionDrainOutcome>;
+};
+
+async function killAdmittedSpawnTree(meta: SpawnAdmissionMeta): Promise<void> {
+  // The systemd scope owns the complete cgroup, including descendants that no
+  // longer share the wrapper's process group. Kill every member immediately;
+  // unlike `systemctl stop`, this never waits through a graceful-stop timeout.
+  if (meta.resourceUnit) {
+    try {
+      await killRunScope(meta.resourceUnit);
+      return;
+    } catch {
+      // Fall through to process-group/direct-pid signalling as a best-effort
+      // backstop. The admission still refuses even if systemd itself failed.
+    }
+  }
+  // On non-Windows platforms, `runChildProcess` always spawns detached, so
+  // the child leads its own process group and the process-group pid is the
+  // right key. On Windows there is no process-group signal primitive, so
+  // the direct pid is the only lever.
+  if (
+    process.platform !== "win32" &&
+    typeof meta.processGroupId === "number" &&
+    Number.isInteger(meta.processGroupId) &&
+    meta.processGroupId > 0
+  ) {
+    try {
+      process.kill(-meta.processGroupId, "SIGKILL");
+      return;
+    } catch (error) {
+      if (isSilentKillFailure(error)) {
+        // Not a process group leader (e.g. the unit's cgroup already reaped
+        // the leader); fall through to the direct pid so the descendant
+        // cannot outlive the refusal.
+      } else {
+        console.warn(
+          { err: error, processGroupId: meta.processGroupId },
+          "spawn admission kill failed for process group",
+        );
+      }
+    }
+  }
+  if (
+    typeof meta.pid === "number" &&
+    Number.isInteger(meta.pid) &&
+    meta.pid > 0
+  ) {
+    try {
+      process.kill(meta.pid, "SIGKILL");
+    } catch (error) {
+      if (isSilentKillFailure(error)) {
+        // Already gone.
+      } else {
+        console.warn(
+          { err: error, pid: meta.pid },
+          "spawn admission kill failed for direct pid",
+        );
+      }
+    }
+  }
+}
+
+/**
+ * `process.kill` failures that mean the target is already dead. ESRCH is the
+ * only one: everything else (EPERM on a misconfigured host, EINVAL on a bad
+ * signal) is a real failure to kill a refused spawn -- exactly the orphan the
+ * fence exists to prevent -- so it is logged rather than swallowed.
+ */
+function isSilentKillFailure(error: unknown): boolean {
+  return (
+    typeof error === "object" &&
+    error !== null &&
+    (error as NodeJS.ErrnoException).code === "ESRCH"
+  );
+}
+
+let spawnAdmissionFenceSingleton: SpawnAdmissionFence | null = null;
+
+/**
+ * Process-global singleton: the fence is consulted from every
+ * `runChildProcess` call site and from the shutdown coordinator in
+ * `server/src/shutdown.ts`. A child spawned anywhere in the process
+ * counts on the same gate, so a post-shutdown spawn is refused the same
+ * way no matter which adapter asks for it.
+ */
+export function getSpawnAdmissionFence(): SpawnAdmissionFence {
+  if (spawnAdmissionFenceSingleton) return spawnAdmissionFenceSingleton;
+  let closed = false;
+  let inFlightCount = 0;
+  const waiters: Array<() => void> = [];
+
+  const fence: SpawnAdmissionFence = {
+    enterAdmission() {
+      inFlightCount += 1;
+      let settled = false;
+      const ticket: SpawnAdmissionTicket = {
+        async admit(meta) {
+          if (closed) {
+            // Refuse AND kill: a refused spawn whose tree survives is the
+            // orphan shape the fence exists to prevent. Settling first
+            // releases the counter so the drain can complete, and it
+            // happens whether or not the kill succeeds — a refusal that
+            // never settled would wedge `drain()` forever.
+            try {
+              await killAdmittedSpawnTree(meta);
+            } finally {
+              if (!settled) {
+                settled = true;
+                inFlightCount -= 1;
+                if (inFlightCount === 0) {
+                  const next = waiters.shift();
+                  if (next) next();
+                }
+              }
+            }
+            throw new Error(
+              "spawn_admission_closed: refused post-spawn admission; admitted tree signalled",
+            );
+          }
+        },
+        settle() {
+          if (settled) return;
+          settled = true;
+          inFlightCount -= 1;
+          if (inFlightCount === 0) {
+            const next = waiters.shift();
+            if (next) next();
+          }
+        },
+      };
+      return ticket;
+    },
+    close() {
+      closed = true;
+    },
+    reopen() {
+      closed = false;
+    },
+    isClosed() {
+      return closed;
+    },
+    inFlight() {
+      return inFlightCount;
+    },
+    drain({ timeoutMs }) {
+      if (inFlightCount === 0) return Promise.resolve("drained" as const);
+      return new Promise<SpawnAdmissionDrainOutcome>((resolve) => {
+        let timer: NodeJS.Timeout | null = null;
+        const wake = () => {
+          if (timer) {
+            clearTimeout(timer);
+            timer = null;
+          }
+          resolve("drained");
+        };
+        waiters.push(wake);
+        // The timeout is bounded so a wedged in-flight lease cannot pin
+        // shutdown forever; the gate's own `close()` is what marks
+        // refused spawns, so a timeout only means the producer has not
+        // settled yet. The drain reports "timed_out" and the caller can
+        // decide whether to keep going.
+        timer = setTimeout(() => {
+          timer = null;
+          const idx = waiters.indexOf(wake);
+          if (idx >= 0) waiters.splice(idx, 1);
+          resolve("timed_out");
+        }, Math.max(0, timeoutMs));
+        if (typeof timer.unref === "function") timer.unref();
+      });
+    },
+  };
+  spawnAdmissionFenceSingleton = fence;
+  return fence;
+}
+
 const DEFAULT_PAPERCLIP_INSTANCE_ID = "default";
 const PATH_SEGMENT_RE = /^[a-zA-Z0-9_-]+$/;
 const SENSITIVE_ENV_KEY =
@@ -4744,15 +4972,89 @@ export async function runChildProcess(
           });
           childEnv[promptFileEnvName] = resolvedPromptFilePath;
         }
-        const child = spawn(target.command, target.args, {
-          cwd: target.cwd ?? opts.cwd,
-          env: childEnv,
-          detached: process.platform !== "win32",
-          shell: false,
-          stdio: [stdinToPipe != null ? "pipe" : "ignore", "pipe", "pipe"],
-        }) as ChildProcessWithEvents;
-        const startedAt = new Date().toISOString();
-        const processGroupId = resolveProcessGroupId(child);
+        const scoped = opts.remoteExecution
+          ? { command: target.command, args: target.args, unit: null, env: {} }
+          : scopedRunCommand(runId, target.command, target.args);
+        // SPA-11948. Take the admission lease BEFORE `spawn()` so the
+        // count covers the whole pre-spawn -> registered window. A
+        // mid-spawn child is in no registry a drain consults, so the
+        // drain would otherwise miss it and let it survive the restart
+        // as an orphan holding a concurrency cap slot. The lease is
+        // settled on every code path below (admitted, refused, spawn
+        // error) so a leaked ticket can never wedge the drain.
+        const admissionTicket = getSpawnAdmissionFence().enterAdmission();
+        let admissionTicketSettled = false;
+        const settleAdmissionTicket = () => {
+          if (admissionTicketSettled) return;
+          admissionTicketSettled = true;
+          admissionTicket.settle();
+        };
+        let child: ChildProcessWithEvents;
+        let startedAt: string;
+        let processGroupId: number | null;
+        try {
+          child = spawn(scoped.command, scoped.args, {
+            cwd: target.cwd ?? opts.cwd,
+            env: { ...childEnv, ...scoped.env },
+            detached: process.platform !== "win32",
+            shell: false,
+            stdio: [stdinToPipe != null ? "pipe" : "ignore", "pipe", "pipe"],
+          }) as ChildProcessWithEvents;
+          startedAt = new Date().toISOString();
+          processGroupId = resolveProcessGroupId(child);
+        } catch (err) {
+          // `spawn()` raised synchronously (ENOENT/EACCES or some other OS
+          // error before any child existed). Without this branch the lease
+          // would leak and the next graceful drain would wedge forever,
+          // because the producer never reached a settling path. Settle
+          // defensively so the in-flight counter drops to zero regardless
+          // of where the OS error fired, then surface the rejection.
+          settleAdmissionTicket();
+          reject(err);
+          return;
+        }
+        // Post-spawn binding. The fence refuses a spawn whose lease
+        // reaches a closed gate: `admit()` rejects AFTER killing the
+        // admitted tree, so a refused spawn is not orphaned. On the
+        // success path the ticket is settled below once the run is
+        // registered; the inFlight counter covers the pre-spawn ->
+        // registered window so a graceful drain cannot miss the child.
+        if (typeof child.pid !== "number" || child.pid <= 0) {
+          // A pid-less spawn is not a real OS process; settle the lease
+          // here and let the `error` handler reject the run promise.
+          settleAdmissionTicket();
+        } else {
+          // The `await` below yields the microtask queue while the canonical
+          // `error` handler is only attached AFTER registration, so a
+          // spawn-time failure surfacing inside that gap would be an
+          // UNHANDLED `error` event and crash the engine process. Pin a gap
+          // handler that settles the lease and rejects; it is removed in the
+          // same synchronous continuation that later attaches the canonical
+          // handler, so no error timing can fall between the two.
+          const onAdmissionGapError = (err: Error) => {
+            settleAdmissionTicket();
+            reject(err);
+          };
+          child.once("error", onAdmissionGapError);
+          try {
+            await admissionTicket.admit({
+              pid: child.pid,
+              processGroupId,
+              resourceUnit: scoped.unit,
+            });
+          } catch (err) {
+            child.removeListener("error", onAdmissionGapError);
+            // `admit()` already killed the tree and settled its own
+            // lease on the refusal path; the secondary `settle` is
+            // idempotent and the `runningProcesses` / `onSpawn` paths
+            // below are intentionally skipped so a refused spawn leaves
+            // no half-registered entry.
+            settleAdmissionTicket();
+            reject(err);
+            return;
+          }
+          child.removeListener("error", onAdmissionGapError);
+        }
 
         const spawnPersistPromise =
           typeof child.pid === "number" && child.pid > 0 && opts.onSpawn
@@ -4772,6 +5074,10 @@ export async function runChildProcess(
           graceSec: opts.graceSec,
           processGroupId,
         });
+        // Registration closes the vulnerable window: shutdown can now see and
+        // signal this process through `runningProcesses`, so release the
+        // pre-spawn lease before any durable callback or process wait.
+        settleAdmissionTicket();
 
         let timedOut = false;
         let stdout = "";
@@ -4866,12 +5172,39 @@ export async function runChildProcess(
               }, opts.timeoutSec * 1000)
             : null;
 
+        // Stream-stall detector (SPA-11981).
+        // The detector's only action is to call `onStall` once the root has
+        // produced no stdout/stderr activity for the configured idle window
+        // AND the root is still alive. It NEVER enumerates processes, NEVER
+        // walks /proc, and NEVER issues a kill signal itself. Containment
+        // belongs to `cleanupScope()` (`systemctl --user stop <unit>`), which
+        // is the cgroup fence and only ever reaches pids inside the unit.
+        let streamStalled = false;
+        const streamStallDetector = createStreamStallDetector({
+          onStall: ({ idleMs: observedIdle }) => {
+            streamStalled = true;
+            // Set the resolve flag first so the eventual `close` handler
+            // emits errorCode. Then tear down the cgroup; the child will
+            // receive SIGKILL from systemd and emit `close` shortly.
+            void cleanupScope();
+            onLogError(
+              new Error(
+                `model stream stalled after ${Math.round(observedIdle / 1000)}s of root inactivity`,
+              ),
+              runId,
+              "stream_stall_detector",
+            );
+          },
+          isRootAlive: () => child.exitCode === null && child.signalCode === null,
+        });
+
         child.stdout?.on("data", (chunk: unknown) => {
           const readable = child.stdout;
           if (!readable) return;
           readable.pause();
           const text = String(chunk);
           stdout = appendWithCap(stdout, text);
+          streamStallDetector.noteActivity();
           maybeArmTerminalResultCleanup();
           logChain = logChain
             .then(() => opts.onLog("stdout", text))
@@ -4890,6 +5223,7 @@ export async function runChildProcess(
           readable.pause();
           const text = String(chunk);
           stderr = appendWithCap(stderr, text);
+          streamStallDetector.noteActivity();
           maybeArmTerminalResultCleanup();
           logChain = logChain
             .then(() => opts.onLog("stderr", text))
@@ -4904,6 +5238,9 @@ export async function runChildProcess(
 
         const stdin = child.stdin;
         if (stdinToPipe != null && stdin) {
+          stdin.on("error", (err: NodeJS.ErrnoException) => {
+            if (err.code !== "EPIPE") onLogError(err, runId, "failed to send adapter stdin");
+          });
           void spawnPersistPromise.finally(() => {
             if (child.killed || stdin.destroyed) return;
             stdin.write(stdinToPipe as string);
@@ -4911,10 +5248,21 @@ export async function runChildProcess(
           });
         }
 
+        let scopeCleanup: Promise<boolean> | null = null;
+        const cleanupScope = () => {
+          scopeCleanup ??= stopRunScope(scoped.unit).then(() => true, (stopError) => {
+            onLogError(stopError, runId, "failed to stop run scope");
+            return false;
+          });
+          return scopeCleanup;
+        };
+
         child.on("error", (err: Error) => {
           if (timeout) clearTimeout(timeout);
           clearTerminalCleanupTimers();
+          streamStallDetector.stop();
           runningProcesses.delete(runId);
+          void cleanupScope();
           void target.cleanup?.();
           const errno = (err as NodeJS.ErrnoException).code;
           const pathValue = mergedEnv.PATH ?? mergedEnv.Path ?? "";
@@ -4926,7 +5274,9 @@ export async function runChildProcess(
         });
 
         child.on("exit", () => {
+          streamStallDetector.stop();
           maybeArmTerminalResultCleanup();
+          void cleanupScope();
         });
 
         child.on(
@@ -4934,8 +5284,14 @@ export async function runChildProcess(
           (code: number | null, signal: NodeJS.Signals | null) => {
             if (timeout) clearTimeout(timeout);
             clearTerminalCleanupTimers();
+            streamStallDetector.stop();
             runningProcesses.delete(runId);
-            void logChain.finally(() => {
+            void logChain.finally(async () => {
+              const scopeStopped = await cleanupScope();
+              if (!scopeStopped) {
+                reject(new Error("run_scope_stop_failed"));
+                return;
+              }
               void Promise.resolve()
                 .then(() => target.cleanup?.())
                 .finally(() => {
@@ -4943,6 +5299,9 @@ export async function runChildProcess(
                     exitCode: code,
                     signal,
                     timedOut,
+                    errorCode: streamStalled
+                      ? MODEL_STREAM_STALLED_ERROR_CODE
+                      : null,
                     stdout,
                     stderr,
                     pid: child.pid ?? null,

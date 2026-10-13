@@ -10,6 +10,7 @@ import {
   gte,
   inArray,
   isNull,
+  ne,
   not,
   notInArray,
   or,
@@ -52,6 +53,11 @@ import {
   workAssessments,
 } from "@paperclipai/db";
 import { parseObject, asBoolean, asNumber } from "../../adapters/utils.js";
+import {
+  PRODUCTIVE_CONTINUATION_RECOVERY_SOURCE,
+  gateContinuationChain,
+  type ContinuationChainStop,
+} from "./continuation-chain-budget.js";
 import { runningProcesses } from "../../adapters/index.js";
 import {
   isNativeRunnerOwnershipHeld,
@@ -127,6 +133,7 @@ import {
   isStrandedIssueRecoveryOriginKind,
 } from "./origins.js";
 import { withRecoveryContext } from "./status-only-context.js";
+import { buildIssueReviewPathLostIdempotencyKey } from "./review-path-recovery.js";
 import { isAutomaticRecoverySuppressedByPauseHold } from "./pause-hold-guard.js";
 import {
   collectDispositionRepairSourceState,
@@ -181,10 +188,37 @@ const STRANDED_ISSUE_RECOVERY_ORIGIN_KIND =
 const DEFERRED_WAKE_CONTEXT_KEY = "_paperclipWakeContext";
 const EXECUTION_REVIEW_PARTICIPANT_RECOVERY_REASON =
   "execution_review_participant_recovery";
+const STRANDED_STAGE_ENTRY_THRESHOLD_MS = 15 * 60_000;
 const STRANDED_BOARD_ESCALATION_POLICY = "board_escalation_no_takeover_v1";
 const DISPOSITION_REPAIR_IDEMPOTENCY_INDEX =
   "agent_wakeup_requests_disposition_repair_idempotency_uq";
 const RESOLVED_DEPENDENCY_WAKE_BACKSTOP_CANDIDATE_LIMIT = 500;
+
+// SPA-12218: the `errorCode` the startup orphan backstop stamps on a run whose
+// process and sandbox are gone while `heartbeat_runs.status` stayed live. That
+// backstop terminalizes the RUN but never re-wakes the owning ISSUE, so the card
+// stays `in_progress` with no live execution path until a human intervenes.
+// `reconcileOrphanedRunIssues` closes that gap: the errorCode, not the run's
+// terminal status, is the discriminator, because the same backstop also stamps
+// `orphaned_running_run_issue_terminal` for a different authority.
+const ORPHANED_RUNNING_RUN_ERROR_CODE = "orphaned_running_run";
+// At most one wake per orphaned run, ever. Keyed on the run rather than the
+// issue so a second, later orphan on the SAME card (a second SIGKILL) gets its
+// own one wake, while a repeated sweep over the same orphan is a no-op.
+const ORPHANED_RUN_REWAKE_IDEMPOTENCY_PREFIX = "issue_orphaned_run_rewake:";
+// SPA-12218: per-sweep ceiling on re-wakes. Sized above the worst single
+// incident observed on this fleet (17 runs orphaned by the 2026-10-13 SIGKILL)
+// and far below the concurrency cap, so one boot drains an ordinary incident
+// completely while a pathological orphan backlog drains over several boots
+// instead of stampeding the provider.
+const ORPHANED_RUN_REWAKE_MAX_PER_SWEEP = 100;
+// The partial unique index that makes the "at most one wake per orphaned run"
+// claim atomic across concurrent boots. Named so a collision can be told apart
+// from an unrelated constraint failure.
+const ORPHANED_RUN_REWAKE_IDEMPOTENCY_CONSTRAINT =
+  "agent_wakeup_requests_orphaned_run_rewake_idempotency_uq";
+const ORPHANED_RUN_REWAKE_SOURCE = "recovery.reconcile_orphaned_run_issue";
+const ORPHANED_RUN_REWAKE_REASON = "orphaned_run_recovery";
 
 // GGU-809: when a stranded `in_progress` issue would otherwise hit the
 // `isRepeatedProductiveContinuationRecovery` escalation path, exempt the
@@ -232,6 +266,10 @@ type RecoveryWakeupOptions = {
   issueStateGuard?: {
     statuses: string[];
     assigneeAgentId: string;
+    stageId?: string;
+    participantAgentId?: string;
+    lastDecisionId?: string | null;
+    stageEnteredAt?: string;
   };
 };
 
@@ -535,6 +573,7 @@ const TRANSIENT_INFRA_CONTINUATION_ERROR_CODES = new Set<string>([
   "codex_transient_upstream",
   "codex_harness_crash",
   "claude_transient_upstream",
+  "model_stream_stalled",
   "provider_quota",
   "timeout",
 ]);
@@ -1010,6 +1049,25 @@ function isRepeatedProductiveContinuationRecovery(
     isProductiveContinuationRun(latestRun)
   );
 }
+
+/**
+ * The outcome of one `enqueueStrandedIssueRecovery` attempt.
+ *
+ * It is a discriminated union rather than a bare run row (or `null`) because a
+ * refusal now has two distinct causes a caller must be able to tell apart: the
+ * ordinary "nothing to enqueue" case, and the chain-wide budget refusing to
+ * extend a spent chain. The second carries the stop receipt so the caller can
+ * escalate exactly once and stay silent on every later sweep.
+ */
+type StrandedRecoveryChainStop = {
+  stop: ContinuationChainStop;
+  /** True when this chain already carries a durable stop receipt. */
+  alreadyStopped: boolean;
+};
+
+type StrandedRecoveryEnqueueOutcome =
+  | { queued: true; run: typeof heartbeatRuns.$inferSelect }
+  | { queued: false; chainStop: StrandedRecoveryChainStop | null };
 
 export function recoveryService(
   db: Db,
@@ -2543,8 +2601,9 @@ export function recoveryService(
     source: string;
     retryOfRunId?: string | null;
     idempotencyKey?: string;
+    issueStateGuard?: RecoveryWakeupOptions["issueStateGuard"];
     extraContext?: Record<string, unknown>;
-  }) {
+  }): Promise<StrandedRecoveryEnqueueOutcome> {
     if (input.retryOfRunId) {
       const [predecessor] = await db
         .select()
@@ -2563,7 +2622,8 @@ export function recoveryService(
       ) {
         // Failure recovery shares the durable incident budget and delay. It
         // cannot fall through into the productive-work continuation queue.
-        if (predecessor.runtimeMode === "native") return null;
+        if (predecessor.runtimeMode === "native")
+          return { queued: false, chainStop: null };
         // SPA-9001: a graceful-shutdown-interrupted predecessor is retriable
         // infrastructure, never a legacy execution needing board
         // reconciliation, and never a bounded transient retry (whose own
@@ -2583,16 +2643,20 @@ export function recoveryService(
             run: predecessor,
             status: predecessor.status,
           });
-          return null;
+          return { queued: false, chainStop: null };
         }
-        if (deps.scheduleRecoveryRetry)
-          return deps.scheduleRecoveryRetry(predecessor.id);
-        return null;
+        if (deps.scheduleRecoveryRetry) {
+          const retryRun = await deps.scheduleRecoveryRetry(predecessor.id);
+          return retryRun
+            ? { queued: true, run: retryRun }
+            : { queued: false, chainStop: null };
+        }
+        return { queued: false, chainStop: null };
       }
     }
     if (
       input.retryOfRunId &&
-      input.source === "issue.productive_terminal_continuation_recovery"
+      input.source === PRODUCTIVE_CONTINUATION_RECOVERY_SOURCE
     ) {
       const [source] = await db
         .select({
@@ -2613,7 +2677,31 @@ export function recoveryService(
             })
           ).kind !== "clear")
       )
-        return null;
+        return { queued: false, chainStop: null };
+      // SPA-11836: the chain-wide retry budget lives on the `retryOfRunId`
+      // ancestry, not on the run. The per-run bounded-retry counters
+      // (`scheduledRetryAttempt`, `continuationAttempt`) never move on this lane,
+      // so nothing else stops an automatic continuation chain that keeps
+      // re-declaring the same blocker. Enforced here, at the single chokepoint
+      // every productive-continuation successor passes through, so no caller can
+      // route around it.
+      if (source.agentId === input.agentId) {
+        const chainGate = await gateContinuationChain(db, {
+          companyId: source.companyId,
+          agentId: input.agentId,
+          issueId: input.issueId,
+          latestRunId: input.retryOfRunId,
+        });
+        if (!chainGate.allowed) {
+          return {
+            queued: false,
+            chainStop: {
+              stop: chainGate.stop,
+              alreadyStopped: chainGate.alreadyStopped,
+            },
+          };
+        }
+      }
     }
     const queued = await deps.enqueueWakeup(input.agentId, {
       source: "automation",
@@ -2631,6 +2719,7 @@ export function recoveryService(
           }
         : {}),
       ...(input.idempotencyKey ? { idempotencyKey: input.idempotencyKey } : {}),
+      ...(input.issueStateGuard ? { issueStateGuard: input.issueStateGuard } : {}),
       payload: withRecoveryContext(
         {
           issueId: input.issueId,
@@ -2658,12 +2747,16 @@ export function recoveryService(
       if (input.idempotencyKey && conflict?.code === "23505" &&
         (conflict.constraint === "agent_wakeup_requests_handoff_bounded_continuation_uq" ||
           conflict.constraint_name === "agent_wakeup_requests_handoff_bounded_continuation_uq" ||
-          conflict.message?.includes("agent_wakeup_requests_handoff_bounded_continuation_uq"))) return null;
+           conflict.message?.includes("agent_wakeup_requests_handoff_bounded_continuation_uq") ||
+           (input.idempotencyKey.startsWith("issue_review_path_lost:") &&
+             (conflict.constraint === "agent_wakeup_requests_review_path_recovery_idempotency_uq" ||
+               conflict.constraint_name === "agent_wakeup_requests_review_path_recovery_idempotency_uq" ||
+               conflict.message?.includes("agent_wakeup_requests_review_path_recovery_idempotency_uq"))))) return null;
       throw error;
     });
 
     if (queued && input.retryOfRunId) {
-      return db
+      const linkedRun: typeof heartbeatRuns.$inferSelect = await db
         .update(heartbeatRuns)
         .set({
           retryOfRunId: input.retryOfRunId,
@@ -2672,9 +2765,10 @@ export function recoveryService(
         .where(eq(heartbeatRuns.id, queued.id))
         .returning()
         .then((rows) => rows[0] ?? queued);
+      return { queued: true, run: linkedRun };
     }
 
-    return queued;
+    return queued ? { queued: true, run: queued } : { queued: false, chainStop: null };
   }
 
   async function enqueueInitialAssignedTodoDispatch(
@@ -3559,6 +3653,46 @@ export function recoveryService(
     return openChildren;
   }
 
+  async function partitionCycleSafeBlockers(
+    companyId: string,
+    issueId: string,
+    childIds: string[],
+  ) {
+    if (childIds.length === 0) {
+      return { safe: [] as string[], skipped: [] as string[] };
+    }
+    const edges = await db
+      .select({
+        blockerIssueId: issueRelations.issueId,
+        blockedIssueId: issueRelations.relatedIssueId,
+      })
+      .from(issueRelations)
+      .where(
+        and(
+          eq(issueRelations.companyId, companyId),
+          eq(issueRelations.type, "blocks"),
+        ),
+      );
+    const adjacency = new Map<string, string[]>();
+    for (const edge of edges) {
+      const targets = adjacency.get(edge.blockerIssueId) ?? [];
+      targets.push(edge.blockedIssueId);
+      adjacency.set(edge.blockerIssueId, targets);
+    }
+    const downstream = new Set<string>();
+    const queue = [issueId];
+    while (queue.length > 0) {
+      const current = queue.shift()!;
+      if (downstream.has(current)) continue;
+      downstream.add(current);
+      queue.push(...(adjacency.get(current) ?? []));
+    }
+    return {
+      safe: childIds.filter((id) => !downstream.has(id)),
+      skipped: childIds.filter((id) => downstream.has(id)),
+    };
+  }
+
   async function resolveContinuationWaitingOnReview(
     issue: typeof issues.$inferSelect,
   ) {
@@ -4086,25 +4220,61 @@ export function recoveryService(
         ]);
       const durablePathRestored =
         action.ownerType !== "board" && sourceState.hasDurableWaitingPath;
+      const cycleSafeChildren = !sourceState.hasDurableWaitingPath
+        ? await partitionCycleSafeBlockers(
+            issue.companyId,
+            issue.id,
+            healthyChildren.map((child) => child.id),
+          )
+        : {
+            safe: healthyChildren.map((child) => child.id),
+            skipped: [] as string[],
+          };
+      if (cycleSafeChildren.skipped.length > 0) {
+        await db
+          .update(issueRecoveryActions)
+          .set({
+            evidence: {
+              ...parseObject(action.evidence),
+              skippedCyclicBlockerIssueIds: cycleSafeChildren.skipped,
+            },
+            updatedAt: new Date(),
+          })
+          .where(
+            and(
+              eq(issueRecoveryActions.id, action.id),
+              inArray(issueRecoveryActions.status, ["active", "escalated"]),
+            ),
+          );
+      }
       if (
         durablePathRestored ||
-        healthyChildren.length > 0 ||
+        cycleSafeChildren.safe.length > 0 ||
         hasNewSourcePath
       ) {
-        if (healthyChildren.length > 0 && !sourceState.hasDurableWaitingPath) {
+        if (
+          cycleSafeChildren.safe.length > 0 &&
+          !sourceState.hasDurableWaitingPath
+        ) {
           const blockerIds = await existingUnresolvedBlockerIssueIds(
             issue.companyId,
             issue.id,
           );
-          await issuesSvc.update(issue.id, {
-            status: "blocked",
-            blockedByIssueIds: [
-              ...new Set([
-                ...blockerIds,
-                ...healthyChildren.map((child) => child.id),
-              ]),
-            ],
-          });
+          try {
+            await issuesSvc.update(issue.id, {
+              status: "blocked",
+              blockedByIssueIds: [
+                ...new Set([...blockerIds, ...cycleSafeChildren.safe]),
+              ],
+            });
+          } catch (err) {
+            logger.error(
+              { err, recoveryActionId: action.id },
+              "recovery blocker update failed; action remains active",
+            );
+            result.skipped += 1;
+            continue;
+          }
         }
         const resolved = await recoveryActionsSvc.resolveActiveForIssue({
           companyId: action.companyId,
@@ -4895,6 +5065,11 @@ export function recoveryService(
       dispatchRequeued: 0,
       continuationRequeued: 0,
       dispositionRepairRequeued: 0,
+      // SPA-11836: how many issues had an automatic continuation chain stopped by
+      // the chain-wide retry budget this sweep, and escalated to `blocked`. Always
+      // visible on every trip so the bound is observable rather than inferred
+      // from the absence of a run.
+      continuationChainStopped: 0,
       productiveContinuationObserved: 0,
       successfulContinuationObserved: 0,
       orphanBlockersAssigned: 0,
@@ -5514,7 +5689,7 @@ export function recoveryService(
                 acceptedInteractionResolvedAt.toISOString(),
             },
           });
-          if (queued) {
+          if (queued.queued) {
             result.continuationRequeued += 1;
             result.issueIds.push(issue.id);
           } else {
@@ -5530,6 +5705,9 @@ export function recoveryService(
           continue;
         }
         const participantLatestRun = participantLatestRunForRecovery;
+        const participantRunBelongsToStage = participantLatestRun?.createdAt && pendingExecutionState.stageEnteredAt
+          ? participantLatestRun.createdAt.getTime() >= Date.parse(pendingExecutionState.stageEnteredAt)
+          : false;
 
         if (
           !participantLatestRun ||
@@ -5545,6 +5723,55 @@ export function recoveryService(
             });
             if (updated) {
               result.escalated += 1;
+              result.issueIds.push(issue.id);
+            } else {
+              result.skipped += 1;
+            }
+          } else if (
+            pendingExecutionState.currentStageType === "review" &&
+            !participantRunBelongsToStage &&
+            pendingExecutionState.stageEnteredAt != null &&
+            Number.isFinite(Date.parse(pendingExecutionState.stageEnteredAt)) &&
+            Date.parse(pendingExecutionState.stageEnteredAt) <= Date.now() - STRANDED_STAGE_ENTRY_THRESHOLD_MS &&
+            !(await hasQueuedIssueWake(issue.companyId, issue.id, participantAgentId)) &&
+            !(await db.select({ id: agentWakeupRequests.id })
+              .from(agentWakeupRequests)
+              .where(and(
+                eq(agentWakeupRequests.companyId, issue.companyId),
+                eq(agentWakeupRequests.agentId, participantAgentId),
+                eq(agentWakeupRequests.status, "deferred_issue_execution"),
+                sql`${agentWakeupRequests.payload} ->> 'issueId' = ${issue.id}`,
+              )).limit(1))[0] &&
+            !(await isInvocationBudgetBlocked(issue, participantAgentId))
+          ) {
+            const queued = await enqueueStrandedIssueRecovery({
+              issueId: issue.id,
+              agentId: participantAgentId,
+              reason: EXECUTION_REVIEW_PARTICIPANT_RECOVERY_REASON,
+              retryReason: EXECUTION_REVIEW_PARTICIPANT_RECOVERY_REASON,
+              source: "issue.execution_review_recovery",
+              idempotencyKey: buildIssueReviewPathLostIdempotencyKey({
+                issueId: issue.id,
+                consumedPathRef: `stage:${pendingExecutionState.currentStageId}:${participantAgentId}:${pendingExecutionState.stageEnteredAt}:${Math.floor(Date.now() / STRANDED_STAGE_ENTRY_THRESHOLD_MS)}`,
+              }),
+              issueStateGuard: {
+                statuses: ["in_review"],
+                assigneeAgentId: issue.assigneeAgentId!,
+                stageId: pendingExecutionState.currentStageId!,
+                participantAgentId,
+                lastDecisionId: pendingExecutionState.lastDecisionId,
+                stageEnteredAt: pendingExecutionState.stageEnteredAt!,
+              },
+              extraContext: {
+                currentStageId: pendingExecutionState.currentStageId ?? null,
+                currentStageType: pendingExecutionState.currentStageType,
+                stageEnteredAt: pendingExecutionState.stageEnteredAt,
+                reviewStageEntryRecovery: true,
+                reviewRecoveryInstruction: "The review stage has no participant run or queued wake. Submit the review decision now, or mark the issue blocked with the exact unblock action.",
+              },
+            });
+            if (queued.queued) {
+              result.reviewParticipantRequeued += 1;
               result.issueIds.push(issue.id);
             } else {
               result.skipped += 1;
@@ -5689,7 +5916,7 @@ export function recoveryService(
               "The previous reviewer run ended while this execution-review stage was still pending. Submit the review decision now, or mark the issue blocked with the exact unblock action.",
           },
         });
-        if (queued) {
+        if (queued.queued) {
           result.reviewParticipantRequeued += 1;
           result.issueIds.push(issue.id);
         } else {
@@ -5786,7 +6013,7 @@ export function recoveryService(
           source: "issue.assignment_recovery",
           retryOfRunId: latestRun.id,
         });
-        if (queued) {
+        if (queued.queued) {
           result.dispatchRequeued += 1;
           result.issueIds.push(issue.id);
         } else {
@@ -5934,9 +6161,37 @@ export function recoveryService(
               }
             : undefined,
         });
-        if (queued) {
+        if (queued.queued) {
           result.continuationRequeued += 1;
           result.issueIds.push(issue.id);
+        } else if (queued.chainStop && !queued.chainStop.alreadyStopped) {
+          // SPA-11836: the chain spent its budget. Escalate ONCE — the issue
+          // moves to `blocked`, which is outside this sweep's candidate statuses,
+          // so no further automatic successor can be minted from it. The durable
+          // stop receipt on the chain makes every later sweep over the same
+          // ancestry refuse silently rather than escalating and commenting again.
+          const updated = await escalateStrandedAssignedIssue({
+            issue,
+            previousStatus: "in_progress",
+            latestRun: successfulRun,
+            notice: {
+              body:
+                `Paperclip stopped queueing automatic continuations for this issue: ` +
+                `${queued.chainStop.stop.message} Every automatic continuation in this ` +
+                `chain ended without advancing the card, so the retry budget is spent. ` +
+                `Moving it to \`blocked\` so it is visible for intervention. Re-dispatch ` +
+                `the issue to start a fresh chain with a fresh budget.`,
+              title: "Automatic continuation chain exhausted",
+              tone: "danger",
+            },
+          });
+          if (updated) {
+            result.continuationChainStopped += 1;
+            result.escalated += 1;
+            result.issueIds.push(issue.id);
+          } else {
+            result.skipped += 1;
+          }
         } else {
           result.skipped += 1;
         }
@@ -6113,7 +6368,7 @@ export function recoveryService(
         source: "issue.continuation_recovery",
         retryOfRunId: latestRun?.id ?? issue.checkoutRunId ?? null,
       });
-      if (queued) {
+      if (queued.queued) {
         result.continuationRequeued += 1;
         result.issueIds.push(issue.id);
       } else {
@@ -6165,24 +6420,19 @@ export function recoveryService(
     const useCursor = !opts?.blockerIssueId;
 
     const queryCandidates = (afterIssueId: string | null) => {
-      // The blocker-scoped re-fire (the heartbeat workspace_finalize hook)
-      // must heal the same wakeable dependents the route-time emission admits:
-      // any assigned dependent not in a terminal/backlog status. `listWakeable
-      // BlockedDependents` filters `["backlog","done","cancelled"]`, so a
-      // `todo` dependent whose blocker resolved while its sync-back was still
-      // in flight would never re-fire if the finalize-time query only matched
-      // `blocked` issues (SPA-8580 / SPA-7489 / SPA-7490). The periodic
-      // all-issues sweep keeps its `blocked`-only filter so it only heals
-      // dependents that are still in the blocked state.
       const statusFilter = opts?.blockerIssueId
         ? notInArray(issues.status, ["backlog", "done", "cancelled"])
-        : eq(issues.status, "blocked");
+        : inArray(issues.status, ["blocked", "todo"]);
       const filters = [
         statusFilter,
         isNull(issues.conversationAgentId),
         visibleIssueCondition(),
         sql`${issues.assigneeAgentId} is not null`,
       ];
+      if (!opts?.blockerIssueId) {
+        filters.push(sql`exists (select 1 from ${issueRelations} where ${issueRelations.relatedIssueId} = ${issues.id} and ${issueRelations.companyId} = ${issues.companyId} and ${issueRelations.type} = 'blocks')`);
+        filters.push(sql`not exists (select 1 from ${issueRelations} as blocker_edge inner join ${issues} as blocker on blocker.id = blocker_edge.issue_id where blocker_edge.related_issue_id = ${issues.id} and blocker_edge.company_id = ${issues.companyId} and blocker_edge.type = 'blocks' and blocker.status <> 'done')`);
+      }
       if (opts?.companyId) filters.push(eq(issues.companyId, opts.companyId));
       if (afterIssueId) filters.push(gt(issues.id, afterIssueId));
 
@@ -6841,6 +7091,345 @@ export function recoveryService(
     return result;
   }
 
+  /**
+   * SPA-12218 — startup orphan re-wake.
+   *
+   * The SIGKILL at 2026-10-13T14:46:35Z left 17 runs recorded `running`. The
+   * startup backstop terminalized them with `errorCode = "orphaned_running_run"`,
+   * but their issues stayed `in_progress` with no live execution path, so a human
+   * had to wake 14 of them by hand ~19 minutes later. The engine must own that
+   * re-wake itself.
+   *
+   * Runs AFTER `sweepStaleIssueLocks` has terminalized the orphaned runs, because
+   * this sweep keys on the errorCode the backstop writes. It only WAKES: it never
+   * rewrites run state and never clears the issue lock (that stays
+   * `sweepStaleIssueLocks`' authority, so the wake cannot race the lock clear).
+   *
+   * The candidate query mirrors `reconcileStrandedAssignedIssues`: active
+   * statuses only, agent-assigned work only (a human-owned card is the
+   * operator's to wake), visible rows only, and committed-but-unadmitted chat
+   * input excluded. Every further gate is a deliberate skip that increments
+   * `skipped`, never a silent pass.
+   */
+  async function reconcileOrphanedRunIssues() {
+    const candidates = await db
+      .select()
+      .from(issues)
+      .where(
+        and(
+          isNull(issues.assigneeUserId),
+          inArray(issues.status, ["todo", "in_progress", "in_review"]),
+          // Mirror `reconcileStrandedAssignedIssues`: an `in_review` card is
+          // woken by its current review PARTICIPANT, which need not be the
+          // assignee. Requiring an agent assignee here would exclude exactly the
+          // review cards whose reviewer is the thing that was interrupted.
+          or(
+            sql`${issues.assigneeAgentId} is not null`,
+            eq(issues.status, "in_review"),
+          ),
+          isNull(issues.hiddenAt),
+          not(unadmittedChatWakeupCondition(issues.id, issues.companyId)),
+          // SPA-12218: restrict the candidate set to TRUE orphans in SQL, BEFORE
+          // the per-boot cap below is applied.
+          //
+          // This ordering is load-bearing, and getting it wrong is a starvation
+          // bug, not a cosmetic one. If the cap were applied to the UNFILTERED
+          // active-issue set, then once a live board held more than CAP active
+          // issues (overwhelmingly already-handled), every subsequent boot would
+          // deterministically select the SAME first CAP rows, skip each as
+          // already re-woken, and never reach a genuine orphan past the cut —
+          // permanently, on every boot. The cap must bound the work we DO, so
+          // the work has to be identified first.
+          //
+          // "Latest run" is decided with the same binding the terminalizer uses
+          // (`issueIdFromRunContext`): `issueId`, or `taskId`, and a context
+          // where the two disagree is NOT bound to this issue at all. The
+          // NOT EXISTS arm rejects a newer run that is not an orphan, so an
+          // issue whose latest run merely CONTAINS an old orphaned run is not
+          // a candidate.
+          sql`EXISTS (
+            SELECT 1 FROM "heartbeat_runs" orphan_run
+            WHERE orphan_run."company_id" = ${issues.companyId}
+              AND (
+                orphan_run."context_snapshot" ->> 'issueId' = ${issues.id}::text
+                OR orphan_run."context_snapshot" ->> 'taskId' = ${issues.id}::text
+              )
+              AND NOT (
+                orphan_run."context_snapshot" ->> 'issueId' IS NOT NULL
+                AND orphan_run."context_snapshot" ->> 'taskId' IS NOT NULL
+                AND orphan_run."context_snapshot" ->> 'issueId' <> orphan_run."context_snapshot" ->> 'taskId'
+              )
+              AND orphan_run."error_code" = ${ORPHANED_RUNNING_RUN_ERROR_CODE}
+              -- Already re-woken? Then this orphan is finished business and must
+              -- not re-enter the candidate set. Without this arm the cap would
+              -- re-select the same already-handled prefix on every boot and the
+              -- deferred tail would starve forever: the sweep would skip each of
+              -- the first CAP rows as already-done and never reach the orphans
+              -- past the cut. Excluding them here makes the cap drain by
+              -- construction -- each boot's candidate set is exactly the orphans
+              -- that still need a wake.
+              AND NOT EXISTS (
+                SELECT 1 FROM "agent_wakeup_requests" orphan_receipt
+                WHERE orphan_receipt."company_id" = orphan_run."company_id"
+                  AND orphan_receipt."idempotency_key" =
+                    ${ORPHANED_RUN_REWAKE_IDEMPOTENCY_PREFIX} || orphan_run."id"
+                  AND orphan_receipt."status" <> 'skipped'
+              )
+              AND NOT EXISTS (
+                SELECT 1 FROM "heartbeat_runs" newer_run
+                WHERE newer_run."company_id" = ${issues.companyId}
+                  AND (
+                    newer_run."context_snapshot" ->> 'issueId' = ${issues.id}::text
+                    OR newer_run."context_snapshot" ->> 'taskId' = ${issues.id}::text
+                  )
+                  AND (
+                    newer_run."created_at" > orphan_run."created_at"
+                    OR (
+                      newer_run."created_at" = orphan_run."created_at"
+                      AND newer_run."id" > orphan_run."id"
+                    )
+                  )
+              )
+          )`,
+        ),
+      )
+      // Oldest first, so when the cap truncates, what gets dropped is the newest
+      // work — the cards most likely to still be under active attention — and
+      // the next boot drains them in the order they were deferred.
+      .orderBy(asc(issues.createdAt));
+
+    const result = {
+      scanned: candidates.length,
+      rewoken: 0,
+      skipped: 0,
+      deferredForNextBoot: 0,
+      issueIds: [] as string[],
+    };
+
+    // Bound the blast radius of a single boot. A SIGKILL can orphan an unbounded
+    // number of runs, and re-waking every one of them at once would queue a
+    // provider thundering herd on the same host that just lost its engine —
+    // converting one incident into a second. The cap is a FLOOR on progress, not
+    // a total: the leftover candidates stay untouched, and the next boot (or the
+    // periodic caller) picks up where this one stopped, because the dedupe below
+    // is durable and already-committed wakes are never repeated.
+    //
+    // `candidates` is already narrowed to true orphans and ordered oldest-first
+    // (see the query above), so the slice can only ever drop genuine work that is
+    // genuinely newer, and the next boot reaches it.
+    const candidatesWithinCap = candidates.slice(0, ORPHANED_RUN_REWAKE_MAX_PER_SWEEP);
+    result.deferredForNextBoot = candidates.length - candidatesWithinCap.length;
+
+    for (const issue of candidatesWithinCap) {
+      // `in_review` work belongs to the CURRENT review participant, not to the
+      // assignee. This mirrors `reconcileStrandedAssignedIssues`, which resolves
+      // the same `executionState.currentParticipant` before waking. Addressing the
+      // assignee here would wake an agent that is not the reviewer and leave the
+      // real one idle — the exact "card sits with nobody" symptom this sweep exists
+      // to close.
+      const executionState =
+        issue.status === "in_review"
+          ? parseIssueExecutionState(issue.executionState)
+          : null;
+      const pendingExecutionState =
+        executionState?.status === "pending" ? executionState : null;
+      const currentParticipant = pendingExecutionState
+        ? pendingExecutionState.currentParticipant
+        : null;
+      const participantAgentId =
+        currentParticipant?.type === "agent"
+          ? currentParticipant.agentId
+          : null;
+      const agentId =
+        issue.status === "in_review" && participantAgentId
+          ? participantAgentId
+          : issue.assigneeAgentId;
+      // A wake must address a real agent. The candidate query already excludes
+      // unassigned rows, so this only guards a concurrent unassignment.
+      if (!agentId) {
+        result.skipped += 1;
+        continue;
+      }
+
+      // Match the terminalization backstop's OWN notion of run->issue binding,
+      // in full. `getLatestIssueRun` matches on `contextSnapshot->>'issueId'`
+      // alone, but the backstop associates a run via `issueIdFromRunContext`,
+      // which (a) also accepts `taskId`, and (b) REJECTS a context where issueId
+      // and taskId are both present and disagree, returning null so the run is
+      // not bound to this issue at all. This query mirrors both arms. Matching
+      // only `issueId` would miss every taskId-only orphan — the precise failure
+      // this card exists to fix — and OR-ing without the disagreement guard
+      // would let a context naming two different issues wake the wrong card.
+      const latestRun = await db
+        .select({
+          id: heartbeatRuns.id,
+          agentId: heartbeatRuns.agentId,
+          status: heartbeatRuns.status,
+          errorCode: heartbeatRuns.errorCode,
+          runtimeMode: heartbeatRuns.runtimeMode,
+          createdAt: heartbeatRuns.createdAt,
+        })
+        .from(heartbeatRuns)
+        .where(
+          and(
+            eq(heartbeatRuns.companyId, issue.companyId),
+            or(
+              sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${issue.id}`,
+              sql`${heartbeatRuns.contextSnapshot} ->> 'taskId' = ${issue.id}`,
+            ),
+            // Parity with `issueIdFromRunContext`'s disagreement rejection.
+            sql`NOT (
+              ${heartbeatRuns.contextSnapshot} ->> 'issueId' IS NOT NULL
+              AND ${heartbeatRuns.contextSnapshot} ->> 'taskId' IS NOT NULL
+              AND ${heartbeatRuns.contextSnapshot} ->> 'issueId' <> ${heartbeatRuns.contextSnapshot} ->> 'taskId'
+            )`,
+          ),
+        )
+        .orderBy(desc(heartbeatRuns.createdAt), desc(heartbeatRuns.id))
+        .limit(1)
+        .then((rows) => rows[0] ?? null);
+      // No run at all, or a latest run that ended under its own authority: the
+      // orphan backstop never owned it, so generic recovery already applies.
+      if (
+        !latestRun ||
+        latestRun.errorCode !== ORPHANED_RUNNING_RUN_ERROR_CODE
+      ) {
+        result.skipped += 1;
+        continue;
+      }
+
+      // A newer run or a parked wake already owns the next action, so the
+      // orphan is superseded and this sweep must not race it with a second wake.
+      if (
+        await hasActiveExecutionPath(issue.companyId, issue.id, agentId) ||
+        (await hasQueuedIssueWake(issue.companyId, issue.id, agentId))
+      ) {
+        result.skipped += 1;
+        continue;
+      }
+
+      if (await hasPendingWakeInteraction(issue.companyId, issue.id)) {
+        result.skipped += 1;
+        continue;
+      }
+
+      // Paused is an operator decision: neither an active pause-mode tree hold
+      // nor a paused assignee agent may be re-woken automatically.
+      const agent = await getAgent(agentId);
+      if (
+        agent?.companyId !== issue.companyId ||
+        !(await isAgentInvokable(agent)) ||
+        (await isAutomaticRecoverySuppressedByPauseHold(
+          db,
+          issue.companyId,
+          issue.id,
+          treeControlSvc,
+        ))
+      ) {
+        result.skipped += 1;
+        continue;
+      }
+
+      const idempotencyKey = `${ORPHANED_RUN_REWAKE_IDEMPOTENCY_PREFIX}${latestRun.id}`;
+      // Level-triggered dedupe, read explicitly. `enqueueWakeup` only
+      // deduplicates a handful of specific `idempotencyKey` prefixes, so setting
+      // the key alone would not make a repeated sweep a no-op. Any prior
+      // non-skipped receipt for this orphan — queued, running, or already
+      // finished — means this orphan was already re-woken once, so it never is
+      // again. This is what makes "at most one wake per issue, ever" durable
+      // across repeated startups rather than only within one boot.
+      //
+      // Keyed on the RUN, not the issue, on purpose: a second, later orphan on
+      // the same card (a second SIGKILL) is a distinct lost execution path and
+      // gets its own single wake.
+      const alreadyRewoken = await db
+        .select({ id: agentWakeupRequests.id })
+        .from(agentWakeupRequests)
+        .where(
+          and(
+            eq(agentWakeupRequests.companyId, issue.companyId),
+            eq(agentWakeupRequests.idempotencyKey, idempotencyKey),
+            ne(agentWakeupRequests.status, "skipped"),
+          ),
+        )
+        .limit(1)
+        .then((rows) => rows.length > 0);
+      if (alreadyRewoken) {
+        result.skipped += 1;
+        continue;
+      }
+
+      // A returned run row is NOT the success signal. `enqueueWakeup` resolves to
+      // null on normal deferred paths (wake-on-demand disabled, concurrency
+      // gating, a conversation-execution suppression), and the wake request is
+      // still recorded — so the orphan HAS been re-woken and the next boot must
+      // not try again. Success is therefore "the wake was issued without
+      // throwing", and a throw degrades to a skip so one bad card cannot abort
+      // the whole startup sweep.
+      try {
+        await deps.enqueueWakeup(agentId, {
+          source: "automation",
+          triggerDetail: "system",
+          reason: ORPHANED_RUN_REWAKE_REASON,
+          payload: withRecoveryContext(
+            {
+              issueId: issue.id,
+              mutation: "orphaned_run_recovery",
+              orphanedRunId: latestRun.id,
+            },
+            "normal_model",
+          ),
+          idempotencyKey,
+          requestedByActorType: "system",
+          requestedByActorId: null,
+          contextSnapshot: withRecoveryContext(
+            {
+              issueId: issue.id,
+              taskId: issue.id,
+              wakeReason: ORPHANED_RUN_REWAKE_REASON,
+              source: ORPHANED_RUN_REWAKE_SOURCE,
+              orphanedRunId: latestRun.id,
+            },
+            "normal_model",
+          ),
+        });
+      } catch (error) {
+        // A unique violation on `..._orphaned_run_rewake_idempotency_uq` is not
+        // a failure: it is the database enforcing "at most one wake per orphaned
+        // run" against a concurrent boot that passed the read above a moment
+        // earlier. Count it as skipped and move on — the other boot's wake is
+        // the one that counts, and logging an error here would cry wolf on every
+        // legitimately-parallel restart.
+        if (
+          isUniqueViolation(
+            error,
+            ORPHANED_RUN_REWAKE_IDEMPOTENCY_CONSTRAINT,
+          )
+        ) {
+          result.skipped += 1;
+          continue;
+        }
+        logger.error(
+          {
+            err: error,
+            issueId: issue.id,
+            agentId,
+            orphanedRunId: latestRun.id,
+            idempotencyKey,
+          },
+          "failed to re-wake issue orphaned by the startup run backstop; the issue stays unwoken until the next boot",
+        );
+        result.skipped += 1;
+        continue;
+      }
+
+      result.rewoken += 1;
+      result.issueIds.push(issue.id);
+    }
+
+    return result;
+  }
+
   return {
     buildRunOutputSilence,
     escalateStrandedRecoveryIssueInPlace,
@@ -6849,6 +7438,7 @@ export function recoveryService(
     scanSilentActiveRuns,
     reconcileStrandedAssignedIssues,
     sweepStaleIssueLocks,
+    reconcileOrphanedRunIssues,
     reconcileResolvedDependencyWakeBackstop,
     readRecoveryTimerIntervalMs,
   };

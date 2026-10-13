@@ -559,6 +559,12 @@ function noopTaskWatchdogService(): TaskWatchdogService {
     }),
     revalidateMutationScope: async () => ({
       allowed: true,
+      admissibility: {
+        admissible: true,
+        reason: "fingerprint_match",
+        staleBlockerHoldIssueIds: [],
+        allowedStatusTransitions: [],
+      },
       classification: {
         state: "stopped",
         reason: "Task watchdog service unavailable in this route context.",
@@ -572,6 +578,8 @@ function noopTaskWatchdogService(): TaskWatchdogService {
           waitsByIssueId: {},
         },
         pendingInteractionsByIssueId: {},
+        staleBlockerHolds: [],
+        blockersResolvedLeaves: [],
       },
     }),
   };
@@ -809,6 +817,38 @@ function authenticatedActorResponsibleUserId(req: Request) {
   return req.actor.type === "agent"
     ? (req.actor.onBehalfOfUserId ?? null)
     : undefined;
+}
+
+/**
+ * Reads the caller-supplied idempotency key for a comment write.
+ *
+ * SPA-11706 D1: this used to be `actor.actorType === "user" ? req.body.clientRequestId
+ * : undefined` at each call site, which silently dropped the key for every agent. An
+ * agent retrying after an ambiguous failure therefore had no way to make the write
+ * idempotent, and a bisect loop wrote 75 copies of one comment. The key is now
+ * opt-in for all actors, and a blank or non-string value is treated as absent so a
+ * stray whitespace key cannot bind an unintended unique constraint.
+ *
+ * Read from BOTH the standard `Idempotency-Key` request header and the
+ * `clientRequestId` body field, header first. The body field is what the existing
+ * board chat surface already sends; the header is the conventional transport and
+ * the one the agent guide documents. Documenting a header the server does not
+ * read would make this fix inert for its own documented consumer (SPA-9687 review
+ * finding D1, carried forward).
+ */
+export function readCommentIdempotencyKey(
+  body: unknown,
+  headers?: unknown,
+): string | undefined {
+  const headerValue = (headers as { [key: string]: unknown } | null | undefined)?.[
+    "idempotency-key"
+  ];
+  if (typeof headerValue === "string" && headerValue.trim().length > 0) {
+    return headerValue;
+  }
+  const raw = (body as { clientRequestId?: unknown } | null | undefined)
+    ?.clientRequestId;
+  return typeof raw === "string" && raw.trim().length > 0 ? raw : undefined;
 }
 
 // Matches the partial unique index that guarantees at most one onboarding
@@ -2323,11 +2363,7 @@ function shouldImplicitlyMoveCommentedIssueToTodo(input: {
   // Only human comments should implicitly reopen finished work.
   // Agent-authored comments remain communicative unless reopen was explicit.
   if (input.actorType !== "user") return false;
-  if (
-    !isClosedIssueStatus(input.issueStatus) &&
-    input.issueStatus !== "blocked"
-  )
-    return false;
+  if (!isClosedIssueStatus(input.issueStatus)) return false;
   if (
     typeof input.assigneeAgentId !== "string" ||
     input.assigneeAgentId.length === 0
@@ -2557,6 +2593,7 @@ async function queueResolvedInteractionContinuationWakeup(input: {
     id: string;
     companyId: string;
     assigneeAgentId: string | null;
+    assigneeUserId?: string | null;
     status: string;
   };
   interaction: {
@@ -2564,6 +2601,7 @@ async function queueResolvedInteractionContinuationWakeup(input: {
     kind: string;
     status: string;
     continuationPolicy: string;
+    createdByAgentId?: string | null;
     sourceCommentId?: string | null;
     sourceRunId?: string | null;
     payload?: unknown;
@@ -2576,8 +2614,13 @@ async function queueResolvedInteractionContinuationWakeup(input: {
   newlyResolvedItemIds?: string[];
   idempotencyKey?: string | null;
 }) {
-  if (!input.issue.assigneeAgentId || isClosedIssueStatus(input.issue.status))
-    return;
+  if (isClosedIssueStatus(input.issue.status)) return;
+  let wakeAgentId = input.issue.assigneeAgentId;
+  if (!wakeAgentId && input.issue.assigneeUserId && input.interaction.createdByAgentId) {
+    const creator = await agentService(input.db).getById(input.interaction.createdByAgentId);
+    wakeAgentId = creator?.companyId === input.issue.companyId ? creator.id : null;
+  }
+  if (!wakeAgentId) return;
 
   const reviewPathLost =
     input.issue.status === "in_review" &&
@@ -2592,6 +2635,8 @@ async function queueResolvedInteractionContinuationWakeup(input: {
         return false;
       }));
   const continuationPolicyAllowsWake =
+    (!input.issue.assigneeAgentId && Boolean(input.issue.assigneeUserId) && Boolean(input.interaction.createdByAgentId) &&
+      ["accepted", "rejected", "answered"].includes(input.interaction.status)) ||
     input.interaction.continuationPolicy === "wake_assignee" ||
     (input.interaction.continuationPolicy === "wake_assignee_on_accept" &&
       // Question interactions resolve as `answered`, not `accepted`. An
@@ -2713,7 +2758,7 @@ async function queueResolvedInteractionContinuationWakeup(input: {
       `interaction:${input.interaction.id}:${publication.endpointId}`,
   );
   void input.heartbeat
-    .wakeup(input.issue.assigneeAgentId, {
+    .wakeup(wakeAgentId, {
       source: "automation",
       triggerDetail: "system",
       reason: "issue_commented",
@@ -2772,7 +2817,7 @@ async function queueResolvedInteractionContinuationWakeup(input: {
           err,
           issueId: input.issue.id,
           interactionId: input.interaction.id,
-          agentId: input.issue.assigneeAgentId,
+          agentId: wakeAgentId,
         },
         "failed to wake assignee on issue interaction resolution",
       ),
@@ -5239,7 +5284,18 @@ export function issueRoutes(
       /** Used only to name the task in denial copy (plan §6). */
       identifier?: string | null;
     },
-    options: { allowVisibleIssueWrite?: boolean } = {},
+    options: {
+      allowVisibleIssueWrite?: boolean;
+      /**
+       * The status transition this request is asking for, when the request is a
+       * status write. Passed through to the task-watchdog staleness revalidation
+       * so the stale-blocker-hold carve-out can authorise only the exact edge it
+       * admits (SPA-7407). Absent for non-status mutations and for callers that
+       * cannot know the target status; a status write with no declared
+       * transition can never match the carve-out token, so it fails closed.
+       */
+      requestedStatusTransition?: { to: string } | null;
+    } = {},
   ) {
     if (req.actor.type !== "agent") return true;
     const actorAgentId = req.actor.agentId;
@@ -5276,7 +5332,12 @@ export function issueRoutes(
         });
         return false;
       }
-      return assertFreshTaskWatchdogSourceMutation(res, watchdogScope, issue);
+      return assertFreshTaskWatchdogSourceMutation(
+        res,
+        watchdogScope,
+        issue,
+        options.requestedStatusTransition ?? null,
+      );
     }
     const boundaryDecision = await decideIssueAccess(
       req,
@@ -5376,13 +5437,45 @@ export function issueRoutes(
     res: Response,
     scope: Awaited<ReturnType<typeof resolveTaskWatchdogMutationScope>>,
     issue: { id: string },
+    requestedStatusTransition: { to: string } | null = null,
   ) {
     if (scope.kind !== "watchdog") return true;
     if (scope.watchdogIssueId && issue.id === scope.watchdogIssueId)
       return true;
 
     const revalidated = await taskWatchdogsSvc.revalidateMutationScope(scope);
-    if (revalidated.allowed) return true;
+    if (revalidated.allowed) {
+      // The stale-blocker-hold carve-out is admitted ONLY for the exact status
+      // edge it authorised. Without this check the stall diagnosis behind the
+      // carve-out would also license closing the card (`blocked` -> `done` or
+      // `cancelled`), which no stall observation can justify (SPA-7407).
+      const allowedTransitions =
+        "admissibility" in revalidated && revalidated.admissibility
+          ? revalidated.admissibility.allowedStatusTransitions
+          : [];
+      if (allowedTransitions.length === 0) return true;
+      const permitted =
+        requestedStatusTransition != null &&
+        allowedTransitions.some(
+          (transition) =>
+            transition.issueId === issue.id &&
+            transition.to === requestedStatusTransition.to,
+        );
+      if (permitted) return true;
+      res.status(409).json({
+        error:
+          "Task-watchdog stale-review repair is limited to releasing a resolved stale blocker hold to todo; refresh the source state before mutating it.",
+        details: {
+          issueId: issue.id,
+          watchedIssueId: scope.watchedIssueId,
+          watchdogId: scope.watchdogId,
+          runStopFingerprint: scope.stopFingerprint,
+          requestedStatus: requestedStatusTransition?.to ?? null,
+          allowedStatusTransitions: allowedTransitions,
+        },
+      });
+      return false;
+    }
     res.status(409).json({
       error: revalidated.reason,
       details: {
@@ -7199,27 +7292,57 @@ export function issueRoutes(
 
   /**
    * Refuse an agent creating a child issue assigned to the agent that created
-   * a still-open ancestor in the same chain. That shape is a delegation cycle
+   * AND assigned to this actor a still-open ancestor in the same chain. That
+   * pair is a live delegation edge, and the shape is a delegation cycle
    * (A delegates to B, B delegates the same work back to A): each agent lacks
    * something the other assumed it had, the chain of blocked issues grows,
-   * and no one tells the human. Humans are unaffected, and closed ancestors
-   * do not count — re-engaging the creator of finished work is normal.
+   * and no one tells the human.
+   *
+   * Creation alone does not refuse. An agent that merely owns a class of work
+   * creates cards in chains without ever delegating them, and a router
+   * decomposes work into cards it assigns to others; refusing those forces
+   * the caller to drop the parent to get past the guard, and the parent is
+   * what carries execution-workspace inheritance. Humans are unaffected, and
+   * closed ancestors do not count — re-engaging the creator of finished work
+   * is normal.
+   *
+   * Create-only by design: the assignee path on PATCH is not guarded, so an
+   * actor that does hold open work from the proposed assignee can still
+   * re-route that work by reassigning the card it holds, or file new work as
+   * a root card and assign it afterwards.
    */
   async function assertNoAgentDelegationCycle(input: {
     actorType: string;
+    actorAgentId: string | null | undefined;
     parentIssueId: string | null | undefined;
     assigneeAgentId: string | null | undefined;
   }) {
     if (input.actorType !== "agent") return;
     if (!input.parentIssueId || !input.assigneeAgentId) return;
-    const ancestor = await svc.findOpenAncestorCreatedByAgent(
+    // Both agent-actor construction sites (middleware/auth.ts:412 and :467)
+    // always carry an agentId, so an agent actor without one is an identity the
+    // chain cannot be attributed to. Refusing outright would block the create
+    // for a caller the predicate cannot reason about, and this guard is a
+    // liveness backstop rather than an authorization control — so it does not
+    // refuse, but it is never silent about skipping.
+    if (!input.actorAgentId) {
+      logger.warn(
+        {
+          parentIssueId: input.parentIssueId,
+          assigneeAgentId: input.assigneeAgentId,
+        },
+        "delegation cycle guard skipped: agent actor has no attributable agent id",
+      );
+    }
+    const ancestor = await svc.findOpenDelegationCycleAncestor(
       input.parentIssueId,
       input.assigneeAgentId,
+      input.actorAgentId ?? null,
     );
     if (!ancestor) return;
     throw conflict(
-      `Delegation cycle: ${ancestor.identifier ?? "an ancestor issue"} in this chain was created by the agent this child would be assigned to. ` +
-        "Complete the remaining work in your own issue, leave the child unassigned, or escalate to a board operator — do not delegate the work back to the agent that delegated it to you.",
+      `Delegation cycle: ${ancestor.identifier ?? "an ancestor issue"} in this chain was created by the agent this child would be assigned to, and is still assigned to you. ` +
+        "Complete the remaining work in your own issue, leave the child unassigned, reassign the issue you already hold, or escalate to a board operator — do not delegate the work back to the agent that delegated it to you.",
       {
         code: "delegation_cycle",
         ancestorIssueId: ancestor.id,
@@ -11659,13 +11782,14 @@ export function issueRoutes(
           rawCreateBody.assigneeAgentId as string | null | undefined,
           { actorType: req.actor.type },
         );
+      const actor = getActorInfo(req);
       await assertNoAgentDelegationCycle({
-        actorType: req.actor.type,
+        actorType: actor.actorType,
+        actorAgentId: actor.agentId,
         parentIssueId:
           typeof effectiveParentId === "string" ? effectiveParentId : null,
         assigneeAgentId: normalizedAssigneeAgentId ?? null,
       });
-      const actor = getActorInfo(req);
       // SPA-8707: a newly created card MUST get its own fresh execution
       // workspace and a branch named for itself. Auto-inheriting the
       // currently-active run's workspace (the PAP-10871 / PAP-10873 behavior)
@@ -12084,8 +12208,10 @@ export function issueRoutes(
           sanitizedBody.assigneeAgentId as string | null | undefined,
           { actorType: req.actor.type },
         );
+      const actor = getActorInfo(req);
       await assertNoAgentDelegationCycle({
-        actorType: req.actor.type,
+        actorType: actor.actorType,
+        actorAgentId: actor.agentId,
         parentIssueId: parent.id,
         assigneeAgentId: normalizedAssigneeAgentId ?? null,
       });
@@ -12114,7 +12240,6 @@ export function issueRoutes(
         createBody.executionWorkspaceSettings?.environmentId,
       );
 
-      const actor = getActorInfo(req);
       const serializationContext =
         await resolveWatchdogFollowUpSerializationContext(req, parent);
       const currentSerializedChild = serializationContext
@@ -12768,7 +12893,16 @@ export function issueRoutes(
         req,
         res,
         existing,
-        { allowVisibleIssueWrite: true },
+        {
+          allowVisibleIssueWrite: true,
+          // Declared so a task-watchdog stale-blocker-hold repair can be
+          // matched against the exact edge it authorised (SPA-7407). Only set
+          // when the request actually names a target status.
+          requestedStatusTransition:
+            typeof req.body.status === "string"
+              ? { to: req.body.status }
+              : null,
+        },
       );
       if (!issueMutationAccess) return;
       if (req.body.comment && !(await assertBoardCommentNotPaused(req, res, existing))) return;
@@ -12887,7 +13021,17 @@ export function issueRoutes(
           res,
           existing,
           "issue_write_terminal_recomplete",
-          {},
+          // SPA-10721 (GitHub #1288): a write can commit server-side while its
+          // response is lost (client sees HTTP 000). Without a read-back the
+          // caller cannot tell "applied, response dropped" from "refused", and
+          // retries burn on the ambiguity. Carry the persisted outcome in the
+          // response so a single retry resolves it: the requested terminal
+          // status is already the stored state (`terminalStatusAlreadySet`),
+          // and `currentStatus` is the state the caller should observe. The
+          // name is scoped to the *status* on purpose — a PATCH that also
+          // carried a comment was refused wholesale, so the comment did not
+          // land and a blanket `alreadyApplied` would be a lie.
+          { terminalStatusAlreadySet: true, currentStatus: existing.status },
           { terminalStatus },
         );
         return;
@@ -13229,13 +13373,14 @@ export function issueRoutes(
       const descriptor = updateFields.unblockDescriptor ?? null;
       if (descriptor && typeof descriptor === "object") {
         const owner = descriptor.owner;
+        const invalidAgentUnblockOwnerMessage =
+          'Agents may only name themselves or use owner: "board" for a board-owned hold';
         if (
           req.actor.type === "agent" &&
-          (owner === "board" || "userId" in owner)
+          owner !== "board" &&
+          "userId" in owner
         ) {
-          throw forbidden(
-            "Agents may only name themselves as an unblock owner",
-          );
+          throw forbidden(invalidAgentUnblockOwnerMessage);
         }
         if (owner !== "board" && "agentId" in owner) {
           const target = await db
@@ -13257,9 +13402,7 @@ export function issueRoutes(
             req.actor.type === "agent" &&
             req.actor.agentId !== owner.agentId
           ) {
-            throw forbidden(
-              "Agents may only name themselves as an unblock owner",
-            );
+            throw forbidden(invalidAgentUnblockOwnerMessage);
           }
         } else if (owner !== "board" && "userId" in owner) {
           const member = await db
@@ -13426,7 +13569,17 @@ export function issueRoutes(
         }
       }
 
-      if (assigneeWillChange && existing.assigneeAgentId) {
+      const attachingMidFlightReview =
+        req.body.executionPolicy !== undefined &&
+        existing.status === "in_progress" &&
+        !previousExecutionPolicy?.stages.length &&
+        !!nextExecutionPolicy?.stages.length &&
+        transition.workflowControlledAssignment === true &&
+        updateFields.status === "in_review" &&
+        parseIssueExecutionState(updateFields.executionState)?.status === "pending" &&
+        assigneeWillChange &&
+        !!existing.assigneeAgentId;
+      if (assigneeWillChange && existing.assigneeAgentId && !attachingMidFlightReview) {
         await stopRunnerGoalForOwnershipChange({
           companyId: existing.companyId,
           issueId: existing.id,
@@ -13529,24 +13682,89 @@ export function issueRoutes(
       } = { value: null };
       const postCommitActivityPublications: ActivityPublication[] = [];
       const postCommitIssueActions: IssuePostCommitAction[] = [];
-      const issueUpdateData = {
+      // SPA-10357 / SPA-10429 ownership-transfer CAS, board-actor mandatory
+      // boundary. The observed harm was an *ownership transfer*: the
+      // 2026-09-28 sweep moved eight DEPLOY-GATE cards off `local-board`
+      // (assigneeUserId -> null, assigneeAgentId -> an agent) with no
+      // caller-observed expected value. Mandatory enforcement therefore
+      // covers the ownership-transmit fields only.
+      //
+      // `status` CAS is provided but OPT-IN: a caller that supplies
+      // `expectedStatus` gets the locked-snapshot comparison, but a
+      // status-only write is not required to supply it. This is deliberate
+      // and load-bearing. Under `deploymentMode: local_trusted` the board
+      // UI (browser, headerless) and the offending monitor sweep are the
+      // SAME actor class — both `type: "board"`, `source: "local_implicit"` —
+      // so a mandatory `expectedStatus` cannot separate the interactive
+      // writer from the sweep; it would 409 every human status change in
+      // the in-repo board UI. The threat is ownership departure, and that is
+      // what is gated here. See SPA-10859 for the no-discriminator probe and
+      // the caller-migration follow-ups.
+      const boardActorRequest = req.actor.type === "board";
+      if (boardActorRequest) {
+        const casRequiredFieldsForBoardActor: Array<{
+          targetKey: "assigneeUserId" | "assigneeAgentId";
+          expectedKey: "expectedAssigneeUserId" | "expectedAssigneeAgentId";
+        }> = [
+          {
+            targetKey: "assigneeUserId",
+            expectedKey: "expectedAssigneeUserId",
+          },
+          {
+            targetKey: "assigneeAgentId",
+            expectedKey: "expectedAssigneeAgentId",
+          },
+        ];
+        for (const { targetKey, expectedKey } of casRequiredFieldsForBoardActor) {
+          if (req.body[targetKey] === undefined) continue;
+          // Transfer-only trigger (SPA-10859): an unchanged value is not an
+          // ownership departure. The board UI's comment/reply flow re-sends
+          // the issue's current assignee values on every post; requiring
+          // expected* on mere presence would 409 every human comment. The
+          // sweep shape — a value that DIFFERS from the row — is what gates.
+          // A supplied-but-wrong expected is still validated by the service
+          // against the locked snapshot, so callers that opt in get full CAS.
+          if (req.body[targetKey] === existing[targetKey as keyof typeof existing]) continue;
+          if (req.body[expectedKey] === undefined) {
+            res.status(409).json({
+              error: `Issue write rejected: board actor did not supply expected value for ${expectedKey}; ownership-transfer CAS is required when changing this field (SPA-10357)`,
+              code: "issue_write_ownership_cas_missing",
+              field: expectedKey,
+            });
+            return;
+          }
+        }
+      }
+      const issueUpdateData: Record<string, unknown> = {
         ...updateFields,
         actorAgentId: actor.agentId ?? null,
         actorUserId: actor.actorType === "user" ? actor.actorId : null,
         // SPA-8957: route-minted override reaches the service only for
         // user/board actors (agents were rejected above).
-        ...(doneOverrideRequested
-          ? {
-            doneGateOverride: {
-              reason: doneOverrideRequested.reason,
-              actorType: actor.actorType,
-              actorId: actor.actorId,
-              agentId: actor.agentId ?? null,
-              runId: actor.runId ?? null,
-            },
-          }
-          : {}),
       };
+      // SPA-10357 / SPA-10429 ownership-transfer CAS expectations. Only
+      // forward keys the caller actually supplied — `undefined` here would
+      // make the service-side `hasOwnProperty` check always return true and
+      // collapse the helper into a no-op cas-missing rejection. Forwarding
+      // a literal `undefined` is therefore a defect, not a no-op.
+      if (req.body.expectedStatus !== undefined) {
+        issueUpdateData.expectedStatus = req.body.expectedStatus;
+      }
+      if (req.body.expectedAssigneeUserId !== undefined) {
+        issueUpdateData.expectedAssigneeUserId = req.body.expectedAssigneeUserId;
+      }
+      if (req.body.expectedAssigneeAgentId !== undefined) {
+        issueUpdateData.expectedAssigneeAgentId = req.body.expectedAssigneeAgentId;
+      }
+      if (doneOverrideRequested) {
+        issueUpdateData.doneGateOverride = {
+          reason: doneOverrideRequested.reason,
+          actorType: actor.actorType,
+          actorId: actor.actorId,
+          agentId: actor.agentId ?? null,
+          runId: actor.runId ?? null,
+        };
+      }
       const shouldCollectCompletionPublication =
         actor.actorType === "user" &&
         existing.status !== "done" &&
@@ -13718,7 +13936,9 @@ export function issueRoutes(
                 },
                 {
                   attachmentIds: commentAttachmentIds,
-                  clientRequestId: actor.actorType === "user" ? commentClientRequestId : undefined,
+                  // SPA-11706 D1: the PATCH-with-comment path threads the same
+                  // opt-in key for agents and users alike (was user-only).
+                  clientRequestId: commentClientRequestId,
                   authorizationReason: issueMutationAuthorizationReason,
                   sourceTrust: attachmentCommentSourceTrust,
                 },
@@ -13791,11 +14011,63 @@ export function issueRoutes(
         publishActivity(publication);
       await flushIssuePostCommitActions(postCommitIssueActions);
 
+      if (attachingMidFlightReview) {
+        try {
+          await stopRunnerGoalForOwnershipChange({
+            companyId: existing.companyId,
+            issueId: existing.id,
+            agentId: existing.assigneeAgentId!,
+          });
+          const runToStopForReassignment = await resolveActiveIssueRun(existing);
+          if (runToStopForReassignment) {
+            const cancelled = await heartbeat.cancelRun(
+              runToStopForReassignment.id,
+              "Cancelled after review stage activation",
+              {
+                errorCode: "issue_reassigned",
+                resultJson: { reassignmentStopConfirmed: true },
+                eventMessage: "run cancelled after review stage activation",
+                eventPayload: { issueId: existing.id },
+              },
+            );
+            if (!cancelled || cancelled.status !== "cancelled") {
+              throw new Error("The active agent run could not be stopped after review activation");
+            }
+            interruptedRunId = cancelled.id;
+          }
+        } catch (err) {
+          logger.warn({ err, issueId: existing.id }, "failed to stop builder after review activation");
+          await logActivity(db, {
+            companyId: existing.companyId,
+            actorType: actor.actorType,
+            actorId: actor.actorId,
+            agentId: actor.agentId,
+            runId: actor.runId,
+            action: "heartbeat.cancel_failed",
+            entityType: "heartbeat_run",
+            entityId: existing.executionRunId ?? existing.id,
+            issueId: existing.id,
+            details: { source: "mid_flight_review_activation", issueId: existing.id },
+          });
+        }
+      }
+
       if (enteringBlocked) {
         const blockedIssue = issue;
         let ownerNotifiedAt: Date | null = null;
         await deliverAgentUnblockNotification({
           issue: blockedIssue,
+          // SPA-11807: an unanswered interaction is itself a legitimate reason to
+          // hold this card blocked, so the auto-wake must yield to it.
+          pendingInteractions: await db
+            .select({ status: issueThreadInteractions.status })
+            .from(issueThreadInteractions)
+            .where(
+              and(
+                eq(issueThreadInteractions.companyId, blockedIssue.companyId),
+                eq(issueThreadInteractions.issueId, blockedIssue.id),
+              ),
+            ),
           wakeup: heartbeat.wakeup,
           markNotified: async (blockedOwnerNotifiedAt) => {
             ownerNotifiedAt = blockedOwnerNotifiedAt;
@@ -14332,7 +14604,8 @@ export function issueRoutes(
           },
           {
             authorizationReason: issueMutationAuthorizationReason,
-            clientRequestId: actor.actorType === "user" ? commentClientRequestId : undefined,
+            // SPA-11706 D1: same opt-in key for agents and users alike.
+            clientRequestId: commentClientRequestId,
             sourceTrust: await sourceTrustForActorWrite(issue, actor),
           },
         );
@@ -14793,6 +15066,7 @@ export function issueRoutes(
         const becameDone =
           existing.status !== "done" && issue.status === "done";
         if (becameDone) {
+          await heartbeat.autoUnblockReadyDependents(issue.id);
           const dependents = await svc.listWakeableBlockedDependents(issue.id);
           for (const dependent of dependents) {
             await addDependencyResolvedWakeup({
@@ -16497,17 +16771,37 @@ export function issueRoutes(
         },
       });
 
-      await questionResponseDeliveries.deliver(interaction.id).catch((err) => {
-        logger.warn(
-          {
-            err,
-            companyId: issue.companyId,
-            issueId: issue.id,
-            interactionId: interaction.id,
-          },
-          "synchronous question response delivery failed; durable outbox will retry",
-        );
-      });
+      const deliveryOutcome = await questionResponseDeliveries
+        .deliver(interaction.id)
+        .catch((err) => {
+          logger.warn(
+            {
+              err,
+              companyId: issue.companyId,
+              issueId: issue.id,
+              interactionId: interaction.id,
+            },
+            "synchronous question response delivery failed; durable outbox will retry",
+          );
+          return null;
+        });
+
+      // SPA-11805 B1: when the answer was just delivered into a live run
+      // (steered or coalesced), that run already holds the answer — queueing a
+      // `wake_assignee` continuation on top of it is the duplicate wake James
+      // flagged on SPA-11120. B2's delivery-side cancel covers a wake armed by
+      // another route before delivery landed; this skip covers the wake this
+      // route would arm after delivery already landed.
+      if (deliveryOutcome?.status !== "delivered") {
+        await queueResolvedInteractionContinuationWakeup({
+          db,
+          heartbeat,
+          issue,
+          interaction,
+          actor,
+          source: "issue.interaction.respond",
+        });
+      }
 
       res.json(interaction);
     },
@@ -17270,6 +17564,12 @@ export function issueRoutes(
         if (!(await assertAgentIssueCommentAllowed(req, res, issue))) return;
         if (req.body.body.trim() !== "/new" && !(await assertBoardCommentNotPaused(req, res, issue))) return;
         const actor = getActorInfo(req);
+        // Unchanged by SPA-11706 D1: this path already required and validated a
+        // body clientRequestId (the 422 above), and it is a board-user path, not
+        // the agent path whose key was being stripped. Reading the header here
+        // would let the guard above and the pre-SELECT below disagree about
+        // which key is in force.
+        const commentClientRequestId = req.body.clientRequestId;
         const userId = req.actor.userId;
         const publications: ActivityPublication[] = [];
         const comment = await db.transaction(async (tx) => {
@@ -17278,10 +17578,10 @@ export function issueRoutes(
           )).for("update");
           const [existing] = await tx.select({ id: issueComments.id }).from(issueComments).where(and(
             eq(issueComments.issueId, issue.id), eq(issueComments.authorUserId, userId),
-            eq(issueComments.clientRequestId, req.body.clientRequestId),
+            eq(issueComments.clientRequestId, commentClientRequestId),
           ));
           const saved = await svc.addComment(issue.id, req.body.body, { userId }, {
-            clientRequestId: req.body.clientRequestId, authorType: "user", attachmentIds: req.body.attachmentIds,
+            clientRequestId: commentClientRequestId, authorType: "user", attachmentIds: req.body.attachmentIds,
           }, tx);
           if (!existing) await logActivity(tx as unknown as Db, {
             companyId: issue.companyId, actorType: actor.actorType, actorId: actor.actorId,
@@ -17334,6 +17634,13 @@ export function issueRoutes(
         await getClosedIssueExecutionWorkspace(issue);
 
       const actor = getActorInfo(req);
+      // SPA-11706 D1: the idempotency key is opt-in for every actor, agents
+      // included. Agents used to have it stripped unconditionally, so an agent
+      // retry after an ambiguous failure wrote a duplicate comment every attempt.
+      const commentClientRequestId = readCommentIdempotencyKey(
+        req.body,
+        req.headers,
+      );
       const commentPresentation =
         req.body.presentation ??
         (await deriveRecoveryCommentPresentation(
@@ -17667,7 +17974,7 @@ export function issueRoutes(
           presentation: commentPresentation,
           metadata: req.body.metadata ?? null,
           attachmentIds: req.body.attachmentIds,
-          clientRequestId: actor.actorType === "user" ? req.body.clientRequestId : undefined,
+          clientRequestId: commentClientRequestId,
           sourceTrust,
         };
         let txResult: {
@@ -17779,7 +18086,7 @@ export function issueRoutes(
           presentation: commentPresentation,
           metadata: req.body.metadata ?? null,
           attachmentIds: req.body.attachmentIds,
-          clientRequestId: actor.actorType === "user" ? req.body.clientRequestId : undefined,
+          clientRequestId: commentClientRequestId,
           authorizationReason: commentAuthorizationReason,
           sourceTrust: await sourceTrustForActorWrite(currentIssue, actor),
         };
@@ -18206,6 +18513,7 @@ export function issueRoutes(
           issueBeforeCommentDecision.status !== "done" &&
           currentIssue.status === "done";
         if (becameDone) {
+          await heartbeat.autoUnblockReadyDependents(currentIssue.id);
           const dependents = await svc.listWakeableBlockedDependents(
             currentIssue.id,
           );

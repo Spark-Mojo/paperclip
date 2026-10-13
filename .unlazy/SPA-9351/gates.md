@@ -796,3 +796,27 @@ PASS would buy nothing (a card's acceptance is post-merge live recovery). The
 restamp to 9284 is therefore the next action, ahead of the independent review.
 Recorded here rather than in prose on the card so the verifier reads it with
 the gates.
+
+## 2026-10-13 transplant onto live base 3328a7e6 (this run, Ty)
+
+Merge preview `git merge --no-commit --no-ff refs/remotes/sparkmojo/rebuild/v2026.916.0-survivors`
+from ec73918: 5 conflict files (9283_snapshot add/add, _journal.json, heartbeat.ts imports +
+reconcileStaleRunScopes, terminal-environment-leases.ts orphan-code hunk already on base,
+lease test file wholly superseded by base). Resolved: keep both import blocks; restore base's
+reconcileStaleRunScopes verbatim (was dropped by the first resolution attempt — tsc proved it:
+TS2552, then zero diff vs donor tree after restore); lease impl keeps base's orphan-code hunk
+(identical to ours); lease TEST takes base's 997-line file verbatim (ours tested heartbeat.wakeup
+wiring that base's drain model supersedes); migration restamps 9283->9288 (SQL + hand-built
+snapshot grafting our 2 rewake indexes onto base's 9285 tail, journal appends 9288 after 9287).
+
+Receipts (foreground, side worktree ty/spa9351-migrate-fix):
+- server tsc --noEmit: 255 lines, byte-identical set to donor tree at same base (all pre-existing
+  unbuilt plugin-sdk/runner declarations, zero new).
+- db tsc --noEmit: exit 0, no diagnostics.
+- git diff --check: exit 0.
+- exhausted-retry-rewake.test.ts: 83/83 (after `pnpm install --frozen-lockfile`; the 3 concurrent-
+  sweeps failures before install were a WRONG-TOOLCHAIN artifact — symlinked donor node_modules
+  resolved @paperclipai/db to the donor tree, so the 9288 index never materialized; probe proved
+  1 rewake index before, 3 after real install).
+- deferred-wake-backstop.test.ts + terminal-environment-leases.test.ts: 63/63 (5 lease + 58 backstop).
+- migration-order gate vs live base on staged tree: PENDING commit (script reads commits, not worktree).

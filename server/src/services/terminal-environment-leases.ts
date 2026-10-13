@@ -156,6 +156,21 @@ export async function resolveReclamationOwnerState(
     };
   }
 
+  // A non-terminal status with an orphan error code is still terminal-owner
+  // proof: the run is dead even if its status field is stale. The 104-row
+  // evidence on SPA-9351 had exactly this shape — `interrupted` with
+  // `errorCode = orphaned_running_run`.
+  if (isOrphanedRunErrorCode(runRow.errorCode)) {
+    return {
+      kind: "terminal_owner",
+      runId: runRow.id,
+      proof: {
+        kind: "orphaned_error_code",
+        errorCode: runRow.errorCode ?? "unknown",
+      },
+    };
+  }
+
   return { kind: "unknown_owner", reason: "missing_run" };
 }
 

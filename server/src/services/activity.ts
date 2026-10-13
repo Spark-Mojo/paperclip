@@ -147,7 +147,7 @@ export function activityService(db: Db) {
     return typeof value === "number" && Number.isFinite(value) ? value : null;
   }
 
-  async function backfillMissingRunLivenessForIssue(companyId: string, issueId: string) {
+  async function backfillMissingRunLivenessForIssue(companyId: string, issueId: string, runIds: string[]) {
     const runs = await db
       .select({
         id: heartbeatRuns.id,
@@ -165,6 +165,7 @@ export function activityService(db: Db) {
       .where(
         and(
           eq(heartbeatRuns.companyId, companyId),
+          inArray(heartbeatRuns.id, runIds),
           isNull(heartbeatRuns.livenessState),
           sql`${heartbeatRuns.status} not in ('queued', 'running')`,
           or(
@@ -179,8 +180,7 @@ export function activityService(db: Db) {
             )`,
           ),
         ),
-      )
-      .limit(20);
+      );
 
     if (runs.length === 0) return;
 
@@ -310,15 +310,20 @@ export function activityService(db: Db) {
           nextAction: classification.nextAction,
           updatedAt: new Date(),
         })
-        .where(and(eq(heartbeatRuns.id, run.id), isNull(heartbeatRuns.livenessState)));
+        .where(and(
+          eq(heartbeatRuns.id, run.id),
+          isNull(heartbeatRuns.livenessState),
+          sql`${heartbeatRuns.status} not in ('queued', 'running')`,
+        ));
     }
   }
 
-  function scheduleRunLivenessBackfill(companyId: string, issueId: string) {
+  function scheduleRunLivenessBackfill(companyId: string, issueId: string, runIds: string[]) {
+    if (runIds.length === 0) return;
     const key = `${companyId}:${issueId}`;
     if (scheduledLivenessBackfills.has(key)) return;
     scheduledLivenessBackfills.add(key);
-    void backfillMissingRunLivenessForIssue(companyId, issueId)
+    void backfillMissingRunLivenessForIssue(companyId, issueId, runIds)
       .catch((err: unknown) => {
         logger.warn({ err, companyId, issueId }, "run liveness backfill failed");
       })
@@ -380,7 +385,6 @@ export function activityService(db: Db) {
         .orderBy(desc(activityLog.createdAt)),
 
     runsForIssue: async (companyId: string, issueId: string) => {
-      scheduleRunLivenessBackfill(companyId, issueId);
       const runs = await db
         .select({
           runId: heartbeatRuns.id,
@@ -437,6 +441,13 @@ export function activityService(db: Db) {
         )
         .orderBy(desc(heartbeatRuns.createdAt));
 
+      scheduleRunLivenessBackfill(
+        companyId,
+        issueId,
+        runs.filter((run) => run.livenessState === null && run.status !== "queued" && run.status !== "running")
+          .slice(0, 20)
+          .map((run) => run.runId),
+      );
       if (runs.length === 0) return runs;
       const runIds = runs.map((run) => run.runId);
       if (runIds.length === 0) return runs;

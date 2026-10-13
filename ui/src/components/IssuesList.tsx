@@ -1705,8 +1705,16 @@ function StreamlinedIssuesList({
     setIssueColumns(visibleIssueColumns.filter((value) => value !== column));
   }, [setIssueColumns, visibleIssueColumns]);
 
-  const assignIssue = useCallback((issueId: string, assigneeAgentId: string | null, assigneeUserId: string | null = null) => {
-    onUpdateIssue(issueId, { assigneeAgentId, assigneeUserId });
+  const assignIssue = useCallback((issueId: string, assigneeAgentId: string | null, assigneeUserId: string | null = null, observed?: { assigneeAgentId: string | null; assigneeUserId: string | null }) => {
+    onUpdateIssue(issueId, {
+      assigneeAgentId,
+      assigneeUserId,
+      // SPA-10357 / SPA-10859 board-actor ownership-transfer CAS: an
+      // assignment change must carry the caller-observed current values so a
+      // concurrent move 409s instead of being silently overwritten.
+      expectedAssigneeAgentId: observed?.assigneeAgentId ?? null,
+      expectedAssigneeUserId: observed?.assigneeUserId ?? null,
+    });
     setAssigneePickerIssueId(null);
     setAssigneeSearch("");
   }, [onUpdateIssue]);
@@ -2373,7 +2381,7 @@ function StreamlinedIssuesList({
                                         onClick={(e) => {
                                           e.preventDefault();
                                           e.stopPropagation();
-                                          assignIssue(issue.id, null, null);
+                                          assignIssue(issue.id, null, null, { assigneeAgentId: issue.assigneeAgentId ?? null, assigneeUserId: issue.assigneeUserId ?? null });
                                         }}
                                       >
                                         No responsible
@@ -2387,7 +2395,7 @@ function StreamlinedIssuesList({
                                           onClick={(e) => {
                                             e.preventDefault();
                                             e.stopPropagation();
-                                            assignIssue(issue.id, null, currentUserId);
+                                            assignIssue(issue.id, null, currentUserId, { assigneeAgentId: issue.assigneeAgentId ?? null, assigneeUserId: issue.assigneeUserId ?? null });
                                           }}
                                         >
                                           <User className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
@@ -2409,7 +2417,7 @@ function StreamlinedIssuesList({
                                             onClick={(e) => {
                                               e.preventDefault();
                                               e.stopPropagation();
-                                              assignIssue(issue.id, agent.id, null);
+                                              assignIssue(issue.id, agent.id, null, { assigneeAgentId: issue.assigneeAgentId ?? null, assigneeUserId: issue.assigneeUserId ?? null });
                                             }}
                                           >
                                             <Identity name={agent.name} size="sm" className="min-w-0" />

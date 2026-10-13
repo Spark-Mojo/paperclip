@@ -189,6 +189,7 @@ import {
   patchInstanceGeneralSettingsSchema,
   patchInstanceExperimentalSettingsSchema,
   patchInstanceSettingsSchema,
+  patchFleetMaxConcurrentRunsSchema,
   startTaskDrainRequestSchema,
   // Resource memberships
   updateDocumentResourceMembershipSchema,
@@ -278,11 +279,15 @@ import {
   resolveChatPublicationSchema,
   replaceChatEndpointResourcesSchema,
   updateChatEndpointSchema,
+  ISSUE_COMMENT_AUTHOR_TYPES,
+  issueCommentPresentationSchema,
+  issueCommentMetadataSchema,
 } from "@paperclipai/shared";
 import {
   COMPANY_IMPORT_TRANSFERS_API_PATH,
   companyImportTransferDeclarationSchema,
 } from "@paperclipai/shared/company-import-transfer";
+import { sourceTrustMetadataSchema } from "@paperclipai/shared/validators/trust-policy";
 
 type JsonSchema = Record<string, unknown>;
 type OpenApiResponse = Record<string, unknown>;
@@ -1099,6 +1104,56 @@ const workTimelineQuerySchema = z
   })
   .strict();
 
+// GH #982 (SPA-11815): the issue-comments read returns soft-deleted comments as
+// tombstones in its DEFAULT read. `deletedAt` is the discriminator -- a
+// tombstone carries a populated `deletedAt` and a body blanked to the empty
+// string -- so publishing it is what lets a caller reading this spec tell a
+// tombstone from a comment whose author genuinely wrote an empty body.
+//
+// Deliberately NOT `.strict()`: the projection, attribution-enrichment and
+// redaction layers may add fields, and a published `additionalProperties: false`
+// would be a contract the server does not actually enforce.
+const issueCommentResponseSchema = z.object({
+  id: z.string(),
+  companyId: z.string(),
+  issueId: z.string(),
+  authorType: z.enum(ISSUE_COMMENT_AUTHOR_TYPES),
+  authorAgentId: z.string().nullable(),
+  authorUserId: z.string().nullable(),
+  onBehalfOfUserId: z.string().nullable(),
+  createdByRunId: z.string().nullable(),
+  derivedAuthorAgentId: z.string().nullable(),
+  derivedCreatedByRunId: z.string().nullable(),
+  // `IssueCommentDerivedAuthorSource` is a type-only union with no runtime
+  // schema, so its two members are named here. Keep in step with
+  // packages/shared/src/types/issue.ts.
+  derivedAuthorSource: z.enum(["run_id", "run_log_comment_post"]).nullable(),
+  clientRequestId: z.string().nullable(),
+  conversationSessionGeneration: z.number().nullable(),
+  body: z.string(),
+  presentation: issueCommentPresentationSchema.nullable(),
+  metadata: issueCommentMetadataSchema.nullable(),
+  // Tombstone marker. Populated on a soft-deleted comment, null on a live one.
+  deletedAt: z.string().nullable(),
+  deletedByType: z.enum(["agent", "user"]).nullable(),
+  deletedByAgentId: z.string().nullable(),
+  deletedByUserId: z.string().nullable(),
+  deletedByRunId: z.string().nullable(),
+  sourceTrust: sourceTrustMetadataSchema.nullable(),
+  createdAt: z.string(),
+  updatedAt: z.string(),
+});
+
+// The tombstone contract, published on the read itself so a caller reading the
+// spec learns it from the response, not from a source file or a ticket.
+const ISSUE_COMMENTS_READ_DESCRIPTION =
+  'Issue comments, newest first by default. Soft-deleted comments ARE included by default: ' +
+  'a tombstone is returned in place with its body blanked to the empty string and its ' +
+  '`deletedAt` populated, so a caller tells a tombstone from a comment whose author wrote an ' +
+  'empty body by reading `deletedAt` (null on a live comment) and never by reading `body`. ' +
+  'The `deletedBy*` fields name who removed the comment. The read applies no filter: callers ' +
+  'that want live comments only can drop the rows where `deletedAt` is not null themselves.';
+
 const workTimelineResponseSchema = z
   .object({
     actors: z.array(
@@ -1290,7 +1345,7 @@ const BOARD_ONLY_PREFIXES = [
   "/api/instance/",
 ];
 
-const BOARD_ONLY_OPERATIONS = new Set([
+export const BOARD_ONLY_OPERATIONS = new Set([
   "GET /api/companies/{companyId}/ai-connections",
   "POST /api/companies/{companyId}/ai-connections",
   "POST /api/companies/{companyId}/ai-connections/local",
@@ -1367,11 +1422,8 @@ const BOARD_ONLY_OPERATIONS = new Set([
   "GET /api/issues/{issueId}/file-resources/content",
   "GET /api/issues/{issueId}/file-resources/list",
   "GET /api/issues/{issueId}/file-resources/resolve",
-  "POST /api/issues/{id}/interactions/{interactionId}/accept",
-  "POST /api/issues/{id}/interactions/{interactionId}/reject",
-  "POST /api/issues/{id}/interactions/{interactionId}/respond",
+  "POST /api/issues/{id}/interactions/{interactionId}/cancel",
   "POST /api/issues/{id}/interactions/{interactionId}/skip",
-  "POST /api/issues/{id}/interactions/{interactionId}/withdraw",
   "GET /api/companies/{companyId}/tools/gallery",
   "GET /api/companies/{companyId}/tools/apps/{galleryKey}/preflight",
   "POST /api/companies/{companyId}/tools/apps/connect",
@@ -3895,7 +3947,13 @@ registry.registerPath({
   tags: ["issues"],
   summary: "List issue comments",
   request: { params: z.object({ id: z.string() }) },
-  responses: { 200: r.ok(), 401: r.unauthorized },
+  responses: {
+    200: {
+      ...r.ok(z.array(issueCommentResponseSchema)),
+      description: ISSUE_COMMENTS_READ_DESCRIPTION,
+    },
+    401: r.unauthorized,
+  },
 });
 
 registry.registerPath({
@@ -5964,6 +6022,23 @@ registry.registerPath({
   summary: "Update experimental instance settings",
   request: { body: jsonBody(patchInstanceExperimentalSettingsSchema) },
   responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized },
+});
+
+registry.registerPath({
+  method: "get",
+  path: "/api/instance/settings/fleet-max-concurrent-runs",
+  tags: ["instance"],
+  summary: "Get the fleet-wide max concurrent runs setting and source",
+  responses: { 200: r.ok(), 401: r.unauthorized },
+});
+
+registry.registerPath({
+  method: "patch",
+  path: "/api/instance/settings/fleet-max-concurrent-runs",
+  tags: ["instance"],
+  summary: "Update the fleet-wide max concurrent runs setting",
+  request: { body: jsonBody(patchFleetMaxConcurrentRunsSchema) },
+  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden },
 });
 
 registry.registerPath({

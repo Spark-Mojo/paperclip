@@ -32,7 +32,7 @@ function readUniqueViolation(error: unknown) {
 }
 
 const migrationSql = await readFile(
-  fileURLToPath(new URL("./migrations/9283_stranded_rewake_idempotency.sql", import.meta.url)),
+  fileURLToPath(new URL("./migrations/9288_stranded_rewake_idempotency.sql", import.meta.url)),
   "utf8",
 );
 

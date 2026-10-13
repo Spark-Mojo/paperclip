@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { eq, sql } from "drizzle-orm";
+import { eq } from "drizzle-orm";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
@@ -7,17 +7,12 @@ import type { Environment } from "@paperclipai/shared";
 import {
   activityLog,
   agents,
-  agentRuntimeState,
-  agentTaskSessions,
-  agentWakeupRequests,
   companies,
-  companySkills,
   createDb,
   environmentLeases,
   environments,
   heartbeatRunEvents,
   heartbeatRuns,
-  issues,
 } from "@paperclipai/db";
 import {
   getEmbeddedPostgresTestSupport,
@@ -41,32 +36,6 @@ if (!embeddedPostgresSupport.supported) {
 
 const RECLAIM_BATCH = 25;
 
-// SPA-9351: the direct-terminal-writer cases below call heartbeat.wakeup,
-// which dispatches post-commit and keeps writing rows after the test body
-// returns. Teardown must drain those dispatches BEFORE deleting fixture rows,
-// and must delete children (agent_task_sessions) before the runs they
-// reference. The same discipline the deferred-wake suite adopted for the
-// `delete from heartbeat_runs` vs async `UPDATE issues` race.
-const trackedHeartbeatServices: Array<{ drainActiveRunExecutions: () => Promise<void> }> = [];
-
-function trackHeartbeatService<T extends { drainActiveRunExecutions: () => Promise<void> }>(
-  service: T,
-): T {
-  trackedHeartbeatServices.push(service);
-  return service;
-}
-
-async function drainTrackedHeartbeatServices(): Promise<void> {
-  // Repeat: a settling run can dispatch a follow-up for the same agent,
-  // registering further work on the same instance before it goes idle.
-  for (let pass = 0; pass < 5; pass += 1) {
-    await Promise.all(
-      trackedHeartbeatServices.map((service) => service.drainActiveRunExecutions()),
-    );
-  }
-  trackedHeartbeatServices.length = 0;
-}
-
 describeEmbeddedPostgres("terminal environment leases (SPA-9423)", () => {
   let cleanupDb: (() => Promise<void>) | null = null;
   let db!: ReturnType<typeof createDb>;
@@ -78,20 +47,14 @@ describeEmbeddedPostgres("terminal environment leases (SPA-9423)", () => {
   }, 30_000);
 
   afterEach(async () => {
-    await drainTrackedHeartbeatServices();
     await db.delete(activityLog);
-    await db.delete(companySkills);
-    await db.delete(agentTaskSessions);
     await db.delete(environmentLeases);
     await db.delete(heartbeatRunEvents);
     await db.delete(heartbeatRuns);
-    await db.delete(agentWakeupRequests);
-    await db.delete(issues);
-    await db.delete(agentRuntimeState);
     await db.delete(agents);
     await db.delete(environments);
     await db.delete(companies);
-  }, 120_000);
+  });
 
   afterAll(async () => {
     await cleanupDb?.();
@@ -107,9 +70,6 @@ describeEmbeddedPostgres("terminal environment leases (SPA-9423)", () => {
       issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
       requireBoardApprovalForNewAgents: false,
       status: "active",
-      // heartbeat.wakeup() needs a responsible user to dispatch a run. The
-      // seed below is used by the direct-terminal-writer cases.
-      defaultResponsibleUserId: "responsible-user",
       createdAt: now,
       updatedAt: now,
     });
@@ -182,81 +142,6 @@ describeEmbeddedPostgres("terminal environment leases (SPA-9423)", () => {
     } as Environment;
   }
 
-  /**
-   * A queued run holding an issue's execution lock, with a second agent as the
-   * new assignee. Mirrors the seeded cross-agent reassignment fixture in
-   * `__tests__/heartbeat-lock-release-on-reassignment.test.ts`, which is the
-   * production shape of the direct terminal writer at heartbeat.ts:28236.
-   */
-  async function seedReassignmentHolder(input: {
-    companyId: string;
-    agentId: string;
-    holderStatus: "queued" | "running";
-  }) {
-    const reviewerAgentId = randomUUID();
-    const issueId = randomUUID();
-    const holderRunId = randomUUID();
-    const wakeupRequestId = randomUUID();
-    const issuePrefix = `T${input.companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
-    const now = new Date();
-
-    await db.insert(agents).values({
-      id: reviewerAgentId,
-      companyId: input.companyId,
-      name: `Lease Reviewer ${reviewerAgentId.slice(0, 8)}`,
-      role: "engineer",
-      status: "idle",
-      adapterType: "codex_local",
-      adapterConfig: {},
-      runtimeConfig: {},
-      permissions: {},
-      createdAt: now,
-      updatedAt: now,
-    });
-    await db.insert(agentWakeupRequests).values({
-      id: wakeupRequestId,
-      companyId: input.companyId,
-      agentId: input.agentId,
-      source: "assignment",
-      status: "queued",
-      createdAt: now,
-      updatedAt: now,
-    });
-    await db.insert(heartbeatRuns).values({
-      id: holderRunId,
-      companyId: input.companyId,
-      agentId: input.agentId,
-      invocationSource: "assignment",
-      triggerDetail: "system",
-      status: input.holderStatus,
-      wakeupRequestId,
-      contextSnapshot: {
-        issueId,
-        taskId: issueId,
-        wakeReason: "issue_assigned",
-      },
-      createdAt: now,
-      updatedAt: now,
-    });
-    await db.insert(issues).values({
-      id: issueId,
-      companyId: input.companyId,
-      title: "Cross-agent reassignment with a held lease",
-      status: "in_review",
-      priority: "medium",
-      assigneeAgentId: reviewerAgentId,
-      executionRunId: holderRunId,
-      executionAgentNameKey: "lease-subject-agent",
-      executionLockedAt: now,
-      issueNumber: 1,
-      identifier: `${issuePrefix}-1`,
-      createdAt: now,
-      updatedAt: now,
-    });
-
-    return { reviewerAgentId, issueId, holderRunId, wakeupRequestId };
-  }
-
   async function seedRun(input: { companyId: string; agentId: string; status: string; id?: string }) {
     const runId = input.id ?? randomUUID();
     const now = new Date();
@@ -271,122 +156,6 @@ describeEmbeddedPostgres("terminal environment leases (SPA-9423)", () => {
     });
     return runId;
   }
-
-  it("atomically releases a local ephemeral lease with its terminal run", async () => {
-    const { companyId, agentId } = await seedCompanyAndAgent();
-    const runId = await seedRun({ companyId, agentId, status: "running" });
-    const lease = await environmentRuntimeService(db).acquireRunLease({
-      companyId,
-      environment: await seedEnvironment({ companyId, driver: "local" }),
-      issueId: null,
-      heartbeatRunId: runId,
-      persistedExecutionWorkspace: null,
-    });
-
-    await heartbeatService(db).terminalizeRunOnLeaseRelease(
-      await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId)).then(rows => rows[0]!),
-    );
-    const [terminalRun] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
-    const [terminalLease] = await db.select().from(environmentLeases).where(eq(environmentLeases.id, lease.lease.id));
-    expect(terminalRun?.status).toBe("interrupted");
-    expect(terminalLease?.status).toBe("released");
-  });
-
-  it.each(["lease-release", "shutdown"] as const)("rolls back terminal run state when durable lease release fails via %s", async (entrypoint) => {
-    const { companyId, agentId } = await seedCompanyAndAgent();
-    const runId = await seedRun({ companyId, agentId, status: "running" });
-    const { lease } = await environmentRuntimeService(db).acquireRunLease({
-      companyId,
-      environment: await seedEnvironment({ companyId, driver: "local" }),
-      issueId: null,
-      heartbeatRunId: runId,
-      persistedExecutionWorkspace: null,
-    });
-    const [originalRun] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
-    await db.execute(sql.raw(`CREATE FUNCTION spa9351_reject_lease_release() RETURNS trigger LANGUAGE plpgsql AS $$
-      BEGIN
-        IF NEW.id = '${lease.id}' AND OLD.status = 'active'
-          AND NEW.status IN ('released', 'pending_cleanup') THEN
-          RAISE EXCEPTION 'SPA9351_LEASE_RELEASE_REJECTED';
-        END IF;
-        RETURN NEW;
-      END $$`));
-    await db.execute(sql.raw(`CREATE TRIGGER spa9351_reject_lease_release
-      BEFORE UPDATE ON environment_leases FOR EACH ROW
-      EXECUTE FUNCTION spa9351_reject_lease_release()`));
-    try {
-      const heartbeat = heartbeatService(db);
-      const terminalization = entrypoint === "lease-release"
-        ? heartbeat.terminalizeRunOnLeaseRelease(originalRun!)
-        : heartbeat.drainRunningRunsForShutdown("SIGTERM", new Date(), [runId]);
-      const failure = await terminalization.then(
-        () => null,
-        (error: unknown) => error,
-      );
-      expect(failure).toBeInstanceOf(Error);
-      const databaseError = (failure as Error & { cause?: Error }).cause ?? failure;
-      expect(String(databaseError)).toContain("SPA9351_LEASE_RELEASE_REJECTED");
-      const [runAfter] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
-      const [leaseAfter] = await db.select().from(environmentLeases).where(eq(environmentLeases.id, lease.id));
-      expect(runAfter).toEqual(originalRun);
-      expect(leaseAfter?.status).toBe("active");
-      expect(leaseAfter?.releasedAt).toBeNull();
-    } finally {
-      await db.execute(sql.raw("DROP TRIGGER spa9351_reject_lease_release ON environment_leases"));
-      await db.execute(sql.raw("DROP FUNCTION spa9351_reject_lease_release()"));
-    }
-  });
-
-  it.each(["succeeded", "failed", "cancelled", "interrupted", "timed_out"])(
-    "reclaims a %s owner within one sweep and is idempotent",
-    async (status) => {
-      const { companyId, agentId } = await seedCompanyAndAgent();
-      const runId = await seedRun({ companyId, agentId, status });
-      const { lease } = await environmentRuntimeService(db).acquireRunLease({
-        companyId,
-        environment: await seedEnvironment({ companyId, driver: "local" }),
-        issueId: null,
-        heartbeatRunId: runId,
-        persistedExecutionWorkspace: null,
-      });
-      const heartbeat = heartbeatService(db);
-      const first = await heartbeat.reclaimTerminalEnvironmentLeases({ batchSize: RECLAIM_BATCH });
-      expect(first.releasedLeaseIds).toEqual([lease.id]);
-      expect(first.driverFailures).toEqual([]);
-      const [released] = await db.select().from(environmentLeases).where(eq(environmentLeases.id, lease.id));
-      const expectedLeaseStatus = status === "failed" || status === "timed_out"
-        ? "failed"
-        : status === "cancelled" ? "expired" : "released";
-      expect(released?.status).toBe(expectedLeaseStatus);
-      expect(released?.releasedAt).toBeInstanceOf(Date);
-      const second = await heartbeat.reclaimTerminalEnvironmentLeases({ batchSize: RECLAIM_BATCH });
-      expect(second.reclaimed).toBe(0);
-      expect(second.releasedLeaseIds).toEqual([]);
-    },
-  );
-
-  it.each(["unknown", "queued", "running", "scheduled_retry"])(
-    "preserves a %s owner despite an orphan error code",
-    async (status) => {
-      const { companyId, agentId } = await seedCompanyAndAgent();
-      const runId = await seedRun({ companyId, agentId, status });
-      await db.update(heartbeatRuns).set({ errorCode: "orphaned_running_run" })
-        .where(eq(heartbeatRuns.id, runId));
-      const { lease } = await environmentRuntimeService(db).acquireRunLease({
-        companyId,
-        environment: await seedEnvironment({ companyId, driver: "local" }),
-        issueId: null,
-        heartbeatRunId: runId,
-        persistedExecutionWorkspace: null,
-      });
-      const result = await heartbeatService(db).reclaimTerminalEnvironmentLeases({ batchSize: RECLAIM_BATCH });
-      const [after] = await db.select().from(environmentLeases).where(eq(environmentLeases.id, lease.id));
-      expect(after?.status).toBe("active");
-      expect(after?.releasedAt).toBeNull();
-      expect(result.reclaimed).toBe(0);
-      expect(result.driverFailures).toEqual([]);
-    },
-  );
 
   it("LEASE-GATES: terminal-release", async () => {
     const { companyId, agentId } = await seedCompanyAndAgent();
@@ -582,6 +351,160 @@ describeEmbeddedPostgres("terminal environment leases (SPA-9423)", () => {
       .from(environmentLeases)
       .where(eq(environmentLeases.id, reclaimLease.lease.id));
     expect(reclaimStatus[0]?.status).not.toBe("active");
+  });
+
+  // SPA-11861 AC1 direct assertion: the card body's leak path is a run that
+  // ends `failed` with `errorCode = "execution_finalization_deadline_exceeded"`,
+  // and a run that is cancelled. Both must leave `released_at` set after the
+  // release path runs. The `LEASE-GATES: terminal-release` test above asserts
+  // lease `status`, not `released_at` directly — a lease transitioning through
+  // `pending_cleanup` or `failed` would also satisfy `not.toBe("active")`.
+  // This test pins the oracle's letter.
+  it("LEASE-GATES: direct-released-at-on-execution-finalization-deadline-and-cancelled", async () => {
+    const { companyId, agentId } = await seedCompanyAndAgent();
+    const heartbeat = heartbeatService(db);
+    const runtime = environmentRuntimeService(db);
+
+    // Case 1: a run that ends `failed` with `errorCode =
+    // "execution_finalization_deadline_exceeded"`. This is the exact terminal
+    // shape the SPA-11861 monitor observed (SPA-11657/SPA-11661/SPA-11635).
+    const execFinRunId = await seedRun({ companyId, agentId, status: "failed" });
+    await db
+      .update(heartbeatRuns)
+      .set({ errorCode: "execution_finalization_deadline_exceeded" })
+      .where(eq(heartbeatRuns.id, execFinRunId));
+    const execFinLease = await runtime.acquireRunLease({
+      companyId,
+      environment: await seedEnvironment({ companyId, driver: "local" }),
+      issueId: null,
+      heartbeatRunId: execFinRunId,
+      persistedExecutionWorkspace: null,
+    });
+    expect(execFinLease.lease.status).toBe("active");
+    expect(execFinLease.lease.releasedAt).toBeNull();
+
+    await heartbeat.releaseEnvironmentLeasesForRun({
+      runId: execFinRunId,
+      companyId,
+      agentId,
+      status: "failed",
+      failureReason: "execution_finalization_deadline_exceeded",
+    });
+
+    const execFinAfter = await db
+      .select({
+        status: environmentLeases.status,
+        releasedAt: environmentLeases.releasedAt,
+      })
+      .from(environmentLeases)
+      .where(eq(environmentLeases.id, execFinLease.lease.id));
+    expect(execFinAfter[0]?.status).not.toBe("active");
+    expect(execFinAfter[0]?.releasedAt).not.toBeNull();
+
+    // Case 2: a run that is cancelled. Mirror the same shape.
+    const cancelledRunId = await seedRun({
+      companyId,
+      agentId,
+      status: "cancelled",
+    });
+    const cancelledLease = await runtime.acquireRunLease({
+      companyId,
+      environment: await seedEnvironment({ companyId, driver: "local" }),
+      issueId: null,
+      heartbeatRunId: cancelledRunId,
+      persistedExecutionWorkspace: null,
+    });
+    expect(cancelledLease.lease.status).toBe("active");
+    expect(cancelledLease.lease.releasedAt).toBeNull();
+
+    await heartbeat.releaseEnvironmentLeasesForRun({
+      runId: cancelledRunId,
+      companyId,
+      agentId,
+      status: "cancelled",
+    });
+
+    const cancelledAfter = await db
+      .select({
+        status: environmentLeases.status,
+        releasedAt: environmentLeases.releasedAt,
+      })
+      .from(environmentLeases)
+      .where(eq(environmentLeases.id, cancelledLease.lease.id));
+    expect(cancelledAfter[0]?.status).not.toBe("active");
+    expect(cancelledAfter[0]?.releasedAt).not.toBeNull();
+
+    // SPA-11861 AC1 + AC2 leaked-call path: prove the backstop sweep
+    // recovers a lease whose owning run reached the terminal shape WITHOUT
+    // going through `releaseEnvironmentLeasesForRun`. This mirrors the
+    // production leak path in `execution-control-reconciliation.ts:153-190`,
+    // which writes `failed + errorCode = execution_finalization_deadline_exceeded`
+    // in a transaction with NO lease-release call.
+    //
+    // Case A: leaked `failed` + `execution_finalization_deadline_exceeded`
+    // (the SPA-11657 / SPA-11661 / SPA-11635 shape).
+    const leakedFinRunId = await seedRun({
+      companyId,
+      agentId,
+      status: "failed",
+    });
+    await db
+      .update(heartbeatRuns)
+      .set({ errorCode: "execution_finalization_deadline_exceeded" })
+      .where(eq(heartbeatRuns.id, leakedFinRunId));
+    const leakedFinLease = await runtime.acquireRunLease({
+      companyId,
+      environment: await seedEnvironment({ companyId, driver: "local" }),
+      issueId: null,
+      heartbeatRunId: leakedFinRunId,
+      persistedExecutionWorkspace: null,
+    });
+
+    // Case B: leaked `cancelled` write that bypasses the 4
+    // releaseEnvironmentLeasesForRun call sites in heartbeat.ts
+    // (the `drainRunningRunsForShutdown` / `settleRecoveredNativeWorkspace` /
+    // process_lost / finally boundary all gate the release path; raw
+    // `cancelled` writes at heartbeat.ts :16809 / :16860 / :26972 skip them).
+    const leakedCancelRunId = await seedRun({
+      companyId,
+      agentId,
+      status: "cancelled",
+    });
+    const leakedCancelLease = await runtime.acquireRunLease({
+      companyId,
+      environment: await seedEnvironment({ companyId, driver: "local" }),
+      issueId: null,
+      heartbeatRunId: leakedCancelRunId,
+      persistedExecutionWorkspace: null,
+    });
+
+    // Run the backstop sweep — no manual release call.
+    const sweepResult = await heartbeat.reclaimTerminalEnvironmentLeases({
+      batchSize: RECLAIM_BATCH,
+    });
+    expect(sweepResult.releasedLeaseIds).toContain(leakedFinLease.lease.id);
+    expect(sweepResult.releasedLeaseIds).toContain(leakedCancelLease.lease.id);
+
+    // Both leaked leases must have releasedAt set after the sweep.
+    const leakedFinAfter = await db
+      .select({
+        status: environmentLeases.status,
+        releasedAt: environmentLeases.releasedAt,
+      })
+      .from(environmentLeases)
+      .where(eq(environmentLeases.id, leakedFinLease.lease.id));
+    expect(leakedFinAfter[0]?.status).not.toBe("active");
+    expect(leakedFinAfter[0]?.releasedAt).not.toBeNull();
+
+    const leakedCancelAfter = await db
+      .select({
+        status: environmentLeases.status,
+        releasedAt: environmentLeases.releasedAt,
+      })
+      .from(environmentLeases)
+      .where(eq(environmentLeases.id, leakedCancelLease.lease.id));
+    expect(leakedCancelAfter[0]?.status).not.toBe("active");
+    expect(leakedCancelAfter[0]?.releasedAt).not.toBeNull();
   });
 
   it("LEASE-GATES: sweep-guards", async () => {
@@ -1070,193 +993,5 @@ describeEmbeddedPostgres("terminal environment leases (SPA-9423)", () => {
       .from(environmentLeases)
       .where(eq(environmentLeases.id, d5Lease.lease.id));
     expect(d5After[0]?.status).toBe("active");
-  });
-
-  // SPA-9351 direct terminal writers. The two atomic setters
-  // (setRunStatus / setRunStatusFromLive) enclose the lease release in the
-  // run's transaction, but the admission path cancels `queued` and
-  // `scheduled_retry` holders through bare `tx.update(heartbeatRuns)` calls at
-  // heartbeat.ts:17918, :18035, :28100, :28236 and :28328. A lease is acquired
-  // before dispatch (environment-runtime.ts:1103 -> environments.ts:1596), so a
-  // cancelled-by-those-paths run leaves its active lease behind and the card
-  // strands with `execution_owner_active` — the shape the 2026-10-07 monitor
-  // found on 118 leases. This gate pins the real admission cancellation, not a
-  // synthetic status write, so a test that only re-implements the UPDATE shape
-  // cannot pass for it.
-  it("releases the lease of a queued holder cancelled on reassignment", async () => {
-    const { companyId, agentId } = await seedCompanyAndAgent();
-    const scenario = await seedReassignmentHolder({ companyId, agentId, holderStatus: "queued" });
-    const { lease } = await environmentRuntimeService(db).acquireRunLease({
-      companyId,
-      environment: await seedEnvironment({ companyId, driver: "local" }),
-      issueId: scenario.issueId,
-      heartbeatRunId: scenario.holderRunId,
-      persistedExecutionWorkspace: null,
-    });
-
-    await trackHeartbeatService(heartbeatService(db)).wakeup(scenario.reviewerAgentId, {
-      source: "automation",
-      triggerDetail: "system",
-      reason: "issue_assigned",
-      payload: { issueId: scenario.issueId },
-      contextSnapshot: {
-        issueId: scenario.issueId,
-        taskId: scenario.issueId,
-        wakeReason: "issue_assigned",
-      },
-      requestedByActorType: "user",
-      requestedByActorId: "local-board",
-    });
-
-    const [holder] = await db
-      .select({ status: heartbeatRuns.status, errorCode: heartbeatRuns.errorCode })
-      .from(heartbeatRuns)
-      .where(eq(heartbeatRuns.id, scenario.holderRunId));
-    expect(holder?.errorCode).toBe("lock_released_on_reassignment");
-    expect(holder?.status).toBe("cancelled");
-
-    const [after] = await db
-      .select({ status: environmentLeases.status, releasedAt: environmentLeases.releasedAt })
-      .from(environmentLeases)
-      .where(eq(environmentLeases.id, lease.id));
-    expect(after?.status).not.toBe("active");
-    expect(after?.releasedAt).toBeInstanceOf(Date);
-  });
-
-  it("releases the lease of a scheduled_retry run cancelled before it became due", async () => {
-    const { companyId, agentId } = await seedCompanyAndAgent();
-    // cancelStaleScheduledRetry (heartbeat.ts:28100) cancels a
-    // scheduled_retry holder whose issue was cancelled before the retry became
-    // due. It writes the run row directly rather than through setRunStatus, so
-    // its lease is exactly the shape that strands. Drive it through the public
-    // admission path: a wakeup for an issue already in `cancelled`.
-    const cancelledIssueId = randomUUID();
-    const issuePrefix = `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
-    const staleRunId = await seedRun({
-      companyId,
-      agentId,
-      status: "scheduled_retry",
-    });
-    const now = new Date();
-    // The admission path finds a legacy holder by context scan
-    // (heartbeat.ts:28291, `contextSnapshot ->> 'issueId'`), so the run has to
-    // name the issue or cancelStaleScheduledRetry never sees it.
-    await db
-      .update(heartbeatRuns)
-      .set({
-        contextSnapshot: {
-          issueId: cancelledIssueId,
-          taskId: cancelledIssueId,
-          wakeReason: "transient_failure_retry",
-        },
-        updatedAt: now,
-      })
-      .where(eq(heartbeatRuns.id, staleRunId));
-    await db.insert(issues).values({
-      id: cancelledIssueId,
-      companyId,
-      title: "Cancelled before the retry became due",
-      status: "cancelled",
-      priority: "medium",
-      issueNumber: 1,
-      identifier: `${issuePrefix}-1`,
-      createdAt: now,
-      updatedAt: now,
-    });
-    const { lease } = await environmentRuntimeService(db).acquireRunLease({
-      companyId,
-      environment: await seedEnvironment({ companyId, driver: "local" }),
-      issueId: cancelledIssueId,
-      heartbeatRunId: staleRunId,
-      persistedExecutionWorkspace: null,
-    });
-
-    await trackHeartbeatService(heartbeatService(db)).wakeup(agentId, {
-      source: "automation",
-      triggerDetail: "system",
-      reason: "issue_assigned",
-      payload: { issueId: cancelledIssueId },
-      contextSnapshot: {
-        issueId: cancelledIssueId,
-        taskId: cancelledIssueId,
-        wakeReason: "issue_assigned",
-      },
-      requestedByActorType: "user",
-      requestedByActorId: "local-board",
-    });
-
-    const [stale] = await db
-      .select({ status: heartbeatRuns.status, errorCode: heartbeatRuns.errorCode })
-      .from(heartbeatRuns)
-      .where(eq(heartbeatRuns.id, staleRunId));
-    expect(stale?.status).toBe("cancelled");
-    expect(stale?.errorCode).toBe("issue_cancelled");
-
-    const [after] = await db
-      .select({ status: environmentLeases.status, releasedAt: environmentLeases.releasedAt })
-      .from(environmentLeases)
-      .where(eq(environmentLeases.id, lease.id));
-    expect(after?.status).not.toBe("active");
-    expect(after?.releasedAt).toBeInstanceOf(Date);
-  });
-
-  // SPA-9351 identity binding. The admission release pins
-  // `heartbeat_run_id = run.id`, so a cancel must never free a DIFFERENT run's
-  // live lease on the same agent. If the WHERE ever loosened to agent/company
-  // scope, a newer queued run that acquired its own lease would have it
-  // released by an older run's cancellation — a second stranding class traded
-  // for the first. This case holds two leases on one company and requires that
-  // cancelling one holder leaves the other's untouched.
-  it("releases only the cancelled run's lease and never a sibling run's", async () => {
-    const { companyId, agentId } = await seedCompanyAndAgent();
-    const environment = await seedEnvironment({ companyId, driver: "local" });
-    const runtime = environmentRuntimeService(db);
-    const scenario = await seedReassignmentHolder({ companyId, agentId, holderStatus: "queued" });
-
-    const cancelledRunLease = await runtime.acquireRunLease({
-      companyId,
-      environment,
-      issueId: scenario.issueId,
-      heartbeatRunId: scenario.holderRunId,
-      persistedExecutionWorkspace: null,
-    });
-    // A second, unrelated run on the SAME company and agent. It holds a lease
-    // the cancel must not touch.
-    const siblingRunId = await seedRun({ companyId, agentId, status: "queued" });
-    const siblingLease = await runtime.acquireRunLease({
-      companyId,
-      environment,
-      issueId: null,
-      heartbeatRunId: siblingRunId,
-      persistedExecutionWorkspace: null,
-    });
-
-    await trackHeartbeatService(heartbeatService(db)).wakeup(scenario.reviewerAgentId, {
-      source: "automation",
-      triggerDetail: "system",
-      reason: "issue_assigned",
-      payload: { issueId: scenario.issueId },
-      contextSnapshot: {
-        issueId: scenario.issueId,
-        taskId: scenario.issueId,
-        wakeReason: "issue_assigned",
-      },
-      requestedByActorType: "user",
-      requestedByActorId: "local-board",
-    });
-
-    const [released] = await db
-      .select({ status: environmentLeases.status, releasedAt: environmentLeases.releasedAt })
-      .from(environmentLeases)
-      .where(eq(environmentLeases.id, cancelledRunLease.lease.id));
-    expect(released?.status).not.toBe("active");
-    expect(released?.releasedAt).toBeInstanceOf(Date);
-
-    const [sibling] = await db
-      .select({ status: environmentLeases.status, releasedAt: environmentLeases.releasedAt })
-      .from(environmentLeases)
-      .where(eq(environmentLeases.id, siblingLease.lease.id));
-    expect(sibling?.status).toBe("active");
-    expect(sibling?.releasedAt).toBeNull();
   });
 });

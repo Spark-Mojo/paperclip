@@ -37,6 +37,24 @@ export type CommandRunner = (
 
 type ReleasePackageEntry = { dir: string; name: string };
 
+export const DIAGNOSTIC_OUTPUT_LIMIT = 16 * 1024;
+
+export function truncateDiagnosticOutput(output: string, limit = DIAGNOSTIC_OUTPUT_LIMIT): string {
+  if (output.length <= limit) return output;
+  // SPA-11990: for build output the failure is at the END, so keep mostly
+  // tail. Cut on newline boundaries so no fragment line reads as a real
+  // diagnostic; prefix the tail fragment with its own ellipsis marker.
+  const tailBudget = Math.floor((limit * 3) / 4);
+  const headBudget = limit - tailBudget;
+  const head = output.slice(0, headBudget);
+  const headCut = head.lastIndexOf("\n");
+  const headPart = headCut > 0 ? head.slice(0, headCut) : head;
+  const tailRaw = output.slice(output.length - tailBudget);
+  const tailCut = tailRaw.indexOf("\n");
+  const tailPart = tailCut >= 0 ? tailRaw.slice(tailCut + 1) : tailRaw;
+  return `${headPart}\n... [truncated ${output.length - headPart.length - tailPart.length} chars] ...\n... ${tailPart}`;
+}
+
 export async function runCommandWithDiagnostics(
   file: string,
   args: string[],
@@ -45,11 +63,23 @@ export async function runCommandWithDiagnostics(
   try {
     return await execFileAsync(file, args, { ...options, encoding: "utf8" });
   } catch (error) {
-    const stderr = error && typeof error === "object" && "stderr" in error && typeof error.stderr === "string"
+    const base = error instanceof Error ? error.message : String(error);
+    const rawStdout = error && typeof error === "object" && "stdout" in error && typeof error.stdout === "string"
+      ? error.stdout.trim()
+      : "";
+    const rawStderr = error && typeof error === "object" && "stderr" in error && typeof error.stderr === "string"
       ? error.stderr.trim()
       : "";
-    if (!stderr || (error instanceof Error && error.message.includes(stderr))) throw error;
-    throw new Error(`${error instanceof Error ? error.message : String(error)}\n${stderr}`, { cause: error });
+    // SPA-11990: build tools (tsc, pnpm -r) report failures on stdout while
+    // stderr may carry unrelated progress noise, so a stderr-only diagnostic
+    // silently drops the real error. Surface the captured stdout as well.
+    // Each stream is appended only when it is not already in the message, so
+    // the two appends are independent: a child writing to BOTH streams keeps
+    // both diagnostics (the common pnpm -r shape).
+    const stdout = rawStdout && !base.includes(rawStdout) ? truncateDiagnosticOutput(rawStdout) : "";
+    const stderr = rawStderr && !base.includes(rawStderr) ? truncateDiagnosticOutput(rawStderr) : "";
+    if (!stdout && !stderr) throw error;
+    throw new Error(`${base}${stdout ? `\n${stdout}` : ""}${stderr ? `\n${stderr}` : ""}`, { cause: error });
   }
 }
 
@@ -278,6 +308,20 @@ export async function installGitPayload(repo: string, sha: string, runCommand: C
     await runCommand("corepack", ["pnpm", "install", "--frozen-lockfile"], { cwd: checkoutPath, env: buildEnv(), maxBuffer: 32 * 1024 * 1024 });
     await runCommand("bash", ["scripts/build-npm.sh", "--skip-checks", "--skip-typecheck"], { cwd: checkoutPath, env: buildEnv(), maxBuffer: 32 * 1024 * 1024 });
     await runCommand("corepack", ["pnpm", "-r", "--filter", "@paperclipai/server...", "--if-present", "run", "build"], { cwd: checkoutPath, env: buildEnv(), maxBuffer: 32 * 1024 * 1024 });
+    // SPA-9160: the server's build script no longer chains `prepare:ui-dist &&`
+    // (reverted in 17a81879f3 to unblock `pnpm -r build` from racing two vite
+    // builds against the same ui/dist), and pnpm pack strips prepack/postpack
+    // from the produced tarball's package.json before packing, so the only
+    // reliable way to guarantee server/ui-dist is to run the prepare script
+    // explicitly here, the same way scripts/engine/install.sh:336 does for
+    // the fork's engine installer. Force a rebuild (reuse=0) so a stale
+    // ui/dist left over from a previous attempt can never satisfy the
+    // post-pack assertion below.
+    await runCommand("corepack", ["pnpm", "--filter", "@paperclipai/server", "run", "prepare:ui-dist"], { cwd: checkoutPath, env: buildEnv({ PAPERCLIP_RELEASE_REUSE_UI_DIST: "0" }), maxBuffer: 32 * 1024 * 1024 });
+    const serverUiDistIndex = path.join(checkoutPath, "server", "ui-dist", "index.html");
+    if (!fs.existsSync(serverUiDistIndex)) {
+      throw new Error(`Git install did not produce ${serverUiDistIndex}; the server tarball would lack the board UI.`);
+    }
     const metadata = JSON.parse(fs.readFileSync(path.join(checkoutPath, "cli", "package.json"), "utf8")) as { version: string };
     const workspacePackages = resolveGitInstallWorkspacePackages(checkoutPath);
     for (const [index, workspacePackage] of workspacePackages.entries()) {
@@ -300,6 +344,15 @@ export async function installGitPayload(repo: string, sha: string, runCommand: C
       throw new Error(`Git install packaging produced ${workspaceTarballs.length} workspace tarballs; expected ${workspacePackages.length}.`);
     }
     await runCommand("npm", ["install", "--prefix", stagedPayload, path.join(stagingRoot, cliTarball), ...workspaceTarballs.map((entry) => path.join(stagingRoot, entry)), "--no-audit", "--no-fund"], { cwd: stagingRoot, maxBuffer: 32 * 1024 * 1024 });
+    // SPA-9160: assert the staged payload actually ships server/ui-dist. pnpm
+    // pack is allowed to silently produce a tarball that drops the prepack-
+    // produced ui-dist if the publish manifest rewrite collapses the files
+    // list, and the live 2026-09-27 20:44Z install shipped an installed
+    // server without ui-dist ("Cannot GET /" on the board for ~10h).
+    const installedServerUiDist = path.join(stagedPayload, "node_modules", "@paperclipai", "server", "ui-dist", "index.html");
+    if (!fs.existsSync(installedServerUiDist)) {
+      throw new Error(`Git install completed but the staged payload is missing ${installedServerUiDist}; refusing to flip the managed-install symlink so the running board stays online. Re-run after verifying the source checkout's scripts/prepare-server-ui-dist.sh still produces ui/dist/index.html.`);
+    }
     await smokePayload(stagedPayload, metadata.version, runCommand);
     fs.renameSync(stagedPayload, payloadPath);
     return { payloadPath, reused: false, version: metadata.version };

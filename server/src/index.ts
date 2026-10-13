@@ -117,10 +117,11 @@ import { createDecisionRetentionNotifyOriginAgent, createDecisionWakeOriginAgent
 import {
   closeHttpListenerForShutdown,
   coordinateHeartbeatSchedulerShutdown,
-  drainRunExecutionFinalizersForShutdown,
+  drainRunsForGracefulShutdown,
   finalizeServerShutdown,
   loadWithoutCoordinatedShutdownSignalHooks,
 } from "./shutdown.js";
+import { getSpawnAdmissionFence } from "@paperclipai/adapter-utils/server-utils";
 import { initializeCloudRuntimeIdentity } from "./services/cloud-runtime-identity.js";
 import { systemdNotify } from "./services/systemd-notify.js";
 import { flushInFlightRunLogMirrors } from "./services/run-log-store.js";
@@ -1048,7 +1049,7 @@ async function startServerWithDatabaseTeardown(
   // 168-worktree HDD load. Periodic re-runs are out of scope for this
   // change — startup is sufficient for the steady-state contract; a
   // scheduler is a follow-up.
-  void reconcileEphemeralWorktreesOnStartup(db as any)
+  void reconcileEphemeralWorktreesOnStartup({ db })
     .then((result) => {
       if (result.reaper.removed > 0 || result.sweep.archived > 0) {
         logger.warn(
@@ -1508,6 +1509,31 @@ async function startServerWithDatabaseTeardown(
           );
         }
 
+        try {
+          // SPA-11948 R1: reaps `paperclip-agent-*.scope` units the previous
+          // engine left behind across a restart, so the cgroup the orphan
+          // reaper runs against no longer holds a cap slot. Order is
+          // load-bearing: must run AFTER hot-restart adoption (so adopted
+          // runs enter the owned set) and BEFORE the orphan reaper and any
+          // queued admission (so a foreign scope cannot hold a cap slot while
+          // queued work is admitted).
+          const staleScopes = await heartbeat.reconcileStaleRunScopes();
+          if (staleScopes.units.length > 0) {
+            logger.warn(
+              {
+                units: staleScopes.units,
+                detachedRunIds: staleScopes.detachedRunIds,
+              },
+              "startup stale agent run scope reconciliation reaped cgroups left across the restart",
+            );
+          }
+        } catch (err) {
+          logger.error(
+            { err },
+            "startup stale agent run scope reconciliation failed - retained scopes will be retried on the next boot",
+          );
+        }
+
         for (let attempt = 1; attempt <= 2; attempt++) {
           try {
             const result = await heartbeat.reapOrphanedRuns();
@@ -1571,14 +1597,21 @@ async function startServerWithDatabaseTeardown(
             "startup session-goal recovery resumed durable agent goals",
           );
         }
-        const reconciled = await heartbeat.reconcileStrandedAssignedIssues();
+        let reconciled: Awaited<ReturnType<typeof heartbeat.reconcileStrandedAssignedIssues>> | null = null;
+        try {
+          reconciled = await heartbeat.reconcileStrandedAssignedIssues();
+        } catch (err) {
+          logger.error({ err }, "startup assigned-issue reconciliation failed; serving with degraded recovery");
+        }
         if (
           promotion.promoted > 0 ||
-          reconciled.assignmentDispatched > 0 ||
-          reconciled.dispatchRequeued > 0 ||
-          reconciled.continuationRequeued > 0 ||
-          reconciled.successfulRunHandoffEscalated > 0 ||
-          reconciled.escalated > 0
+          (reconciled && (
+            reconciled.assignmentDispatched > 0 ||
+            reconciled.dispatchRequeued > 0 ||
+            reconciled.continuationRequeued > 0 ||
+            reconciled.successfulRunHandoffEscalated > 0 ||
+            reconciled.escalated > 0
+          ))
         ) {
           logger.warn(
             { promotedScheduledRetries: promotion.promoted, promotedScheduledRetryRunIds: promotion.runIds, ...reconciled },
@@ -1610,6 +1643,26 @@ async function startServerWithDatabaseTeardown(
         const swept = await heartbeat.sweepStaleIssueLocks();
         if (swept.cleared > 0) {
           logger.warn({ ...swept }, "startup stale-lock sweeper cleared issue locks");
+        }
+
+        // SPA-12218: order is load-bearing. `sweepStaleIssueLocks` above is the
+        // backstop that terminalizes orphaned runs (`orphaned_running_run`), and
+        // this sweep keys on that errorCode, so it must run after it — never
+        // before, and never in place of it. A failure here degrades: the stale
+        // runs stay terminalized, and the next boot retries the re-wake.
+        try {
+          const rewoken = await heartbeat.reconcileOrphanedRunIssues();
+          if (rewoken.rewoken > 0) {
+            logger.warn(
+              { ...rewoken },
+              "startup orphaned-run reconciliation restored interrupted issue execution paths",
+            );
+          }
+        } catch (err) {
+          logger.error(
+            { err },
+            "startup orphaned-run reconciliation failed; interrupted issues stay unwoken until the next boot",
+          );
         }
       })().catch((err) => {
         logger.error({ err }, "startup heartbeat recovery failed");
@@ -1890,6 +1943,18 @@ async function startServerWithDatabaseTeardown(
               }
             })
             .then(async () => {
+              const settled = await heartbeat.sweepSettledAwaitingYouIssues();
+              if (settled.handedBack > 0 || settled.autoClosed > 0) {
+                logger.warn({ ...settled }, "periodic awaiting-you settlement settled fully-answered user-owned cards");
+              }
+            })
+            .then(async () => {
+              const pulled = await heartbeat.pullIdleAgentTodoIssues();
+              if (pulled.pulled > 0) {
+                logger.warn({ ...pulled }, "periodic idle todo pull dispatched assigned todo cards");
+              }
+            })
+            .then(async () => {
               const reconciled = await heartbeat.reconcileTaskWatchdogs();
               if (reconciled.triggered > 0) {
                 logger.warn({ ...reconciled }, "periodic task-watchdog reconciliation triggered watchdog work");
@@ -2041,13 +2106,15 @@ async function startServerWithDatabaseTeardown(
       signal,
       prepareHotRestartShutdown,
       waitForHeartbeatSchedulerIdle,
+      spawnAdmissionFence: getSpawnAdmissionFence(),
+      log: logger,
     });
     const skipHeartbeatDrain = heartbeatShutdown.hotRestart?.skipDrain === true;
     const selectiveDrainRunIds = heartbeatShutdown.hotRestart?.drainRunIds ?? null;
     if (skipHeartbeatDrain) {
       logger.info(
         { signal, hotRestart: heartbeatShutdown.hotRestart },
-        "hot-restart shutdown prepared after scheduler quiescence; skipping graceful run drain",
+        "hot-restart shutdown prepared after scheduler quiescence and spawn-admission drain; skipping graceful run drain so adoptable runs stay alive",
       );
     } else if (heartbeatShutdown.preparationError) {
       logger.error(
@@ -2064,19 +2131,23 @@ async function startServerWithDatabaseTeardown(
 
     if (!skipHeartbeatDrain && drainHeartbeatRunsForShutdown) {
       try {
-        const drain = await drainHeartbeatRunsForShutdown(signal, selectiveDrainRunIds);
-        logger.info({ signal, drain }, "graceful heartbeat run drain complete");
+        await drainRunsForGracefulShutdown({
+          signal,
+          spawnAdmissionFence: getSpawnAdmissionFence(),
+          drainRuns: async () => {
+            const drain = await drainHeartbeatRunsForShutdown!(
+              signal,
+              selectiveDrainRunIds,
+            );
+            logger.info({ signal, drain }, "graceful heartbeat run drain complete");
+          },
+          drainExecutionFinalizers:
+            drainHeartbeatExecutionFinalizers ?? (async () => undefined),
+          log: logger,
+        });
       } catch (err) {
         logger.error({ err, signal }, "graceful heartbeat run drain failed");
       }
-    }
-
-    if (!skipHeartbeatDrain) {
-      await drainRunExecutionFinalizersForShutdown({
-        signal,
-        drain: drainHeartbeatExecutionFinalizers,
-        log: logger,
-      });
     }
 
     // Whatever the drain did not finalize (timed-out runs, the hot-restart

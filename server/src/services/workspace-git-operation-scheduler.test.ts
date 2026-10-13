@@ -99,6 +99,44 @@ describe("WorkspaceGitOperationScheduler", () => {
     expect(scheduler.snapshot()).toMatchObject({ activeCount: 0, queuedCount: 0, inFlightCount: 0 });
   });
 
+  it("bounds ahead behind scan across 49 workspaces", async () => {
+    const requests = 49;
+    const workspaces = await Promise.all(Array.from({ length: requests }, (_, index) => makeWorkspace(`workspace-${index}`)));
+    const bound = 2;
+    const releases: Array<() => void> = [];
+    let active = 0;
+    let peak = 0;
+    const runner: WorkspaceGitRunner = () => new Promise((resolve) => {
+      active += 1;
+      peak = Math.max(peak, active);
+      releases.push(() => {
+        active -= 1;
+        resolve({ stdout: "0\t1\n", stderr: "" });
+      });
+    });
+    const scheduler = createWorkspaceGitOperationScheduler({
+      concurrency: process.env.PAPERCLIP_TEST_UNBOUNDED_AHEAD_BEHIND === "1" ? requests : bound,
+      queueCapacity: requests,
+      runner,
+    });
+    const results = Array.from({ length: requests }, (_, index) => scheduler.run({
+      workspacePath: workspaces[index]!,
+      args: ["rev-list", "--left-right", "--count", "base...HEAD"],
+      operation: "execution_workspaces.close_readiness_ahead_behind",
+      cacheTtlMs: 0,
+    }));
+    await vi.waitFor(() => expect(scheduler.snapshot().inFlightCount).toBe(requests));
+    for (let index = 0; index < requests; index += 1) {
+      await vi.waitFor(() => expect(releases.length).toBeGreaterThan(0));
+      releases.shift()?.();
+    }
+    const counts = await Promise.all(results);
+    expect(counts[0]?.stdout.trim()).toBe("0\t1");
+    expect(counts).toHaveLength(requests);
+    process.stdout.write(`ahead-behind fixture: N=${requests} bound=${bound} peak=${peak}\n`);
+    expect(peak).toBeLessThanOrEqual(bound);
+  });
+
   it("honors per-operation deadlines and keeps different execution bounds out of one flight", async () => {
     const workspace = await makeWorkspace();
     const observedTimeouts: number[] = [];

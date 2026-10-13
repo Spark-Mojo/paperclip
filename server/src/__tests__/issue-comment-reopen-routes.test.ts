@@ -30,6 +30,11 @@ const mockHeartbeatService = vi.hoisted(() => ({
   getActiveRunForAgent: vi.fn(async () => null),
   cancelRun: vi.fn(async () => null),
   cancelLiveRunsForIssue: vi.fn(async () => [] as Array<{ id: string; companyId: string; agentId: string; status: string }>),
+  // SPA-11905: the route calls heartbeat.autoUnblockReadyDependents on a
+  // becameDone transition (issues.ts); a missing mock turned every such
+  // transition into an unhandled TypeError that also aborted the
+  // listWakeableBlockedDependents assertions downstream.
+  autoUnblockReadyDependents: vi.fn(async () => undefined),
 }));
 
 const mockAgentService = vi.hoisted(() => ({
@@ -521,6 +526,9 @@ describe.sequential("issue comment reopen routes", () => {
       .send({
         comment: "hello",
         reopen: true,
+        // SPA-10357 board-actor ownership-transfer CAS: a reassignment from
+        // the row's current assignee requires the expected pre-transfer value.
+        expectedAssigneeAgentId: "22222222-2222-4222-8222-222222222222",
         assigneeAgentId: "33333333-3333-4333-8333-333333333333",
       });
 
@@ -551,6 +559,7 @@ describe.sequential("issue comment reopen routes", () => {
         comment: "Inspect the file",
         commentClientRequestId: "77777777-7777-4777-8777-777777777777",
         attachmentIds: [id],
+        expectedAssigneeAgentId: "22222222-2222-4222-8222-222222222222",
         assigneeAgentId: "33333333-3333-4333-8333-333333333333",
       });
     expect(res.status).toBe(200);
@@ -600,6 +609,7 @@ describe.sequential("issue comment reopen routes", () => {
       .send({
         comment: "Inspect",
         attachmentIds: ["9af8228f-0be7-45ae-a104-6fbe0af6f1d3"],
+        expectedAssigneeAgentId: "22222222-2222-4222-8222-222222222222",
         assigneeAgentId: "33333333-3333-4333-8333-333333333333",
       });
     expect(res.status).toBe(409);
@@ -619,6 +629,7 @@ describe.sequential("issue comment reopen routes", () => {
       .patch("/api/issues/11111111-1111-4111-8111-111111111111")
       .send({
         comment: "hello",
+        expectedAssigneeAgentId: "22222222-2222-4222-8222-222222222222",
         assigneeAgentId: "33333333-3333-4333-8333-333333333333",
       });
 
@@ -656,7 +667,7 @@ describe.sequential("issue comment reopen routes", () => {
 
     const res = await request(await installActor(createApp()))
       .patch("/api/issues/11111111-1111-4111-8111-111111111111")
-      .send({ comment: "hello", assigneeAgentId: "codexcoder" });
+      .send({ comment: "hello", expectedAssigneeAgentId: "22222222-2222-4222-8222-222222222222", assigneeAgentId: "codexcoder" });
 
     expect(res.status).toBe(200);
     expect(mockAgentService.resolveByReference).toHaveBeenCalledWith(
@@ -707,6 +718,9 @@ describe.sequential("issue comment reopen routes", () => {
       .send({
         comment: "hello",
         reopen: true,
+        // SPA-10357 board-actor ownership-transfer CAS: a reassignment from
+        // the row's current assignee requires the expected pre-transfer value.
+        expectedAssigneeAgentId: "22222222-2222-4222-8222-222222222222",
         assigneeAgentId: "33333333-3333-4333-8333-333333333333",
       });
 
@@ -1092,7 +1106,7 @@ describe.sequential("issue comment reopen routes", () => {
     );
   });
 
-  it("moves assigned blocked issues back to todo via POST comments", async () => {
+  it("does not implicitly move assigned blocked issues to todo via plain POST comments", async () => {
     mockIssueService.getById.mockResolvedValue(makeIssue("blocked"));
     mockIssueService.update.mockImplementation(
       async (_id: string, patch: Record<string, unknown>) => ({
@@ -1104,6 +1118,40 @@ describe.sequential("issue comment reopen routes", () => {
     const res = await request(await installActor(createApp()))
       .post("/api/issues/11111111-1111-4111-8111-111111111111/comments")
       .send({ body: "please continue" });
+
+    expect(res.status).toBe(201);
+    expect(mockIssueService.update).not.toHaveBeenCalled();
+    await waitForWakeup(() =>
+      expect(mockHeartbeatService.wakeup).toHaveBeenCalledWith(
+        "22222222-2222-4222-8222-222222222222",
+        expect.objectContaining({
+          reason: "issue_commented",
+          payload: expect.objectContaining({
+            commentId: "comment-1",
+            mutation: "comment",
+          }),
+          contextSnapshot: expect.objectContaining({
+            issueId: "11111111-1111-4111-8111-111111111111",
+            wakeCommentId: "comment-1",
+            wakeReason: "issue_commented",
+          }),
+        }),
+      ),
+    );
+  });
+
+  it("moves assigned blocked issues back to todo via POST comments when resume is explicit", async () => {
+    mockIssueService.getById.mockResolvedValue(makeIssue("blocked"));
+    mockIssueService.update.mockImplementation(
+      async (_id: string, patch: Record<string, unknown>) => ({
+        ...makeIssue("blocked"),
+        ...patch,
+      }),
+    );
+
+    const res = await request(await installActor(createApp()))
+      .post("/api/issues/11111111-1111-4111-8111-111111111111/comments")
+      .send({ body: "please continue", resume: true });
 
     expect(res.status).toBe(201);
     expect(mockIssueService.update).toHaveBeenCalledWith(
@@ -1668,7 +1716,44 @@ describe.sequential("issue comment reopen routes", () => {
     ]);
   });
 
-  it("still implicitly reopens a blocked issue via PATCH when the same request clears blockers", async () => {
+  it("does not implicitly reopen a blocked issue via PATCH when the same request clears blockers unless resume is explicit", async () => {
+    mockIssueService.getById.mockResolvedValue(makeIssue("blocked"));
+    mockIssueService.getRelationSummaries.mockResolvedValue({
+      blockedBy: [],
+      blocks: [],
+    });
+    mockIssueService.getDependencyReadiness.mockResolvedValue({
+      issueId: "11111111-1111-4111-8111-111111111111",
+      blockerIssueIds: [],
+      unresolvedBlockerIssueIds: [],
+      unresolvedBlockerCount: 0,
+      allBlockersDone: true,
+      isDependencyReady: true,
+    });
+    mockIssueService.update.mockImplementation(
+      async (_id: string, patch: Record<string, unknown>) => ({
+        ...makeIssue("blocked"),
+        ...patch,
+      }),
+    );
+
+    const res = await request(await installActor(createApp()))
+      .patch("/api/issues/11111111-1111-4111-8111-111111111111")
+      .send({
+        blockedByIssueIds: [],
+        comment: "nothing left to wait on, plain comment",
+      });
+
+    expect(res.status).toBe(200);
+    expect(mockIssueService.update).toHaveBeenCalled();
+    const patch = mockIssueService.update.mock.calls[0][1] as Record<
+      string,
+      unknown
+    >;
+    expect(patch.status).toBeUndefined();
+  });
+
+  it("reopens a blocked issue via PATCH when the same request clears blockers and resume is explicit", async () => {
     mockIssueService.getById.mockResolvedValue(makeIssue("blocked"));
     mockIssueService.getRelationSummaries.mockResolvedValue({
       blockedBy: [],
@@ -1694,6 +1779,7 @@ describe.sequential("issue comment reopen routes", () => {
       .send({
         blockedByIssueIds: [],
         comment: "nothing left to wait on, please continue",
+        resume: true,
       });
 
     expect(res.status).toBe(200);
@@ -1841,7 +1927,7 @@ describe.sequential("issue comment reopen routes", () => {
     );
   });
 
-  it("moves assigned blocked issues back to todo via the PATCH comment path", async () => {
+  it("does not implicitly move assigned blocked issues to todo via plain PATCH comments", async () => {
     const issue = makeIssue("blocked");
     mockIssueService.getById.mockResolvedValue(issue);
     mockIssueService.update.mockImplementation(
@@ -1852,6 +1938,45 @@ describe.sequential("issue comment reopen routes", () => {
     const res = await request(await installActor(createApp()))
       .patch("/api/issues/11111111-1111-4111-8111-111111111111")
       .send({ comment: "please continue" });
+
+    expect(res.status).toBe(200);
+    expect(mockIssueService.update).toHaveBeenCalledWith(
+      "11111111-1111-4111-8111-111111111111",
+      expect.objectContaining({
+        actorAgentId: null,
+        actorUserId: "local-board",
+      }),
+    );
+    const patch = mockIssueService.update.mock.calls[0][1] as Record<
+      string,
+      unknown
+    >;
+    expect(patch.status).toBeUndefined();
+    await waitForWakeup(() =>
+      expect(mockHeartbeatService.wakeup).toHaveBeenCalledWith(
+        "22222222-2222-4222-8222-222222222222",
+        expect.objectContaining({
+          reason: "issue_commented",
+          payload: expect.objectContaining({
+            commentId: "comment-1",
+            mutation: "comment",
+          }),
+        }),
+      ),
+    );
+  });
+
+  it("moves assigned blocked issues back to todo via the PATCH comment path when resume is explicit", async () => {
+    const issue = makeIssue("blocked");
+    mockIssueService.getById.mockResolvedValue(issue);
+    mockIssueService.update.mockImplementation(
+      async (_id: string, patch: Record<string, unknown>) =>
+        makeIssueUpdateReceipt(issue, patch),
+    );
+
+    const res = await request(await installActor(createApp()))
+      .patch("/api/issues/11111111-1111-4111-8111-111111111111")
+      .send({ comment: "please continue", resume: true });
 
     expect(res.status).toBe(200);
     expect(mockIssueService.update).toHaveBeenCalledWith(
@@ -2750,6 +2875,7 @@ describe.sequential("issue comment reopen routes", () => {
       .send({
         comment: "hello",
         interrupt: true,
+        expectedAssigneeAgentId: "22222222-2222-4222-8222-222222222222",
         assigneeAgentId: "33333333-3333-4333-8333-333333333333",
       });
 

@@ -1,4 +1,6 @@
 {
+  "id": "9d087daf-70ba-4cb8-88b6-191065dc76f6",
+  "prevId": "70d41d4f-6714-441e-afe6-16a8410a9360",
   "version": "7",
   "dialect": "postgresql",
   "tables": {
@@ -2007,50 +2009,6 @@
             }
           ],
           "isUnique": false,
-          "concurrently": false,
-          "method": "btree",
-          "with": {}
-        },
-        "agent_wakeup_requests_exhausted_retry_rewake_idempotency_uq": {
-          "name": "agent_wakeup_requests_exhausted_retry_rewake_idempotency_uq",
-          "columns": [
-            {
-              "expression": "company_id",
-              "isExpression": false,
-              "asc": true,
-              "nulls": "last"
-            },
-            {
-              "expression": "idempotency_key",
-              "isExpression": false,
-              "asc": true,
-              "nulls": "last"
-            }
-          ],
-          "isUnique": true,
-          "where": "\"agent_wakeup_requests\".\"idempotency_key\" LIKE 'exhausted_retry_rewake:%'",
-          "concurrently": false,
-          "method": "btree",
-          "with": {}
-        },
-        "agent_wakeup_requests_orphaned_retry_rewake_idempotency_uq": {
-          "name": "agent_wakeup_requests_orphaned_retry_rewake_idempotency_uq",
-          "columns": [
-            {
-              "expression": "company_id",
-              "isExpression": false,
-              "asc": true,
-              "nulls": "last"
-            },
-            {
-              "expression": "idempotency_key",
-              "isExpression": false,
-              "asc": true,
-              "nulls": "last"
-            }
-          ],
-          "isUnique": true,
-          "where": "\"agent_wakeup_requests\".\"idempotency_key\" LIKE 'orphaned_retry_rewake:%'",
           "concurrently": false,
           "method": "btree",
           "with": {}
@@ -22865,6 +22823,22 @@
           "concurrently": false,
           "method": "btree",
           "with": {}
+        },
+        "heartbeat_runs_company_missing_terminal_liveness_idx": {
+          "name": "heartbeat_runs_company_missing_terminal_liveness_idx",
+          "columns": [
+            {
+              "expression": "company_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "concurrently": false,
+          "method": "btree",
+          "with": {},
+          "where": "\"liveness_state\" IS NULL AND \"status\" NOT IN ('queued', 'running')"
         }
       },
       "foreignKeys": {
@@ -47887,10 +47861,8 @@
   "policies": {},
   "views": {},
   "_meta": {
+    "columns": {},
     "schemas": {},
-    "tables": {},
-    "columns": {}
-  },
-  "id": "77da1aa7-cdc7-4f81-8353-d3e15a39c4e9",
-  "prevId": "70d41d4f-6714-441e-afe6-16a8410a9360"
+    "tables": {}
+  }
 }

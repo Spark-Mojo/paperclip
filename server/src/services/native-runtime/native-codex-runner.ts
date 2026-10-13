@@ -6,6 +6,8 @@ import { fileURLToPath } from "node:url";
 import { and, eq } from "drizzle-orm";
 
 import type { AdapterExecutionResult } from "@paperclipai/adapter-utils";
+import { getSpawnAdmissionFence } from "@paperclipai/adapter-utils/server-utils";
+import { scopedRunCommand, stopRunScope } from "@paperclipai/adapter-utils/run-resource-scope";
 import type { Db } from "@paperclipai/db";
 import { agentSessionGoalActions, agentTaskSessions } from "@paperclipai/db";
 
@@ -381,27 +383,54 @@ export async function executeNativeCodexRunner(input: {
     prepared.queueCommand("turn.start", { text: input.prompt }, `turn_${input.runId}`);
   }
 
-  const child = spawn(binary, buildNativeRunnerArguments({
-    connectUrl: prepared.connectUrl,
-    stateDirectory: runnerStateDirectory,
-    runnerInstanceId: input.runnerInstanceId,
-    environmentLeaseId: input.environmentLeaseId,
-    runId: input.runId,
-    normalizedSessionId: input.normalizedSessionId,
-    turnId: input.turnId,
-    itemId: input.itemId,
-    runnerDigest,
-    maxRuntimeMs: input.timeoutMs,
-  }), {
-    cwd: input.cwd,
-    detached: process.platform !== "win32",
-    env: {
-      ...process.env,
-      ...input.environment,
-      PAPERCLIP_RUNNER_BOOTSTRAP_TICKET: prepared.bootstrapTicket,
-    },
-    stdio: ["ignore", "pipe", "pipe"],
-  });
+  let scoped: ReturnType<typeof scopedRunCommand>;
+  try {
+    scoped = scopedRunCommand(input.runId, binary, buildNativeRunnerArguments({
+      connectUrl: prepared.connectUrl,
+      stateDirectory: runnerStateDirectory,
+      runnerInstanceId: input.runnerInstanceId,
+      environmentLeaseId: input.environmentLeaseId,
+      runId: input.runId,
+      normalizedSessionId: input.normalizedSessionId,
+      turnId: input.turnId,
+      itemId: input.itemId,
+      runnerDigest,
+      maxRuntimeMs: input.timeoutMs,
+    }));
+  } catch (error) {
+    await prepared.release();
+    throw error;
+  }
+  // SPA-11948 R2. The native runner spawns in its own `paperclip-agent-*.scope`
+  // directly, bypassing the adapter `runChildProcess` path, so it must take the
+  // same spawn-admission lease: a runner whose `spawn()` lands after shutdown
+  // closed the gate but before the durable `onSpawn` registration would
+  // otherwise survive the restart as an orphan holding a cap slot. The lease is
+  // taken BEFORE `spawn()`; `admit()` refuses (and kills the scope's whole
+  // cgroup) when the gate is closed; `settle()` runs on every path below.
+  const admissionTicket = getSpawnAdmissionFence().enterAdmission();
+  let child: ChildProcess;
+  try {
+    child = spawn(scoped.command, scoped.args, {
+      cwd: input.cwd,
+      detached: process.platform !== "win32",
+      env: {
+        ...process.env,
+        ...input.environment,
+        PAPERCLIP_RUNNER_BOOTSTRAP_TICKET: prepared.bootstrapTicket,
+        ...scoped.env,
+      },
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+  } catch (error) {
+    // `spawn()` raised synchronously; settle the admission lease so a later
+    // graceful drain cannot wedge on it, and release the environment lease --
+    // this catch sits BEFORE the outer run try whose finally would otherwise
+    // own `prepared.release()` (mirrors the scopedRunCommand catch above).
+    admissionTicket.settle();
+    await prepared.release();
+    throw error;
+  }
   const exit = waitForExit(child);
   child.stdout?.on("data", (chunk: Buffer) => {
     void input.onLog("stdout", chunk.toString("utf8"));
@@ -411,12 +440,27 @@ export async function executeNativeCodexRunner(input: {
   });
 
   try {
-    if (!child.pid) throw new Error("paperclip_runner_process_not_started");
-    await input.onSpawn({
-      pid: child.pid,
-      processGroupId: process.platform === "win32" ? null : child.pid,
-      startedAt: new Date().toISOString(),
-    });
+    if (!child.pid) {
+      admissionTicket.settle();
+      throw new Error("paperclip_runner_process_not_started");
+    }
+    try {
+      await admissionTicket.admit({
+        pid: child.pid,
+        processGroupId: process.platform === "win32" ? null : child.pid,
+        resourceUnit: scoped.unit,
+      });
+      await input.onSpawn({
+        pid: child.pid,
+        processGroupId: process.platform === "win32" ? null : child.pid,
+        startedAt: new Date().toISOString(),
+      });
+    } finally {
+      // Registration closes the pre-spawn -> registered window for every
+      // outcome of `admit`/`onSpawn`; `settle()` is idempotent, so the
+      // refusal path (which settles inside `admit`) is covered too.
+      admissionTicket.settle();
+    }
     if (goalControl) {
       const commandKey = createHash("sha256").update(goalControl.requestId).digest("hex").slice(0, 20);
       const commands = nativeGoalCommands(goalControl);
@@ -514,7 +558,11 @@ export async function executeNativeCodexRunner(input: {
     }
     throw error;
   } finally {
-    await stopChild(child, exit).catch(() => undefined);
-    await prepared.release();
+    try {
+      await stopChild(child, exit).catch(() => undefined);
+      await stopRunScope(scoped.unit);
+    } finally {
+      await prepared.release();
+    }
   }
 }

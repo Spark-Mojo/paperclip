@@ -209,6 +209,13 @@ function normalizeGeneralSettings(raw: unknown): InstanceGeneralSettings {
       backupRetention: parsed.data.backupRetention ?? DEFAULT_BACKUP_RETENTION,
       // Absent => unrestricted; only carry through an explicit policy.
       ...(parsed.data.executionMode ? { executionMode: parsed.data.executionMode } : {}),
+      // Absent => not configured, so the fleet-wide run ceiling falls through
+      // to the env var (see heartbeat.ts fleetMaxConcurrentRuns()). An explicit
+      // `null` IS carried through: it is a deliberate "no ceiling" override
+      // that must win over the env var, not an absence.
+      ...(Object.prototype.hasOwnProperty.call(parsed.data, "fleetMaxConcurrentRuns")
+        ? { fleetMaxConcurrentRuns: parsed.data.fleetMaxConcurrentRuns ?? null }
+        : {}),
     };
   }
   return {
@@ -529,8 +536,16 @@ export function instanceSettingsService(db: Db, options: InstanceSettingsService
       return toExperimentalView(row.experimental);
     },
 
-    updateGeneral: async (patch: PatchInstanceGeneralSettings): Promise<InstanceSettings> => {
-      const current = await getOrCreateRow();
+    updateGeneral: async (
+      patch: PatchInstanceGeneralSettings,
+      writeOptions?: { db?: InstanceSettingsWriteDb },
+    ): Promise<InstanceSettings> => {
+      // The write may run inside a caller-supplied transaction (e.g. the
+      // fleet-max-concurrent-runs PATCH route holds a Postgres advisory lock
+      // across this call so a concurrent PATCH on another server replica
+      // cannot interleave its own read-modify-write — see instance-settings.ts).
+      const runner = writeOptions?.db ?? db;
+      const current = await getOrCreateRow(runner);
       const storedGeneral = normalizeGeneralSettings(current.general);
       // A full-GET echo carries the overlaid operator value for a field the
       // user never chose; stripping it keeps the overlay strictly read-time,
@@ -541,7 +556,7 @@ export function instanceSettingsService(db: Db, options: InstanceSettingsService
         operatorDefaults,
       );
       const now = new Date();
-      const [updated] = await db
+      const [updated] = await runner
         .update(instanceSettings)
         .set({
           general: { ...nextGeneral },

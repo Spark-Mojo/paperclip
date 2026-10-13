@@ -67,6 +67,7 @@ import { isRuntimeOwnedGitBranch } from "./execution-workspace-branch-ownership.
 import { logActivity } from "./activity-log.js";
 import { readProjectWorkspaceRuntimeConfig } from "./project-workspace-runtime-config.js";
 import { workspaceGitOperationScheduler } from "./workspace-git-operation-scheduler.js";
+import { withWorktreeGitLease } from "./worktree-git-lease.js";
 import {
   cleanupWorktreeInstanceArtifacts,
   deriveWorktreeInstanceId,
@@ -949,6 +950,20 @@ async function executeProcess(input: {
   stdoutBytes: number;
   stderrBytes: number;
 }> {
+  if (input.command === "git") {
+    return withWorktreeGitLease(input.cwd, () => executeProcessUnlocked(input));
+  }
+  return executeProcessUnlocked(input);
+}
+
+async function executeProcessUnlocked(input: {
+  command: string;
+  args: string[];
+  cwd: string;
+  env?: NodeJS.ProcessEnv;
+  maxStdoutBytes?: number;
+  maxStderrBytes?: number;
+}) {
   const proc = await new Promise<{
     stdout: ProcessOutputAccumulator;
     stderr: ProcessOutputAccumulator;
@@ -984,16 +999,13 @@ async function executeProcess(input: {
 }
 
 async function runGit(args: string[], cwd: string, opts?: { env?: NodeJS.ProcessEnv }): Promise<string> {
-  const proc = await executeProcess({
-    command: "git",
-    args,
-    cwd,
-    env: opts?.env,
+  return withWorktreeGitLease(cwd, async () => {
+    const proc = await executeProcess({ command: "git", args, cwd, env: opts?.env });
+    if (proc.code !== 0) {
+      throw new Error(proc.stderr.trim() || proc.stdout.trim() || `git ${args.join(" ")} failed`);
+    }
+    return proc.stdout.trim();
   });
-  if (proc.code !== 0) {
-    throw new Error(proc.stderr.trim() || proc.stdout.trim() || `git ${args.join(" ")} failed`);
-  }
-  return proc.stdout.trim();
 }
 
 async function runExpensiveGitStatus(input: {
@@ -2725,6 +2737,7 @@ async function refreshUnstartedWorktreeToBase(input: {
     return { refreshed: false, baseRefSha: null };
   }
 
+  await assertReusableWorktreeSafe(input.worktreePath);
   await recordGitOperation(input.recorder, {
     phase: "worktree_prepare",
     args: ["reset", "--hard", input.currentBaseRefSha],
@@ -2836,6 +2849,120 @@ async function isGitCheckout(cwd: string): Promise<boolean> {
   return Boolean(await runGit(["rev-parse", "--git-dir"], cwd).catch(() => null));
 }
 
+export async function assertReusableWorktreeSafe(worktreePath: string): Promise<void> {
+  return withWorktreeGitLease(worktreePath, async () => {
+    await inspectReusableWorktreeLock(worktreePath);
+  }, true);
+}
+
+async function inspectReusableWorktreeLock(worktreePath: string): Promise<void> {
+  const gitDirRaw = await runGit(["rev-parse", "--absolute-git-dir"], worktreePath);
+  const gitDir = await fs.realpath(gitDirRaw);
+  const worktree = await fs.realpath(worktreePath);
+  const lockPath = path.join(gitDir, "index.lock");
+  const probe = async () => {
+    if (process.platform !== "linux") {
+      throw new WorkspaceRuntimeValidationFailure(
+        `Worktree reuse requires Linux live Git writer detection (current platform: ${process.platform})`,
+        { workspaceValidation: { reason: "live_git_writer_probe_unavailable", worktreePath } },
+      );
+    }
+    const gitProcesses = await executeProcess({ command: "pgrep", args: ["-x", "git"], cwd: worktreePath });
+    if (gitProcesses.code !== 0 && gitProcesses.code !== 1) throw new Error("live Git writer detection failed");
+    if (gitProcesses.stderr.trim() || gitProcesses.stdoutTruncated || gitProcesses.stderrTruncated) throw new Error("live Git writer detection failed");
+    let skippedPids = 0;
+    for (const pid of gitProcesses.stdout.trim().split(/\s+/)) {
+      if (!/^\d+$/.test(pid) || Number(pid) === process.pid) continue;
+      const base = path.join("/proc", pid);
+      try {
+        let permissionDenied = false;
+        const readable = async <T>(read: () => Promise<T>): Promise<T | null> => {
+          try {
+            return await read();
+          } catch (error) {
+            const code = (error as NodeJS.ErrnoException).code;
+            if (code === "EACCES" || code === "EPERM") {
+              permissionDenied = true;
+              return null;
+            }
+            if (code === "ENOENT" || code === "ESRCH") return null;
+            throw error;
+          }
+        };
+        const pointsIntoWorktree = (target: string) => target === worktree || target.startsWith(`${worktree}${path.sep}`)
+          || target === gitDir || target.startsWith(`${gitDir}${path.sep}`);
+        const cwd = await readable(() => fs.realpath(path.join(base, "cwd")));
+        if (cwd && pointsIntoWorktree(cwd)) throw new Error(`live Git writer in ${worktreePath}`);
+        const cmdline = await readable(() => fs.readFile(path.join(base, "cmdline"), "utf8"));
+        const args = cmdline?.split("\0") ?? [];
+        let commandCwd = cwd;
+        for (let i = 1; i < args.length; i++) {
+          const arg = args[i];
+          let value: string | undefined;
+          if (arg === "-c" || arg === "--config-env") { i++; continue; }
+          if (arg === "-C" || arg === "--git-dir" || arg === "--work-tree") value = args[++i];
+          else if (arg.startsWith("--git-dir=") || arg.startsWith("--work-tree=")) value = arg.slice(arg.indexOf("=") + 1);
+          else if (!arg.startsWith("-")) break;
+          if (!value) continue;
+          const resolved = path.isAbsolute(value) ? path.resolve(value) : commandCwd ? path.resolve(commandCwd, value) : null;
+          if (!resolved) continue;
+          const physical = await readable(() => fs.realpath(resolved));
+          if (pointsIntoWorktree(physical ?? resolved)) throw new Error(`live Git writer in ${worktreePath}`);
+          if (arg === "-C") commandCwd = physical ?? resolved;
+        }
+        const handles = await readable(() => fs.readdir(path.join(base, "fd")));
+        for (const handle of handles ?? []) {
+          const target = await readable(() => fs.readlink(path.join(base, "fd", handle)));
+          if (target && (target === lockPath || target === gitDir || target.startsWith(`${gitDir}${path.sep}`) || target === worktree || target.startsWith(`${worktree}${path.sep}`))) {
+            throw new Error(`live Git writer in ${worktreePath}`);
+          }
+        }
+        if (permissionDenied) {
+          await fs.stat(base);
+          const currentCwd = await readable(() => fs.realpath(path.join(base, "cwd")));
+          if (currentCwd && pointsIntoWorktree(currentCwd)) throw new Error(`live Git writer in ${worktreePath}`);
+          skippedPids++;
+        }
+      } catch (error) {
+        const code = (error as NodeJS.ErrnoException).code;
+        if (code === "ENOENT" || code === "ESRCH" || code === "EACCES" || code === "EPERM") {
+          skippedPids++;
+          continue;
+        }
+        throw error;
+      }
+    }
+    if (skippedPids > 0) console.warn(`[workspace-runtime] skipped ${skippedPids} inaccessible Git process(es) during worktree reuse scan`);
+  };
+  await probe();
+  const lock = await fs.lstat(lockPath).catch((error: NodeJS.ErrnoException) => {
+    if (error.code === "ENOENT") return null;
+    throw error;
+  });
+  if (lock) {
+    if (!lock.isFile() || lock.size !== 0 || Date.now() - lock.mtimeMs < 600_000) {
+      throw new Error(`unsafe Git index.lock at ${lockPath}`);
+    }
+    await probe();
+    const holder = await executeProcess({ command: "fuser", args: [lockPath], cwd: worktreePath });
+    if (holder.code !== 1 || holder.stdout.trim() || holder.stderr.trim() || holder.stdoutTruncated || holder.stderrTruncated) {
+      throw new Error(`Git index.lock holder could not be excluded at ${lockPath}`);
+    }
+    const current = await fs.lstat(lockPath);
+    if (current.ino !== lock.ino || current.mtimeMs !== lock.mtimeMs || current.size !== 0) {
+      throw new Error(`Git index.lock changed during inspection at ${lockPath}`);
+    }
+  }
+  await probe();
+  if (lock) {
+    const current = await fs.lstat(lockPath);
+    if (current.ino !== lock.ino || current.mtimeMs !== lock.mtimeMs || current.size !== 0) {
+      throw new Error(`Git index.lock changed during inspection at ${lockPath}`);
+    }
+    await fs.unlink(lockPath);
+  }
+}
+
 async function detectRemoteDefaultBranch(
   repoRoot: string,
   resolveGitAuth?: GitRemoteAuthProvider | null,
@@ -2904,6 +3031,154 @@ async function listLinkedGitWorktreePaths(repoRoot: string): Promise<Set<string>
     paths.add(await resolvePathForWorktreeComparison(worktree));
   }
   return paths;
+}
+
+/**
+ * SPA-9437: tear down a persisted git worktree whose bound repo no longer
+ * matches the current project workspace's repo, so the next realization
+ * picks the NEW repo instead of failing `not_registered` validation.
+ *
+ * Called only when the persisted cwd's repo root (resolved via `git
+ * rev-parse --show-toplevel`) differs from the current project workspace's
+ * `baseCwd` repo root. The OLD worktree is rebuilt as part of the next
+ * `realizeExecutionWorkspace` call against the NEW repo.
+ *
+ * Guarded: refuses to delete a dirty worktree OR a worktree whose branch
+ * tip has no live upstream — both would silently destroy agent work that
+ * has not been delivered yet. Refusal throws a `WorkspaceRuntimeValidationFailure`
+ * so the recovery sweep / board sees a typed error and the next run
+ * produces a clear human-actionable message instead of a silent setup
+ * retry loop.
+ *
+ * `executionWorkspaceId` and `sourceIssue` are present so the validation
+ * payload names the bound row and the source issue — board comments and
+ * recovery records then read like "issue <id> row <workspaceId> bound to
+ * <oldRepo>, current project workspace repo <newRepo>".
+ */
+async function tearDownPersistedWorktreeBoundToOtherRepo(input: {
+  reuseWorktreePath: string;
+  persistedRepoRoot: string;
+  currentRepoRoot: string;
+  branchName: string | null;
+  executionWorkspaceId: string | null;
+  sourceIssue: ExecutionWorkspaceIssueRef | null;
+  recorder: WorkspaceOperationRecorder | null;
+  resolveGitAuth: GitRemoteAuthProvider | null;
+}): Promise<"tore_down" | "skipped_not_a_checkout"> {
+  // Skip the tear-down when the persisted cwd is not a git checkout (it
+  // may be a non-git provider or a corrupted directory). The downstream
+  // validator will throw the right error for that case.
+  if (!await isGitCheckout(input.reuseWorktreePath)) {
+    return "skipped_not_a_checkout";
+  }
+  // Inspect git status BEFORE deciding to delete. We refuse on dirty or
+  // on a branch tip that is not reachable on origin AND not runtime-owned.
+  const status = await runExpensiveGitStatus({
+    args: ["status", "--porcelain=v1", "--untracked-files=all"],
+    cwd: input.reuseWorktreePath,
+    operation: "workspace_runtime.persisted_other_repo_status",
+  });
+  const dirty = status.split(/\r?\n/).some((line) => line.length > 0);
+  if (dirty) {
+    throw new WorkspaceRuntimeValidationFailure(
+      `Persisted git worktree "${input.reuseWorktreePath}" belongs to repo "${input.persistedRepoRoot}", ` +
+        `but the current project workspace is for repo "${input.currentRepoRoot}". The worktree has ` +
+        `uncommitted changes that the engine will not silently destroy. Inspect the worktree, resolve ` +
+        `the changes (commit, stash, or push to origin), then retry the run.`,
+      {
+        workspaceValidation: {
+          reason: "git_worktree_belongs_to_other_repo",
+          reasonCode: "dirty_worktree_in_other_repo",
+          worktreePath: input.reuseWorktreePath,
+          persistedRepoRoot: input.persistedRepoRoot,
+          currentRepoRoot: input.currentRepoRoot,
+          executionWorkspaceId: input.executionWorkspaceId,
+          sourceIssueId: input.sourceIssue?.id ?? null,
+        },
+      },
+    );
+  }
+  // The worktree is clean. Verify the branch tip is recoverable before
+  // deleting the worktree: runtime-owned branches can be recreated on
+  // demand; operator-owned branches must exist on origin or in a local
+  // ref so a future pull can re-attach the tip.
+  {
+    const commitsAhead = await runGit(
+      ["rev-list", "--count", "HEAD", "--not", "--remotes=origin"],
+      input.reuseWorktreePath,
+    ).catch(() => null);
+    if (commitsAhead !== "0") {
+      throw new WorkspaceRuntimeValidationFailure(
+        `Persisted git worktree "${input.reuseWorktreePath}" belongs to repo "${input.persistedRepoRoot}", ` +
+          `but the current project workspace is for repo "${input.currentRepoRoot}". The worktree's ` +
+          `HEAD is not confirmed reachable from an origin ref. ` +
+          `Push the old worktree's commits before retrying the run.`,
+        {
+          workspaceValidation: {
+            reason: "git_worktree_belongs_to_other_repo",
+            reasonCode: "branch_unreachable_in_other_repo",
+            worktreePath: input.reuseWorktreePath,
+            persistedRepoRoot: input.persistedRepoRoot,
+            currentRepoRoot: input.currentRepoRoot,
+            branchName: input.branchName,
+            executionWorkspaceId: input.executionWorkspaceId,
+            sourceIssueId: input.sourceIssue?.id ?? null,
+          },
+        },
+      );
+    }
+  }
+  // Safe path: clean worktree AND branch tip is recoverable. Remove the
+  // worktree from the OLD repo's `git worktree list`. `git worktree
+  // remove --force` is required because the worktree is in a different
+  // repo than the current `repoRoot`; without --force, git refuses on
+  // a worktree whose `.git` file points elsewhere. We do NOT delete the
+  // branch ref — `branchCreatedByRuntime` is intentionally NOT touched
+  // here, so a future `realizeExecutionWorkspace` against the NEW repo
+  // can attach the same branch verbatim. The OLD repo's worktree list
+  // is pruned so subsequent `git worktree list` calls do not return the
+  // removed path.
+  try {
+    await recordGitOperation(input.recorder, {
+      phase: "worktree_cleanup",
+      args: ["worktree", "remove", "--force", input.reuseWorktreePath],
+      cwd: input.persistedRepoRoot,
+      metadata: {
+        worktreePath: input.reuseWorktreePath,
+        persistedRepoRoot: input.persistedRepoRoot,
+        currentRepoRoot: input.currentRepoRoot,
+        cleanupAction: "spa9437_persisted_other_repo_remove",
+      },
+      successMessage: `Tore down persisted git worktree at ${input.reuseWorktreePath} (different repo, SPA-9437)\n`,
+      failureLabel: `git worktree remove --force ${input.reuseWorktreePath}`,
+    });
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    throw new WorkspaceRuntimeValidationFailure(
+      `Persisted git worktree "${input.reuseWorktreePath}" belongs to repo "${input.persistedRepoRoot}", ` +
+        `but the current project workspace is for repo "${input.currentRepoRoot}". The worktree ` +
+        `itself is clean, but \`git worktree remove\` failed: ${message}. Inspect and remove it by hand, ` +
+        `then retry the run.`,
+      {
+        workspaceValidation: {
+          reason: "git_worktree_belongs_to_other_repo",
+          reasonCode: "worktree_remove_failed",
+          worktreePath: input.reuseWorktreePath,
+          persistedRepoRoot: input.persistedRepoRoot,
+          currentRepoRoot: input.currentRepoRoot,
+          executionWorkspaceId: input.executionWorkspaceId,
+          sourceIssueId: input.sourceIssue?.id ?? null,
+          removeError: message,
+        },
+      },
+    );
+  }
+  // Prune the OLD repo's worktree list so a subsequent validator cannot
+  // accidentally re-discover the removed path. Best-effort — a prune
+  // failure on the OLD repo is harmless (the row is gone from disk) and
+  // does not block the next realization.
+  await runGit(["worktree", "prune"], input.persistedRepoRoot).catch(() => {});
+  return "tore_down";
 }
 
 export async function inspectManagedGitWorktreeBranch(input: {
@@ -3491,6 +3766,48 @@ export async function realizeExecutionWorkspace(input: {
 
   await fs.mkdir(worktreeParentDir, { recursive: true });
 
+  // SPA-11953: when a configured worktree path is a real Git checkout
+  // owned by a DIFFERENT repo than the current project workspace's repo,
+  // refuse before ANY existing-path cleanup or reuse logic. Ephemeral
+  // realization deliberately removes stale same-repo run worktrees below,
+  // so this ownership fence must run first or that cleanup can destroy a
+  // foreign repo's worktree before the ordinary existing-path guard sees it.
+  // The operator chose a `worktreeParentDir` shared between two repos (or one
+  // repo rebound onto a path the other repo carved first), and we have no
+  // proof the foreign worktree is clean or recoverable. Surface the collision
+  // typed so the human-actionable message names both repos and the payload
+  // names the occupying + current repo roots for downstream consumers.
+  // `resolveGitOwnerRepoRoot` is the SAME primitive the SPA-9437 persisted
+  // rebind path uses, so a path that is itself a worktree of repo X is
+  // normalized to X on both sides. Both roots then pass through the existing
+  // worktree-comparison realpath helper so a symlinked `os.tmpdir()` cannot
+  // make the same repo compare unequal.
+  if (await directoryExists(worktreePath)) {
+    const occupiedOwnerRepoRoot = await resolveGitOwnerRepoRoot(worktreePath).catch(() => null);
+    const canonicalOccupiedRepoRoot = occupiedOwnerRepoRoot
+      ? await resolvePathForWorktreeComparison(occupiedOwnerRepoRoot)
+      : null;
+    const canonicalCurrentRepoRoot = await resolvePathForWorktreeComparison(repoRoot);
+    if (
+      canonicalOccupiedRepoRoot
+      && canonicalOccupiedRepoRoot !== canonicalCurrentRepoRoot
+    ) {
+      throw new WorkspaceRuntimeValidationFailure(
+        `Configured worktree path "${worktreePath}" already exists and is owned by a different git repository ("${canonicalOccupiedRepoRoot}") than the current project workspace's repo ("${canonicalCurrentRepoRoot}"). The engine will not remove or reparent a worktree belonging to another repo — that path is outside this card's safety boundary. Choose a worktreeParentDir scoped to "${canonicalCurrentRepoRoot}", remove the occupying worktree manually if you really mean to release it, or rebind the project workspace to the repo that already owns this path.`,
+        {
+          workspaceValidation: {
+            reason: "git_worktree_belongs_to_other_repo",
+            reasonCode: "configured_path_owned_by_other_repo",
+            worktreePath,
+            branchName,
+            occupyingRepoRoot: canonicalOccupiedRepoRoot,
+            currentRepoRoot: canonicalCurrentRepoRoot,
+          },
+        },
+      );
+    }
+  }
+
   // SPA-9275: in ephemeral mode the directory is keyed by run id; a stale
   // directory from a crashed previous run blocks the fresh `git worktree add`,
   // so the realize path force-removes the existing path before creating the
@@ -3524,6 +3841,7 @@ export async function realizeExecutionWorkspace(input: {
   }
 
   async function reuseExistingWorktree(reusablePath: string, effectiveBranchName = branchName, extraWarnings: string[] = []) {
+    await assertReusableWorktreeSafe(reusablePath);
     // An exact-branch attach must never move the requested branch, so skip
     // the unstarted-worktree fast-forward that template-derived reuse gets.
     const refresh = currentBaseRefSha && !requestedExistingBranch
@@ -3948,11 +4266,87 @@ export async function ensurePersistedExecutionWorkspaceAvailable(input: {
     );
   }
   const repoRoot = await runGit(["rev-parse", "--show-toplevel"], baseCwd);
+  // SPA-9437: normalize both sides through `--git-common-dir` so the
+  // comparison is repo-relative, not worktree-relative. `repoRoot` resolves
+  // the baseCwd to its `--show-toplevel` (a worktree path when baseCwd
+  // is a worktree); `currentOwnerRepoRoot` resolves that to the owning
+  // repo so a project workspace that is itself a worktree of repo X
+  // does NOT spuriously compare against X's worktree as a different repo.
+  const currentOwnerRepoRoot = await resolveGitOwnerRepoRoot(baseCwd).catch(() => null);
   const recordedBaseRefSha = readRecordedBaseRefSha(input.workspace.metadata);
   if (await directoryExists(cwd)) {
     const reuseBaseRef = input.workspace.baseRef ?? input.base.repoRef ?? null;
     const reuseWorktreePath = realized.worktreePath ?? cwd;
+    try {
+      await assertReusableWorktreeSafe(reuseWorktreePath);
+    } catch (error) {
+      if (gitErrorIncludes(error, "index.lock")) {
+        throw new WorkspaceRuntimeValidationFailure(
+          `Persisted git worktree at "${reuseWorktreePath}" is not reusable: ${error instanceof Error ? error.message : String(error)}`,
+          { workspaceValidation: { reason: "unsafe_git_index_lock", worktreePath: reuseWorktreePath, executionWorkspaceId: input.workspace.id ?? null } },
+        );
+      }
+      throw error;
+    }
     const repairWarnings: string[] = [];
+    // SPA-9437: the persisted cwd belongs to a different repo than the
+    // current project workspace's repo. The issue's `projectWorkspaceId`
+    // changed after the workspace was realized, so the OLD worktree's `.git`
+    // points into the OLD repo's `.git/worktrees/`. Reusing it as if it
+    // belonged to the NEW repo would silently lose the persisted
+    // execution-workspace semantics and the next validator pass would
+    // throw `not_registered`. Tear down the OLD worktree only when it is
+    // safe to do so (clean AND its branch tip is recoverable); otherwise
+    // surface a typed validation failure so the recovery sweep / operator
+    // can act on it.
+    const persistedCwd = await inspectManagedGitWorktreeBranch({
+      worktreePath: reuseWorktreePath,
+      expectedBranchName: realized.branchName,
+    });
+    const persistedRepoRoot = persistedCwd.repoRoot ?? null;
+    // Compare the persisted cwd's owning repo against the current
+    // project workspace's owning repo. `inspectManagedGitWorktreeBranch`
+    // already resolves the cwd through `--git-common-dir`, so a
+    // persisted worktree-of-repo-X is normalized to X. The current
+    // side must use the same normalization to avoid a false positive
+    // when `baseCwd` is itself a worktree.
+    if (
+      persistedRepoRoot
+      && currentOwnerRepoRoot
+      && path.resolve(persistedRepoRoot) !== path.resolve(currentOwnerRepoRoot)
+    ) {
+      // SPA-9437: the persisted cwd belongs to a different repo than the
+      // current project workspace's repo. Tear down the OLD worktree when
+      // safe (clean + recoverable branch tip) and signal "this binding is
+      // unprovisionable" via the SPA-9315 typed error so the allocator's
+      // `provisionExecutionWorkspaceForFreshnessDecision` recognizes it and
+      // provisions a fresh workspace against the NEW repo. The OLD row is
+      // left as a dead `active` binding (its on-disk leaf is gone) — the
+      // reaper picks it up when the source issue goes terminal. On refuse
+      // paths the helper throws `WorkspaceRuntimeValidationFailure` so the
+      // recovery sweep / operator can act on dirty or unreachable worktree
+      // state.
+      const torn = await tearDownPersistedWorktreeBoundToOtherRepo({
+        reuseWorktreePath,
+        persistedRepoRoot,
+        currentRepoRoot: currentOwnerRepoRoot ?? repoRoot,
+        branchName: realized.branchName,
+        executionWorkspaceId: input.workspace.id ?? null,
+        sourceIssue: input.issue,
+        recorder: input.recorder ?? null,
+        resolveGitAuth: input.resolveGitAuth ?? null,
+      });
+      if (torn === "tore_down") {
+        throw new ExecutionWorkspaceNotProvisionableError({
+          executionWorkspaceId: input.workspace.id ?? null,
+          workspaceStatus: input.workspace.status ?? null,
+          cwd: reuseWorktreePath,
+          strategy: "git_worktree",
+        });
+      }
+      // "skipped_not_a_checkout" → fall through to the existing validation
+      // path so the right error surfaces for non-git providers.
+    }
     if (await isGitCheckout(reuseWorktreePath) && realized.branchCreatedByRuntime) {
       // Branch-coherence repair may check out another branch, adopt a forward
       // branch, or move the recorded ref from a detached HEAD. Those repairs

@@ -6,7 +6,7 @@ import request from "supertest";
 import { describe, expect, it } from "vitest";
 import { COMPANY_IMPORT_TRANSFERS_ROUTE_PATH } from "@paperclipai/shared/company-import-transfer";
 import { errorHandler } from "../middleware/index.js";
-import { buildOpenApiSpec, openApiRoutes } from "../routes/openapi.js";
+import { buildOpenApiSpec, openApiRoutes, BOARD_ONLY_OPERATIONS } from "../routes/openapi.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROUTES_DIR = path.resolve(__dirname, "../routes");
@@ -910,5 +910,73 @@ describe("openapi routes", () => {
     // terminal, or foreign session id.
     const codes = Object.keys(cancel.responses).sort();
     expect(codes).toEqual(["200", "401", "403", "404"]);
+  });
+
+  it("aligns interaction resolution route authorization with actual handler actor admission", () => {
+    const { spec } = loadSpecRoutes();
+
+    // Inspect the actual issues router route definitions directly so that if an
+    // interaction route changes its actor admission check (e.g. adding or removing
+    // assertBoard), this test dynamically verifies that the OpenAPI spec reflects it.
+    const issuesSource = fs.readFileSync(
+      path.join(ROUTES_DIR, "issues.ts"),
+      "utf8",
+    );
+
+    // Discover all mounted interaction resolution action routes from issues.ts dynamically
+    // Pattern matches: router.post("/issues/:id/interactions/:interactionId/:action"
+    const interactionRouteRegex = /router\.post\(\s*["']\/issues\/:id\/interactions\/:interactionId\/([a-zA-Z0-9_-]+)["']/g;
+    const discoveredActions: string[] = [];
+    let routeMatch: RegExpExecArray | null;
+    while ((routeMatch = interactionRouteRegex.exec(issuesSource)) !== null) {
+      discoveredActions.push(routeMatch[1]);
+    }
+
+    expect(discoveredActions.length).toBeGreaterThan(0);
+
+    for (const action of discoveredActions) {
+      const openApiOperationKey = `POST /api/issues/{id}/interactions/{interactionId}/${action}`;
+      const routePath = `/api/issues/{id}/interactions/{interactionId}/${action}`;
+      const op = spec.paths[routePath]?.post;
+      expect(op, `Spec path for ${routePath} must exist`).toBeDefined();
+
+      // Check whether handler implementation restricts this route to board actors
+      const handlerPattern = new RegExp(
+        `router\\.post\\(\\s*["']/issues/:id/interactions/:interactionId/${action}["']([\\s\\S]*?)(?:router\\.post|\\n\\s*\\}\\s*\\);)`,
+      );
+      const handlerMatch = issuesSource.match(handlerPattern);
+      expect(handlerMatch, `Handler for ${action} must exist in issues.ts`).toBeTruthy();
+      const handlerCode = handlerMatch![1];
+      const isBoardOnlyInHandler = handlerCode.includes("Agent actors cannot");
+
+      if (isBoardOnlyInHandler) {
+        // Must be in BOARD_ONLY_OPERATIONS set
+        expect(
+          BOARD_ONLY_OPERATIONS.has(openApiOperationKey),
+          `${openApiOperationKey} must be in BOARD_ONLY_OPERATIONS`,
+        ).toBe(true);
+        expect(op["x-paperclip-authorization"]).toEqual({
+          actor: "board",
+        });
+        expect(op.security).toEqual([
+          { BoardSessionAuth: [] },
+          { BoardApiKeyAuth: [] },
+        ]);
+      } else {
+        // Must NOT be in BOARD_ONLY_OPERATIONS set
+        expect(
+          BOARD_ONLY_OPERATIONS.has(openApiOperationKey),
+          `${openApiOperationKey} must NOT be in BOARD_ONLY_OPERATIONS`,
+        ).toBe(false);
+        expect(op["x-paperclip-authorization"]).toEqual({
+          actor: "board_or_agent",
+        });
+        expect(op.security).toEqual([
+          { BoardSessionAuth: [] },
+          { BoardApiKeyAuth: [] },
+          { AgentBearerAuth: [] },
+        ]);
+      }
+    }
   });
 });

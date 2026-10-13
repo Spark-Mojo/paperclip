@@ -1,6 +1,7 @@
 import { documentService } from "./documents.js";
 import { parseTaskSearch, taskSearchCtes, taskSearchScore } from "./task-search.js";
 import { createdFromIssueCondition } from "./issue-creation-origin.js";
+import { isAwaitingInteractionResolution } from "./pending-interaction-hold.js";
 import { executionProjectionsForRuns } from "./execution-projection.js";
 import type { ExecutionProjection } from "@paperclipai/shared";
 import { Buffer } from "node:buffer";
@@ -192,6 +193,11 @@ import {
 import { buildIssueChanges } from "./issue-change-receipt.js";
 import { projectSafeChatPublication } from "./chat-publication-projection.js";
 import { issueThreadInteractionAttentionAgentAllowed } from "./issue-thread-interaction-resolution.js";
+import {
+  buildIssueBlockersResolvedWakeStateKey,
+  findExistingIssueBlockersResolvedWakeForReadyState,
+  ISSUE_BLOCKERS_RESOLVED_WAKE_REASON,
+} from "./issue-dependency-wakeups.js";
 
 const ALL_ISSUE_STATUSES = [
   "backlog",
@@ -242,6 +248,18 @@ export type IssuePostCommitAction = {
   runId: string;
   issueId: string;
   issueStatus: string;
+} | {
+  type: "retire_execution_workspace_after_project_workspace_rebind";
+  companyId: string;
+  issueId: string;
+  executionWorkspaceId: string;
+  /**
+   * Diagnostic surfaced on the card so the board / agent can see exactly
+   * which old repo the OLD worktree belonged to and which new project
+   * workspace is in effect now.
+   */
+  previousProjectWorkspaceId: string | null;
+  nextProjectWorkspaceId: string | null;
 };
 
 /** Execute side effects that must never run before the issue transaction commits. */
@@ -254,27 +272,99 @@ export async function executeIssuePostCommitActions(
   const heartbeat = heartbeatService(db);
   const cancelledRunIds = new Set<string>();
   for (const action of actions) {
-    if (cancelledRunIds.has(action.runId)) continue;
-    cancelledRunIds.add(action.runId);
-    try {
-      await heartbeat.cancelRun(
-        action.runId,
-        "Task closed while waiting for operator input",
-        {
-          resultJson: {
-            cancelledByIssueStatus: action.issueStatus,
-            cancelledIssueId: action.issueId,
+    if (action.type === "cancel_native_question_run") {
+      if (cancelledRunIds.has(action.runId)) continue;
+      cancelledRunIds.add(action.runId);
+      try {
+        await heartbeat.cancelRun(
+          action.runId,
+          "Task closed while waiting for operator input",
+          {
+            resultJson: {
+              cancelledByIssueStatus: action.issueStatus,
+              cancelledIssueId: action.issueId,
+            },
           },
-        },
-      );
-    } catch (err) {
-      // The durable marker written by the issue transaction remains available
-      // to startup and periodic recovery. Do not report a post-commit failure
-      // as though the already-committed issue transition had rolled back.
-      logger.warn(
-        { err, runId: action.runId, issueId: action.issueId },
-        "native question cancellation deferred to recovery sweep",
-      );
+        );
+      } catch (err) {
+        // The durable marker written by the issue transaction remains available
+        // to startup and periodic recovery. Do not report a post-commit failure
+        // as though the already-committed issue transition had rolled back.
+        logger.warn(
+          { err, runId: action.runId, issueId: action.issueId },
+          "native question cancellation deferred to recovery sweep",
+        );
+      }
+      continue;
+    }
+    if (action.type === "retire_execution_workspace_after_project_workspace_rebind") {
+      try {
+        const { executionWorkspaceService } = await import(
+          "./execution-workspaces.js"
+        );
+        const outcome = await executionWorkspaceService(
+          db,
+        ).retireExecutionWorkspaceAfterProjectWorkspaceRebind({
+          companyId: action.companyId,
+          executionWorkspaceId: action.executionWorkspaceId,
+          sourceIssueId: action.issueId,
+          reason:
+            `project workspace rebind ` +
+            `${action.previousProjectWorkspaceId ?? "<none>"} -> ` +
+            `${action.nextProjectWorkspaceId ?? "<none>"}`,
+        });
+        if (outcome.outcome === "refused_dirty") {
+          logger.warn(
+            {
+              companyId: action.companyId,
+              issueId: action.issueId,
+              executionWorkspaceId: outcome.executionWorkspaceId,
+              worktreePath: outcome.worktreePath,
+              dirtyReason: outcome.dirtyReason,
+            },
+            "execution workspace not retired after project workspace rebind: worktree is dirty",
+          );
+        } else if (outcome.outcome === "refused_unpushed") {
+          logger.warn(
+            {
+              companyId: action.companyId,
+              issueId: action.issueId,
+              executionWorkspaceId: outcome.executionWorkspaceId,
+              worktreePath: outcome.worktreePath,
+              unpushedReason: outcome.unpushedReason,
+            },
+            "execution workspace not retired after project workspace rebind: branch tip has no live upstream",
+          );
+        } else if (outcome.outcome === "not_found") {
+          logger.info(
+            {
+              companyId: action.companyId,
+              issueId: action.issueId,
+              executionWorkspaceId: action.executionWorkspaceId,
+            },
+            "execution workspace not retired after project workspace rebind: row not found",
+          );
+        } else if (outcome.outcome === "skipped_already_closed") {
+          logger.info(
+            {
+              companyId: action.companyId,
+              issueId: action.issueId,
+              executionWorkspaceId: outcome.executionWorkspaceId,
+            },
+            "execution workspace not retired after project workspace rebind: row already closed",
+          );
+        }
+      } catch (err) {
+        // The bound row remains untouched on failure; the next run will see
+        // status=active and either succeed when the OLD worktree's repo
+        // matches or fail validation again, surfacing the dirty/unpushed
+        // reason through the existing recovery sweep.
+        logger.error(
+          { err, action },
+          "execution workspace retire after project workspace rebind failed; leaving bound row intact",
+        );
+      }
+      continue;
     }
   }
 }
@@ -6528,6 +6618,65 @@ async function countBlockedInboxIssues(
   }, 0);
 }
 
+export type IssueWriteOwnershipCASExpectations = {
+  expectedStatus?: string | null;
+  expectedAssigneeUserId?: string | null;
+  expectedAssigneeAgentId?: string | null;
+};
+
+export type IssueWriteOwnershipCASRow = {
+  status: string;
+  assigneeUserId: string | null;
+  assigneeAgentId: string | null;
+};
+
+export type IssueWriteOwnershipCASChanges = {
+  statusChanged: boolean;
+  assigneeUserIdChanged: boolean;
+  assigneeAgentIdChanged: boolean;
+};
+
+export function assertIssueWriteOwnershipCAS(
+  existing: IssueWriteOwnershipCASRow,
+  expected: IssueWriteOwnershipCASExpectations | undefined,
+  changes: IssueWriteOwnershipCASChanges,
+) {
+  if (!expected) expected = {};
+  const compare = (
+    key: "expectedStatus" | "expectedAssigneeUserId" | "expectedAssigneeAgentId",
+    liveValue: string | null,
+    changed: boolean,
+  ) => {
+    if (!changed) return;
+    const suppliedRaw = (expected as Record<string, string | null | undefined>)[key];
+    if (suppliedRaw === undefined) {
+      throw conflict(
+        `Issue write rejected: caller did not supply expected value for ${key}; ownership-transfer CAS is required when changing this field (SPA-10357)`,
+        {
+          code: "issue_write_ownership_cas_missing",
+          field: key,
+        },
+      );
+    }
+    const suppliedNorm = suppliedRaw ?? null;
+    const liveNorm = liveValue ?? null;
+    if (suppliedNorm !== liveNorm) {
+      throw conflict(
+        `Issue write rejected: caller-supplied expected value for ${key} does not match the row's current value`,
+        {
+          code: "issue_write_ownership_cas_mismatch",
+          field: key,
+          callerExpected: suppliedNorm,
+          live: liveNorm,
+        },
+      );
+    }
+  };
+  compare("expectedStatus", existing.status, changes.statusChanged);
+  compare("expectedAssigneeUserId", existing.assigneeUserId, changes.assigneeUserIdChanged);
+  compare("expectedAssigneeAgentId", existing.assigneeAgentId, changes.assigneeAgentIdChanged);
+}
+
 export function issueService(db: Db) {
   const instanceSettings = instanceSettingsService(db);
   const treeControlSvc = issueTreeControlService(db);
@@ -7123,12 +7272,27 @@ export function issueService(db: Db) {
     projectId: string | null | undefined,
     executionWorkspaceId: string,
     dbOrTx: DbReader = db,
+    options?: {
+      projectWorkspaceId?: string | null;
+      /**
+       * When `true`, the caller is asserting this pin came from an explicit
+       * `executionWorkspaceId` argument rather than from inherited workspace
+       * linkage. SPA-11953 (second shape) refuses a caller-supplied pin
+       * whose execution workspace belongs to a different project workspace
+       * than the child — explicit pins are intent, never silently dropped.
+       * Inherited pins are reconciled (cleared) earlier in `create`, so by the
+       * time this assertion runs the only pin reaching it is either a true
+       * caller-supplied pin or a same-repo inherited pin.
+       */
+      callerSuppliedExecutionWorkspaceId?: boolean;
+    },
   ) {
     const workspace = await dbOrTx
       .select({
         id: executionWorkspaces.id,
         companyId: executionWorkspaces.companyId,
         projectId: executionWorkspaces.projectId,
+        projectWorkspaceId: executionWorkspaces.projectWorkspaceId,
       })
       .from(executionWorkspaces)
       .where(eq(executionWorkspaces.id, executionWorkspaceId))
@@ -7139,6 +7303,16 @@ export function issueService(db: Db) {
     if (projectId && workspace.projectId !== projectId) {
       throw unprocessable(
         "Execution workspace must belong to the selected project",
+      );
+    }
+    if (
+      options?.callerSuppliedExecutionWorkspaceId === true &&
+      options.projectWorkspaceId &&
+      (workspace.projectWorkspaceId == null ||
+        workspace.projectWorkspaceId !== options.projectWorkspaceId)
+    ) {
+      throw unprocessable(
+        `Selected project workspace ${options.projectWorkspaceId} differs from caller-supplied execution workspace's project workspace ${workspace.projectWorkspaceId ?? "(legacy null)"} (execution workspace ${executionWorkspaceId}). Pick an execution workspace that belongs to the selected project workspace, or omit executionWorkspaceId to let the issue provision a fresh workspace for the selected project workspace.`,
       );
     }
     return workspace;
@@ -8356,24 +8530,37 @@ export function issueService(db: Db) {
 
     /**
      * Walk the full parent chain from `parentIssueId` (inclusive) looking for
-     * a still-open ancestor created by `agentId`. Used to refuse agent
-     * delegation cycles: an agent assigning a new child to the agent that
-     * created an open ancestor is handing the same work back to its own
-     * delegator (A→B→A hot-potato). One recursive query covers the entire
-     * chain regardless of depth; `UNION` (not `UNION ALL`) deduplicates
-     * revisited rows, so a parent graph corrupted into a loop terminates
-     * instead of recursing forever.
+     * a still-open ancestor that `agentId` created AND assigned to
+     * `actorAgentId`. That pair is a live delegation edge: `agentId`
+     * delegated work to the actor, and the actor is now filing new work
+     * assigned back to `agentId` while still holding it — the hot-potato
+     * shape that grows an unowned blocked chain and tells no human.
+     *
+     * Both conjuncts are load-bearing. A bare creation edge also matches an
+     * agent that merely owns a class of work and files cards in chains
+     * (standing ownership, e.g. the git-ops owner), and intake
+     * decompositions filed by the actor's router — neither is a ping-pong,
+     * and refusing them forces the caller to abandon the parent chain, which
+     * is what carries workspace inheritance.
+     *
+     * One recursive query covers the entire chain regardless of depth;
+     * `UNION` (not `UNION ALL`) deduplicates revisited rows, so a parent
+     * graph corrupted into a loop terminates instead of recursing forever.
+     * An unidentified actor cannot hold an assignment, so it never matches.
      */
-    findOpenAncestorCreatedByAgent: async (
+    findOpenDelegationCycleAncestor: async (
       parentIssueId: string,
       agentId: string,
+      actorAgentId: string | null,
     ): Promise<{
       id: string;
       identifier: string | null;
       parentId: string | null;
       createdByAgentId: string | null;
+      assigneeAgentId: string | null;
       status: string;
     } | null> => {
+      if (!actorAgentId) return null;
       const rows = await db.execute(sql`
         WITH RECURSIVE ancestors(id, parent_id) AS (
           SELECT id, parent_id FROM issues WHERE id = ${parentIssueId}
@@ -8382,10 +8569,11 @@ export function issueService(db: Db) {
           FROM issues parent
           JOIN ancestors ON parent.id = ancestors.parent_id
         )
-        SELECT i.id, i.identifier, i.parent_id, i.created_by_agent_id, i.status
+        SELECT i.id, i.identifier, i.parent_id, i.created_by_agent_id, i.assignee_agent_id, i.status
         FROM issues i
         JOIN ancestors a ON a.id = i.id
         WHERE i.created_by_agent_id = ${agentId}
+          AND i.assignee_agent_id = ${actorAgentId}
           AND i.status NOT IN ('done', 'cancelled')
         LIMIT 1
       `);
@@ -8402,6 +8590,10 @@ export function issueService(db: Db) {
         createdByAgentId:
           typeof first.created_by_agent_id === "string"
             ? first.created_by_agent_id
+            : null,
+        assigneeAgentId:
+          typeof first.assignee_agent_id === "string"
+            ? first.assignee_agent_id
             : null,
         status: String(first.status),
       };
@@ -9070,6 +9262,142 @@ export function issueService(db: Db) {
           blockedTransitionAt: candidate.blockedTransitionAt,
         }));
     },
+
+    /**
+     * SPA-10513 slice 3. Return `blocked` dependents of `blockerIssueId` whose
+     * whole blocker set is now resolved, so the caller can move them to `todo`
+     * and wake the assignee exactly once.
+     *
+     * This is the write-side projection of the same admission decision
+     * `listWakeableBlockedDependents` makes, and it deliberately repeats that
+     * query instead of calling it: that method is a pure read whose result many
+     * callers and route-test fixtures depend on, and its admission set also
+     * admits `todo`/`in_review` dependents. The extra `status = 'blocked'`
+     * predicate below is the load-bearing difference — only a genuinely blocked
+     * card may be transitioned by this path.
+     *
+     * Company, status and ownership rules are preserved: the blocker lookup is
+     * the same company-scoped join, conversation containers are excluded by the
+     * same predicate, backlog parks and terminal cards are excluded by the
+     * explicit status predicate, and the assignee must be a non-null agent with
+     * no human assignee.
+     *
+     * The caller MUST capture `blockedTransitionAt` from this result and use it
+     * for the wake idempotency key: the transition itself clears that column, so
+     * re-reading it after the write mints a different epoch and would let the
+     * same closure wake twice.
+     */
+    listBlockedDependentsReadyForAutoUnblock: async (
+      blockerIssueId: string,
+    ) => {
+      const dbOrTx = db;
+      const blockerIssue = await dbOrTx
+        .select({ id: issues.id, companyId: issues.companyId })
+        .from(issues)
+        .where(eq(issues.id, blockerIssueId))
+        .then((rows) => rows[0] ?? null);
+      if (!blockerIssue) return [];
+
+      const candidates = await dbOrTx
+        .select({
+          id: issues.id,
+          companyId: issues.companyId,
+          assigneeAgentId: issues.assigneeAgentId,
+          assigneeUserId: issues.assigneeUserId,
+          status: issues.status,
+          conversationAgentId: issues.conversationAgentId,
+          blockedTransitionAt: issues.blockedTransitionAt,
+        })
+        .from(issueRelations)
+        .innerJoin(issues, eq(issueRelations.relatedIssueId, issues.id))
+        .where(
+          and(
+            eq(issueRelations.companyId, blockerIssue.companyId),
+            eq(issueRelations.type, "blocks"),
+            eq(issueRelations.issueId, blockerIssueId),
+            isNull(issues.conversationAgentId),
+            // Only a genuinely blocked card is ever transitioned. `backlog` is a
+            // human parking surface and the terminal statuses are closed.
+            eq(issues.status, "blocked"),
+            // Human-owned work has no agent to hand back to, and a card can
+            // only have one assignee.
+            sql`${issues.assigneeAgentId} is not null`,
+            isNull(issues.assigneeUserId),
+          ),
+        );
+      if (candidates.length === 0) return [];
+
+      // Same unified readiness gate the wake path uses: every blocker done AND
+      // every done blocker's workspace finalize obligation discharged.
+      const readinessMap = await listIssueDependencyReadinessMap(
+        dbOrTx,
+        blockerIssue.companyId,
+        candidates.map((candidate) => candidate.id),
+      );
+
+      return candidates
+        .map((candidate) => ({
+          candidate,
+          readiness:
+            readinessMap.get(candidate.id) ??
+            createIssueDependencyReadiness(candidate.id),
+        }))
+        .filter(
+          ({ readiness }) =>
+            readiness.isDependencyReady && readiness.blockerIssueIds.length > 0,
+        )
+        .map(({ candidate, readiness }) => ({
+          id: candidate.id,
+          companyId: candidate.companyId,
+          assigneeAgentId: candidate.assigneeAgentId!,
+          blockerIssueIds: readiness.blockerIssueIds,
+          blockedTransitionAt: candidate.blockedTransitionAt,
+        }));
+    },
+
+    autoUnblockReadyDependent: async (candidate: {
+      id: string;
+      companyId: string;
+      assigneeAgentId: string;
+    }) => db.transaction(async (tx) => {
+      const [locked] = await tx.select({
+        status: issues.status,
+        assigneeAgentId: issues.assigneeAgentId,
+        assigneeUserId: issues.assigneeUserId,
+        conversationAgentId: issues.conversationAgentId,
+        blockedTransitionAt: issues.blockedTransitionAt,
+      })
+        .from(issues)
+        .where(and(eq(issues.id, candidate.id), eq(issues.companyId, candidate.companyId)))
+        .for("update")
+        .limit(1);
+      if (locked?.status !== "blocked" || locked.assigneeAgentId !== candidate.assigneeAgentId ||
+        locked.assigneeUserId || locked.conversationAgentId) return null;
+      const readiness = await listIssueDependencyReadinessMap(tx, candidate.companyId, [candidate.id]);
+      const state = readiness.get(candidate.id);
+      if (!state?.isDependencyReady || state.blockerIssueIds.length === 0) return null;
+      const [updated] = await tx.update(issues)
+        .set({
+          status: "todo",
+          unblockDescriptor: null,
+          blockedTransitionAt: null,
+          blockedOwnerNotifiedAt: null,
+          checkoutRunId: null,
+          executionRunId: null,
+          executionAgentNameKey: null,
+          executionLockedAt: null,
+          completedAt: null,
+          cancelledAt: null,
+          updatedAt: new Date(),
+        })
+        .where(and(eq(issues.id, candidate.id), eq(issues.companyId, candidate.companyId), eq(issues.status, "blocked")))
+        .returning({ id: issues.id });
+      return updated ? {
+        agentId: locked.assigneeAgentId,
+        blockedTransitionAt: locked.blockedTransitionAt,
+        blockerIssueIds: state.blockerIssueIds,
+      } : null;
+    }),
 
     getWakeableParentAfterChildCompletion: async (
       parentIssueId: string,
@@ -9836,6 +10164,22 @@ export function issueService(db: Db) {
         let executionWorkspaceSettings =
           (issueData.executionWorkspaceSettings as
             Record<string, unknown> | null | undefined) ?? null;
+        // SPA-11953 (second shape): flag when the execution workspace pin we
+        // are about to persist was INHERITED from a source issue, so the
+        // post-resolution reconciliation step (after projectWorkspaceId is
+        // finally resolved against the project's defaults) can drop a
+        // cross-repo inherited pin while leaving a CALLER-SUPPLIED pin
+        // alone. Caller-supplied pins with a mismatched projectWorkspaceId
+        // are refused by `assertValidExecutionWorkspace` further below — an
+        // explicit pin is intent, never silently discarded.
+        let inheritedExecutionWorkspacePin = false;
+        let inheritedSourceProjectWorkspaceId: string | null = null;
+        let pendingDropReceipt: {
+          parentIssueId: string | null;
+          droppedExecutionWorkspaceId: string;
+          sourceProjectWorkspaceId: string | null;
+          resolvedProjectWorkspaceId: string | null;
+        } | null = null;
         const workspaceInheritanceIssueId = skipExecutionWorkspaceInheritance
           ? null
           : (inheritExecutionWorkspaceFromIssueId ??
@@ -9880,6 +10224,7 @@ export function issueService(db: Db) {
               .select({
                 id: executionWorkspaces.id,
                 mode: executionWorkspaces.mode,
+                projectWorkspaceId: executionWorkspaces.projectWorkspaceId,
               })
               .from(executionWorkspaces)
               .where(
@@ -9902,6 +10247,13 @@ export function issueService(db: Db) {
                   sourceWorkspace.mode,
                 ),
               };
+              inheritedExecutionWorkspacePin = true;
+              // SPA-11953 (second shape): capture the source workspace's
+              // projectWorkspaceId here so the post-resolution reconciliation
+              // step below can compare against the child's resolved value
+              // without re-querying the same row inside the same tx.
+              inheritedSourceProjectWorkspaceId =
+                sourceWorkspace.projectWorkspaceId ?? null;
             }
           }
         }
@@ -10021,12 +10373,81 @@ export function issueService(db: Db) {
             tx,
           );
         }
+        // SPA-11953 (second shape): an inherited execution workspace pin
+        // whose source projectWorkspaceId does not match the child's
+        // resolved projectWorkspaceId must be DROPPED here, not later in the
+        // heartbeat allocator. The child's projectWorkspaceId may have been
+        // inherited from the source project (10151-10157) or resolved from
+        // the project's primary workspace (10266-10300); the comparison
+        // runs against whichever value is final at this point. A CALLER-
+        // SUPPLIED pin with a mismatched projectWorkspaceId is REFUSED
+        // further below — explicit pins are intent, never silently dropped.
+        // `sourceWorkspace.projectWorkspaceId` may be NULL on legacy rows; we
+        // treat null-vs-set as a mismatch because we have no proof the legacy
+        // row belongs to this child's repo, and the cost of a wrong skip
+        // (one extra clone) is strictly less than the cost of a wrong inherit
+        // (the deterministic `setup_failed` this card fixes).
+        if (inheritedExecutionWorkspacePin && executionWorkspaceId) {
+          // SPA-11953 (second shape): the source workspace's projectWorkspaceId
+          // was captured at the inheritance site (so we don't re-query the
+          // same row inside the same tx). Compare against the child's now-
+          // resolved `projectWorkspaceId`. Null source is treated as a
+          // mismatch because we have no proof the legacy row belongs to this
+          // child's repo; the cost of a wrong skip is one extra clone, the
+          // cost of a wrong inherit is the deterministic `setup_failed` this
+          // card fixes.
+          const sourceProjectWorkspaceId = inheritedSourceProjectWorkspaceId;
+          if (
+            sourceProjectWorkspaceId == null ||
+            sourceProjectWorkspaceId !== projectWorkspaceId
+          ) {
+            const droppedExecutionWorkspaceId = executionWorkspaceId;
+            executionWorkspaceId = null;
+            executionWorkspacePreference = null;
+            executionWorkspaceSettings = null;
+            // SPA-11953 second shape: the inherited pin was just nulled, so
+            // the child is now in the same state as a freshly-created issue
+            // with no inherited/explicit pin. Re-run the project policy
+            // default-fill (mirroring the block above at :10289-10301) so the
+            // child ends up with the project's default settings, not a
+            // settings=null column. The block above was skipped at the time
+            // because the inherited pin was still set, so its work is owed
+            // here.
+            if (issueData.projectId) {
+              executionWorkspaceSettings =
+                defaultIssueExecutionWorkspaceSettingsForProject(
+                  gateProjectExecutionWorkspacePolicy(
+                    await loadProjectPolicyOnce(),
+                    isolatedWorkspacesEnabled,
+                  ),
+                ) as Record<string, unknown> | null;
+            }
+            // Receipt is deferred and emitted AFTER the issue insert below;
+            // logging inside the open tx would publish a "dropped" receipt
+            // for an issue that later rolls back (e.g. a downstream
+            // constraint failure), which would mislead the monitor's
+            // worktree-path-collision-across-repos ledger class.
+            pendingDropReceipt = {
+              parentIssueId:
+                inheritExecutionWorkspaceFromIssueId ?? issueData.parentId ?? null,
+              droppedExecutionWorkspaceId,
+              sourceProjectWorkspaceId,
+              resolvedProjectWorkspaceId: projectWorkspaceId,
+            };
+          }
+        }
         if (executionWorkspaceId) {
           await assertValidExecutionWorkspace(
             companyId,
             issueData.projectId,
             executionWorkspaceId,
             tx,
+            {
+              projectWorkspaceId,
+              callerSuppliedExecutionWorkspaceId:
+                !inheritedExecutionWorkspacePin &&
+                issueData.executionWorkspaceId !== undefined,
+            },
           );
         }
         if (
@@ -10170,6 +10591,17 @@ export function issueService(db: Db) {
           [enriched],
           tx,
         );
+        if (pendingDropReceipt) {
+          logger.info(
+            {
+              companyId,
+              issueId: issue.id,
+              identifier: issue.identifier,
+              ...pendingDropReceipt,
+            },
+            "issues.create dropped inherited cross-repo execution workspace pin (SPA-11953)",
+          );
+        }
         return withRelations;
       };
       if (dbOrTx === db) return db.transaction(persist);
@@ -10544,6 +10976,16 @@ export function issueService(db: Db) {
          * completions (watchdog evaluation folds). Never settable from HTTP.
          */
         doneGateBypass?: boolean;
+        /**
+         * SPA-10357 / SPA-10429 ownership-transfer CAS. Each expected* field
+         * is the value the caller observed before submitting this PATCH; if
+         * it does not match the row's locked snapshot at write time, the
+         * PATCH fails 409 without mutating. The route handler enforces
+         * "required iff the corresponding target field is changing".
+         */
+        expectedStatus?: string | null;
+        expectedAssigneeUserId?: string | null;
+        expectedAssigneeAgentId?: string | null;
       },
       dbOrTx: any = db,
       postCommitActivityPublications?: ActivityPublication[],
@@ -10591,8 +11033,21 @@ export function issueService(db: Db) {
         companyGuard,
         doneGateOverride,
         doneGateBypass,
+        expectedStatus,
+        expectedAssigneeUserId,
+        expectedAssigneeAgentId,
         ...issueData
       } = data;
+      const writeOwnershipCASExpectations: IssueWriteOwnershipCASExpectations = {
+        expectedStatus,
+        expectedAssigneeUserId,
+        expectedAssigneeAgentId,
+      };
+
+      const hasAnyCASExpectation =
+        expectedStatus !== undefined ||
+        expectedAssigneeUserId !== undefined ||
+        expectedAssigneeAgentId !== undefined;
       if (
         issueData.assigneeAgentId !== undefined &&
         issueData.assigneeAgentId !== existing.assigneeAgentId
@@ -10666,11 +11121,17 @@ export function issueService(db: Db) {
         !doneGateOverride &&
         !doneGateBypass
       ) {
-        const { issueDoneGateService } = await import("./issue-done-gate.js");
+        const { assertIssueExecutionStagesComplete, issueDoneGateService } = await import("./issue-done-gate.js");
+        const closingState = issueData.executionState === undefined ? existing.executionState : issueData.executionState;
+        assertIssueExecutionStagesComplete({ executionPolicy: existing.executionPolicy, executionState: closingState });
+        if (issueData.executionPolicy !== undefined) {
+          assertIssueExecutionStagesComplete({ executionPolicy: issueData.executionPolicy, executionState: closingState });
+        }
         const gate = issueDoneGateService(db);
         const decision = await gate.evaluateDoneGate({
           id: existing.id,
           companyId: existing.companyId,
+          identifier: existing.identifier,
           // SPA-9038: the card's own description can carry binding PR links.
           description: typeof issueData.description === "string"
             ? issueData.description
@@ -10900,6 +11361,34 @@ export function issueService(db: Db) {
           .for("update")
           .then((rows: Array<typeof issues.$inferSelect>) => rows[0] ?? null);
         if (!receiptExisting) return null;
+        if (hasAnyCASExpectation) {
+          // SPA-10859 boundary (Dex option (a)): the service validates the
+          // expectations the caller actually supplied against the locked
+          // snapshot. It does NOT synthesize a requirement for a field the
+          // caller left out — the board-actor mandatory set
+          // (ownership-transmit fields only) is enforced at the route, where
+          // the actor class is known. Gating each `*Changed` flag on its
+          // expectation being present keeps status CAS opt-in here, so a
+          // board write that carries expectedAssignee* but not
+          // expectedStatus is not silently re-promoted to mandatory status
+          // (which would re-break the in-repo board UI), and in-tree
+          // service callers that never set these fields pass through intact.
+          const lockedChanges: IssueWriteOwnershipCASChanges = {
+            statusChanged:
+              expectedStatus !== undefined && issueData.status !== undefined,
+            assigneeUserIdChanged:
+              expectedAssigneeUserId !== undefined &&
+              issueData.assigneeUserId !== undefined,
+            assigneeAgentIdChanged:
+              expectedAssigneeAgentId !== undefined &&
+              issueData.assigneeAgentId !== undefined,
+          };
+          assertIssueWriteOwnershipCAS(
+            receiptExisting,
+            writeOwnershipCASExpectations,
+            lockedChanges,
+          );
+        }
         if (actorAgentId && patch.status === "done") {
           const [review] = await tx.select({ id: toolActionRequests.id }).from(toolActionRequests).where(and(eq(toolActionRequests.companyId, existing.companyId), eq(toolActionRequests.issueId, id), inArray(toolActionRequests.status, ["pending", "approved", "executing"]))).limit(1);
           if (review) throw conflict("This task is waiting for a connection review. Finish unrelated work, then yield in_review without retrying the governed call.", { code: "tool_review_pending", actionRequestId: review.id });
@@ -11033,6 +11522,30 @@ export function issueService(db: Db) {
           }
           if (updated.status === "done" || updated.status === "cancelled") {
             await finalizeSummarySlotsForTerminalIssue(tx, updated);
+            // SPA-11805 A2: a terminal transition retires pending execution
+            // work for the issue. Drain only unclaimed rows
+            // (`deferred_issue_execution`/`queued` with no run bound): a wake
+            // armed before the close must die at the close, and a claimed or
+            // running row belongs to a live run that the close must not kill.
+            await tx
+              .update(agentWakeupRequests)
+              .set({
+                status: "cancelled",
+                finishedAt: new Date(),
+                error: "issue_terminal",
+                updatedAt: new Date(),
+              })
+              .where(
+                and(
+                  eq(agentWakeupRequests.companyId, updated.companyId),
+                  inArray(agentWakeupRequests.status, [
+                    "deferred_issue_execution",
+                    "queued",
+                  ]),
+                  isNull(agentWakeupRequests.runId),
+                  wakeRequestTargetsIssue(updated.id),
+                ),
+              );
             // Every terminal transition funnels through here, including direct
             // service callers (tree control, recovery, pipelines, status cards)
             // that never touch the HTTP routes, so pending interaction cards
@@ -11166,6 +11679,33 @@ export function issueService(db: Db) {
               .where(eq(executionWorkspaces.id, workspace.id));
           }
         }
+        // SPA-9437: when the issue's project workspace changes, the OLD
+        // execution workspace (if any) belongs to the OLD repo and would
+        // deterministically fail workspace_validation on the next run.
+        // Queue a post-commit action so the engine retires that workspace
+        // (set status=archived, clear issue.executionWorkspaceId) so the
+        // next run provisions a fresh workspace against the new project
+        // workspace. The action runs after the issue transaction commits
+        // and refuses when the OLD worktree has dirty / unpushed state.
+        if (
+          existing.executionWorkspaceId
+          && issueData.projectWorkspaceId !== undefined
+          && existing.projectWorkspaceId !== nextProjectWorkspaceId
+        ) {
+          if (dbOrTx !== db && !postCommitActions) {
+            throw new Error(
+              "Project workspace rebind in an external transaction requires a post-commit action queue",
+            );
+          }
+          queuedPostCommitActions.push({
+            type: "retire_execution_workspace_after_project_workspace_rebind",
+            companyId: existing.companyId,
+            issueId: existing.id,
+            executionWorkspaceId: existing.executionWorkspaceId,
+            previousProjectWorkspaceId: existing.projectWorkspaceId,
+            nextProjectWorkspaceId: nextProjectWorkspaceId ?? null,
+          });
+        }
         const [enriched] = await withIssueLabels(tx, [updated]);
         const nextBlockedByIssueIds =
           blockedByIssueIds === undefined
@@ -11256,6 +11796,190 @@ export function issueService(db: Db) {
             },
           });
           activityPublications.push(publication);
+        }
+        // SPA-11863 (James ruling 2026-09-14 on SPA-7212) — auto-drop
+        // first-class `blocks` edges when the blocker reaches `cancelled`.
+        // The cancelled half was operator-served in the old shape; the
+        // ruling makes the cancelled half self-serving on the read model.
+        // We drop the edge here, log it (blocker + dependent + actor), and
+        // queue exactly one `issue_blockers_resolved` wake per ready
+        // dependent. No drop on any non-terminal state, no drop of a
+        // `done` edge, never cross `company_id`; if we cannot prove
+        // `cancelled` at drop time we retain the edge. The woken dependent
+        // reaches a runnable state without a human PATCH: the existing
+        // auto-unblock backstop flips `blocked` -> `todo` once readiness
+        // is clean, and the wake fires here so the assignee's queue moves
+        // immediately. Only the dependents this cancellation actually
+        // gated get a wake; level-triggered idempotency dedups across
+        // a second transition for the same ready state.
+        //
+        // The drop loop keeps the edge for non-`blocked` dependents
+        // (already `in_progress`, `todo`, etc. — the audit trail stays);
+        // the wake only fires for `blocked` dependents with an agent
+        // assignee. Human-owned or conversation-container dependents
+        // get the drop + log row but no wake (no agent queue to land on).
+        if (
+          existing.status !== "cancelled" &&
+          updated.status === "cancelled"
+        ) {
+          const dropNow = new Date();
+          // Walk every `blocks` edge whose head is the just-cancelled
+          // issue and whose tail is a same-company dependent currently
+          // `blocked`. The same-company predicate on `issues` is the
+          // cross-company fence; the relation's `companyId` may have been
+          // seeded by an out-of-band writer that crossed boundaries, and
+          // we must not auto-drop a cross-company edge.
+          const dependentRows = await tx
+            .select({
+              dependentId: issueRelations.relatedIssueId,
+              dependentAssigneeAgentId: issues.assigneeAgentId,
+              dependentAssigneeUserId: issues.assigneeUserId,
+              dependentConversationAgentId: issues.conversationAgentId,
+              dependentBlockedTransitionAt: issues.blockedTransitionAt,
+              dependentCompanyId: issues.companyId,
+            })
+            .from(issueRelations)
+            .innerJoin(
+              issues,
+              eq(issueRelations.relatedIssueId, issues.id),
+            )
+            .where(
+              and(
+                eq(issueRelations.companyId, updated.companyId),
+                eq(issueRelations.type, "blocks"),
+                eq(issueRelations.issueId, updated.id),
+                eq(issues.companyId, updated.companyId),
+                eq(issues.status, "blocked"),
+              ),
+            );
+          for (const dependent of dependentRows) {
+            // Drop the edge atomically with the cancellation. The
+            // same-company predicate is redundant after the SELECT but
+            // is the read-side safety belt if the dependent row's
+            // companyId were rewritten between the SELECT and the DELETE.
+            const deleted = await tx
+              .delete(issueRelations)
+              .where(
+                and(
+                  eq(issueRelations.companyId, updated.companyId),
+                  eq(issueRelations.type, "blocks"),
+                  eq(issueRelations.issueId, updated.id),
+                  eq(issueRelations.relatedIssueId, dependent.dependentId),
+                ),
+              )
+              .returning({ issueId: issueRelations.issueId });
+            if (deleted.length === 0) {
+              // Lost the race (e.g., another caller dropped the same
+              // edge between our candidate read and the delete).
+              // Retain; do not log or wake.
+              continue;
+            }
+            await logActivity(tx as unknown as Db, {
+              companyId: updated.companyId,
+              actorType: actorAgentId
+                ? "agent"
+                : actorUserId
+                  ? "user"
+                  : "system",
+              actorId:
+                actorAgentId ?? actorUserId ?? "issue_service",
+              agentId: actorAgentId ?? null,
+              action: "issue.blocker_edge_auto_dropped",
+              entityType: "issue",
+              entityId: updated.id,
+              details: {
+                blockerIssueId: updated.id,
+                blockerIdentifier: updated.identifier ?? null,
+                blockerTitle: updated.title ?? null,
+                dependentIssueId: dependent.dependentId,
+                blockerStatusAtDrop: "cancelled",
+                droppedAt: dropNow.toISOString(),
+                // Source is a protocol discriminator, not a credential.
+                // The sanitizer's JWT-shape heuristic would otherwise
+                // blank it (three dotted segments); a hyphenated /
+                // snake_case token falls outside the heuristic.
+                source: "issue-cancelled-blocker-auto-drop",
+                requestedByActorType: actorAgentId
+                  ? "agent"
+                  : actorUserId
+                    ? "user"
+                    : "system",
+                requestedByActorId:
+                  actorAgentId ?? actorUserId ?? null,
+              },
+            });
+            // Recompute the dependent's readiness NOW (post-drop, still
+            // inside the same tx so the join reads the new reality).
+            // Only wake if the dependent is genuinely ready and owned
+            // by an agent (the agent queue is the surface that turns
+            // readiness into motion).
+            const postReadiness = await listIssueDependencyReadinessMap(
+              tx,
+              dependent.dependentCompanyId,
+              [dependent.dependentId],
+            );
+            const state = postReadiness.get(dependent.dependentId);
+            if (!state || !state.isDependencyReady) {
+              // Other blockers are still gating this dependent. The
+              // drop is committed and the log row is written; there
+              // is no ready-dependent-to-wake for this edge.
+              continue;
+            }
+            const assigneeAgentId =
+              dependent.dependentAssigneeAgentId ?? null;
+            if (
+              !assigneeAgentId ||
+              dependent.dependentAssigneeUserId ||
+              dependent.dependentConversationAgentId
+            ) {
+              // Human-owned or conversation-container dependents get
+              // the drop + log row but no wake (no agent queue).
+              continue;
+            }
+            const wakeIdempotencyKey =
+              buildIssueBlockersResolvedWakeStateKey({
+                dependentIssueId: dependent.dependentId,
+                blockerIssueIds: state.blockerIssueIds,
+                blockedTransitionAt:
+                  dependent.dependentBlockedTransitionAt ?? null,
+              });
+            const existingWake =
+              await findExistingIssueBlockersResolvedWakeForReadyState(
+                tx,
+                {
+                  companyId: dependent.dependentCompanyId,
+                  dependentIssueId: dependent.dependentId,
+                  blockerIssueIds: state.blockerIssueIds,
+                  blockedTransitionAt:
+                    dependent.dependentBlockedTransitionAt ?? null,
+                },
+              );
+            if (existingWake) {
+              continue;
+            }
+            await tx.insert(agentWakeupRequests).values({
+              companyId: dependent.dependentCompanyId,
+              agentId: assigneeAgentId,
+              source: "automation",
+              triggerDetail: "system",
+              status: "queued",
+              reason: ISSUE_BLOCKERS_RESOLVED_WAKE_REASON,
+              payload: {
+                issueId: dependent.dependentId,
+                resolvedBlockerIssueId: updated.id,
+                blockerIssueIds: state.blockerIssueIds,
+                source: "issue-cancelled-blocker-auto-drop",
+              },
+              idempotencyKey: wakeIdempotencyKey,
+              contextSnapshot: {
+                issueId: dependent.dependentId,
+                taskId: dependent.dependentId,
+                wakeReason: ISSUE_BLOCKERS_RESOLVED_WAKE_REASON,
+                resolvedBlockerIssueId: updated.id,
+                blockerIssueIds: state.blockerIssueIds,
+              },
+            });
+          }
         }
         return {
           ...enriched,
@@ -11376,11 +12100,12 @@ export function issueService(db: Db) {
       checkoutRunId: string | null,
     ) => {
       const issueCompany = await db
-        .select({ companyId: issues.companyId })
+        .select({ companyId: issues.companyId, status: issues.status })
         .from(issues)
         .where(eq(issues.id, id))
         .then((rows) => rows[0] ?? null);
       if (!issueCompany) throw notFound("Issue not found");
+      const currentBlockedStatus = issueCompany.status === "blocked";
       await assertAssignableAgent(db, issueCompany.companyId, agentId, {
         kind: "work",
       });
@@ -11433,6 +12158,38 @@ export function issueService(db: Db) {
           unresolvedBlockerIssueIds,
           unresolvedBlockers,
         });
+      }
+
+      // SPA-11807: a card can be blocked on an unanswered interaction instead
+      // of on a blocker relation, and checkout sets `in_progress`
+      // unconditionally. Dependency readiness cannot see that hold, so a wake
+      // or checkout could silently release a card still waiting on a human
+      // decision — and because checkout logs no status activity, the release
+      // left no audit trail. Refuse, naming the interaction, so the caller
+      // learns the real reason instead of assuming it holds execution.
+      if (currentBlockedStatus) {
+        const holdingInteractions = await db
+          .select({
+            id: issueThreadInteractions.id,
+            status: issueThreadInteractions.status,
+          })
+          .from(issueThreadInteractions)
+          .where(
+            and(
+              eq(issueThreadInteractions.companyId, issueCompany.companyId),
+              eq(issueThreadInteractions.issueId, id),
+            ),
+          );
+        if (isAwaitingInteractionResolution(holdingInteractions)) {
+          throw unprocessable(
+            "Issue is blocked on an unanswered interaction",
+            {
+              holdingInteractionIds: holdingInteractions
+                .filter((interaction) => interaction.status === "pending")
+                .map((interaction) => interaction.id),
+            },
+          );
+        }
       }
 
       const sameRunAssigneeCondition = checkoutRunId
@@ -12406,6 +13163,27 @@ export function issueService(db: Db) {
         }
       }
       if (!comment) {
+        // SPA-11706 D1: the agent-keyed idempotency constraint is enforced by the
+        // DATABASE, not by a pre-SELECT. A read-then-write lookup cannot be correct
+        // here: two concurrent identical retries both miss the read and both reach
+        // the insert, and the loser would surface a 23505 as a 500 — the very
+        // symptom this fixes. `ON CONFLICT DO NOTHING` makes the race safe by
+        // construction: the loser inserts nothing, then reads the winner's row back.
+        //
+        // `onConflictDoNothing` in drizzle 0.45.2 reads `where` (not `targetWhere`),
+        // so the inference predicate is passed as `where`; `targetWhere` is silently
+        // dropped by that version and Postgres then reports 42P10.
+        const agentKeyedReplay =
+          actor.agentId && options?.clientRequestId
+            ? {
+                target: [
+                  issueComments.issueId,
+                  issueComments.authorAgentId,
+                  issueComments.clientRequestId,
+                ] as const,
+                where: sql`${issueComments.clientRequestId} is not null and ${issueComments.authorAgentId} is not null`,
+              }
+            : null;
         [comment] = await dbOrTx
           .insert(issueComments)
           .values({
@@ -12425,7 +13203,27 @@ export function issueService(db: Db) {
               ? { createdAt }
               : {}),
           })
+          .onConflictDoNothing(agentKeyedReplay ?? undefined)
           .returning();
+        if (!comment && agentKeyedReplay) {
+          const [winner] = await dbOrTx
+            .select()
+            .from(issueComments)
+            .where(
+              and(
+                eq(issueComments.issueId, issueId),
+                eq(issueComments.authorAgentId, actor.agentId!),
+                eq(issueComments.clientRequestId, options!.clientRequestId!),
+              ),
+            );
+          if (!winner) {
+            throw new Error("Failed to create issue comment");
+          }
+          if (winner.body !== redactedBody) {
+            throw conflict("Idempotency key was already used for different content");
+          }
+          comment = winner;
+        }
       }
       if (!comment) throw new Error("Failed to create issue comment");
 

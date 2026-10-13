@@ -13,6 +13,7 @@ const {
   createAppMock,
   createBetterAuthInstanceMock,
   createDbMock,
+  reconcileEphemeralWorktreesOnStartupMock,
   detectPortMock,
   deriveAuthTrustedOriginsMock,
   environmentCustomImagesServiceMock,
@@ -45,6 +46,12 @@ const {
       from: vi.fn(() => ({ where: vi.fn(async () => []) })),
     })),
   }) as never);
+  const reconcileEphemeralWorktreesOnStartupMock = vi.fn(async () => ({
+    reposScanned: 0,
+    reaper: { scanned: 0, removed: 0, rescued: 0, errors: [] },
+    sweep: { scanned: 0, archived: 0, rescued: 0, errors: [] },
+    totalErrors: [],
+  }));
   const detectPortMock = vi.fn(async ({ port }: { port: number; hostname: string }) => port);
   const deriveAuthTrustedOriginsMock = vi.fn(() => []);
   const resolveHeartbeatSchedulingSuppressionMock = vi.fn(() => ({
@@ -61,6 +68,8 @@ const {
       blockedRunIds: [],
     })),
     reconcileHotRestartAdoption: vi.fn(async () => ({ mode: "none" })),
+    // SPA-11948: stale `paperclip-agent-*.scope` reconciliation at boot.
+    reconcileStaleRunScopes: vi.fn(async () => ({ units: [], detachedRunIds: [] })),
     reapOrphanedRuns: vi.fn(async () => ({ reaped: 0, runIds: [] })),
     reclaimTerminalEnvironmentLeases: vi.fn(async () => ({ reclaimed: 0, driverFailures: [] })),
     reclaimTerminalEnvironmentLeasesForRestart: vi.fn(async () => ({ releasedRestartOrphans: [], replacedRunIds: [], replacementDispatchFailures: [] })),
@@ -79,6 +88,7 @@ const {
       issueIds: [],
     })),
     reconcileResolvedDependencyWakes: vi.fn(async () => ({ healed: 0 })),
+    pullIdleAgentTodoIssues: vi.fn(async () => ({ enabled: false, checked: 0, pulled: 0 })),
     reconcileTaskWatchdogs: vi.fn(async () => ({ triggered: 0 })),
     scanSilentActiveRuns: vi.fn(async () => ({ created: 0, escalated: 0 })),
     sweepStaleIssueLocks: vi.fn(async () => ({ cleared: 0 })),
@@ -142,6 +152,7 @@ const {
     createAppMock,
     createBetterAuthInstanceMock,
     createDbMock,
+    reconcileEphemeralWorktreesOnStartupMock,
     detectPortMock,
     deriveAuthTrustedOriginsMock,
     environmentCustomImagesServiceMock,
@@ -163,6 +174,26 @@ const {
     routineServiceMock,
   };
 });
+
+/**
+ * Installs a temporary implementation and returns an undo that restores the
+ * previous one. `vi.clearAllMocks()` in `beforeEach` resets call history but
+ * leaves implementations in place, so an override that a test never reaches
+ * would otherwise leak into every later test in the file.
+ */
+function restoreImpl<T extends (...args: never[]) => unknown>(
+  mock: {
+    mockImplementation(fn: T): unknown;
+    getMockImplementation(): T | undefined;
+  },
+  impl: T,
+) {
+  const previous = mock.getMockImplementation() as T | undefined;
+  mock.mockImplementation(impl);
+  return () => {
+    if (previous) mock.mockImplementation(previous);
+  };
+}
 
 function buildTestConfig(overrides: Record<string, unknown> = {}) {
   return {
@@ -332,12 +363,7 @@ vi.mock("../services/index.js", () => ({
     unknown: 0,
     duplicates: 0,
   })),
-  reconcileEphemeralWorktreesOnStartup: vi.fn(async () => ({
-    reposScanned: 0,
-    reaper: { scanned: 0, removed: 0, rescued: 0, errors: [] },
-    sweep: { scanned: 0, archived: 0, rescued: 0, errors: [] },
-    totalErrors: [],
-  })),
+  reconcileEphemeralWorktreesOnStartup: reconcileEphemeralWorktreesOnStartupMock,
   reconcilePersistedRuntimeServicesOnStartup: vi.fn(async () => ({ reconciled: 0 })),
   resolveHeartbeatSchedulingSuppression: resolveHeartbeatSchedulingSuppressionMock,
   routineService: routineServiceFactoryMock,
@@ -435,6 +461,13 @@ describe("startServer feedback export wiring", () => {
     createBetterAuthInstanceMock.mockReturnValue({});
     deriveAuthTrustedOriginsMock.mockReturnValue([]);
     process.env.BETTER_AUTH_SECRET = "test-secret";
+  });
+
+  it("passes the initialized database to ephemeral worktree reconciliation", async () => {
+    await startServer();
+    const db = createDbMock.mock.results[0]?.value;
+    expect(db).toBeDefined();
+    expect(reconcileEphemeralWorktreesOnStartupMock).toHaveBeenCalledWith({ db });
   });
 
   it("starts without PAPERCLIP_DECISION_SIGNING_SECRET by generating a persisted key", async () => {
@@ -667,6 +700,64 @@ describe("startServer feedback export wiring", () => {
     }
   });
 
+  // SPA-11948. Startup ordering is load-bearing, not incidental. Each step is
+  // gated on the previous one's durable result:
+  //
+  //   hot-restart adoption  -> marks the runs this engine genuinely still owns
+  //   stale-scope reconcile  -> reaps `paperclip-agent-*.scope` units left by a
+  //                             previous engine, skipping the adopted ones
+  //   orphan reaper          -> clears `running` rows with no live process
+  //   queued admission       -> only now may queued work be admitted
+  //
+  // Reap-before-adopt would kill adopted live work; admit-before-reconcile
+  // would admit queued runs while a foreign scope still holds a cap slot.
+  it("reconciles stale run scopes after hot-restart adoption and before queued admission", async () => {
+    loadConfigMock.mockReturnValue(buildTestConfig({
+      heartbeatSchedulerEnabled: true,
+      heartbeatSchedulerIntervalMs: 30000,
+    }));
+
+    const order: string[] = [];
+    // `vi.clearAllMocks()` clears calls but NOT implementations, so an
+    // unconsumed `mockImplementationOnce` would survive into the next test and
+    // in the RED state `reconcileStaleRunScopes` is never called at all. Use
+    // `mockImplementation` with an explicit restore instead.
+    const restore = [
+      restoreImpl(heartbeatServiceMock.reconcileHotRestartAdoption, async () => {
+        order.push("hot_restart_adoption");
+        return { mode: "reported" };
+      }),
+      restoreImpl(heartbeatServiceMock.reconcileStaleRunScopes, async () => {
+        order.push("stale_scope_reconciliation");
+        return { units: [], detachedRunIds: [] };
+      }),
+      restoreImpl(heartbeatServiceMock.reapOrphanedRuns, async () => {
+        order.push("orphan_reaper");
+        return { reaped: 0, runIds: [] };
+      }),
+      restoreImpl(heartbeatServiceMock.resumeQueuedRuns, async () => {
+        order.push("queued_admission");
+        return undefined;
+      }),
+    ];
+
+    try {
+      await startServer();
+
+      // Every step ran, in the one order that keeps adopted work alive and
+      // stops a foreign scope from holding a cap slot during admission.
+      expect(order).toEqual([
+        "hot_restart_adoption",
+        "stale_scope_reconciliation",
+        "orphan_reaper",
+        "queued_admission",
+      ]);
+      expect(heartbeatServiceMock.reconcileStaleRunScopes).toHaveBeenCalledTimes(1);
+    } finally {
+      for (const undo of restore) undo();
+    }
+  });
+
   it("does not replay hot-restart adoption when the orphan reaper retries", async () => {
     loadConfigMock.mockReturnValue(buildTestConfig({
       heartbeatSchedulerEnabled: true,
@@ -681,6 +772,23 @@ describe("startServer feedback export wiring", () => {
 
     expect(heartbeatServiceMock.reconcileHotRestartAdoption).toHaveBeenCalledTimes(1);
     expect(heartbeatServiceMock.reapOrphanedRuns).toHaveBeenCalledTimes(2);
+  });
+
+  it("keeps the bound listener and later recovery steps active when issue reconciliation fails", async () => {
+    loadConfigMock.mockReturnValue(buildTestConfig({
+      heartbeatSchedulerEnabled: true,
+      heartbeatSchedulerIntervalMs: 30000,
+    }));
+    heartbeatServiceMock.reconcileStrandedAssignedIssues.mockRejectedValueOnce(
+      new Error("Blocking relations cannot contain cycles"),
+    );
+
+    const started = await startServer();
+
+    expect(started.server).toBe(fakeServer);
+    expect(fakeServer.listen).toHaveBeenCalledTimes(1);
+    expect(fakeServer.close).not.toHaveBeenCalled();
+    expect(heartbeatServiceMock.reconcileResolvedDependencyWakes).toHaveBeenCalledTimes(1);
   });
 
   it("closes the bound listener when native startup recovery fails", async () => {

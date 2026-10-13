@@ -20,6 +20,10 @@ import {
 } from "../../../services/issues.js";
 import { issueRecoveryActionService } from "../../../services/issue-recovery-actions.js";
 import { RECOVERY_ORIGIN_KINDS } from "../../../services/recovery/origins.js";
+import {
+  HEARTBEAT_QUERY_DIAGNOSTIC_TAGS,
+  measureHeartbeatQuery,
+} from "../../../services/heartbeat-query-diagnostics.js";
 import { isTerminalIssueStatus } from "../domain/policy.js";
 import type { WatchdogRunReader, WatchdogWriter } from "../application/ports.js";
 import type {
@@ -74,18 +78,19 @@ export function createPostgresWatchdogAdapter(db: Db): WatchdogRunReader & Watch
     suspicionBefore: Date;
     issueCreatedAtGte?: Date | null;
   }): Promise<RunSnapshot[]> {
-    const rows = await db
-      .select()
-      .from(heartbeatRuns)
-      .where(
-        and(
-          input.companyId ? eq(heartbeatRuns.companyId, input.companyId) : undefined,
-          eq(heartbeatRuns.status, "running"),
-          sql`coalesce(${heartbeatRuns.lastOutputAt}, ${heartbeatRuns.processStartedAt}, ${heartbeatRuns.startedAt}, ${heartbeatRuns.createdAt}) <= ${input.suspicionBefore.toISOString()}::timestamptz`,
-        ),
-      )
-      .orderBy(asc(heartbeatRuns.createdAt))
-      .limit(100);
+    const rows = await measureHeartbeatQuery(HEARTBEAT_QUERY_DIAGNOSTIC_TAGS[1], () =>
+      db
+        .select()
+        .from(heartbeatRuns)
+        .where(
+          and(
+            input.companyId ? eq(heartbeatRuns.companyId, input.companyId) : undefined,
+            eq(heartbeatRuns.status, "running"),
+            sql`coalesce(${heartbeatRuns.lastOutputAt}, ${heartbeatRuns.processStartedAt}, ${heartbeatRuns.startedAt}, ${heartbeatRuns.createdAt}) <= ${input.suspicionBefore.toISOString()}::timestamptz`,
+          ),
+        )
+        .orderBy(asc(heartbeatRuns.createdAt))
+        .limit(100));
 
     let candidates = rows.map(toRunSnapshot);
 
