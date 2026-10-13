@@ -606,6 +606,39 @@ describeEmbeddedPostgres("issue done gate — hybrid PR binding: reference_only 
     expect(refused.map((entry) => entry.reference.number).sort()).toEqual([1423, 1424]);
   });
 
+  // Clause 3(a) — "owns" must mean CLAIMS, so two routing-only cards cannot
+  // certify each other in a circle. Neither card owns PR 1426 as an unmarked
+  // product; each disclaims it and names the other. Counting disclaiming rows
+  // as owners would give each exactly one "owner" (the other), and both would
+  // close with the PR unmerged and nothing on the board owning it — a
+  // self-service skip of immutable rule 12 built from nothing but two markers.
+  // Both cards must refuse.
+  it("mutually_marked_reference_only_cards_cannot_certify_each_other", async () => {
+    const cardA = await createCard(db, companyId, { identifier: "SPA-12017" });
+    const cardB = await createCard(db, companyId, { identifier: "SPA-12018" });
+    // A attaches marking B as owner; B attaches marking A as owner. No
+    // unmarked product exists on either card — that is the whole point.
+    await attachPullRequestWorkProduct(db, cardA, 1426, {
+      doneGate: { binding: "reference_only", owningIssueIdentifier: "SPA-12018" },
+    });
+    await attachPullRequestWorkProduct(db, cardB, 1426, {
+      doneGate: { binding: "reference_only", owningIssueIdentifier: "SPA-12017" },
+    });
+
+    const gate = issueDoneGateService(db, {
+      resolvePullRequestDetails: async () => ({
+        ...details("open", "open"),
+        headRef: "craft/SPA-12017-lane",
+      }),
+    });
+    expect(
+      await gate.evaluateDoneGate({ id: cardA.id, companyId, identifier: cardA.identifier }),
+    ).toMatchObject({ outcome: "refuse" });
+    expect(
+      await gate.evaluateDoneGate({ id: cardB.id, companyId, identifier: cardB.identifier }),
+    ).toMatchObject({ outcome: "refuse" });
+  });
+
   // Clause 3, condition 2 — the identifier compare is exact. A case variant is
   // not the stored identifier, so the claim is unproven and fails closed. This
   // pins the compare against a future case-insensitive "helpful" normalisation,
