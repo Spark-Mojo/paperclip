@@ -43,6 +43,12 @@ API_TOKEN="${PAPERCLIP_API_KEY:-}"
 SERVICE_NAME="paperclip.service"
 TIMEOUT_SECONDS=1800
 POLL_SECONDS=15
+# Abort-safety state (R2): once the pause lands, EVERY exit path must try to
+# restore the recorded cap so admissions never stay paused after this command
+# ends. RESTORE_ATTEMPTED makes the EXIT trap a no-op once a restore has been
+# tried (no double restore), and dry-run never pauses so it never restores.
+PAUSED=0
+RESTORE_ATTEMPTED=0
 
 log() { printf '[drain-then-restart] %s\n' "$*"; }
 die() { printf '[drain-then-restart] ERROR: %s\n' "$*" >&2; exit 1; }
@@ -212,12 +218,49 @@ probe() {
   esac
 }
 
+# restore_recorded_cap — one restore attempt per run. Returns 0 on a verified
+# restore, 1 on failure (after printing the operator's manual fix). Never
+# exits by itself, so it is safe inside the EXIT trap. RESTORE_BODY and
+# RESTORE_EXPECT are computed in step 1 from the recorded cap.
+restore_recorded_cap() {
+  RESTORE_ATTEMPTED=1
+  if [ "$DRY_RUN" = "1" ]; then
+    log "DRY-RUN: would PATCH $FLEET_CAP_PATH $RESTORE_BODY"
+    return 0
+  fi
+  local restored_json restored_value restored_source
+  if ! restored_json="$(api PATCH "$FLEET_CAP_PATH" "$RESTORE_BODY")"; then
+    log "WARNING: cap restore failed; restore manually with: curl -X PATCH -H 'Authorization: Bearer <token>' -H 'Content-Type: application/json' -d '$RESTORE_BODY' $API_URL$FLEET_CAP_PATH"
+    return 1
+  fi
+  restored_value="$(json_field "$restored_json" value 2>/dev/null)" || restored_value=""
+  if [ "$restored_value" != "$RESTORE_EXPECT" ]; then
+    log "WARNING: cap restore did not land: expected $RESTORE_EXPECT, got ${restored_value:-<unreadable>} (fix with: curl -X PATCH -H 'Authorization: Bearer <token>' -H 'Content-Type: application/json' -d '$RESTORE_BODY' $API_URL$FLEET_CAP_PATH)"
+    return 1
+  fi
+  restored_source="$(json_field "$restored_json" source 2>/dev/null)" || restored_source="api"
+  log "cap restored to value=$restored_value (source: $restored_source)"
+  return 0
+}
+
+# finish — EXIT trap: the abort-safety net. A probe failure (SPA-11913 UI-less
+# board), a failed restart, or the health come-back timeout all land here with
+# admissions still paused; restore once on the way out so the fleet resumes by
+# itself. The original exit code is preserved (the trap never calls exit).
+finish() {
+  if [ "$PAUSED" = "1" ] && [ "$RESTORE_ATTEMPTED" = "0" ]; then
+    log "restoring the recorded cap before exiting so the fleet resumes by itself"
+    restore_recorded_cap || true
+  fi
+}
+trap finish EXIT
+
 # --- steps ----------------------------------------------------------------
 
 log "step 1/5: record current fleet cap"
 CAP_BEFORE_JSON="$(api GET "$FLEET_CAP_PATH")"
 CAP_BEFORE_VALUE="$(json_field "$CAP_BEFORE_JSON" value)"
-CAP_BEFORE_SOURCE="$(json_field "$CAP_BEFORE_JSON" source)"
+CAP_BEFORE_SOURCE="$(json_field "$CAP_BEFORE_JSON" source 2>/dev/null)" || CAP_BEFORE_SOURCE="api"
 log "recorded cap: value=$CAP_BEFORE_VALUE source=$CAP_BEFORE_SOURCE"
 # "none" (null) means no ceiling; restore must re-apply null, not 0.
 if [ "$CAP_BEFORE_VALUE" = "null" ]; then
@@ -235,6 +278,7 @@ else
   PAUSED_JSON="$(api PATCH "$FLEET_CAP_PATH" '{"value":0}')"
   PAUSED_VALUE="$(json_field "$PAUSED_JSON" value)"
   [ "$PAUSED_VALUE" = "0" ] || die "pause did not land: effective cap is $PAUSED_VALUE"
+  PAUSED=1
   log "admissions paused (cap=0). Running runs are NOT touched; queued stays queued."
 fi
 
@@ -257,7 +301,7 @@ while :; do
       # Best-effort run listing across companies; the drain verdict above is
       # authoritative, this is the operator's "which runs" answer.
       COMPANIES_JSON="$(curl -sS -H "Authorization: Bearer $API_TOKEN" "$API_URL/api/companies" || true)"
-      for COMPANY_ID in $(json_field "$COMPANIES_JSON" 2>/dev/null | node -e '
+      for COMPANY_ID in $(printf '%s' "$COMPANIES_JSON" | node -e '
         let input = "";
         process.stdin.on("data", (c) => (input += c));
         process.stdin.on("end", () => {
@@ -287,8 +331,7 @@ while :; do
       done
     fi
     log "restoring the recorded cap before exiting so the fleet resumes by itself"
-    api PATCH "$FLEET_CAP_PATH" "$RESTORE_BODY" >/dev/null \
-      || log "WARNING: cap restore failed after timeout; restore manually with: curl -X PATCH -H 'Authorization: Bearer <token>' -H 'Content-Type: application/json' -d '$RESTORE_BODY' $API_URL$FLEET_CAP_PATH"
+    restore_recorded_cap || true
     die "drain timeout: runs still live; nothing was restarted, nothing was killed"
   fi
   sleep "$POLL_SECONDS"
@@ -315,14 +358,10 @@ log "step 5/5: probes (UI + health), then restore the recorded cap"
 probe "/" 'id="root"' "board UI served"
 probe "/api/health" '"status"' "health endpoint"
 
-if [ "$DRY_RUN" = "1" ]; then
-  log "DRY-RUN: would PATCH $FLEET_CAP_PATH $RESTORE_BODY"
-else
-  RESTORED_JSON="$(api PATCH "$FLEET_CAP_PATH" "$RESTORE_BODY")"
-  RESTORED_VALUE="$(json_field "$RESTORED_JSON" value)"
-  [ "$RESTORED_VALUE" = "$RESTORE_EXPECT" ] \
-    || die "cap restore did not land: expected $RESTORE_EXPECT, got $RESTORED_VALUE (fix with: curl -X PATCH -d '$RESTORE_BODY' $API_URL$FLEET_CAP_PATH)"
-  log "cap restored to value=$RESTORED_VALUE (source: $(json_field "$RESTORED_JSON" source))"
+# On a probe/restart failure the EXIT trap already restored (or attempted to);
+# here the restore IS the step, so a failed restore fails the run loudly.
+if ! restore_recorded_cap; then
+  die "cap restore failed; see the WARNING above for the manual fix"
 fi
 
 log "DONE: drained restart complete. Queued wakes admit again from the restored cap."
