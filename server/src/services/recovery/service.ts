@@ -10,6 +10,7 @@ import {
   gte,
   inArray,
   isNull,
+  ne,
   not,
   notInArray,
   or,
@@ -170,6 +171,32 @@ const STRANDED_BOARD_ESCALATION_POLICY = "board_escalation_no_takeover_v1";
 const DISPOSITION_REPAIR_IDEMPOTENCY_INDEX =
   "agent_wakeup_requests_disposition_repair_idempotency_uq";
 const RESOLVED_DEPENDENCY_WAKE_BACKSTOP_CANDIDATE_LIMIT = 500;
+
+// SPA-12218: the `errorCode` the startup orphan backstop stamps on a run whose
+// process and sandbox are gone while `heartbeat_runs.status` stayed live. That
+// backstop terminalizes the RUN but never re-wakes the owning ISSUE, so the card
+// stays `in_progress` with no live execution path until a human intervenes.
+// `reconcileOrphanedRunIssues` closes that gap: the errorCode, not the run's
+// terminal status, is the discriminator, because the same backstop also stamps
+// `orphaned_running_run_issue_terminal` for a different authority.
+const ORPHANED_RUNNING_RUN_ERROR_CODE = "orphaned_running_run";
+// At most one wake per orphaned run, ever. Keyed on the run rather than the
+// issue so a second, later orphan on the SAME card (a second SIGKILL) gets its
+// own one wake, while a repeated sweep over the same orphan is a no-op.
+const ORPHANED_RUN_REWAKE_IDEMPOTENCY_PREFIX = "issue_orphaned_run_rewake:";
+// SPA-12218: per-sweep ceiling on re-wakes. Sized above the worst single
+// incident observed on this fleet (17 runs orphaned by the 2026-10-13 SIGKILL)
+// and far below the concurrency cap, so one boot drains an ordinary incident
+// completely while a pathological orphan backlog drains over several boots
+// instead of stampeding the provider.
+const ORPHANED_RUN_REWAKE_MAX_PER_SWEEP = 100;
+// The partial unique index that makes the "at most one wake per orphaned run"
+// claim atomic across concurrent boots. Named so a collision can be told apart
+// from an unrelated constraint failure.
+const ORPHANED_RUN_REWAKE_IDEMPOTENCY_CONSTRAINT =
+  "agent_wakeup_requests_orphaned_run_rewake_idempotency_uq";
+const ORPHANED_RUN_REWAKE_SOURCE = "recovery.reconcile_orphaned_run_issue";
+const ORPHANED_RUN_REWAKE_REASON = "orphaned_run_recovery";
 
 // GGU-809: when a stranded `in_progress` issue would otherwise hit the
 // `isRepeatedProductiveContinuationRecovery` escalation path, exempt the
@@ -6497,6 +6524,345 @@ export function recoveryService(
     return result;
   }
 
+  /**
+   * SPA-12218 — startup orphan re-wake.
+   *
+   * The SIGKILL at 2026-10-13T14:46:35Z left 17 runs recorded `running`. The
+   * startup backstop terminalized them with `errorCode = "orphaned_running_run"`,
+   * but their issues stayed `in_progress` with no live execution path, so a human
+   * had to wake 14 of them by hand ~19 minutes later. The engine must own that
+   * re-wake itself.
+   *
+   * Runs AFTER `sweepStaleIssueLocks` has terminalized the orphaned runs, because
+   * this sweep keys on the errorCode the backstop writes. It only WAKES: it never
+   * rewrites run state and never clears the issue lock (that stays
+   * `sweepStaleIssueLocks`' authority, so the wake cannot race the lock clear).
+   *
+   * The candidate query mirrors `reconcileStrandedAssignedIssues`: active
+   * statuses only, agent-assigned work only (a human-owned card is the
+   * operator's to wake), visible rows only, and committed-but-unadmitted chat
+   * input excluded. Every further gate is a deliberate skip that increments
+   * `skipped`, never a silent pass.
+   */
+  async function reconcileOrphanedRunIssues() {
+    const candidates = await db
+      .select()
+      .from(issues)
+      .where(
+        and(
+          isNull(issues.assigneeUserId),
+          inArray(issues.status, ["todo", "in_progress", "in_review"]),
+          // Mirror `reconcileStrandedAssignedIssues`: an `in_review` card is
+          // woken by its current review PARTICIPANT, which need not be the
+          // assignee. Requiring an agent assignee here would exclude exactly the
+          // review cards whose reviewer is the thing that was interrupted.
+          or(
+            sql`${issues.assigneeAgentId} is not null`,
+            eq(issues.status, "in_review"),
+          ),
+          isNull(issues.hiddenAt),
+          not(unadmittedChatWakeupCondition(issues.id, issues.companyId)),
+          // SPA-12218: restrict the candidate set to TRUE orphans in SQL, BEFORE
+          // the per-boot cap below is applied.
+          //
+          // This ordering is load-bearing, and getting it wrong is a starvation
+          // bug, not a cosmetic one. If the cap were applied to the UNFILTERED
+          // active-issue set, then once a live board held more than CAP active
+          // issues (overwhelmingly already-handled), every subsequent boot would
+          // deterministically select the SAME first CAP rows, skip each as
+          // already re-woken, and never reach a genuine orphan past the cut —
+          // permanently, on every boot. The cap must bound the work we DO, so
+          // the work has to be identified first.
+          //
+          // "Latest run" is decided with the same binding the terminalizer uses
+          // (`issueIdFromRunContext`): `issueId`, or `taskId`, and a context
+          // where the two disagree is NOT bound to this issue at all. The
+          // NOT EXISTS arm rejects a newer run that is not an orphan, so an
+          // issue whose latest run merely CONTAINS an old orphaned run is not
+          // a candidate.
+          sql`EXISTS (
+            SELECT 1 FROM "heartbeat_runs" orphan_run
+            WHERE orphan_run."company_id" = ${issues.companyId}
+              AND (
+                orphan_run."context_snapshot" ->> 'issueId' = ${issues.id}::text
+                OR orphan_run."context_snapshot" ->> 'taskId' = ${issues.id}::text
+              )
+              AND NOT (
+                orphan_run."context_snapshot" ->> 'issueId' IS NOT NULL
+                AND orphan_run."context_snapshot" ->> 'taskId' IS NOT NULL
+                AND orphan_run."context_snapshot" ->> 'issueId' <> orphan_run."context_snapshot" ->> 'taskId'
+              )
+              AND orphan_run."error_code" = ${ORPHANED_RUNNING_RUN_ERROR_CODE}
+              -- Already re-woken? Then this orphan is finished business and must
+              -- not re-enter the candidate set. Without this arm the cap would
+              -- re-select the same already-handled prefix on every boot and the
+              -- deferred tail would starve forever: the sweep would skip each of
+              -- the first CAP rows as already-done and never reach the orphans
+              -- past the cut. Excluding them here makes the cap drain by
+              -- construction -- each boot's candidate set is exactly the orphans
+              -- that still need a wake.
+              AND NOT EXISTS (
+                SELECT 1 FROM "agent_wakeup_requests" orphan_receipt
+                WHERE orphan_receipt."company_id" = orphan_run."company_id"
+                  AND orphan_receipt."idempotency_key" =
+                    ${ORPHANED_RUN_REWAKE_IDEMPOTENCY_PREFIX} || orphan_run."id"
+                  AND orphan_receipt."status" <> 'skipped'
+              )
+              AND NOT EXISTS (
+                SELECT 1 FROM "heartbeat_runs" newer_run
+                WHERE newer_run."company_id" = ${issues.companyId}
+                  AND (
+                    newer_run."context_snapshot" ->> 'issueId' = ${issues.id}::text
+                    OR newer_run."context_snapshot" ->> 'taskId' = ${issues.id}::text
+                  )
+                  AND (
+                    newer_run."created_at" > orphan_run."created_at"
+                    OR (
+                      newer_run."created_at" = orphan_run."created_at"
+                      AND newer_run."id" > orphan_run."id"
+                    )
+                  )
+              )
+          )`,
+        ),
+      )
+      // Oldest first, so when the cap truncates, what gets dropped is the newest
+      // work — the cards most likely to still be under active attention — and
+      // the next boot drains them in the order they were deferred.
+      .orderBy(asc(issues.createdAt));
+
+    const result = {
+      scanned: candidates.length,
+      rewoken: 0,
+      skipped: 0,
+      deferredForNextBoot: 0,
+      issueIds: [] as string[],
+    };
+
+    // Bound the blast radius of a single boot. A SIGKILL can orphan an unbounded
+    // number of runs, and re-waking every one of them at once would queue a
+    // provider thundering herd on the same host that just lost its engine —
+    // converting one incident into a second. The cap is a FLOOR on progress, not
+    // a total: the leftover candidates stay untouched, and the next boot (or the
+    // periodic caller) picks up where this one stopped, because the dedupe below
+    // is durable and already-committed wakes are never repeated.
+    //
+    // `candidates` is already narrowed to true orphans and ordered oldest-first
+    // (see the query above), so the slice can only ever drop genuine work that is
+    // genuinely newer, and the next boot reaches it.
+    const candidatesWithinCap = candidates.slice(0, ORPHANED_RUN_REWAKE_MAX_PER_SWEEP);
+    result.deferredForNextBoot = candidates.length - candidatesWithinCap.length;
+
+    for (const issue of candidatesWithinCap) {
+      // `in_review` work belongs to the CURRENT review participant, not to the
+      // assignee. This mirrors `reconcileStrandedAssignedIssues`, which resolves
+      // the same `executionState.currentParticipant` before waking. Addressing the
+      // assignee here would wake an agent that is not the reviewer and leave the
+      // real one idle — the exact "card sits with nobody" symptom this sweep exists
+      // to close.
+      const executionState =
+        issue.status === "in_review"
+          ? parseIssueExecutionState(issue.executionState)
+          : null;
+      const pendingExecutionState =
+        executionState?.status === "pending" ? executionState : null;
+      const currentParticipant = pendingExecutionState
+        ? pendingExecutionState.currentParticipant
+        : null;
+      const participantAgentId =
+        currentParticipant?.type === "agent"
+          ? currentParticipant.agentId
+          : null;
+      const agentId =
+        issue.status === "in_review" && participantAgentId
+          ? participantAgentId
+          : issue.assigneeAgentId;
+      // A wake must address a real agent. The candidate query already excludes
+      // unassigned rows, so this only guards a concurrent unassignment.
+      if (!agentId) {
+        result.skipped += 1;
+        continue;
+      }
+
+      // Match the terminalization backstop's OWN notion of run->issue binding,
+      // in full. `getLatestIssueRun` matches on `contextSnapshot->>'issueId'`
+      // alone, but the backstop associates a run via `issueIdFromRunContext`,
+      // which (a) also accepts `taskId`, and (b) REJECTS a context where issueId
+      // and taskId are both present and disagree, returning null so the run is
+      // not bound to this issue at all. This query mirrors both arms. Matching
+      // only `issueId` would miss every taskId-only orphan — the precise failure
+      // this card exists to fix — and OR-ing without the disagreement guard
+      // would let a context naming two different issues wake the wrong card.
+      const latestRun = await db
+        .select({
+          id: heartbeatRuns.id,
+          agentId: heartbeatRuns.agentId,
+          status: heartbeatRuns.status,
+          errorCode: heartbeatRuns.errorCode,
+          runtimeMode: heartbeatRuns.runtimeMode,
+          createdAt: heartbeatRuns.createdAt,
+        })
+        .from(heartbeatRuns)
+        .where(
+          and(
+            eq(heartbeatRuns.companyId, issue.companyId),
+            or(
+              sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${issue.id}`,
+              sql`${heartbeatRuns.contextSnapshot} ->> 'taskId' = ${issue.id}`,
+            ),
+            // Parity with `issueIdFromRunContext`'s disagreement rejection.
+            sql`NOT (
+              ${heartbeatRuns.contextSnapshot} ->> 'issueId' IS NOT NULL
+              AND ${heartbeatRuns.contextSnapshot} ->> 'taskId' IS NOT NULL
+              AND ${heartbeatRuns.contextSnapshot} ->> 'issueId' <> ${heartbeatRuns.contextSnapshot} ->> 'taskId'
+            )`,
+          ),
+        )
+        .orderBy(desc(heartbeatRuns.createdAt), desc(heartbeatRuns.id))
+        .limit(1)
+        .then((rows) => rows[0] ?? null);
+      // No run at all, or a latest run that ended under its own authority: the
+      // orphan backstop never owned it, so generic recovery already applies.
+      if (
+        !latestRun ||
+        latestRun.errorCode !== ORPHANED_RUNNING_RUN_ERROR_CODE
+      ) {
+        result.skipped += 1;
+        continue;
+      }
+
+      // A newer run or a parked wake already owns the next action, so the
+      // orphan is superseded and this sweep must not race it with a second wake.
+      if (
+        await hasActiveExecutionPath(issue.companyId, issue.id, agentId) ||
+        (await hasQueuedIssueWake(issue.companyId, issue.id, agentId))
+      ) {
+        result.skipped += 1;
+        continue;
+      }
+
+      if (await hasPendingWakeInteraction(issue.companyId, issue.id)) {
+        result.skipped += 1;
+        continue;
+      }
+
+      // Paused is an operator decision: neither an active pause-mode tree hold
+      // nor a paused assignee agent may be re-woken automatically.
+      const agent = await getAgent(agentId);
+      if (
+        agent?.companyId !== issue.companyId ||
+        !(await isAgentInvokable(agent)) ||
+        (await isAutomaticRecoverySuppressedByPauseHold(
+          db,
+          issue.companyId,
+          issue.id,
+          treeControlSvc,
+        ))
+      ) {
+        result.skipped += 1;
+        continue;
+      }
+
+      const idempotencyKey = `${ORPHANED_RUN_REWAKE_IDEMPOTENCY_PREFIX}${latestRun.id}`;
+      // Level-triggered dedupe, read explicitly. `enqueueWakeup` only
+      // deduplicates a handful of specific `idempotencyKey` prefixes, so setting
+      // the key alone would not make a repeated sweep a no-op. Any prior
+      // non-skipped receipt for this orphan — queued, running, or already
+      // finished — means this orphan was already re-woken once, so it never is
+      // again. This is what makes "at most one wake per issue, ever" durable
+      // across repeated startups rather than only within one boot.
+      //
+      // Keyed on the RUN, not the issue, on purpose: a second, later orphan on
+      // the same card (a second SIGKILL) is a distinct lost execution path and
+      // gets its own single wake.
+      const alreadyRewoken = await db
+        .select({ id: agentWakeupRequests.id })
+        .from(agentWakeupRequests)
+        .where(
+          and(
+            eq(agentWakeupRequests.companyId, issue.companyId),
+            eq(agentWakeupRequests.idempotencyKey, idempotencyKey),
+            ne(agentWakeupRequests.status, "skipped"),
+          ),
+        )
+        .limit(1)
+        .then((rows) => rows.length > 0);
+      if (alreadyRewoken) {
+        result.skipped += 1;
+        continue;
+      }
+
+      // A returned run row is NOT the success signal. `enqueueWakeup` resolves to
+      // null on normal deferred paths (wake-on-demand disabled, concurrency
+      // gating, a conversation-execution suppression), and the wake request is
+      // still recorded — so the orphan HAS been re-woken and the next boot must
+      // not try again. Success is therefore "the wake was issued without
+      // throwing", and a throw degrades to a skip so one bad card cannot abort
+      // the whole startup sweep.
+      try {
+        await deps.enqueueWakeup(agentId, {
+          source: "automation",
+          triggerDetail: "system",
+          reason: ORPHANED_RUN_REWAKE_REASON,
+          payload: withRecoveryContext(
+            {
+              issueId: issue.id,
+              mutation: "orphaned_run_recovery",
+              orphanedRunId: latestRun.id,
+            },
+            "normal_model",
+          ),
+          idempotencyKey,
+          requestedByActorType: "system",
+          requestedByActorId: null,
+          contextSnapshot: withRecoveryContext(
+            {
+              issueId: issue.id,
+              taskId: issue.id,
+              wakeReason: ORPHANED_RUN_REWAKE_REASON,
+              source: ORPHANED_RUN_REWAKE_SOURCE,
+              orphanedRunId: latestRun.id,
+            },
+            "normal_model",
+          ),
+        });
+      } catch (error) {
+        // A unique violation on `..._orphaned_run_rewake_idempotency_uq` is not
+        // a failure: it is the database enforcing "at most one wake per orphaned
+        // run" against a concurrent boot that passed the read above a moment
+        // earlier. Count it as skipped and move on — the other boot's wake is
+        // the one that counts, and logging an error here would cry wolf on every
+        // legitimately-parallel restart.
+        if (
+          isUniqueViolation(
+            error,
+            ORPHANED_RUN_REWAKE_IDEMPOTENCY_CONSTRAINT,
+          )
+        ) {
+          result.skipped += 1;
+          continue;
+        }
+        logger.error(
+          {
+            err: error,
+            issueId: issue.id,
+            agentId,
+            orphanedRunId: latestRun.id,
+            idempotencyKey,
+          },
+          "failed to re-wake issue orphaned by the startup run backstop; the issue stays unwoken until the next boot",
+        );
+        result.skipped += 1;
+        continue;
+      }
+
+      result.rewoken += 1;
+      result.issueIds.push(issue.id);
+    }
+
+    return result;
+  }
+
   return {
     buildRunOutputSilence,
     escalateStrandedRecoveryIssueInPlace,
@@ -6505,6 +6871,7 @@ export function recoveryService(
     scanSilentActiveRuns,
     reconcileStrandedAssignedIssues,
     sweepStaleIssueLocks,
+    reconcileOrphanedRunIssues,
     reconcileResolvedDependencyWakeBackstop,
     readRecoveryTimerIntervalMs,
   };
