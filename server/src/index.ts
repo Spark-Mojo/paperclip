@@ -1644,6 +1644,26 @@ async function startServerWithDatabaseTeardown(
         if (swept.cleared > 0) {
           logger.warn({ ...swept }, "startup stale-lock sweeper cleared issue locks");
         }
+
+        // SPA-12218: order is load-bearing. `sweepStaleIssueLocks` above is the
+        // backstop that terminalizes orphaned runs (`orphaned_running_run`), and
+        // this sweep keys on that errorCode, so it must run after it — never
+        // before, and never in place of it. A failure here degrades: the stale
+        // runs stay terminalized, and the next boot retries the re-wake.
+        try {
+          const rewoken = await heartbeat.reconcileOrphanedRunIssues();
+          if (rewoken.rewoken > 0) {
+            logger.warn(
+              { ...rewoken },
+              "startup orphaned-run reconciliation restored interrupted issue execution paths",
+            );
+          }
+        } catch (err) {
+          logger.error(
+            { err },
+            "startup orphaned-run reconciliation failed; interrupted issues stay unwoken until the next boot",
+          );
+        }
       })().catch((err) => {
         logger.error({ err }, "startup heartbeat recovery failed");
         throw err;
