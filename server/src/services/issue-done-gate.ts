@@ -1,4 +1,4 @@
-import { and, desc, eq, isNotNull, isNull } from "drizzle-orm";
+import { and, desc, eq, inArray, isNotNull, isNull, ne } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
   executionWorkspaces,
@@ -99,6 +99,90 @@ import {
  * list. The unresolved-relative-route refusal path
  * (`unresolvedPaperclipPullRoutes`) is unchanged.
  *
+ * SPA-12043 (James's SPA-11961 HYBRID card-close rule) — WORK-PRODUCT
+ * ATTRIBUTION. Until now the gate bound a PR by the SHAPE of a reference: a
+ * `pull_request` work product on the card, or a GitHub PR URL /
+ * `owner/repo#N` shorthand in card prose. Ownership was not a concept the gate
+ * could see, so a follow-up or routing card that merely CITED another card's
+ * deliverable PR refused to close for as long as that PR was open — while the
+ * builder card, the one that owns the PR, was the only card the rule had
+ * anything to say about. The hybrid rule adds ownership, carried on
+ * `issue_work_products.metadata.doneGate` (work products only — prose is never
+ * a claim):
+ *
+ *   - `doneGate` ABSENT (or a jsonb `null`) → the work product is OWNED by
+ *     this card and ALWAYS binds. This is clause 1, and it is what preserves
+ *     SPA-8957 + SPA-9038 verbatim: an unmarked product is exactly the product
+ *     those two rulings were written about. Notably the gate must never
+ *     INFER `reference_only` from the shape of the world — a card that
+ *     authored nothing while some other card uniquely owns the PR still OWNS
+ *     its own unmarked product, and inference would hand every such card a
+ *     free skip of immutable rule 12.
+ *   - `{ binding: "completion_dependency" }` → clause 2: the card declares the
+ *     PR a dependency of its own completion, so it binds ALWAYS, even when
+ *     another card owns that same PR as a work product. Ownership elsewhere
+ *     does not outrank a declared dependency — the depender opted in.
+ *   - `{ binding: "reference_only", owningIssueIdentifier }` → clauses 3 + 4:
+ *     the card only REFERENCES the PR; the reference does not bind, and only
+ *     when the ENGINE independently proves all three:
+ *       (a) exactly ONE OTHER card owns that same PR as a `pull_request` work
+ *           product — zero owners and two-or-more owners are both unproven.
+ *           "Owns" means the row CLAIMS the PR: a row whose own marker is
+ *           `reference_only` is a disclaimer and does not count, so two
+ *           routing-only cards cannot certify each other in a circle and
+ *           close over an unmerged PR that nobody owns;
+ *       (b) that owner's `issues.identifier` equals `owningIssueIdentifier`
+ *           EXACTLY — case-sensitive string equality against the stored
+ *           identifier. A "helpful" case-insensitive normalisation here would
+ *           silently widen who may claim someone else's PR;
+ *       (c) the citing card is proven ROUTING-ONLY — zero `execution_workspaces`
+ *           rows with `sourceIssueId` = the citing card, zero `branch`/`commit`
+ *           work products, and zero `pull_request` work products that are not
+ *           `reference_only`: nothing it could have authored. (c) is a
+ *           WHOLE-CARD property, so a card that also owns an unmarked PR
+ *           product of its own fails (c) and then EVERY `reference_only`
+ *           claim on that card is unproven — including one that is correctly
+ *           marked beside it.
+ *   - any other shape — `{ binding: "owned" }`, `reference_only` with a
+ *     missing/blank/non-string `owningIssueIdentifier`, `{}`, or a non-object —
+ *     is UNREADABLE attribution and REFUSES (clause 4). So does any
+ *     `reference_only` claim whose proof fails (clause 5). Malformed input
+ *     never throws and never buys a bypass: it refuses, exactly as an unmerged
+ *     PR does, and it reuses the `open_pull_requests` refusal kind so the
+ *     board message stays truthful (the card cannot close while an unmerged PR
+ *     is attributed to it).
+ *
+ * WHY the proof is engine-derived rather than read off the marker: the marker
+ * is written by the very card that wants the bypass. If naming an owning
+ * identifier were sufficient — in metadata or in prose — SPA-11961 would be a
+ * self-service skip of immutable rule 12: attach a product, name someone else,
+ * close with an unmerged deliverable. So (a) counts other cards' real rows,
+ * (b) compares the owner's stored `issues.identifier`, and (c) counts what
+ * this card actually authored. Prose keeps its SPA-9981 classification
+ * untouched, because a sentence citing another card's PR is exactly the shape
+ * that must NOT earn reference-only status. Prose also cannot EARN it: the
+ * attribute is only ever read off a `pull_request` work product. One
+ * consequence worth stating, because it is load-bearing for SPA-9038: a prose
+ * citation of the same PR is deduped INTO the product entry, so the
+ * product-level decision governs in both directions — re-linking the PR in a
+ * closing comment neither resurrects a reference the product retired nor
+ * downgrades one the product binds.
+ *
+ * Uniqueness is enforced IN THE GATE on every evaluation, deliberately NOT by
+ * a DB unique index: `issue_work_products` has no normalized PR-key column to
+ * index (PR identity is extracted in JS from url/externalId/title/summary/
+ * metadata), and the fork's drizzle snapshot chain is already base-red —
+ * `9286` carries no snapshot — so a migration here would land on a broken
+ * chain. A gate-side count is also the stronger property: it is re-proved at
+ * every close, so a duplicate owner inserted after the fact cannot ride an
+ * older proof.
+ *
+ * Clause 6 — park such a routing card `blocked` on its owning card until the
+ * PR lands — is a GOVERNANCE statement and deliberately gets NO code here.
+ * The interim workaround (an agent triages the blocked pair on the board)
+ * must not be canonised into the engine: turning a temporary human habit into
+ * engine behaviour is precisely what the card ruled out.
+ *
  * The refused transition returns 409 with the offending PR list and the two
  * sanctioned escapes: wait for the merge sha on main, or an explicit
  * board override (see `doneOverride` on the PATCH route — agents may never
@@ -147,6 +231,28 @@ const COMMENT_SCAN_LIMIT = 200;
  * this stays an indexed lookup even with ~5.6k rows in production.
  */
 const EXECUTION_WORKSPACE_LOOKUP_LIMIT = 200;
+
+/**
+ * SPA-12043: `pull_request` work products read per evaluation (unchanged
+ * SPA-9981 bound). A saturated read is surfaced as `productScanTruncated` so
+ * the routing-only proof can fail closed on it: a truncated view of a card's
+ * products must never read as "this card owns none".
+ */
+const PULL_REQUEST_PRODUCT_SCAN_LIMIT = 100;
+
+/**
+ * SPA-12043: other cards' `pull_request` work products scanned for the
+ * ownership proof. There is no normalized PR-key column, so uniqueness is
+ * counted in JS over extracted references — and a saturated scan is treated as
+ * UNPROVEN (fail-closed), never as "only one owner".
+ */
+const OTHER_PULL_REQUEST_OWNER_SCAN_LIMIT = 5_000;
+
+/**
+ * SPA-12043 clause 3(c): work-product types that prove a card AUTHORED
+ * something, so it cannot be a routing-only citer.
+ */
+const AUTHORED_WORK_PRODUCT_TYPES: string[] = ["branch", "commit"];
 
 function isSparkMojoRepo(reference: GitHubPullRequestReference): boolean {
   return reference.owner.toLowerCase() === SPARK_MOJO_ORG;
@@ -206,6 +312,68 @@ export type IssueDoneGateServiceOptions = {
 
 function formatReference(reference: GitHubPullRequestReference) {
   return `${reference.owner}/${reference.repo}#${reference.number}`;
+}
+
+/**
+ * SPA-12043: the attribution a `pull_request` work product claims for itself,
+ * read from `metadata.doneGate`.
+ *
+ *   - `undefined` — no usable `doneGate` assertion: absent, a jsonb `null`
+ *     (which is not an assertion), or a `metadata` value that is not a plain
+ *     object at all. The product is OWNED by this card and binds. Clause 1;
+ *     this is the overwhelming majority of products and preserves SPA-8957 +
+ *     SPA-9038 unchanged.
+ *   - `{ kind: "completion_dependency" }` — clause 2; binds always.
+ *   - `{ kind: "reference_only", owningIssueIdentifier }` — clause 3; a CLAIM
+ *     that drops the reference out of the refusal only when the engine proves
+ *     it (see `proveReferenceOnlyClaims`).
+ *   - `{ kind: "unreadable" }` — present but not one of the two legal shapes.
+ *
+ * Malformed input is a VALUE here, never a throw: a gate that throws on a
+ * hand-rolled marker would 500 the close instead of refusing it, and a gate
+ * that guessed "owned" would be a bypass. Unreadable binds.
+ */
+export type DoneGateAttribution =
+  | undefined
+  | { kind: "completion_dependency" }
+  | { kind: "reference_only"; owningIssueIdentifier: string }
+  | { kind: "unreadable" };
+
+function readDoneGateAttribution(metadata: unknown): DoneGateAttribution {
+  if (typeof metadata !== "object" || metadata === null || Array.isArray(metadata)) return undefined;
+  const raw = (metadata as Record<string, unknown>).doneGate;
+  // Absent, and a jsonb `null`, are both "no assertion" — the product is
+  // owned. Only a PRESENT value can be attribution.
+  if (raw === undefined || raw === null) return undefined;
+  if (typeof raw !== "object" || Array.isArray(raw)) return { kind: "unreadable" };
+  const marker = raw as Record<string, unknown>;
+  if (marker.binding === "completion_dependency") return { kind: "completion_dependency" };
+  if (marker.binding === "reference_only") {
+    const owningIssueIdentifier = marker.owningIssueIdentifier;
+    if (typeof owningIssueIdentifier !== "string" || owningIssueIdentifier.trim().length === 0) {
+      return { kind: "unreadable" };
+    }
+    // The RAW string is what gets compared: trimming here would let a padded
+    // identifier pass a proof it has not earned.
+    return { kind: "reference_only", owningIssueIdentifier };
+  }
+  return { kind: "unreadable" };
+}
+
+/**
+ * The exact value array a `pull_request` work product is scanned for
+ * references in — shared by the card's own products (`listBoundPullRequests`)
+ * and by the ownership proof's other-card scan, so both sides of the
+ * uniqueness count extract identity through ONE code path.
+ */
+function workProductReferenceValues(row: {
+  url: string | null;
+  externalId: string | null;
+  title: string | null;
+  summary: string | null;
+  metadata: unknown;
+}): unknown[] {
+  return [row.url, row.externalId, row.title, row.summary, row.metadata ? JSON.stringify(row.metadata) : null];
 }
 
 /**
@@ -309,6 +477,13 @@ export function issueDoneGateService(db: Db, opts: IssueDoneGateServiceOptions =
    * (always binding). The returned `productReferences` array is the
    * authoritative source list; the prose array holds only refs that did
    * not collide with a product.
+   *
+   * SPA-12043: the same pass returns the per-key attribution each product
+   * claims (`attributionByKey`, keyed on the lowercased `owner/repo#N`),
+   * the per-ROW attributions (`productAttributions`, in row order — the
+   * routing-only proof reads these, not the deduped keys, so a `pull_request`
+   * row that extracts no reference still counts as an owned product), and
+   * `productScanTruncated` for the fail-closed case.
    */
   async function listBoundPullRequests(
     issue: { id: string; companyId: string; description?: string | null },
@@ -317,6 +492,34 @@ export function issueDoneGateService(db: Db, opts: IssueDoneGateServiceOptions =
     const unresolved = new Set<number>();
     const productReferences: GitHubPullRequestReference[] = [];
     const proseReferences: GitHubPullRequestReference[] = [];
+    const attributionByKey = new Map<string, DoneGateAttribution>();
+    const productAttributions: DoneGateAttribution[] = [];
+    /**
+     * Two products on the same card can cite the same PR with different
+     * markers. Fail closed: the key counts as `reference_only` only when
+     * EVERY row that cites it says so — one unmarked row beside a marked one
+     * re-asserts ownership. Two MARKED rows that name DIFFERENT owners are
+     * also refused: the first row's identifier is not silently kept, because
+     * picking one of two conflicting claims would let a card choose which
+     * owner to be judged against.
+     */
+    const recordAttribution = (key: string, attribution: DoneGateAttribution) => {
+      if (!attributionByKey.has(key)) {
+        attributionByKey.set(key, attribution);
+        return;
+      }
+      const existing = attributionByKey.get(key);
+      if (existing?.kind !== "reference_only" || attribution?.kind !== "reference_only") {
+        attributionByKey.set(key, undefined);
+        return;
+      }
+      // Both marked, but naming DIFFERENT owners. Keep neither: letting the
+      // first row decide which owner the card is judged against would let a
+      // card write a second, self-serving marker beside an honest one.
+      if (existing.owningIssueIdentifier !== attribution.owningIssueIdentifier) {
+        attributionByKey.set(key, undefined);
+      }
+    };
     const addProse = (body: string) => {
       addExtracted(extractGitHubPullRequestReferences([body]).filter(isSparkMojoRepo));
       for (const number of unresolvedPaperclipPullRoutes(body)) {
@@ -325,13 +528,14 @@ export function issueDoneGateService(db: Db, opts: IssueDoneGateServiceOptions =
         if (repos.size !== 1) unresolved.add(number);
       }
     };
-    const addReferences = (values: readonly unknown[]) => {
+    const addReferences = (values: readonly unknown[], attribution: DoneGateAttribution) => {
       for (const reference of extractGitHubPullRequestReferences(values)) {
         const key = formatReference(reference).toLowerCase();
         if (!references.has(key)) {
           references.set(key, reference);
           productReferences.push(reference);
         }
+        recordAttribution(key, attribution);
       }
     };
     const addExtracted = (extracted: readonly GitHubPullRequestReference[]) => {
@@ -359,17 +563,12 @@ export function issueDoneGateService(db: Db, opts: IssueDoneGateServiceOptions =
         eq(issueWorkProducts.type, "pull_request"),
       ))
       .orderBy(desc(issueWorkProducts.updatedAt))
-      .limit(100);
+      .limit(PULL_REQUEST_PRODUCT_SCAN_LIMIT);
 
     for (const product of products) {
-      const values = [
-        product.url,
-        product.externalId,
-        product.title,
-        product.summary,
-        product.metadata ? JSON.stringify(product.metadata) : null,
-      ];
-      addReferences(values);
+      const attribution = readDoneGateAttribution(product.metadata);
+      productAttributions.push(attribution);
+      addReferences(workProductReferenceValues(product), attribution);
     }
 
     // SPA-9038: prose bindings — description first, then recent live comments.
@@ -394,7 +593,207 @@ export function issueDoneGateService(db: Db, opts: IssueDoneGateServiceOptions =
       productReferences,
       proseReferences,
       unresolved: [...unresolved],
+      attributionByKey,
+      productAttributions,
+      productScanTruncated: products.length >= PULL_REQUEST_PRODUCT_SCAN_LIMIT,
     };
+  }
+
+  /**
+   * SPA-12043 clause 3(a): every OTHER card's `pull_request` work products in
+   * the company, mapped to the issue ids that cite each reference key. Same
+   * five columns and the same `extractGitHubPullRequestReferences` surface as
+   * `listBoundPullRequests` — one extraction code path, so "the same PR" means
+   * the same thing on both sides of the count.
+   *
+   * `truncated` is a fail-closed signal, not a size hint: a truncated scan
+   * cannot prove that an owner is the ONLY owner, so every claim it would
+   * support stays unproven.
+   *
+   * A row that DISCLAIMS (its own marker is `reference_only`) is not an owner.
+   * This is what stops two routing-only cards from certifying each other: if
+   * C marks PR X `reference_only` naming A, and A marks X `reference_only`
+   * naming C, then counting disclaiming rows as owners gives each card exactly
+   * one "owner" — the other — and both close with the PR unmerged and nothing
+   * in the board owning it. Ownership must be asserted by someone, so the
+   * count is over rows that actually CLAIM the PR: unmarked (clause 1),
+   * `completion_dependency` (clause 2), and `unreadable` (which binds, and so
+   * is the stricter reading — an ambiguous marker never manufactures an owner
+   * out of thin air, it just cannot be discounted either).
+   */
+  async function listOtherPullRequestOwners(issue: { id: string; companyId: string }) {
+    const rows = await db
+      .select({
+        issueId: issueWorkProducts.issueId,
+        url: issueWorkProducts.url,
+        externalId: issueWorkProducts.externalId,
+        title: issueWorkProducts.title,
+        summary: issueWorkProducts.summary,
+        metadata: issueWorkProducts.metadata,
+      })
+      .from(issueWorkProducts)
+      .where(and(
+        eq(issueWorkProducts.companyId, issue.companyId),
+        eq(issueWorkProducts.type, "pull_request"),
+        ne(issueWorkProducts.issueId, issue.id),
+      ))
+      .limit(OTHER_PULL_REQUEST_OWNER_SCAN_LIMIT);
+    const owners = new Map<string, Set<string>>();
+    for (const row of rows) {
+      // A disclaiming row is a reference, not an owner (see the doc block).
+      if (readDoneGateAttribution(row.metadata)?.kind === "reference_only") continue;
+      for (const reference of extractGitHubPullRequestReferences(workProductReferenceValues(row))) {
+        const key = formatReference(reference).toLowerCase();
+        const issueIds = owners.get(key) ?? new Set<string>();
+        issueIds.add(row.issueId);
+        owners.set(key, issueIds);
+      }
+    }
+    return { owners, truncated: rows.length >= OTHER_PULL_REQUEST_OWNER_SCAN_LIMIT };
+  }
+
+  /**
+   * SPA-12043 clause 3(c): the citing card is ROUTING-ONLY — it could not have
+   * authored the PR it references. Three signals, none of them prose: zero
+   * `execution_workspaces` rows sourced from this card, zero `branch`/`commit`
+   * work products, and zero `pull_request` products that are not
+   * `reference_only`.
+   *
+   * Read from the per-ROW attributions, not the deduped reference keys, and
+   * evaluated per CARD rather than per marked product: one unmarked PR product
+   * of its own fails the whole card, and then every `reference_only` claim on
+   * it is unproven — including a correctly marked one sitting beside it.
+   */
+  async function isRoutingOnlyCard(
+    issue: { id: string; companyId: string },
+    productAttributions: readonly DoneGateAttribution[],
+    productScanTruncated: boolean,
+  ): Promise<boolean> {
+    // A truncated view of this card's products must not read as "owns none".
+    if (productScanTruncated) return false;
+    for (const attribution of productAttributions) {
+      if (attribution?.kind !== "reference_only") return false;
+    }
+    const workspaces = await db
+      .select({ id: executionWorkspaces.id })
+      .from(executionWorkspaces)
+      .where(and(
+        eq(executionWorkspaces.companyId, issue.companyId),
+        eq(executionWorkspaces.sourceIssueId, issue.id),
+      ))
+      .limit(1);
+    if (workspaces.length > 0) return false;
+    // `execution_workspaces.sourceIssueId` is nullable and `onDelete: "set
+    // null"`, so a workspace whose source card was removed leaves no
+    // `sourceIssueId` trail — but a product row carrying a non-null
+    // `executionWorkspaceId` is direct evidence that a real workspace produced
+    // it. Treat that as authorship: it can only make (c) fail closed.
+    const workspaceProduced = await db
+      .select({ id: issueWorkProducts.id })
+      .from(issueWorkProducts)
+      .where(and(
+        eq(issueWorkProducts.companyId, issue.companyId),
+        eq(issueWorkProducts.issueId, issue.id),
+        isNotNull(issueWorkProducts.executionWorkspaceId),
+      ))
+      .limit(1);
+    if (workspaceProduced.length > 0) return false;
+    const authored = await db
+      .select({ id: issueWorkProducts.id })
+      .from(issueWorkProducts)
+      .where(and(
+        eq(issueWorkProducts.companyId, issue.companyId),
+        eq(issueWorkProducts.issueId, issue.id),
+        inArray(issueWorkProducts.type, AUTHORED_WORK_PRODUCT_TYPES),
+      ))
+      .limit(1);
+    return authored.length === 0;
+  }
+
+  /**
+   * SPA-12043 clause 3(b): the candidate owners' STORED identifiers. Company
+   * scoped even though the ids came from a company-scoped scan — a predicate
+   * the proof does not need is free defence against a scan that ever widens.
+   * A row that cannot be read back (deleted, moved) simply yields no entry,
+   * which fails the exact compare and refuses.
+   */
+  async function loadIssueIdentifiers(
+    companyId: string,
+    issueIds: readonly string[],
+  ): Promise<Map<string, string>> {
+    const identifiers = new Map<string, string>();
+    if (issueIds.length === 0) return identifiers;
+    const rows = await db
+      .select({ id: issues.id, identifier: issues.identifier })
+      .from(issues)
+      .where(and(
+        eq(issues.companyId, companyId),
+        inArray(issues.id, [...issueIds]),
+      ))
+      .limit(issueIds.length);
+    for (const row of rows) {
+      if (typeof row.identifier === "string") identifiers.set(row.id, row.identifier);
+    }
+    return identifiers;
+  }
+
+  /**
+   * SPA-12043 clause 3: prove every `reference_only` claim on this card, once
+   * per evaluation and only when a claim exists (most evaluations carry no
+   * `doneGate` metadata at all and must not pay for these reads).
+   *
+   * THE PROOF IS THE ENGINE'S, NOT THE MARKER'S. A `doneGate` marker is
+   * written by the very card that wants the bypass, so trusting
+   * `owningIssueIdentifier` because the marker says so would make SPA-11961 a
+   * self-service skip of immutable rule 12: attach a product, name someone
+   * else, close with an unmerged deliverable. What is honoured here is a
+   * derivation the citing card cannot fake — other cards' real rows, the
+   * owner's stored `issues.identifier`, and what this card actually authored.
+   *
+   * Fail-closed by construction: the verdict map starts all-false and no path
+   * that cannot PROVE a claim ever sets it true, so an unreadable marker, a
+   * zero-owner scan, duplicate owners, a truncated scan, a missing identifier
+   * row and an exact-compare mismatch all land identically — the reference
+   * binds and the card refuses.
+   */
+  async function proveReferenceOnlyClaims(input: {
+    issue: { id: string; companyId: string };
+    claims: ReadonlyMap<string, string>;
+    productAttributions: readonly DoneGateAttribution[];
+    productScanTruncated: boolean;
+  }): Promise<Map<string, boolean>> {
+    const verdicts = new Map<string, boolean>();
+    for (const key of input.claims.keys()) verdicts.set(key, false);
+    if (verdicts.size === 0) return verdicts;
+
+    // (c) whole-card, cheapest, and it decides every claim at once.
+    const routingOnly = await isRoutingOnlyCard(
+      input.issue,
+      input.productAttributions,
+      input.productScanTruncated,
+    );
+    if (!routingOnly) return verdicts;
+
+    // (a) uniqueness, counted over other cards' real rows.
+    const { owners, truncated } = await listOtherPullRequestOwners(input.issue);
+    if (truncated) return verdicts;
+    const candidateOwnerIds = new Set<string>();
+    for (const key of input.claims.keys()) {
+      for (const ownerIssueId of owners.get(key) ?? []) candidateOwnerIds.add(ownerIssueId);
+    }
+
+    // (b) exact identifier equality against the owner's STORED identifier.
+    const identifiers = await loadIssueIdentifiers(input.issue.companyId, [...candidateOwnerIds]);
+    for (const [key, owningIssueIdentifier] of input.claims) {
+      const ownerIssueIds = owners.get(key);
+      // Zero owners and two-or-more owners are both unproven: ambiguity is not
+      // a licence, it is the absence of one.
+      if (!ownerIssueIds || ownerIssueIds.size !== 1) continue;
+      const ownerIssueId = [...ownerIssueIds][0]!;
+      // Case-sensitive by design — see the module header.
+      verdicts.set(key, identifiers.get(ownerIssueId) === owningIssueIdentifier);
+    }
+    return verdicts;
   }
 
   /**
@@ -471,7 +870,8 @@ export function issueDoneGateService(db: Db, opts: IssueDoneGateServiceOptions =
   async function evaluateDoneGate(
     issue: { id: string; companyId: string; description?: string | null; identifier?: string | null },
   ): Promise<DoneGateDecision> {
-    const { productReferences, proseReferences, unresolved } = await listBoundPullRequests(issue);
+    const bound = await listBoundPullRequests(issue);
+    const { productReferences, proseReferences, unresolved, attributionByKey } = bound;
     if (unresolved.length > 0) {
       return { outcome: "refuse", reason: { kind: "unresolved_pull_request_reference", numbers: unresolved } };
     }
@@ -514,7 +914,10 @@ export function issueDoneGateService(db: Db, opts: IssueDoneGateServiceOptions =
     for (const entry of resolved.values()) {
       if (entry.source !== "prose") {
         // Product refs are always deliverable; merged product → supersedes
-        // same-repo card-lane prose refs.
+        // same-repo card-lane prose refs. SPA-12043 leaves this untouched on
+        // purpose: it is a same-repo mutation rule over refs this card BOUND,
+        // and narrowing it would change SPA-9981 behaviour for unmarked
+        // products, which clause 1 freezes.
         if (entry.state === "merged") {
           deliverableMergedRepos.add(`${entry.reference.owner.toLowerCase()}/${entry.reference.repo.toLowerCase()}`);
         }
@@ -542,10 +945,37 @@ export function issueDoneGateService(db: Db, opts: IssueDoneGateServiceOptions =
     // workspace-deliverable and fail-closed prose refs are NEVER muted —
     // the current deliverable binds until it merges, and an unclassifiable
     // reference has nothing to supersede it with.
+    //
+    // SPA-12043: collect this card's `reference_only` claims. Evaluated lazily
+    // below (only if a product branch actually reaches one) because the
+    // overwhelming majority of evaluations carry no `doneGate` metadata at all
+    // and must not pay for the proof's extra reads.
+    const referenceOnlyClaims = new Map<string, string>();
+    for (const [key, attribution] of attributionByKey) {
+      if (attribution?.kind === "reference_only") referenceOnlyClaims.set(key, attribution.owningIssueIdentifier);
+    }
+    let referenceOnlyVerdicts: Map<string, boolean> | null = null;
+
     const refusal: DoneGatePullRequestState[] = [];
-    for (const entry of resolved.values()) {
+    for (const [entryKey, entry] of resolved) {
       if (entry.state === "merged" || entry.state === "closed") continue;
       if (entry.source === "product") {
+        // SPA-12043 — the hybrid rule's one decision point. Absent marker =
+        // OWNED and binds (clause 1: SPA-8957 + SPA-9038 verbatim);
+        // `completion_dependency` binds even when another card owns the PR
+        // (clause 2); a `reference_only` claim leaves the refusal ONLY where
+        // the engine proved it (clauses 3 + 4). Every other shape — unreadable
+        // attribution (clause 4) and any unproven claim (clause 5) — falls
+        // through to `refusal.push`, because the marker is never self-service.
+        if (attributionByKey.get(entryKey)?.kind === "reference_only") {
+          referenceOnlyVerdicts ??= await proveReferenceOnlyClaims({
+            issue,
+            claims: referenceOnlyClaims,
+            productAttributions: bound.productAttributions,
+            productScanTruncated: bound.productScanTruncated,
+          });
+          if (referenceOnlyVerdicts.get(entryKey) === true) continue;
+        }
         refusal.push({ reference: entry.reference, state: entry.state });
         continue;
       }
@@ -578,7 +1008,17 @@ export function issueDoneGateService(db: Db, opts: IssueDoneGateServiceOptions =
     };
   }
 
-  /** 409 payload shape — the refusal the card pastes back on the board. */
+  /**
+   * 409 payload shape — the refusal the card pastes back on the board.
+   *
+   * SPA-12043 deliberately adds NO reason kind: an unreadable `doneGate` marker
+   * and an unproven `reference_only` claim both land here as
+   * `open_pull_requests`, which is the truth they need to tell — an unmerged PR
+   * is attributed to this card, so this card cannot close. Do not add a
+   * dedicated ambiguity kind for it: the branch below is a non-exhaustive read
+   * of `reason.pullRequests`, and a new kind without a new branch here would
+   * ship a broken payload.
+   */
   function refusalError(reason: DoneGateBlockedReason) {
     if (reason.kind === "unresolved_pull_request_reference") {
       return conflict(
