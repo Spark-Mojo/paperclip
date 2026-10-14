@@ -402,6 +402,49 @@ d("SPA-11947 heartbeat run-list projection columns migration", () => {
       total_cost_usd: { amount: 3, currency: "USD" },
     });
     await expectLedgerSummaryParity(sql, typedRun);
+
+    // Nested JSON nulls are preserved verbatim by the stored column
+    // (jsonb_set writes the selected value unchanged), while the pre-9286
+    // per-row expression stripped them recursively via jsonb_strip_nulls.
+    // The same-row parity oracle is deliberately NOT called for this row —
+    // it would fail by design — so the assertions below document the KNOWN
+    // difference rather than claiming equivalence: nested `detail: null`
+    // survives in `stored` but is gone from `from_old_expression`.
+    // Top-level scalar/array/object behaviour is unchanged, so only the
+    // nested-null keys differ. (Array-element nulls are kept by BOTH sides —
+    // jsonb_strip_nulls strips null-valued OBJECT keys recursively but never
+    // array elements — so no array case is pinned here.)
+    const nestedNullRun = await seedRun(sql, {
+      stopReason: "timeout",
+      timeoutSource: { kind: "budget", detail: null, retryable: true },
+      costUsd: { amount: 3, note: null },
+    });
+    const storedNested = await readLedgerSummary(sql, nestedNullRun);
+    expect(storedNested).toEqual({
+      stopReason: "timeout",
+      timeoutSource: { kind: "budget", detail: null, retryable: true },
+      costUsd: { amount: 3, note: null },
+      cost_usd: { amount: 3, note: null },
+      total_cost_usd: { amount: 3, note: null },
+    });
+    const [nestedRow] = await sql.unsafe<
+      Array<{ stored: unknown; from_old_expression: unknown }>
+    >(
+      `SELECT result_ledger_summary AS stored,
+              ${OLD_LEDGER_SUMMARY_EXPRESSION} AS from_old_expression
+       FROM heartbeat_runs WHERE id = $1`,
+      [nestedNullRun],
+    );
+    expect(nestedRow?.from_old_expression).toEqual({
+      stopReason: "timeout",
+      timeoutSource: { kind: "budget", retryable: true },
+      costUsd: { amount: 3 },
+      cost_usd: { amount: 3 },
+      total_cost_usd: { amount: 3 },
+    });
+    expect(nestedRow?.stored ?? null).not.toEqual(
+      nestedRow?.from_old_expression ?? null,
+    );
   }, 240_000);
 
   it("keeps each projected key exactly once", async () => {
