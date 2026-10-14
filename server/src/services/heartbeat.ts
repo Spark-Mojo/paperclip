@@ -3700,66 +3700,32 @@ const heartbeatRunSummaryListColumns = {
 } as const;
 
 const heartbeatRunListContextColumns = {
-  contextIssueId: sql<
-    string | null
-  >`${heartbeatRuns.contextSnapshot} ->> 'issueId'`.as("contextIssueId"),
-  contextTaskId: sql<
-    string | null
-  >`${heartbeatRuns.contextSnapshot} ->> 'taskId'`.as("contextTaskId"),
-  contextTaskKey: sql<
-    string | null
-  >`${heartbeatRuns.contextSnapshot} ->> 'taskKey'`.as("contextTaskKey"),
-  contextCommentId: sql<
-    string | null
-  >`${heartbeatRuns.contextSnapshot} ->> 'commentId'`.as("contextCommentId"),
-  contextWakeCommentId: sql<
-    string | null
-  >`${heartbeatRuns.contextSnapshot} ->> 'wakeCommentId'`.as(
-    "contextWakeCommentId",
-  ),
-  contextWakeReason: sql<
-    string | null
-  >`${heartbeatRuns.contextSnapshot} ->> 'wakeReason'`.as("contextWakeReason"),
-  contextWakeSource: sql<
-    string | null
-  >`${heartbeatRuns.contextSnapshot} ->> 'wakeSource'`.as("contextWakeSource"),
-  contextWakeTriggerDetail: sql<
-    string | null
-  >`${heartbeatRuns.contextSnapshot} ->> 'wakeTriggerDetail'`.as(
-    "contextWakeTriggerDetail",
-  ),
+  contextIssueId: heartbeatRuns.contextIssueId,
+  contextTaskId: heartbeatRuns.contextTaskId,
+  contextTaskKey: heartbeatRuns.contextTaskKey,
+  contextCommentId: heartbeatRuns.contextCommentId,
+  contextWakeCommentId: heartbeatRuns.contextWakeCommentId,
+  contextWakeReason: heartbeatRuns.contextWakeReason,
+  contextWakeSource: heartbeatRuns.contextWakeSource,
+  contextWakeTriggerDetail: heartbeatRuns.contextWakeTriggerDetail,
 } as const;
 
 const heartbeatRunListResultColumns = {
-  resultSummary: sql<
-    string | null
-  >`left(${heartbeatRuns.resultJson} ->> 'summary', ${HEARTBEAT_RUN_RESULT_SUMMARY_MAX_CHARS})`.as(
+  resultSummary: sql<string | null>`left(${heartbeatRuns.resultListSummary}, ${HEARTBEAT_RUN_RESULT_SUMMARY_MAX_CHARS})`.as(
     "resultSummary",
   ),
-  resultResult: sql<
-    string | null
-  >`left(${heartbeatRuns.resultJson} ->> 'result', ${HEARTBEAT_RUN_RESULT_SUMMARY_MAX_CHARS})`.as(
+  resultResult: sql<string | null>`left(${heartbeatRuns.resultListResult}, ${HEARTBEAT_RUN_RESULT_SUMMARY_MAX_CHARS})`.as(
     "resultResult",
   ),
-  resultMessage: sql<
-    string | null
-  >`left(${heartbeatRuns.resultJson} ->> 'message', ${HEARTBEAT_RUN_RESULT_SUMMARY_MAX_CHARS})`.as(
+  resultMessage: sql<string | null>`left(${heartbeatRuns.resultListMessage}, ${HEARTBEAT_RUN_RESULT_SUMMARY_MAX_CHARS})`.as(
     "resultMessage",
   ),
-  resultError: sql<
-    string | null
-  >`left(${heartbeatRuns.resultJson} ->> 'error', ${HEARTBEAT_RUN_RESULT_SUMMARY_MAX_CHARS})`.as(
+  resultError: sql<string | null>`left(${heartbeatRuns.resultListError}, ${HEARTBEAT_RUN_RESULT_SUMMARY_MAX_CHARS})`.as(
     "resultError",
   ),
-  resultTotalCostUsd: sql<
-    string | null
-  >`${heartbeatRuns.resultJson} ->> 'total_cost_usd'`.as("resultTotalCostUsd"),
-  resultCostUsd: sql<
-    string | null
-  >`${heartbeatRuns.resultJson} ->> 'cost_usd'`.as("resultCostUsd"),
-  resultCostUsdCamel: sql<
-    string | null
-  >`${heartbeatRuns.resultJson} ->> 'costUsd'`.as("resultCostUsdCamel"),
+  resultTotalCostUsd: heartbeatRuns.resultListTotalCostUsd,
+  resultCostUsd: heartbeatRuns.resultListCostUsd,
+  resultCostUsdCamel: heartbeatRuns.resultListCostUsdCamel,
 } as const;
 
 const heartbeatRunSafeResultJsonColumn = sql<Record<string, unknown> | null>`
@@ -3808,14 +3774,50 @@ const heartbeatRunSafeResultJsonColumn = sql<Record<string, unknown> | null>`
   end
 `.as("resultJson");
 
+const {
+  contextTaskKey: _contextTaskKey,
+  contextCommentId: _contextCommentId,
+  contextWakeCommentId: _contextWakeCommentId,
+  contextWakeCommentIds: _contextWakeCommentIds,
+  contextWakeReason: _contextWakeReason,
+  contextWakeSource: _contextWakeSource,
+  contextWakeTriggerDetail: _contextWakeTriggerDetail,
+  resultListSummary: _resultListSummary,
+  resultListResult: _resultListResult,
+  resultListMessage: _resultListMessage,
+  resultListError: _resultListError,
+  resultListTotalCostUsd: _resultListTotalCostUsd,
+  resultListCostUsd: _resultListCostUsd,
+  resultListCostUsdCamel: _resultListCostUsdCamel,
+  resultLedgerSummary: _resultLedgerSummary,
+  ...heartbeatRunPublicColumns
+} = getTableColumns(heartbeatRuns);
+void [
+  _contextTaskKey,
+  _contextCommentId,
+  _contextWakeCommentId,
+  _contextWakeCommentIds,
+  _contextWakeReason,
+  _contextWakeSource,
+  _contextWakeTriggerDetail,
+  _resultListSummary,
+  _resultListResult,
+  _resultListMessage,
+  _resultListError,
+  _resultListTotalCostUsd,
+  _resultListCostUsd,
+  _resultListCostUsdCamel,
+  _resultLedgerSummary,
+];
+
 const heartbeatRunSafeColumns = {
-  ...getTableColumns(heartbeatRuns),
+  ...heartbeatRunPublicColumns,
   processGroupId: heartbeatRunProcessGroupIdColumn,
   resultJson: heartbeatRunSafeResultJsonColumn,
 } as const;
 
 const heartbeatRunSqlAsciiSafeColumns = {
-  ...getTableColumns(heartbeatRuns),
+  ...heartbeatRunPublicColumns,
   processGroupId: heartbeatRunProcessGroupIdColumn,
   error: sql<string | null>`NULL`.as("error"),
   resultJson: sql<Record<string, unknown> | null>`NULL`.as("resultJson"),
@@ -11300,7 +11302,7 @@ export function heartbeatService(
     return db
       .select(
         opts?.unsafeFullResultJson
-          ? getTableColumns(heartbeatRuns)
+          ? heartbeatRunPublicColumns
           : safeForLegacyEncoding
             ? heartbeatRunSqlAsciiSafeColumns
             : heartbeatRunSafeColumns,
