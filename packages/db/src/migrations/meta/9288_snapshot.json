@@ -1852,6 +1852,28 @@
           "method": "btree",
           "with": {}
         },
+        "agent_wakeup_requests_orphaned_run_rewake_idempotency_uq": {
+          "name": "agent_wakeup_requests_orphaned_run_rewake_idempotency_uq",
+          "columns": [
+            {
+              "expression": "company_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "idempotency_key",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": true,
+          "where": "\"agent_wakeup_requests\".\"idempotency_key\" LIKE 'issue_orphaned_run_rewake:%' AND \"agent_wakeup_requests\".\"status\" <> 'skipped'",
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        },
         "agent_wakeup_requests_disposition_repair_idempotency_uq": {
           "name": "agent_wakeup_requests_disposition_repair_idempotency_uq",
           "columns": [
@@ -25069,6 +25091,34 @@
         }
       },
       "indexes": {
+        "issue_comments_agent_client_request_uq": {
+          "name": "issue_comments_agent_client_request_uq",
+          "columns": [
+            {
+              "expression": "issue_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "author_agent_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "client_request_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": true,
+          "where": "\"issue_comments\".\"client_request_id\" is not null and \"issue_comments\".\"author_agent_id\" is not null",
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        },
         "issue_comments_issue_idx": {
           "name": "issue_comments_issue_idx",
           "columns": [
@@ -48066,6 +48116,6 @@
     "tables": {},
     "columns": {}
   },
-  "id": "61a362c7-4267-4804-bb94-7a41e8c07545",
-  "prevId": "36e742cd-c6a1-4b0e-91cb-5237a24817dd"
+  "id": "af8fb3ac-10d4-4b35-9f12-f949d8c0696d",
+  "prevId": "a71763d2-4104-4c4f-a0d5-ec28b74f68e9"
 }

@@ -13,12 +13,12 @@ const cleanups: Array<() => Promise<void>> = [];
 const support = await getEmbeddedPostgresTestSupport();
 const d = support.supported ? describe : describe.skip;
 
-const MIGRATION_FILE = "9286_heartbeat_run_list_projection_columns.sql";
-const JOURNAL_TAG = "9286_heartbeat_run_list_projection_columns";
+const MIGRATION_FILE = "9288_heartbeat_run_list_projection_columns.sql";
+const JOURNAL_TAG = "9288_heartbeat_run_list_projection_columns";
 const MIGRATIONS_DIR = fileURLToPath(new URL("./migrations", import.meta.url));
 const JOURNAL_PATH = fileURLToPath(new URL("./migrations/meta/_journal.json", import.meta.url));
-const SNAPSHOT_PATH = fileURLToPath(new URL("./migrations/meta/9286_snapshot.json", import.meta.url));
-const PREVIOUS_SNAPSHOT_PATH = fileURLToPath(new URL("./migrations/meta/9285_snapshot.json", import.meta.url));
+const SNAPSHOT_PATH = fileURLToPath(new URL("./migrations/meta/9288_snapshot.json", import.meta.url));
+const PREVIOUS_SNAPSHOT_PATH = fileURLToPath(new URL("./migrations/meta/9286_snapshot.json", import.meta.url));
 const SCHEMA_PATH = fileURLToPath(new URL("./schema/heartbeat_runs.ts", import.meta.url));
 const MIGRATION_PATH = fileURLToPath(new URL(`./migrations/${MIGRATION_FILE}`, import.meta.url));
 
@@ -498,15 +498,31 @@ d("SPA-11947 heartbeat run-list projection columns migration", () => {
     await expectLedgerSummaryParity(sql, runId);
   }, 240_000);
 
-  it("registers one 9286 migration and chains its snapshot to 9285", async () => {
+  it("registers one 9288 migration and chains its snapshot to the base 9286 snapshot", async () => {
     const journal = JSON.parse(await readFile(JOURNAL_PATH, "utf8")) as {
       entries: Array<{ idx: number; tag: string; when: number }>;
     };
     const matches = journal.entries.filter((entry) => entry.tag === JOURNAL_TAG);
     expect(matches).toHaveLength(1);
-    expect(matches[0]).toMatchObject({ idx: 9286, tag: JOURNAL_TAG });
+    expect(matches[0]).toMatchObject({ idx: 9288, tag: JOURNAL_TAG });
     expect(journal.entries.at(-1)).toEqual(matches[0]);
     expect(await readdir(MIGRATIONS_DIR)).toContain(MIGRATION_FILE);
+
+    // This migration was renumbered 9286 -> 9288 because the base branch landed
+    // 9286 and 9287 out from under the original index. A merge that resolves the
+    // journal conflict by taking one side wholesale silently DELETES the other
+    // side's entries: the .sql files stay on disk, so every assertion above
+    // still passes while those migrations never run. Pin the neighbours this
+    // renumber had to preserve, and pin the ordering the chain depends on.
+    for (const idx of [9286, 9287]) {
+      expect(
+        journal.entries.some((entry) => entry.idx === idx),
+        `journal entry ${idx} was dropped — the base branch's migration would never run`,
+      ).toBe(true);
+    }
+    const indices = journal.entries.map((entry) => entry.idx);
+    expect(indices).toEqual([...indices].sort((a, b) => a - b));
+    expect(new Set(indices).size).toBe(indices.length);
 
     const previous = JSON.parse(await readFile(PREVIOUS_SNAPSHOT_PATH, "utf8")) as { id: string };
     const snapshot = JSON.parse(await readFile(SNAPSHOT_PATH, "utf8")) as {
@@ -584,7 +600,7 @@ d("SPA-11947 heartbeat run-list projection columns migration", () => {
   }, 240_000);
 
   it(
-    "keeps the 9286 snapshot byte-identical to what drizzle-kit would emit",
+    "keeps the 9288 snapshot byte-identical to what drizzle-kit would emit",
     async () => {
       const snapshot = JSON.parse(await readFile(SNAPSHOT_PATH, "utf8")) as {
         id: string;
@@ -619,7 +635,7 @@ d("SPA-11947 heartbeat run-list projection columns migration", () => {
       for (const name of allColumnNames) {
         const committed = committedColumns[name];
         const rebuilt = rebuiltColumns[name];
-        expect(committed, `${name} missing from the committed 9286 snapshot`).toBeDefined();
+        expect(committed, `${name} missing from the committed 9288 snapshot`).toBeDefined();
         expect(rebuilt, `${name} missing from generateDrizzleJson output`).toBeDefined();
         expect(committed).toEqual(rebuilt);
         // Spelled out separately so a failure says WHICH half of the entry is
