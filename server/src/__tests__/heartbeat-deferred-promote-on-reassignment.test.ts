@@ -539,7 +539,7 @@ describeEmbeddedPostgres("SPA-9351 shape 3: reassignment mid-run starts the new 
 
     await request(app)
       .patch(`/api/issues/${issueId}`)
-      .send({ assigneeAgentId: newAgentId })
+      .send({ assigneeAgentId: newAgentId, expectedAssigneeAgentId: oldAgentId })
       .expect(200);
 
     // The route dispatches the assignee wake from a detached async block, so a
@@ -625,7 +625,7 @@ describeEmbeddedPostgres("SPA-9351 shape 3: reassignment mid-run starts the new 
     // and queues the new assignee's wake, and the holder is already terminal by
     // the time that wake's admission reads the issue. No run-end event can
     // promote the row afterwards, so the run must still start.
-    const { app, newAgentId, issueId, oldRunId } = await seedMidRunReassignment();
+    const { app, oldAgentId, newAgentId, issueId, oldRunId } = await seedMidRunReassignment();
 
     // Make the holder terminal before the reassignment runs, while the issue
     // still names it as the execution owner. The stale lock is what the
@@ -637,7 +637,7 @@ describeEmbeddedPostgres("SPA-9351 shape 3: reassignment mid-run starts the new 
 
     await request(app)
       .patch(`/api/issues/${issueId}`)
-      .send({ assigneeAgentId: newAgentId })
+      .send({ assigneeAgentId: newAgentId, expectedAssigneeAgentId: oldAgentId })
       .expect(200);
 
     const cardRunsFor = async () => {

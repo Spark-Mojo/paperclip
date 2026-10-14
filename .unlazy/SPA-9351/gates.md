@@ -820,3 +820,90 @@ Receipts (foreground, side worktree ty/spa9351-migrate-fix):
   1 rewake index before, 3 after real install).
 - deferred-wake-backstop.test.ts + terminal-environment-leases.test.ts: 63/63 (5 lease + 58 backstop).
 - migration-order gate vs live base on staged tree: PENDING commit (script reads commits, not worktree).
+
+## 2026-10-14 gates on the 9288 remainder branch (ty/spa9351-remainder-9288)
+
+Base: 3328a7e6af2828fd7ab170fa5fde1a533e9a6ddd (refs/remotes/sparkmojo/rebuild/v2026.916.0-survivors).
+
+DELIVERABLE: remainder-9288 | craft: engine-transplant | paths: 19 deliverable paths vs base
+
+GATE: migration-order | deliverable: remainder-9288
+  CHECK: node .github/scripts/check-pr-migration-order.mjs 3328a7e6af2828fd7ab170fa5fde1a533e9a6ddd $(git rev-parse HEAD)
+  EXPECT: exit 0
+  OBSERVED: exit 0 -- "All new migrations follow packages/db/src/migrations/9287_orphaned_run_rewake_idempotency.sql."
+  NEGATIVE: same command with head 08b21db8b28cde95ff18a2844a8ae35b4d2e05ad
+  NEGATIVE EXPECT: exit 1, "::error title=Migration numbers must follow the target branch ... renumber ... starting at 9288"
+  NEGATIVE OBSERVED: exit 1 with exactly that message (the superseded 9284 restamp).
+
+GATE: snapshot-lineage | deliverable: remainder-9288
+  CHECK: python3 snapshot comparator asserting 9288.prevId == base tail id and the complete delta is the two intended partial unique indexes
+  EXPECT: exit 0
+  OBSERVED: exit 0. base tail 9285_snapshot.json id 36e742cd-c6a1-4b0e-91cb-5237a24817dd == 9288 prevId (CHAIN_OK). Base ships NO 9286/9287 snapshot files (its tail snapshot is 9285); the graft is on the real tail, not the stale 9283-9284 lineage. Complete delta vs the whole base tail object: only tables.public.agent_wakeup_requests.indexes changes; indexes added exactly {agent_wakeup_requests_exhausted_retry_rewake_idempotency_uq, agent_wakeup_requests_orphaned_retry_rewake_idempotency_uq}; added [] removed []; changed []; tables added/removed [] and changed only that one table. Base carries no orphaned_* index, so the PR's orphaned_retry_rewake partial index does not collide with base's 9287 orphaned_run_rewake key namespace.
+  NEGATIVE: comparator with one asserted index removed from the expected set
+  NEGATIVE EXPECT: exit 1
+  NEGATIVE OBSERVED: exit 1 ("unexpected index delta").
+
+GATE: journal | deliverable: remainder-9288
+  CHECK: journal entries >= base entries, tail idx 9288, zero duplicate idx, last tag 9288_stranded_rewake_idempotency
+  EXPECT: exit 0
+  OBSERVED: exit 0. base 287 entries max 9287 dups 0; head 288 entries max 9288 dups 0, tag 9288_stranded_rewake_idempotency.
+
+GATE: unrelated-ledger-preservation | deliverable: remainder-9288
+  CHECK: git diff --name-status 3328a7e6af HEAD -- .unlazy
+  EXPECT: only ".unlazy/SPA-9351/gates.md" added; zero D entries
+  OBSERVED: exit 0. The transplant had deleted 9 unrelated ledgers (4cc2a10b, SPA-10069, SPA-10721, SPA-10859, SPA-11264, SPA-11798, SPA-7407, SPA-9434, SPA-9437); each was restored byte-for-byte from base in commits b682d51d6. A stray empty `.unlazt` file created during that restore was removed in the next commit; it is absent from the final diff.
+
+GATE: tsc-server | deliverable: remainder-9288
+  CHECK: pnpm -C server exec tsc --noEmit
+  EXPECT: exit 0
+  OBSERVED: exit 0. Preparation: pnpm install --frozen-lockfile exit 0; @paperclipai/plugin-sdk ensure-build-deps exit 0; @paperclipai/paperclip-runner build:typescript exit 0. Without that preparation the same command reports TS2307/TS7016 from src/vendor/paperclip-runner/*, which are unbuilt declarations, not defects in this diff.
+  NEGATIVE A: inject `const __spa9351_r2_negative: number = "not-a-number";` into server/src/services/deferred-wake-backstop.ts
+  NEGATIVE A EXPECT: exit 1 (TS2322)
+  NEGATIVE B: move the paperclip-runner declaration aside
+  NEGATIVE B EXPECT: exit 1 (TS7016)
+  Both negatives reproduce the earlier unbuilt-declaration error set, proving the preparation step is what clears it and the check is not vacuously green.
+
+GATE: tsc-db | deliverable: remainder-9288
+  CHECK: pnpm -C packages/db exec tsc --noEmit
+  EXPECT: exit 0
+  OBSERVED: exit 0
+
+GATE: R-shapes-1-4 | deliverable: remainder-9288
+  CHECK: pnpm -C server exec vitest run src/services/recovery/exhausted-retry-rewake.test.ts src/services/deferred-wake-backstop.test.ts --disable-console-intercept --reporter=dot
+  EXPECT: exit 0
+  OBSERVED: exit 0. Test Files 2 passed (2), Tests 141 passed (141), 190.32s. STRANDED-RECOVERY-GATES markers emitted: shape2-promote, shape2-guards, shape3-immediate, shape2-scheduled. Backstop warnings report checked:1 promoted:1 (a real promotion, not a no-op sweep).
+
+GATE: M-migration | deliverable: remainder-9288
+  CHECK: pnpm -C packages/db exec vitest run src/stranded-rewake-idempotency-migration.test.ts --disable-console-intercept --reporter=dot
+  EXPECT: exit 0
+  OBSERVED: exit 0. Test Files 1 passed (1), Tests 7 passed (7).
+
+GATE: H-shape3-reassignment | deliverable: remainder-9288
+  CHECK: pnpm -C server exec vitest run src/__tests__/heartbeat-deferred-promote-on-reassignment.test.ts --disable-console-intercept --reporter=dot
+  EXPECT: exit 0
+  OBSERVED: exit 0. Test Files 1 passed (1), Tests 4 passed (4), 56.63s.
+  DEFECT FOUND AND FIXED THIS RUN: both new SPA-9351 shape-3 cases returned 409. Cause: the route enforces the SPA-10357 ownership-transfer CAS -- "board actor did not supply expected value for expectedAssigneeAgentId". The two new cases sent only `assigneeAgentId`. Fixed by sending `expectedAssigneeAgentId: oldAgentId` (and destructuring `oldAgentId` in the second case). This was a test defect, not a production defect; no production code changed for it.
+
+GATE: H-wake-queue | deliverable: remainder-9288
+  CHECK: pnpm -C server exec vitest run src/modules/wake-queue/application/use-cases.test.ts --disable-console-intercept --reporter=dot
+  EXPECT: exit 0
+  OBSERVED: exit 0. Test Files 1 passed (1), Tests 66 passed (66).
+
+GATE: BASE-RED (not a blocker) | deliverable: remainder-9288
+  CHECK: pnpm -C server exec vitest run src/__tests__/server-startup-feedback-export.test.ts -t "retired review detector"
+  EXPECT: exit 0
+  OBSERVED: exit 1 on this head AND exit 1 on the pristine base worktree at 3328a7e6af2828fd7ab170fa5fde1a533e9a6ddd (disposable worktree /srv/bulk/worktrees/spa9351-base-check, deps installed the same way). Same single failure both sides: "expected vi.fn() to be called 2 times, but got 1 times" at server-startup-feedback-export.test.ts:593. Base reproduction is byte-executable, not asserted.
+  NON-TOUCH PROOF: this diff's only change to that file is 3 additive mock lines (reclaimTerminalEnvironmentLeases, reclaimTerminalEnvironmentLeasesForRestart, reconcileStaleDeferredWakes). sha256 of the file as of base on both sides: 87f4fbfaea1e67453dd6288483e7a8ebc71ac70615f2afd36bd4fce39f71f429. The failing assertion lives in a block this diff never touches.
+  VERDICT: PRE-EXISTING BASE RED, not introduced by SPA-9351.
+
+GATE: diff-check | deliverable: remainder-9288
+  CHECK: git diff --check
+  EXPECT: exit 0
+  OBSERVED: exit 0
+
+EVIDENCE: remainder-9288 | commit: (this commit) | gates: all above | critic: n/a this run | at: 2026-10-14T00:20Z
+
+NOT PROVEN / KNOWN GAPS:
+- No independent verification yet. Three earlier verify attempts on the PR #138 lineage returned BLOCKED(access: DIFF-TOO-LARGE). This ledger and the 19-path inventory are the input the next verify run needs.
+- The two merge-fixture teardown races recorded on the earlier lineage are not re-measured on this branch; the promoted=0 predicate fix is carried in heartbeat.ts and is covered by the 141-test run above.
+- Not claimed: nonlocal (sandbox/ssh/plugin) environment-lease provider cleanup atomicity. This branch's lease work is local-ephemeral, as recorded on 2026-10-09.
