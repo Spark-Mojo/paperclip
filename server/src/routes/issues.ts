@@ -6575,11 +6575,161 @@ export function issueRoutes(
     return false;
   }
 
+  /**
+   * SPA-12197: resolve the REQUESTED post-mutation blocker set through the
+   * real dependency resolver.
+   *
+   * Returns the unresolved blocker ids of the requested set, or null when no
+   * relaxation applies (caller did not narrow the set, or a removed blocker
+   * is not terminal — in both cases the guard falls back to the stored set
+   * exactly as before).
+   *
+   * Two stages, both fail-closed:
+   *
+   * 1. Terminal-only removals: every stored edge the request would drop must
+   *    already be `done`/`cancelled` (status re-read from the DB, never
+   *    trusted from the request). A still-open removed blocker returns null.
+   * 2. Synthetic resolution: write per-call `blocks` rows naming a random
+   *    synthetic dependent id for the requested blockers PLUS any dropped
+   *    `done` blocker that carries an execution workspace (re-added so the
+   *    resolver's finalize barrier can still hold it — see the re-add note
+   *    below), run the REAL `listIssueDependencyReadinessMap` (via
+   *    `svc.listDependencyReadiness`) against them, then delete the rows in
+   *    `finally`. The empty id set resolves trivially clean (no rows, no
+   *    unresolved). This closes both residual bypasses in one move: a `done`
+   *    blocker stuck behind the workspace-finalize barrier resolves
+   *    UNRESOLVED in the synthetic run (no relaxation for pending-finalize
+   *    drops), and a newly ADDED open blocker resolves unresolved too (no
+   *    smuggling a live blocker in beside a terminal drop). The synthetic id
+   *    is a random UUID no real issue can collide with; no other query
+   *    enumerates relations by dependent id except the resolver itself, and
+   *    only this call knows the synthetic id.
+   *
+   * NOTE the inherited TOCTOU: the guard resolves the requested set now;
+   * `svc.update` writes it later inside its own transaction. A concurrent
+   * writer could mutate the blocker edges in between. The window is one
+   * request wide and the terminal-only constraint keeps it narrow, but on a
+   * contended card the write still wins over the guard's snapshot.
+   */
+  async function resolveRequestedBlockedBySet(
+    companyId: string,
+    requestedBlockedByIssueIds: string[],
+    removedBlockerIds: string[],
+  ): Promise<string[] | null> {
+    if (removedBlockerIds.length === 0) return null;
+    try {
+      const rows = await db
+        .select({ id: issueRows.id, status: issueRows.status })
+        .from(issueRows)
+        .where(
+          and(
+            eq(issueRows.companyId, companyId),
+            inArray(issueRows.id, removedBlockerIds),
+          ),
+        );
+      const byId = new Map(rows.map((row) => [row.id, row.status]));
+      // Every removed blocker must exist and be terminal. A missing row means
+      // we cannot prove terminality, so no relaxation.
+      const allRemovedTerminal = removedBlockerIds.every((id) => {
+        const status = byId.get(id);
+        return status === "done" || status === "cancelled";
+      });
+      if (!allRemovedTerminal) return null;
+      const syntheticId = randomUUID();
+      try {
+        // The synthetic resolution constrains blockers the request KEEPS.
+        // Dropped blockers are intentionally absent from the synthetic set —
+        // the terminal-only check above already cleared them — EXCEPT a
+        // dropped `done` blocker may still be behind the workspace-finalize
+        // barrier, and the resolver only reports that barrier for blockers
+        // present in the set it resolves. So re-add each dropped `done`
+        // blocker that carries an execution workspace to the synthetic set:
+        // if the barrier holds it, the resolution comes back unresolved and
+        // the guard refuses (no relaxation for pending-finalize drops). A
+        // dropped `done` blocker with no workspace, or one whose finalize
+        // already succeeded, resolves clean and the drop proceeds. Cancelled
+        // drops need no re-add: nothing in the resolver can hold a cancelled
+        // edge except its non-done status, which the terminal-only check
+        // already proved.
+        const droppedDoneWithWorkspace = await db
+          .select({
+            id: issueRows.id,
+            executionWorkspaceId: issueRows.executionWorkspaceId,
+          })
+          .from(issueRows)
+          .where(
+            and(
+              eq(issueRows.companyId, companyId),
+              inArray(issueRows.id, removedBlockerIds),
+              eq(issueRows.status, "done"),
+            ),
+          )
+          .then((doneRows) =>
+            doneRows
+              .filter((row) => row.executionWorkspaceId)
+              .map((row) => row.id),
+          );
+        const syntheticBlockerIds = [
+          ...new Set([
+            ...requestedBlockedByIssueIds,
+            ...droppedDoneWithWorkspace,
+          ]),
+        ];
+        if (syntheticBlockerIds.length > 0) {
+          await db.insert(issueRelations).values(
+            syntheticBlockerIds.map((blockerIssueId) => ({
+              companyId,
+              issueId: blockerIssueId,
+              relatedIssueId: syntheticId,
+              type: "blocks" as const,
+            })),
+          );
+        }
+        const readiness = await svc.listDependencyReadiness(
+          companyId,
+          [syntheticId],
+        );
+        const state = readiness.get(syntheticId);
+        // The resolver seeds one map entry per requested id up front and only
+        // fills it when blocker rows join, so a NON-empty synthetic set must
+        // always produce an entry. A missing entry for a non-empty set means
+        // the resolver did not see our rows — fail CLOSED (null), never
+        // clean. Only the empty set (no rows written at all) is trivially
+        // clean.
+        if (!state) return syntheticBlockerIds.length === 0 ? [] : null;
+        return state.unresolvedBlockerIssueIds;
+      } finally {
+        await db
+          .delete(issueRelations)
+          .where(eq(issueRelations.relatedIssueId, syntheticId));
+      }
+    } catch {
+      return null;
+    }
+  }
+
   async function assertExplicitResumeIntentAllowed(
     req: Request,
     res: Response,
     issue: Parameters<typeof decideIssueAccess>[1],
-    options: { resumeIntent?: boolean } = {},
+    options: {
+      resumeIntent?: boolean;
+      /**
+       * SPA-12197: the explicit post-mutation `blockedByIssueIds` array this
+       * request carries, when it carries one. Used to judge the
+       * unresolved-blocker guard against the requested relation set rather
+       * than the stored one. `undefined` means "this request did not touch the
+       * blocker set", which preserves today's behaviour exactly.
+       */
+      requestedBlockedByIssueIds?: string[];
+      /**
+       * SPA-12197: the blockers currently in the stored relation set that
+       * `requestedBlockedByIssueIds` does NOT contain — i.e. exactly the edges
+       * this request would drop. The caller computes this from the relation
+       * summaries it already read. Empty/absent means "no relaxation".
+       */
+      removedBlockerIssueIds?: string[];
+    } = {},
   ) {
     if (
       await assertLowTrustControlPlaneDenied(req, res, issue.companyId, issue)
@@ -6628,12 +6778,47 @@ export function issueRoutes(
 
     if (issue.status === "blocked") {
       const readiness = await svc.getDependencyReadiness(issue.id);
-      if (readiness.unresolvedBlockerCount > 0) {
+      const requestedBlockedByIssueIds = options.requestedBlockedByIssueIds;
+      // SPA-12197 (friction #1623): the readiness read above is against the
+      // STORED `blocks` rows, but the relation write this request would make
+      // (`svc.update` → `syncBlockedByIssueIds`, a set-replace) only runs
+      // later. A blocked card whose only unresolved blockers are TERMINAL
+      // (`done` / `cancelled`) therefore 409s forever — including on the one
+      // request that would clear the wedge — because the guard is judged
+      // against the pre-mutation relation set and the mutation never runs.
+      //
+      // When (and only when) the caller explicitly supplies the post-mutation
+      // `blockedByIssueIds` array, judge the guard against THAT set instead of
+      // the stored one. This mirrors the existing `enteringBlocked` precedent,
+      // which already evaluates against the requested set on the way INTO
+      // blocked. It is request-driven, not engine-autonomous: the caller is
+      // authorizing the edge drop, so the engine gains no new authority to
+      // manage a blocker edge on its own.
+      //
+      // Relax ONLY when the full requested post-mutation set resolves clean
+      // through the real resolver: terminal-only removals (proven above), no
+      // pending-finalize drops, and no smuggled-in open blockers (both proven
+      // by the synthetic resolution). A null return means "no relaxation" and
+      // the guard judges the stored set exactly as before.
+      const relaxedUnresolvedBlockerIssueIds =
+        Array.isArray(requestedBlockedByIssueIds)
+          ? await resolveRequestedBlockedBySet(
+              issue.companyId,
+              requestedBlockedByIssueIds,
+              options.removedBlockerIssueIds ?? [],
+            )
+          : null;
+      const unresolvedBlockerIssueIds =
+        relaxedUnresolvedBlockerIssueIds ?? readiness.unresolvedBlockerIssueIds;
+      const unresolvedBlockerCount =
+        relaxedUnresolvedBlockerIssueIds?.length ??
+        readiness.unresolvedBlockerCount;
+      if (unresolvedBlockerCount > 0) {
         res.status(409).json({
           error: "Issue follow-up blocked by unresolved blockers",
           details: {
             issueId: issue.id,
-            unresolvedBlockerIssueIds: readiness.unresolvedBlockerIssueIds,
+            unresolvedBlockerIssueIds,
           },
         });
         return false;
@@ -13065,12 +13250,44 @@ export function issueRoutes(
         typeof updateFields.status === "string" &&
         updateFields.status !== existing.status &&
         (isBlocked || (isClosed && !isClosedIssueStatus(updateFields.status)));
+  /**
+   * SPA-12197: the requested/removed blocker id sets for the guard.
+   *
+   * Both PATCH lanes (reopen + status-transition) read the same
+   * unresolved-blocker guard, so both hand it the same relaxation inputs:
+   * the explicit post-mutation `blockedByIssueIds` array the request carries
+   * (absent → `undefined`, i.e. unchanged behaviour), and the exact stored
+   * edges the request would drop (stored minus requested).
+   */
+  function requestedBlockerSetOptions(): {
+    requestedBlockedByIssueIds?: string[];
+    removedBlockerIssueIds?: string[];
+  } {
+    if (!Array.isArray(req.body.blockedByIssueIds)) {
+      return {};
+    }
+    const requested = [...new Set(req.body.blockedByIssueIds as string[])];
+    return {
+      requestedBlockedByIssueIds: requested,
+      removedBlockerIssueIds: (existingRelations?.blockedBy ?? [])
+        .map((relation) => relation.id)
+        .filter((id) => !requested.includes(id)),
+    };
+  }
+
       if (
         resumeRequested !== true &&
         req.actor.type === "agent" &&
         reopenRequested === true
       ) {
-        if (!(await assertExplicitResumeIntentAllowed(req, res, existing)))
+        if (
+          !(await assertExplicitResumeIntentAllowed(
+            req,
+            res,
+            existing,
+            requestedBlockerSetOptions(),
+          ))
+        )
           return;
       }
       await assertIssueEnvironmentSelection(
@@ -13120,7 +13337,12 @@ export function issueRoutes(
       if (
         resumeRequested !== true &&
         agentStatusTransitionRequiresResumeAuthority &&
-        !(await assertExplicitResumeIntentAllowed(req, res, existing))
+        !(await assertExplicitResumeIntentAllowed(
+          req,
+          res,
+          existing,
+          requestedBlockerSetOptions(),
+        ))
       ) {
         return;
       }
