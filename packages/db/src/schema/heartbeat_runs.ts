@@ -107,6 +107,113 @@ export const heartbeatRuns = pgTable(
     contextTaskId: text("context_task_id").generatedAlwaysAs(
       (): SQL => sql`${heartbeatRuns.contextSnapshot} ->> 'taskId'`,
     ),
+    // SPA-11947 — the two run-list projections the board polls on every
+    // request (`activityService.runsForIssue` and `heartbeatService.list`)
+    // return these context scalars. Same STORED-generated-column shape as the
+    // two ids above, extended to the remaining keys those projections read so
+    // neither has to dereference the wide JSONB TOAST document per row.
+    contextTaskKey: text("context_task_key").generatedAlwaysAs(
+      (): SQL => sql`${heartbeatRuns.contextSnapshot} ->> 'taskKey'`,
+    ),
+    contextCommentId: text("context_comment_id").generatedAlwaysAs(
+      (): SQL => sql`${heartbeatRuns.contextSnapshot} ->> 'commentId'`,
+    ),
+    contextWakeCommentId: text("context_wake_comment_id").generatedAlwaysAs(
+      (): SQL => sql`${heartbeatRuns.contextSnapshot} ->> 'wakeCommentId'`,
+    ),
+    // `->` (not `->>`): the ledger returns the wake-comment id ARRAY verbatim,
+    // so the column holds the same JSONB value the old expression returned.
+    contextWakeCommentIds: jsonb("context_wake_comment_ids")
+      .$type<string[] | null>()
+      .generatedAlwaysAs(
+        (): SQL => sql`${heartbeatRuns.contextSnapshot} -> 'wakeCommentIds'`,
+      ),
+    contextWakeReason: text("context_wake_reason").generatedAlwaysAs(
+      (): SQL => sql`${heartbeatRuns.contextSnapshot} ->> 'wakeReason'`,
+    ),
+    contextWakeSource: text("context_wake_source").generatedAlwaysAs(
+      (): SQL => sql`${heartbeatRuns.contextSnapshot} ->> 'wakeSource'`,
+    ),
+    contextWakeTriggerDetail: text("context_wake_trigger_detail").generatedAlwaysAs(
+      (): SQL => sql`${heartbeatRuns.contextSnapshot} ->> 'wakeTriggerDetail'`,
+    ),
+    // SPA-11947 — `heartbeatService.list`'s non-summary projection reads the
+    // result scalars below with `left(..., HEARTBEAT_RUN_RESULT_SUMMARY_MAX_CHARS)`.
+    // The columns store the UNTRUNCATED text so the bound stays owned by
+    // server/src/services/heartbeat-run-summary.ts (this package must not
+    // import from server); the projection keeps applying `left()` itself.
+    resultListSummary: text("result_list_summary").generatedAlwaysAs(
+      (): SQL => sql`${heartbeatRuns.resultJson} ->> 'summary'`,
+    ),
+    resultListResult: text("result_list_result").generatedAlwaysAs(
+      (): SQL => sql`${heartbeatRuns.resultJson} ->> 'result'`,
+    ),
+    resultListMessage: text("result_list_message").generatedAlwaysAs(
+      (): SQL => sql`${heartbeatRuns.resultJson} ->> 'message'`,
+    ),
+    resultListError: text("result_list_error").generatedAlwaysAs(
+      (): SQL => sql`${heartbeatRuns.resultJson} ->> 'error'`,
+    ),
+    resultListTotalCostUsd: text("result_list_total_cost_usd").generatedAlwaysAs(
+      (): SQL => sql`${heartbeatRuns.resultJson} ->> 'total_cost_usd'`,
+    ),
+    resultListCostUsd: text("result_list_cost_usd").generatedAlwaysAs(
+      (): SQL => sql`${heartbeatRuns.resultJson} ->> 'cost_usd'`,
+    ),
+    resultListCostUsdCamel: text("result_list_cost_usd_camel").generatedAlwaysAs(
+      (): SQL => sql`${heartbeatRuns.resultJson} ->> 'costUsd'`,
+    ),
+    // SPA-11947 — `activityService.runsForIssue` returns a narrowed result
+    // summary. The poll reads this one narrow JSONB column instead of
+    // de-TOASTing `result_json` for every run in the window, and the stored
+    // value is byte-for-byte what the per-row expression used to return.
+    //
+    // The obvious spelling of that expression —
+    // jsonb_strip_nulls(jsonb_build_object(...)) — is NOT usable here: both
+    // functions are STABLE rather than IMMUTABLE, and PostgreSQL rejects a
+    // STORED generated column whose expression is not immutable (SQLSTATE
+    // 42P17, observed when this migration was applied inside the
+    // embedded-Postgres test cluster). Wrapping them in a function marked
+    // IMMUTABLE would assert a false fact to the planner.
+    //
+    // So the object is assembled from pieces PostgreSQL does classify as
+    // IMMUTABLE: the jsonb operators (-> and ->>), jsonb_set, and jsonb
+    // concatenation (||). Each key contributes either a single-key object or
+    // '{}', and the fragments are concatenated:
+    //
+    //   * SQL NULL (key absent) and the JSON literal null (key present with a
+    //     null value) both contribute '{}', i.e. the key is omitted — the same
+    //     result jsonb_strip_nulls produced, reached with an equality test
+    //     against 'null'::jsonb instead of a call to jsonb_strip_nulls.
+    //   * Every surviving value is written verbatim by jsonb_set, so scalars,
+    //     arrays and nested objects are preserved unchanged.
+    //
+    // Inherited behaviour worth knowing (not introduced here): `->` on a key
+    // that is present with a JSON null returns the jsonb value null, not SQL
+    // NULL, so coalesce does NOT fall through to the snake_case alias and the
+    // null is then omitted.
+    resultLedgerSummary: jsonb("result_ledger_summary")
+      .$type<Record<string, unknown> | null>()
+      .generatedAlwaysAs(
+        (): SQL => sql`
+        case
+          when ${heartbeatRuns.resultJson} is null then null
+          else
+            case when (${heartbeatRuns.resultJson} -> 'conversationReset') is null or (${heartbeatRuns.resultJson} -> 'conversationReset') = 'null'::jsonb then '{}'::jsonb else jsonb_set('{}'::jsonb, '{conversationReset}', ${heartbeatRuns.resultJson} -> 'conversationReset', true) end
+            || case when (coalesce(${heartbeatRuns.resultJson} -> 'billingType', ${heartbeatRuns.resultJson} -> 'billing_type')) is null or (coalesce(${heartbeatRuns.resultJson} -> 'billingType', ${heartbeatRuns.resultJson} -> 'billing_type')) = 'null'::jsonb then '{}'::jsonb else jsonb_set('{}'::jsonb, '{billingType}', coalesce(${heartbeatRuns.resultJson} -> 'billingType', ${heartbeatRuns.resultJson} -> 'billing_type'), true) end
+            || case when (coalesce(${heartbeatRuns.resultJson} -> 'billing_type', ${heartbeatRuns.resultJson} -> 'billingType')) is null or (coalesce(${heartbeatRuns.resultJson} -> 'billing_type', ${heartbeatRuns.resultJson} -> 'billingType')) = 'null'::jsonb then '{}'::jsonb else jsonb_set('{}'::jsonb, '{billing_type}', coalesce(${heartbeatRuns.resultJson} -> 'billing_type', ${heartbeatRuns.resultJson} -> 'billingType'), true) end
+            || case when (coalesce(${heartbeatRuns.resultJson} -> 'costUsd', ${heartbeatRuns.resultJson} -> 'cost_usd', ${heartbeatRuns.resultJson} -> 'total_cost_usd')) is null or (coalesce(${heartbeatRuns.resultJson} -> 'costUsd', ${heartbeatRuns.resultJson} -> 'cost_usd', ${heartbeatRuns.resultJson} -> 'total_cost_usd')) = 'null'::jsonb then '{}'::jsonb else jsonb_set('{}'::jsonb, '{costUsd}', coalesce(${heartbeatRuns.resultJson} -> 'costUsd', ${heartbeatRuns.resultJson} -> 'cost_usd', ${heartbeatRuns.resultJson} -> 'total_cost_usd'), true) end
+            || case when (coalesce(${heartbeatRuns.resultJson} -> 'cost_usd', ${heartbeatRuns.resultJson} -> 'costUsd', ${heartbeatRuns.resultJson} -> 'total_cost_usd')) is null or (coalesce(${heartbeatRuns.resultJson} -> 'cost_usd', ${heartbeatRuns.resultJson} -> 'costUsd', ${heartbeatRuns.resultJson} -> 'total_cost_usd')) = 'null'::jsonb then '{}'::jsonb else jsonb_set('{}'::jsonb, '{cost_usd}', coalesce(${heartbeatRuns.resultJson} -> 'cost_usd', ${heartbeatRuns.resultJson} -> 'costUsd', ${heartbeatRuns.resultJson} -> 'total_cost_usd'), true) end
+            || case when (coalesce(${heartbeatRuns.resultJson} -> 'total_cost_usd', ${heartbeatRuns.resultJson} -> 'cost_usd', ${heartbeatRuns.resultJson} -> 'costUsd')) is null or (coalesce(${heartbeatRuns.resultJson} -> 'total_cost_usd', ${heartbeatRuns.resultJson} -> 'cost_usd', ${heartbeatRuns.resultJson} -> 'costUsd')) = 'null'::jsonb then '{}'::jsonb else jsonb_set('{}'::jsonb, '{total_cost_usd}', coalesce(${heartbeatRuns.resultJson} -> 'total_cost_usd', ${heartbeatRuns.resultJson} -> 'cost_usd', ${heartbeatRuns.resultJson} -> 'costUsd'), true) end
+            || case when (${heartbeatRuns.resultJson} -> 'stopReason') is null or (${heartbeatRuns.resultJson} -> 'stopReason') = 'null'::jsonb then '{}'::jsonb else jsonb_set('{}'::jsonb, '{stopReason}', ${heartbeatRuns.resultJson} -> 'stopReason', true) end
+            || case when (${heartbeatRuns.resultJson} -> 'effectiveTimeoutSec') is null or (${heartbeatRuns.resultJson} -> 'effectiveTimeoutSec') = 'null'::jsonb then '{}'::jsonb else jsonb_set('{}'::jsonb, '{effectiveTimeoutSec}', ${heartbeatRuns.resultJson} -> 'effectiveTimeoutSec', true) end
+            || case when (${heartbeatRuns.resultJson} -> 'effectiveTimeoutMs') is null or (${heartbeatRuns.resultJson} -> 'effectiveTimeoutMs') = 'null'::jsonb then '{}'::jsonb else jsonb_set('{}'::jsonb, '{effectiveTimeoutMs}', ${heartbeatRuns.resultJson} -> 'effectiveTimeoutMs', true) end
+            || case when (${heartbeatRuns.resultJson} -> 'timeoutConfigured') is null or (${heartbeatRuns.resultJson} -> 'timeoutConfigured') = 'null'::jsonb then '{}'::jsonb else jsonb_set('{}'::jsonb, '{timeoutConfigured}', ${heartbeatRuns.resultJson} -> 'timeoutConfigured', true) end
+            || case when (${heartbeatRuns.resultJson} -> 'timeoutSource') is null or (${heartbeatRuns.resultJson} -> 'timeoutSource') = 'null'::jsonb then '{}'::jsonb else jsonb_set('{}'::jsonb, '{timeoutSource}', ${heartbeatRuns.resultJson} -> 'timeoutSource', true) end
+            || case when (${heartbeatRuns.resultJson} -> 'timeoutFired') is null or (${heartbeatRuns.resultJson} -> 'timeoutFired') = 'null'::jsonb then '{}'::jsonb else jsonb_set('{}'::jsonb, '{timeoutFired}', ${heartbeatRuns.resultJson} -> 'timeoutFired', true) end
+        end
+      `,
+      ),
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
     updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
   },
