@@ -22,6 +22,49 @@ export const AGENT_ROOT_ISSUE_REQUIRES_PROJECT_REMEDIATION =
 export const AGENT_ROOT_ISSUE_REQUIRES_PROJECT_MESSAGE =
   `An agent-created task must belong to a project, but this create resolved no project: it is a root task (no parent) and names neither projectId nor a project/execution workspace to infer one from. ${AGENT_ROOT_ISSUE_REQUIRES_PROJECT_REMEDIATION}`;
 
+/**
+ * A repo-bound `agent_default` card is the miscategorised-code-card shape
+ * (SPA-11739): `executionWorkspaceSettings.mode = "agent_default"` resolves no
+ * git workspace, so a card that is in fact bound to a repository would launch
+ * from a non-git cwd in silence. Neither the project binding nor the deliberate
+ * `agent_default` bypass can be used as the discriminator — the binding is
+ * absent on the exact project-less shape this card reports, and the bypass is
+ * true for ANY explicit `agent_default` request, deliberate or miscategorised.
+ *
+ * The repo binding itself is the deterministic signal: a run whose resolved or
+ * persisted workspace carries a repo URL cannot usefully run from a non-git
+ * cwd. A genuinely non-code `agent_default` card (SPA-8036 / SPA-8019 Option A)
+ * carries no repo URL on any surface, so this predicate stays false and the
+ * deliberate bypass is unchanged.
+ *
+ * Mirrors `isUnrunnableWorktreeCombo`: a pure fail-closed decision over inputs
+ * the caller already has, so the launch path stays free of IO and the shape is
+ * unit-testable without a database.
+ */
+export const REPO_REQUIRED_BUT_AGENT_HOME_CWD_CODE = "repo_required_but_agent_home_cwd";
+
+export function isRepoRequiredButAgentHomeCwd(input: {
+  requestedExecutionWorkspaceMode: string | null | undefined;
+  resolvedWorkspaceRepoUrl: string | null | undefined;
+  persistedExecutionWorkspaceRepoUrl: string | null | undefined;
+  effectiveCwd: string | null | undefined;
+  cwdIsAgentFallback: boolean;
+  cwdHasGitMetadata: boolean | null;
+}): boolean {
+  if (input.requestedExecutionWorkspaceMode !== "agent_default") return false;
+  const boundRepoUrl =
+    (input.resolvedWorkspaceRepoUrl ?? "").trim() ||
+    (input.persistedExecutionWorkspaceRepoUrl ?? "").trim();
+  if (!boundRepoUrl) return false;
+  const effectiveCwd = (input.effectiveCwd ?? "").trim();
+  if (!effectiveCwd) return false;
+  // Either the run fell back to the agent home dir (never a git workspace), or
+  // it landed somewhere else that has no git metadata — both are "the run
+  // cannot reach the repository it is bound to".
+  if (input.cwdIsAgentFallback) return true;
+  return input.cwdHasGitMetadata === false;
+}
+
 type WorkspaceStrategyType = ExecutionWorkspaceStrategy["type"];
 
 export type UnrunnableWorktreeIssueRef = {

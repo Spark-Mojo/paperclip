@@ -104,6 +104,14 @@ export type {
   AdapterLoginCapability,
 } from "./login-capability.js";
 export { raceLoginRunnerExit } from "./login-runner-lifecycle.js";
+export {
+  createStreamStallDetector,
+  MODEL_STREAM_STALLED_ERROR_CODE,
+} from "./stream-stall-detector.js";
+export type {
+  StreamStallDetector,
+  StreamStallDetectorOptions,
+} from "./stream-stall-detector.js";
 export type {
   LoginRunnerOutcome,
   LoginRunnerResult,

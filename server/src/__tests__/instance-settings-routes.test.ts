@@ -761,11 +761,36 @@ describe("instance settings routes", () => {
 
       // Schema validation failures go through the generic validate() middleware
       // (plain Zod 400), not the semantic unprocessable() 422 used elsewhere.
-      await request(app).patch("/api/instance/settings/fleet-max-concurrent-runs").send({ value: 0 }).expect(400);
       await request(app).patch("/api/instance/settings/fleet-max-concurrent-runs").send({ value: 51 }).expect(400);
       await request(app).patch("/api/instance/settings/fleet-max-concurrent-runs").send({ value: 1.5 }).expect(400);
       await request(app).patch("/api/instance/settings/fleet-max-concurrent-runs").send({}).expect(400);
       expect(mockInstanceSettingsService.updateGeneral).not.toHaveBeenCalled();
+    });
+
+    it("accepts 0 as a pause (no new admissions, running untouched)", async () => {
+      mockInstanceSettingsService.getGeneral.mockResolvedValueOnce({
+        censorUsernameInLogs: false,
+        keyboardShortcuts: false,
+        feedbackDataSharingPreference: "prompt",
+        fleetMaxConcurrentRuns: 5,
+      });
+      mockInstanceSettingsService.updateGeneral.mockResolvedValueOnce({
+        id: "instance-settings-1",
+        general: {
+          censorUsernameInLogs: false,
+          keyboardShortcuts: false,
+          feedbackDataSharingPreference: "prompt",
+          fleetMaxConcurrentRuns: 0,
+        },
+      });
+      const app = await createApp(adminActor);
+
+      const res = await request(app)
+        .patch("/api/instance/settings/fleet-max-concurrent-runs")
+        .send({ value: 0 });
+
+      expect(res.status).toBe(200);
+      expect(res.body).toEqual({ value: 0, source: "db" });
     });
 
     it("sets an explicit ceiling, invalidates the cache, and logs old/new/actor", async () => {

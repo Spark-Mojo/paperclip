@@ -1,5 +1,7 @@
+import { spawn } from "node:child_process";
 import { EventEmitter } from "node:events";
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import * as adapterServerUtils from "@paperclipai/adapter-utils/server-utils";
 import {
   closeHttpListenerForShutdown,
   coordinateHeartbeatSchedulerShutdown,
@@ -7,6 +9,7 @@ import {
   finalizeServerShutdown,
   loadWithoutCoordinatedShutdownSignalHooks,
 } from "./shutdown.js";
+import * as shutdownModule from "./shutdown.js";
 
 function deferred<T = void>() {
   let resolve!: (value: T) => void;
@@ -21,6 +24,62 @@ function deferred<T = void>() {
 function stubLogger() {
   return { info: vi.fn(), error: vi.fn() };
 }
+
+/**
+ * SPA-11948 R2. Fixture processes are tracked at module scope, not just inside
+ * the test body. A vitest-level timeout kills a test WITHOUT unwinding its
+ * `finally`, so body-only cleanup would leak a live detached child. The
+ * `afterEach` sweep below is the backstop for that path.
+ */
+const shutdownFixturePids = new Set<number>();
+
+function trackShutdownFixturePid(pid: number | null | undefined) {
+  if (typeof pid === "number" && Number.isInteger(pid) && pid > 0) {
+    shutdownFixturePids.add(pid);
+  }
+}
+
+function forceKillShutdownFixtures() {
+  for (const pid of shutdownFixturePids) {
+    // The fixture is spawned detached, so it leads its own process group: the
+    // group kill is the one that matches how a refused run spawn is torn down.
+    try {
+      process.kill(-pid, "SIGKILL");
+      continue;
+    } catch {
+      // Not a process group leader; fall through to the bare pid.
+    }
+    try {
+      process.kill(pid, "SIGKILL");
+    } catch {
+      // Already dead.
+    }
+  }
+  shutdownFixturePids.clear();
+}
+
+function isPidAlive(pid: number | null | undefined) {
+  if (typeof pid !== "number" || !Number.isInteger(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function waitForPidExit(pid: number, timeoutMs = 5_000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (!isPidAlive(pid)) return true;
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  return !isPidAlive(pid);
+}
+
+afterEach(() => {
+  forceKillShutdownFixtures();
+});
 
 describe("finalizeServerShutdown", () => {
   it("awaits the setup-token cleanup before the database stop and the process exit", async () => {
@@ -522,4 +581,525 @@ describe("coordinateHeartbeatSchedulerShutdown", () => {
       waitedForSchedulerIdle: true,
     });
   });
+
+  it.skipIf(process.platform === "win32")(
+    "closes and drains spawn admission before the hot-restart snapshot without killing registered adoptable runs",
+    async () => {
+      const adapterApi = adapterServerUtils as unknown as Record<string, unknown>;
+      const getFence = adapterApi.getSpawnAdmissionFence as
+        | (() => SpawnAdmissionFence)
+        | undefined;
+      expect(typeof getFence, "missing_spawn_admission_api:getSpawnAdmissionFence").toBe(
+        "function",
+      );
+      const fence = getFence!();
+      fence.reopen();
+      expect(fence.inFlight()).toBe(0);
+
+      const adoptable = spawn(
+        process.execPath,
+        ["-e", "setInterval(() => {}, 1000)"],
+        { detached: true, stdio: "ignore" },
+      );
+      trackShutdownFixturePid(adoptable.pid);
+      adoptable.unref();
+      const order: string[] = [];
+      const originalClose = fence.close;
+      const originalDrain = fence.drain;
+      fence.close = () => {
+        order.push("admission_close");
+        originalClose.call(fence);
+      };
+      fence.drain = async (options) => {
+        order.push("admission_drain");
+        return originalDrain.call(fence, options);
+      };
+
+      try {
+        await vi.waitFor(() => expect(isPidAlive(adoptable.pid!)).toBe(true));
+        const prepareHotRestartShutdown = vi.fn(async () => {
+          order.push("snapshot");
+          expect(fence.isClosed()).toBe(true);
+          expect(fence.inFlight()).toBe(0);
+          expect(isPidAlive(adoptable.pid!)).toBe(true);
+          return { mode: "hot_restart" as const, skipDrain: true as const };
+        });
+
+        await expect(
+          coordinateHeartbeatSchedulerShutdown({
+            signal: "SIGTERM",
+            prepareHotRestartShutdown,
+            waitForHeartbeatSchedulerIdle: async () => {
+              order.push("scheduler_idle");
+            },
+            spawnAdmissionFence: fence,
+            log: stubLogger(),
+          }),
+        ).resolves.toEqual({
+          hotRestart: { mode: "hot_restart", skipDrain: true },
+          preparationError: null,
+          waitedForSchedulerIdle: true,
+        });
+
+        expect(order).toEqual([
+          "scheduler_idle",
+          "admission_close",
+          "admission_drain",
+          "snapshot",
+        ]);
+        expect(fence.isClosed()).toBe(true);
+        expect(isPidAlive(adoptable.pid!)).toBe(true);
+      } finally {
+        fence.close = originalClose;
+        fence.drain = originalDrain;
+        fence.reopen();
+        forceKillShutdownFixtures();
+      }
+    },
+    20_000,
+  );
+
+  it("refuses to take a hot-restart snapshot when spawn admission does not drain", async () => {
+    let closed = false;
+    const fence = {
+      close: vi.fn(() => {
+        closed = true;
+      }),
+      reopen: vi.fn(() => {
+        closed = false;
+      }),
+      isClosed: () => closed,
+      inFlight: () => 1,
+      enterAdmission: () => ({
+        admit: async () => undefined,
+        settle: () => undefined,
+      }),
+      drain: vi.fn(async () => "timed_out" as const),
+    } satisfies SpawnAdmissionFence;
+    const prepareHotRestartShutdown = vi.fn(async () => ({
+      mode: "hot_restart" as const,
+      skipDrain: true as const,
+    }));
+
+    const result = await coordinateHeartbeatSchedulerShutdown({
+      signal: "SIGTERM",
+      prepareHotRestartShutdown,
+      waitForHeartbeatSchedulerIdle: async () => undefined,
+      spawnAdmissionFence: fence,
+      spawnAdmissionDrainTimeoutMs: 5,
+      log: stubLogger(),
+    });
+
+    expect(prepareHotRestartShutdown).not.toHaveBeenCalled();
+    expect(result.hotRestart).toBeNull();
+    expect(result.preparationError).toBeInstanceOf(Error);
+    expect((result.preparationError as Error).message).toContain(
+      "spawn_admission_drain_timed_out",
+    );
+    expect(fence.isClosed()).toBe(true);
+  });
+});
+
+// SPA-11948 R2. The spawn-admission fence (`getSpawnAdmissionFence`) and the
+// shutdown drain helper (`drainRunsForGracefulShutdown`) do not exist yet, so
+// BOTH are read through `Record<string, unknown>` casts rather than named
+// imports. A named import of a missing export is a module LINK error, which
+// would take every unrelated case in this file down with it; the cast keeps
+// this tests-only commit collecting and turns each gap into one precise
+// assertion failure instead. `pnpm --filter @paperclipai/server typecheck` stays
+// green for this file, so the RED below is attributable to behavior alone.
+//
+// The fence shape is NOT re-pinned here: it mirrors the sibling adapter test
+// (`packages/adapter-utils/src/server-utils.test.ts`), which owns that
+// contract. This file only consumes the process-global singleton the server
+// itself imports through `@paperclipai/adapter-utils/server-utils`, so the
+// fence it closes is the same object the production spawn path gates on.
+type SpawnAdmissionMeta = {
+  pid: number;
+  processGroupId: number | null;
+  resourceUnit: string | null;
+};
+
+type SpawnAdmissionTicket = {
+  /** Post-spawn. Rejects `spawn_admission_closed` after signalling the tree. */
+  admit(meta: SpawnAdmissionMeta): Promise<void>;
+  /** End the attempt. Idempotent; required on both the admitted and refused paths. */
+  settle(): void;
+};
+
+type SpawnAdmissionFence = {
+  /** Take an admission lease. MUST be called BEFORE `spawn()`. */
+  enterAdmission(): SpawnAdmissionTicket;
+  close(): void;
+  reopen(): void;
+  isClosed(): boolean;
+  inFlight(): number;
+  drain(options?: { timeoutMs?: number }): Promise<unknown>;
+};
+
+type GetSpawnAdmissionFence = () => SpawnAdmissionFence;
+
+/**
+ * The shutdown ordering contract under test (R2, server side):
+ *
+ *   1. close spawn admission — nothing may reach the registry after this point;
+ *   2. await the work already admitted or mid-spawn (the fence's own drain);
+ *   3. drain the runs that ARE registered;
+ *   4. drain execution finalizers.
+ *
+ * Step 2 is the half that is easy to lose: without it, a child whose `spawn()`
+ * returned but whose registration has not runs is invisible to step 3, the
+ * teardown reports "clean", and the child survives the restart as an orphan
+ * still holding a concurrency cap slot.
+ */
+type DrainRunsForGracefulShutdown = (input: {
+  signal: "SIGINT" | "SIGTERM";
+  spawnAdmissionFence: SpawnAdmissionFence;
+  drainRuns: () => Promise<void>;
+  drainExecutionFinalizers: () => Promise<void>;
+  timeoutMs?: number;
+  log: { info(obj: object, msg: string): void; error(obj: object, msg: string): void };
+}) => Promise<unknown>;
+
+function readShutdownApis() {
+  const adapterApi = adapterServerUtils as unknown as Record<string, unknown>;
+  const shutdownApi = shutdownModule as unknown as Record<string, unknown>;
+
+  expect(
+    typeof adapterApi.getSpawnAdmissionFence,
+    "missing_spawn_admission_api:getSpawnAdmissionFence",
+  ).toBe("function");
+  expect(
+    typeof shutdownApi.drainRunsForGracefulShutdown,
+    "missing_shutdown_api:drainRunsForGracefulShutdown",
+  ).toBe("function");
+
+  return {
+    getSpawnAdmissionFence: adapterApi.getSpawnAdmissionFence as GetSpawnAdmissionFence,
+    drainRunsForGracefulShutdown:
+      shutdownApi.drainRunsForGracefulShutdown as DrainRunsForGracefulShutdown,
+  };
+}
+
+describe("drainRunsForGracefulShutdown — spawn-admission ordering (SPA-11948)", () => {
+  // A real detached child, not a mock: the refusal half of R2 claims a refused
+  // spawn is KILLED rather than orphaned, and only a live process can prove it.
+  // It leads its own process group, so `processGroupId` is its own pid.
+  function spawnAdmissionFixture() {
+    const fixture = spawn(
+      process.execPath,
+      [
+        "-e",
+        // Idle until released, then self-terminate: an independent bound on the
+        // fixture's lifetime, so a leaked process cannot outlive the suite.
+        "const t=setInterval(()=>{},1000);setTimeout(()=>{clearInterval(t);process.exit(0);},25000);",
+      ],
+      { detached: true, stdio: "ignore" },
+    );
+    trackShutdownFixturePid(fixture.pid);
+    // The fixture must never keep the worker's event loop alive.
+    fixture.unref();
+    return fixture;
+  }
+
+  it.skipIf(process.platform === "win32")(
+    "closes spawn admission before draining runs and refuses an admitted spawn that arrives afterwards",
+    async () => {
+      const { getSpawnAdmissionFence, drainRunsForGracefulShutdown } = readShutdownApis();
+      const fence = getSpawnAdmissionFence();
+      fence.reopen();
+
+      // The fence is a process-global singleton, so a lease leaked by another
+      // case would make every `inFlight()` reading below vacuous. Assert the
+      // precondition rather than assuming it.
+      expect(
+        fence.inFlight(),
+        "fence_must_start_with_no_outstanding_admission_leases",
+      ).toBe(0);
+
+      // Lease BEFORE the process exists — the production order, and the reason
+      // a post-spawn barrier cannot make `inFlight()` read 0 by construction.
+      const ticket = fence.enterAdmission();
+      expect(
+        fence.inFlight(),
+        "admission_lease_must_count_before_the_spawn_happens",
+      ).toBe(1);
+
+      const fixture = spawnAdmissionFixture();
+
+      const order: string[] = [];
+      // Sampled, not asserted, from inside the drain: if the helper swallows a
+      // thrown assertion, the sampled value still reports the ordering fact.
+      let admissionClosedWhenRunsDrained: boolean | null = null;
+      const drainRuns = vi.fn(async () => {
+        order.push("run_drain");
+        admissionClosedWhenRunsDrained = fence.isClosed();
+      });
+      const drainExecutionFinalizers = vi.fn(async () => {
+        order.push("execution_finalizer_drain");
+      });
+
+      try {
+        await vi.waitFor(() => expect(isPidAlive(fixture.pid!)).toBe(true));
+
+        // Admission is OPEN here, so this one is registered rather than refused.
+        let openAdmissionError: unknown;
+        try {
+          await ticket.admit({
+            pid: fixture.pid!,
+            processGroupId: fixture.pid!,
+            resourceUnit: null,
+          });
+        } catch (error) {
+          openAdmissionError = error;
+        }
+        expect(
+          openAdmissionError,
+          "admitted_spawn_was_refused_while_spawn_admission_was_open",
+        ).toBeUndefined();
+
+        ticket.settle();
+        expect(
+          fence.inFlight(),
+          "settle_must_release_the_admission_lease",
+        ).toBe(0);
+
+        await drainRunsForGracefulShutdown({
+          signal: "SIGTERM",
+          spawnAdmissionFence: fence,
+          drainRuns,
+          drainExecutionFinalizers,
+          timeoutMs: 5_000,
+          log: stubLogger(),
+        });
+
+        expect(order, "run_drain_must_precede_execution_finalizer_drain").toEqual([
+          "run_drain",
+          "execution_finalizer_drain",
+        ]);
+        // The load-bearing ordering fact: nothing may reach the registry after
+        // the drain starts, so admission closes FIRST.
+        expect(
+          admissionClosedWhenRunsDrained,
+          "run_drain_started_before_spawn_admission_closed",
+        ).toBe(true);
+        expect(fence.isClosed()).toBe(true);
+        // The fence's own drain waited for the lease to settle rather than
+        // declaring victory because the gate happens to be closed.
+        expect(
+          fence.inFlight(),
+          "fence_drain_ignored_an_outstanding_admission_lease",
+        ).toBe(0);
+
+        // A spawn that arrives after the gate closed is refused — and KILLED,
+        // which is the half that matters: the caller's `spawn()` already
+        // returned, so a refused-but-alive child is exactly the orphan that
+        // holds a concurrency cap slot across the restart.
+        const lateFixture = spawnAdmissionFixture();
+        await vi.waitFor(() => expect(isPidAlive(lateFixture.pid!)).toBe(true));
+
+        const lateTicket = fence.enterAdmission();
+        expect(
+          fence.inFlight(),
+          "admission_lease_must_count_even_while_the_gate_is_closed",
+        ).toBe(1);
+
+        let refusal: unknown;
+        try {
+          await lateTicket.admit({
+            pid: lateFixture.pid!,
+            processGroupId: lateFixture.pid!,
+            resourceUnit: null,
+          });
+        } catch (error) {
+          refusal = error;
+        }
+        expect(
+          refusal,
+          "admitted_spawn_after_shutdown_was_admitted_instead_of_refused",
+        ).toBeInstanceOf(Error);
+        expect((refusal as Error).message).toContain("spawn_admission_closed");
+        expect(
+          await waitForPidExit(lateFixture.pid!, 5_000),
+          "refused_admitted_spawn_survived_as_an_orphan",
+        ).toBe(true);
+
+        lateTicket.settle();
+        expect(
+          fence.inFlight(),
+          "settled_lease_must_release_the_admission_counter",
+        ).toBe(0);
+      } finally {
+        ticket.settle();
+        forceKillShutdownFixtures();
+        fence.reopen();
+      }
+    },
+    20_000,
+  );
+
+  it("fails closed on an admission timeout before registered-run or finalizer drains", async () => {
+    const timeoutFence = {
+      close: vi.fn(),
+      reopen: vi.fn(),
+      drain: vi.fn(async () => "timed_out" as const),
+    };
+    const drainRuns = vi.fn(async () => undefined);
+    const drainExecutionFinalizers = vi.fn(async () => undefined);
+
+    await expect(
+      readShutdownApis().drainRunsForGracefulShutdown({
+        signal: "SIGTERM",
+        spawnAdmissionFence: timeoutFence as unknown as SpawnAdmissionFence,
+        drainRuns,
+        drainExecutionFinalizers,
+        timeoutMs: 5,
+        log: stubLogger(),
+      }),
+    ).rejects.toThrow("spawn_admission_drain_timed_out");
+
+    expect(drainRuns).not.toHaveBeenCalled();
+    expect(drainExecutionFinalizers).not.toHaveBeenCalled();
+  });
+
+  it("still drains execution finalizers when the registered-run drain rejects", async () => {
+    const runDrainError = new Error("registered run drain failed");
+    const order: string[] = [];
+    const drainedFence = {
+      close: vi.fn(),
+      reopen: vi.fn(),
+      drain: vi.fn(async () => "drained" as const),
+    };
+
+    await expect(
+      readShutdownApis().drainRunsForGracefulShutdown({
+        signal: "SIGTERM",
+        spawnAdmissionFence: drainedFence as unknown as SpawnAdmissionFence,
+        drainRuns: async () => {
+          order.push("run_drain");
+          throw runDrainError;
+        },
+        drainExecutionFinalizers: async () => {
+          order.push("execution_finalizer_drain");
+        },
+        log: stubLogger(),
+      }),
+    ).rejects.toBe(runDrainError);
+
+    expect(order).toEqual(["run_drain", "execution_finalizer_drain"]);
+  });
+
+  it.skipIf(process.platform === "win32")(
+    "holds the run and finalizer drains until admitted mid-spawn work has settled",
+    async () => {
+      const { drainRunsForGracefulShutdown } = readShutdownApis();
+
+      // A stub fence, not the process-global one: the shutdown helper takes the
+      // fence as a dependency (like every other seam in `shutdown.ts`), so a
+      // stub is the honest way to hold step 2 of the contract open. The stub's
+      // drain IS the wait for spawns already admitted or mid-spawn, which is why
+      // parking it must stall both drains below.
+      const fenceCalls: string[] = [];
+      let admissionClosed = false;
+      const atAdmissionDrain = deferred<{ timeoutMs: number | undefined }>();
+      const releaseAdmissionDrain = deferred();
+      const fence = {
+        close() {
+          admissionClosed = true;
+          fenceCalls.push("admission_close");
+        },
+        reopen() {
+          admissionClosed = false;
+        },
+        isClosed() {
+          return admissionClosed;
+        },
+        inFlight() {
+          // Never drains by itself: only `releaseAdmissionDrain` ends the wait.
+          return 1;
+        },
+        // Present for shape honesty only — this test never spawns, so it never
+        // takes a lease. The wait it does exercise is the fence's own drain.
+        enterAdmission: () => ({
+          admit: async () => undefined,
+          settle: () => undefined,
+        }),
+        drain: async (options?: { timeoutMs?: number }) => {
+          fenceCalls.push("admission_drain");
+          atAdmissionDrain.resolve({ timeoutMs: options?.timeoutMs });
+          await releaseAdmissionDrain.promise;
+          return "drained";
+        },
+      } as unknown as SpawnAdmissionFence;
+
+      const order: string[] = [];
+      const drainRuns = vi.fn(async () => {
+        order.push("run_drain");
+      });
+      const drainExecutionFinalizers = vi.fn(async () => {
+        order.push("execution_finalizer_drain");
+      });
+
+      let settled = false;
+      const shutdown = drainRunsForGracefulShutdown({
+        signal: "SIGTERM",
+        spawnAdmissionFence: fence,
+        drainRuns,
+        drainExecutionFinalizers,
+        timeoutMs: 5_000,
+        log: stubLogger(),
+      }).finally(() => {
+        settled = true;
+      });
+
+      try {
+        await Promise.race([
+          atAdmissionDrain.promise,
+          new Promise<never>((_, reject) =>
+            setTimeout(
+              () => reject(new Error("shutdown_never_awaited_spawn_admission_drain")),
+              5_000,
+            ),
+          ),
+        ]);
+        // Admission closes BEFORE the wait for admitted work, never after it.
+        expect(
+          fenceCalls,
+          "spawn_admission_not_closed_before_admitted_work_was_awaited",
+        ).toEqual(["admission_close", "admission_drain"]);
+        expect(fence.isClosed()).toBe(true);
+
+        const earlyOutcome = await Promise.race([
+          shutdown.then(() => "settled" as const),
+          new Promise<"still_open">((resolve) =>
+            setTimeout(() => resolve("still_open"), 150),
+          ),
+        ]);
+        expect(
+          earlyOutcome,
+          "shutdown_settled_while_a_spawn_was_still_in_flight",
+        ).toBe("still_open");
+        expect(settled).toBe(false);
+        expect(
+          order,
+          "run_or_finalizer_drain_started_before_admitted_work_settled",
+        ).toEqual([]);
+
+        releaseAdmissionDrain.resolve();
+        await shutdown;
+
+        expect(order).toEqual(["run_drain", "execution_finalizer_drain"]);
+      } finally {
+        releaseAdmissionDrain.resolve();
+        forceKillShutdownFixtures();
+        // Bounded: a helper that never calls the fence's drain would otherwise
+        // leave `shutdown` pending forever and hang the run on this await.
+        await Promise.race([
+          shutdown.catch(() => undefined),
+          new Promise((resolve) => setTimeout(resolve, 2_000)),
+        ]);
+      }
+    },
+    20_000,
+  );
 });

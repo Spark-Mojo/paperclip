@@ -819,6 +819,38 @@ function authenticatedActorResponsibleUserId(req: Request) {
     : undefined;
 }
 
+/**
+ * Reads the caller-supplied idempotency key for a comment write.
+ *
+ * SPA-11706 D1: this used to be `actor.actorType === "user" ? req.body.clientRequestId
+ * : undefined` at each call site, which silently dropped the key for every agent. An
+ * agent retrying after an ambiguous failure therefore had no way to make the write
+ * idempotent, and a bisect loop wrote 75 copies of one comment. The key is now
+ * opt-in for all actors, and a blank or non-string value is treated as absent so a
+ * stray whitespace key cannot bind an unintended unique constraint.
+ *
+ * Read from BOTH the standard `Idempotency-Key` request header and the
+ * `clientRequestId` body field, header first. The body field is what the existing
+ * board chat surface already sends; the header is the conventional transport and
+ * the one the agent guide documents. Documenting a header the server does not
+ * read would make this fix inert for its own documented consumer (SPA-9687 review
+ * finding D1, carried forward).
+ */
+export function readCommentIdempotencyKey(
+  body: unknown,
+  headers?: unknown,
+): string | undefined {
+  const headerValue = (headers as { [key: string]: unknown } | null | undefined)?.[
+    "idempotency-key"
+  ];
+  if (typeof headerValue === "string" && headerValue.trim().length > 0) {
+    return headerValue;
+  }
+  const raw = (body as { clientRequestId?: unknown } | null | undefined)
+    ?.clientRequestId;
+  return typeof raw === "string" && raw.trim().length > 0 ? raw : undefined;
+}
+
 // Matches the partial unique index that guarantees at most one onboarding
 // first-task issue per company (packages/db/src/schema/issues.ts).
 function isOnboardingFirstTaskConflict(error: unknown): boolean {
@@ -6543,11 +6575,161 @@ export function issueRoutes(
     return false;
   }
 
+  /**
+   * SPA-12197: resolve the REQUESTED post-mutation blocker set through the
+   * real dependency resolver.
+   *
+   * Returns the unresolved blocker ids of the requested set, or null when no
+   * relaxation applies (caller did not narrow the set, or a removed blocker
+   * is not terminal — in both cases the guard falls back to the stored set
+   * exactly as before).
+   *
+   * Two stages, both fail-closed:
+   *
+   * 1. Terminal-only removals: every stored edge the request would drop must
+   *    already be `done`/`cancelled` (status re-read from the DB, never
+   *    trusted from the request). A still-open removed blocker returns null.
+   * 2. Synthetic resolution: write per-call `blocks` rows naming a random
+   *    synthetic dependent id for the requested blockers PLUS any dropped
+   *    `done` blocker that carries an execution workspace (re-added so the
+   *    resolver's finalize barrier can still hold it — see the re-add note
+   *    below), run the REAL `listIssueDependencyReadinessMap` (via
+   *    `svc.listDependencyReadiness`) against them, then delete the rows in
+   *    `finally`. The empty id set resolves trivially clean (no rows, no
+   *    unresolved). This closes both residual bypasses in one move: a `done`
+   *    blocker stuck behind the workspace-finalize barrier resolves
+   *    UNRESOLVED in the synthetic run (no relaxation for pending-finalize
+   *    drops), and a newly ADDED open blocker resolves unresolved too (no
+   *    smuggling a live blocker in beside a terminal drop). The synthetic id
+   *    is a random UUID no real issue can collide with; no other query
+   *    enumerates relations by dependent id except the resolver itself, and
+   *    only this call knows the synthetic id.
+   *
+   * NOTE the inherited TOCTOU: the guard resolves the requested set now;
+   * `svc.update` writes it later inside its own transaction. A concurrent
+   * writer could mutate the blocker edges in between. The window is one
+   * request wide and the terminal-only constraint keeps it narrow, but on a
+   * contended card the write still wins over the guard's snapshot.
+   */
+  async function resolveRequestedBlockedBySet(
+    companyId: string,
+    requestedBlockedByIssueIds: string[],
+    removedBlockerIds: string[],
+  ): Promise<string[] | null> {
+    if (removedBlockerIds.length === 0) return null;
+    try {
+      const rows = await db
+        .select({ id: issueRows.id, status: issueRows.status })
+        .from(issueRows)
+        .where(
+          and(
+            eq(issueRows.companyId, companyId),
+            inArray(issueRows.id, removedBlockerIds),
+          ),
+        );
+      const byId = new Map(rows.map((row) => [row.id, row.status]));
+      // Every removed blocker must exist and be terminal. A missing row means
+      // we cannot prove terminality, so no relaxation.
+      const allRemovedTerminal = removedBlockerIds.every((id) => {
+        const status = byId.get(id);
+        return status === "done" || status === "cancelled";
+      });
+      if (!allRemovedTerminal) return null;
+      const syntheticId = randomUUID();
+      try {
+        // The synthetic resolution constrains blockers the request KEEPS.
+        // Dropped blockers are intentionally absent from the synthetic set —
+        // the terminal-only check above already cleared them — EXCEPT a
+        // dropped `done` blocker may still be behind the workspace-finalize
+        // barrier, and the resolver only reports that barrier for blockers
+        // present in the set it resolves. So re-add each dropped `done`
+        // blocker that carries an execution workspace to the synthetic set:
+        // if the barrier holds it, the resolution comes back unresolved and
+        // the guard refuses (no relaxation for pending-finalize drops). A
+        // dropped `done` blocker with no workspace, or one whose finalize
+        // already succeeded, resolves clean and the drop proceeds. Cancelled
+        // drops need no re-add: nothing in the resolver can hold a cancelled
+        // edge except its non-done status, which the terminal-only check
+        // already proved.
+        const droppedDoneWithWorkspace = await db
+          .select({
+            id: issueRows.id,
+            executionWorkspaceId: issueRows.executionWorkspaceId,
+          })
+          .from(issueRows)
+          .where(
+            and(
+              eq(issueRows.companyId, companyId),
+              inArray(issueRows.id, removedBlockerIds),
+              eq(issueRows.status, "done"),
+            ),
+          )
+          .then((doneRows) =>
+            doneRows
+              .filter((row) => row.executionWorkspaceId)
+              .map((row) => row.id),
+          );
+        const syntheticBlockerIds = [
+          ...new Set([
+            ...requestedBlockedByIssueIds,
+            ...droppedDoneWithWorkspace,
+          ]),
+        ];
+        if (syntheticBlockerIds.length > 0) {
+          await db.insert(issueRelations).values(
+            syntheticBlockerIds.map((blockerIssueId) => ({
+              companyId,
+              issueId: blockerIssueId,
+              relatedIssueId: syntheticId,
+              type: "blocks" as const,
+            })),
+          );
+        }
+        const readiness = await svc.listDependencyReadiness(
+          companyId,
+          [syntheticId],
+        );
+        const state = readiness.get(syntheticId);
+        // The resolver seeds one map entry per requested id up front and only
+        // fills it when blocker rows join, so a NON-empty synthetic set must
+        // always produce an entry. A missing entry for a non-empty set means
+        // the resolver did not see our rows — fail CLOSED (null), never
+        // clean. Only the empty set (no rows written at all) is trivially
+        // clean.
+        if (!state) return syntheticBlockerIds.length === 0 ? [] : null;
+        return state.unresolvedBlockerIssueIds;
+      } finally {
+        await db
+          .delete(issueRelations)
+          .where(eq(issueRelations.relatedIssueId, syntheticId));
+      }
+    } catch {
+      return null;
+    }
+  }
+
   async function assertExplicitResumeIntentAllowed(
     req: Request,
     res: Response,
     issue: Parameters<typeof decideIssueAccess>[1],
-    options: { resumeIntent?: boolean } = {},
+    options: {
+      resumeIntent?: boolean;
+      /**
+       * SPA-12197: the explicit post-mutation `blockedByIssueIds` array this
+       * request carries, when it carries one. Used to judge the
+       * unresolved-blocker guard against the requested relation set rather
+       * than the stored one. `undefined` means "this request did not touch the
+       * blocker set", which preserves today's behaviour exactly.
+       */
+      requestedBlockedByIssueIds?: string[];
+      /**
+       * SPA-12197: the blockers currently in the stored relation set that
+       * `requestedBlockedByIssueIds` does NOT contain — i.e. exactly the edges
+       * this request would drop. The caller computes this from the relation
+       * summaries it already read. Empty/absent means "no relaxation".
+       */
+      removedBlockerIssueIds?: string[];
+    } = {},
   ) {
     if (
       await assertLowTrustControlPlaneDenied(req, res, issue.companyId, issue)
@@ -6596,12 +6778,47 @@ export function issueRoutes(
 
     if (issue.status === "blocked") {
       const readiness = await svc.getDependencyReadiness(issue.id);
-      if (readiness.unresolvedBlockerCount > 0) {
+      const requestedBlockedByIssueIds = options.requestedBlockedByIssueIds;
+      // SPA-12197 (friction #1623): the readiness read above is against the
+      // STORED `blocks` rows, but the relation write this request would make
+      // (`svc.update` → `syncBlockedByIssueIds`, a set-replace) only runs
+      // later. A blocked card whose only unresolved blockers are TERMINAL
+      // (`done` / `cancelled`) therefore 409s forever — including on the one
+      // request that would clear the wedge — because the guard is judged
+      // against the pre-mutation relation set and the mutation never runs.
+      //
+      // When (and only when) the caller explicitly supplies the post-mutation
+      // `blockedByIssueIds` array, judge the guard against THAT set instead of
+      // the stored one. This mirrors the existing `enteringBlocked` precedent,
+      // which already evaluates against the requested set on the way INTO
+      // blocked. It is request-driven, not engine-autonomous: the caller is
+      // authorizing the edge drop, so the engine gains no new authority to
+      // manage a blocker edge on its own.
+      //
+      // Relax ONLY when the full requested post-mutation set resolves clean
+      // through the real resolver: terminal-only removals (proven above), no
+      // pending-finalize drops, and no smuggled-in open blockers (both proven
+      // by the synthetic resolution). A null return means "no relaxation" and
+      // the guard judges the stored set exactly as before.
+      const relaxedUnresolvedBlockerIssueIds =
+        Array.isArray(requestedBlockedByIssueIds)
+          ? await resolveRequestedBlockedBySet(
+              issue.companyId,
+              requestedBlockedByIssueIds,
+              options.removedBlockerIssueIds ?? [],
+            )
+          : null;
+      const unresolvedBlockerIssueIds =
+        relaxedUnresolvedBlockerIssueIds ?? readiness.unresolvedBlockerIssueIds;
+      const unresolvedBlockerCount =
+        relaxedUnresolvedBlockerIssueIds?.length ??
+        readiness.unresolvedBlockerCount;
+      if (unresolvedBlockerCount > 0) {
         res.status(409).json({
           error: "Issue follow-up blocked by unresolved blockers",
           details: {
             issueId: issue.id,
-            unresolvedBlockerIssueIds: readiness.unresolvedBlockerIssueIds,
+            unresolvedBlockerIssueIds,
           },
         });
         return false;
@@ -7260,27 +7477,57 @@ export function issueRoutes(
 
   /**
    * Refuse an agent creating a child issue assigned to the agent that created
-   * a still-open ancestor in the same chain. That shape is a delegation cycle
+   * AND assigned to this actor a still-open ancestor in the same chain. That
+   * pair is a live delegation edge, and the shape is a delegation cycle
    * (A delegates to B, B delegates the same work back to A): each agent lacks
    * something the other assumed it had, the chain of blocked issues grows,
-   * and no one tells the human. Humans are unaffected, and closed ancestors
-   * do not count — re-engaging the creator of finished work is normal.
+   * and no one tells the human.
+   *
+   * Creation alone does not refuse. An agent that merely owns a class of work
+   * creates cards in chains without ever delegating them, and a router
+   * decomposes work into cards it assigns to others; refusing those forces
+   * the caller to drop the parent to get past the guard, and the parent is
+   * what carries execution-workspace inheritance. Humans are unaffected, and
+   * closed ancestors do not count — re-engaging the creator of finished work
+   * is normal.
+   *
+   * Create-only by design: the assignee path on PATCH is not guarded, so an
+   * actor that does hold open work from the proposed assignee can still
+   * re-route that work by reassigning the card it holds, or file new work as
+   * a root card and assign it afterwards.
    */
   async function assertNoAgentDelegationCycle(input: {
     actorType: string;
+    actorAgentId: string | null | undefined;
     parentIssueId: string | null | undefined;
     assigneeAgentId: string | null | undefined;
   }) {
     if (input.actorType !== "agent") return;
     if (!input.parentIssueId || !input.assigneeAgentId) return;
-    const ancestor = await svc.findOpenAncestorCreatedByAgent(
+    // Both agent-actor construction sites (middleware/auth.ts:412 and :467)
+    // always carry an agentId, so an agent actor without one is an identity the
+    // chain cannot be attributed to. Refusing outright would block the create
+    // for a caller the predicate cannot reason about, and this guard is a
+    // liveness backstop rather than an authorization control — so it does not
+    // refuse, but it is never silent about skipping.
+    if (!input.actorAgentId) {
+      logger.warn(
+        {
+          parentIssueId: input.parentIssueId,
+          assigneeAgentId: input.assigneeAgentId,
+        },
+        "delegation cycle guard skipped: agent actor has no attributable agent id",
+      );
+    }
+    const ancestor = await svc.findOpenDelegationCycleAncestor(
       input.parentIssueId,
       input.assigneeAgentId,
+      input.actorAgentId ?? null,
     );
     if (!ancestor) return;
     throw conflict(
-      `Delegation cycle: ${ancestor.identifier ?? "an ancestor issue"} in this chain was created by the agent this child would be assigned to. ` +
-        "Complete the remaining work in your own issue, leave the child unassigned, or escalate to a board operator — do not delegate the work back to the agent that delegated it to you.",
+      `Delegation cycle: ${ancestor.identifier ?? "an ancestor issue"} in this chain was created by the agent this child would be assigned to, and is still assigned to you. ` +
+        "Complete the remaining work in your own issue, leave the child unassigned, reassign the issue you already hold, or escalate to a board operator — do not delegate the work back to the agent that delegated it to you.",
       {
         code: "delegation_cycle",
         ancestorIssueId: ancestor.id,
@@ -11720,13 +11967,14 @@ export function issueRoutes(
           rawCreateBody.assigneeAgentId as string | null | undefined,
           { actorType: req.actor.type },
         );
+      const actor = getActorInfo(req);
       await assertNoAgentDelegationCycle({
-        actorType: req.actor.type,
+        actorType: actor.actorType,
+        actorAgentId: actor.agentId,
         parentIssueId:
           typeof effectiveParentId === "string" ? effectiveParentId : null,
         assigneeAgentId: normalizedAssigneeAgentId ?? null,
       });
-      const actor = getActorInfo(req);
       // SPA-8707: a newly created card MUST get its own fresh execution
       // workspace and a branch named for itself. Auto-inheriting the
       // currently-active run's workspace (the PAP-10871 / PAP-10873 behavior)
@@ -12145,8 +12393,10 @@ export function issueRoutes(
           sanitizedBody.assigneeAgentId as string | null | undefined,
           { actorType: req.actor.type },
         );
+      const actor = getActorInfo(req);
       await assertNoAgentDelegationCycle({
-        actorType: req.actor.type,
+        actorType: actor.actorType,
+        actorAgentId: actor.agentId,
         parentIssueId: parent.id,
         assigneeAgentId: normalizedAssigneeAgentId ?? null,
       });
@@ -12175,7 +12425,6 @@ export function issueRoutes(
         createBody.executionWorkspaceSettings?.environmentId,
       );
 
-      const actor = getActorInfo(req);
       const serializationContext =
         await resolveWatchdogFollowUpSerializationContext(req, parent);
       const currentSerializedChild = serializationContext
@@ -13001,12 +13250,44 @@ export function issueRoutes(
         typeof updateFields.status === "string" &&
         updateFields.status !== existing.status &&
         (isBlocked || (isClosed && !isClosedIssueStatus(updateFields.status)));
+  /**
+   * SPA-12197: the requested/removed blocker id sets for the guard.
+   *
+   * Both PATCH lanes (reopen + status-transition) read the same
+   * unresolved-blocker guard, so both hand it the same relaxation inputs:
+   * the explicit post-mutation `blockedByIssueIds` array the request carries
+   * (absent → `undefined`, i.e. unchanged behaviour), and the exact stored
+   * edges the request would drop (stored minus requested).
+   */
+  function requestedBlockerSetOptions(): {
+    requestedBlockedByIssueIds?: string[];
+    removedBlockerIssueIds?: string[];
+  } {
+    if (!Array.isArray(req.body.blockedByIssueIds)) {
+      return {};
+    }
+    const requested = [...new Set(req.body.blockedByIssueIds as string[])];
+    return {
+      requestedBlockedByIssueIds: requested,
+      removedBlockerIssueIds: (existingRelations?.blockedBy ?? [])
+        .map((relation) => relation.id)
+        .filter((id) => !requested.includes(id)),
+    };
+  }
+
       if (
         resumeRequested !== true &&
         req.actor.type === "agent" &&
         reopenRequested === true
       ) {
-        if (!(await assertExplicitResumeIntentAllowed(req, res, existing)))
+        if (
+          !(await assertExplicitResumeIntentAllowed(
+            req,
+            res,
+            existing,
+            requestedBlockerSetOptions(),
+          ))
+        )
           return;
       }
       await assertIssueEnvironmentSelection(
@@ -13056,7 +13337,12 @@ export function issueRoutes(
       if (
         resumeRequested !== true &&
         agentStatusTransitionRequiresResumeAuthority &&
-        !(await assertExplicitResumeIntentAllowed(req, res, existing))
+        !(await assertExplicitResumeIntentAllowed(
+          req,
+          res,
+          existing,
+          requestedBlockerSetOptions(),
+        ))
       ) {
         return;
       }
@@ -13872,7 +14158,9 @@ export function issueRoutes(
                 },
                 {
                   attachmentIds: commentAttachmentIds,
-                  clientRequestId: actor.actorType === "user" ? commentClientRequestId : undefined,
+                  // SPA-11706 D1: the PATCH-with-comment path threads the same
+                  // opt-in key for agents and users alike (was user-only).
+                  clientRequestId: commentClientRequestId,
                   authorizationReason: issueMutationAuthorizationReason,
                   sourceTrust: attachmentCommentSourceTrust,
                 },
@@ -14538,7 +14826,8 @@ export function issueRoutes(
           },
           {
             authorizationReason: issueMutationAuthorizationReason,
-            clientRequestId: actor.actorType === "user" ? commentClientRequestId : undefined,
+            // SPA-11706 D1: same opt-in key for agents and users alike.
+            clientRequestId: commentClientRequestId,
             sourceTrust: await sourceTrustForActorWrite(issue, actor),
           },
         );
@@ -16704,26 +16993,37 @@ export function issueRoutes(
         },
       });
 
-      await questionResponseDeliveries.deliver(interaction.id).catch((err) => {
-        logger.warn(
-          {
-            err,
-            companyId: issue.companyId,
-            issueId: issue.id,
-            interactionId: interaction.id,
-          },
-          "synchronous question response delivery failed; durable outbox will retry",
-        );
-      });
+      const deliveryOutcome = await questionResponseDeliveries
+        .deliver(interaction.id)
+        .catch((err) => {
+          logger.warn(
+            {
+              err,
+              companyId: issue.companyId,
+              issueId: issue.id,
+              interactionId: interaction.id,
+            },
+            "synchronous question response delivery failed; durable outbox will retry",
+          );
+          return null;
+        });
 
-      await queueResolvedInteractionContinuationWakeup({
-        db,
-        heartbeat,
-        issue,
-        interaction,
-        actor,
-        source: "issue.interaction.respond",
-      });
+      // SPA-11805 B1: when the answer was just delivered into a live run
+      // (steered or coalesced), that run already holds the answer — queueing a
+      // `wake_assignee` continuation on top of it is the duplicate wake James
+      // flagged on SPA-11120. B2's delivery-side cancel covers a wake armed by
+      // another route before delivery landed; this skip covers the wake this
+      // route would arm after delivery already landed.
+      if (deliveryOutcome?.status !== "delivered") {
+        await queueResolvedInteractionContinuationWakeup({
+          db,
+          heartbeat,
+          issue,
+          interaction,
+          actor,
+          source: "issue.interaction.respond",
+        });
+      }
 
       res.json(interaction);
     },
@@ -17486,6 +17786,12 @@ export function issueRoutes(
         if (!(await assertAgentIssueCommentAllowed(req, res, issue))) return;
         if (req.body.body.trim() !== "/new" && !(await assertBoardCommentNotPaused(req, res, issue))) return;
         const actor = getActorInfo(req);
+        // Unchanged by SPA-11706 D1: this path already required and validated a
+        // body clientRequestId (the 422 above), and it is a board-user path, not
+        // the agent path whose key was being stripped. Reading the header here
+        // would let the guard above and the pre-SELECT below disagree about
+        // which key is in force.
+        const commentClientRequestId = req.body.clientRequestId;
         const userId = req.actor.userId;
         const publications: ActivityPublication[] = [];
         const comment = await db.transaction(async (tx) => {
@@ -17494,10 +17800,10 @@ export function issueRoutes(
           )).for("update");
           const [existing] = await tx.select({ id: issueComments.id }).from(issueComments).where(and(
             eq(issueComments.issueId, issue.id), eq(issueComments.authorUserId, userId),
-            eq(issueComments.clientRequestId, req.body.clientRequestId),
+            eq(issueComments.clientRequestId, commentClientRequestId),
           ));
           const saved = await svc.addComment(issue.id, req.body.body, { userId }, {
-            clientRequestId: req.body.clientRequestId, authorType: "user", attachmentIds: req.body.attachmentIds,
+            clientRequestId: commentClientRequestId, authorType: "user", attachmentIds: req.body.attachmentIds,
           }, tx);
           if (!existing) await logActivity(tx as unknown as Db, {
             companyId: issue.companyId, actorType: actor.actorType, actorId: actor.actorId,
@@ -17550,6 +17856,13 @@ export function issueRoutes(
         await getClosedIssueExecutionWorkspace(issue);
 
       const actor = getActorInfo(req);
+      // SPA-11706 D1: the idempotency key is opt-in for every actor, agents
+      // included. Agents used to have it stripped unconditionally, so an agent
+      // retry after an ambiguous failure wrote a duplicate comment every attempt.
+      const commentClientRequestId = readCommentIdempotencyKey(
+        req.body,
+        req.headers,
+      );
       const commentPresentation =
         req.body.presentation ??
         (await deriveRecoveryCommentPresentation(
@@ -17883,7 +18196,7 @@ export function issueRoutes(
           presentation: commentPresentation,
           metadata: req.body.metadata ?? null,
           attachmentIds: req.body.attachmentIds,
-          clientRequestId: actor.actorType === "user" ? req.body.clientRequestId : undefined,
+          clientRequestId: commentClientRequestId,
           sourceTrust,
         };
         let txResult: {
@@ -17995,7 +18308,7 @@ export function issueRoutes(
           presentation: commentPresentation,
           metadata: req.body.metadata ?? null,
           attachmentIds: req.body.attachmentIds,
-          clientRequestId: actor.actorType === "user" ? req.body.clientRequestId : undefined,
+          clientRequestId: commentClientRequestId,
           authorizationReason: commentAuthorizationReason,
           sourceTrust: await sourceTrustForActorWrite(currentIssue, actor),
         };

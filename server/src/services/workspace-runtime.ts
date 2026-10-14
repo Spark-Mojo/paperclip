@@ -3766,6 +3766,48 @@ export async function realizeExecutionWorkspace(input: {
 
   await fs.mkdir(worktreeParentDir, { recursive: true });
 
+  // SPA-11953: when a configured worktree path is a real Git checkout
+  // owned by a DIFFERENT repo than the current project workspace's repo,
+  // refuse before ANY existing-path cleanup or reuse logic. Ephemeral
+  // realization deliberately removes stale same-repo run worktrees below,
+  // so this ownership fence must run first or that cleanup can destroy a
+  // foreign repo's worktree before the ordinary existing-path guard sees it.
+  // The operator chose a `worktreeParentDir` shared between two repos (or one
+  // repo rebound onto a path the other repo carved first), and we have no
+  // proof the foreign worktree is clean or recoverable. Surface the collision
+  // typed so the human-actionable message names both repos and the payload
+  // names the occupying + current repo roots for downstream consumers.
+  // `resolveGitOwnerRepoRoot` is the SAME primitive the SPA-9437 persisted
+  // rebind path uses, so a path that is itself a worktree of repo X is
+  // normalized to X on both sides. Both roots then pass through the existing
+  // worktree-comparison realpath helper so a symlinked `os.tmpdir()` cannot
+  // make the same repo compare unequal.
+  if (await directoryExists(worktreePath)) {
+    const occupiedOwnerRepoRoot = await resolveGitOwnerRepoRoot(worktreePath).catch(() => null);
+    const canonicalOccupiedRepoRoot = occupiedOwnerRepoRoot
+      ? await resolvePathForWorktreeComparison(occupiedOwnerRepoRoot)
+      : null;
+    const canonicalCurrentRepoRoot = await resolvePathForWorktreeComparison(repoRoot);
+    if (
+      canonicalOccupiedRepoRoot
+      && canonicalOccupiedRepoRoot !== canonicalCurrentRepoRoot
+    ) {
+      throw new WorkspaceRuntimeValidationFailure(
+        `Configured worktree path "${worktreePath}" already exists and is owned by a different git repository ("${canonicalOccupiedRepoRoot}") than the current project workspace's repo ("${canonicalCurrentRepoRoot}"). The engine will not remove or reparent a worktree belonging to another repo — that path is outside this card's safety boundary. Choose a worktreeParentDir scoped to "${canonicalCurrentRepoRoot}", remove the occupying worktree manually if you really mean to release it, or rebind the project workspace to the repo that already owns this path.`,
+        {
+          workspaceValidation: {
+            reason: "git_worktree_belongs_to_other_repo",
+            reasonCode: "configured_path_owned_by_other_repo",
+            worktreePath,
+            branchName,
+            occupyingRepoRoot: canonicalOccupiedRepoRoot,
+            currentRepoRoot: canonicalCurrentRepoRoot,
+          },
+        },
+      );
+    }
+  }
+
   // SPA-9275: in ephemeral mode the directory is keyed by run id; a stale
   // directory from a crashed previous run blocks the fresh `git worktree add`,
   // so the realize path force-removes the existing path before creating the

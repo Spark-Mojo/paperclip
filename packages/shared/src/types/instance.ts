@@ -41,8 +41,9 @@ export interface InstanceGeneralSettings {
   /**
    * Live DB override for the fleet-wide ceiling on concurrently RUNNING agent
    * runs (server/src/services/heartbeat.ts `fleetMaxConcurrentRuns()`).
-   * Integer 1..50 sets an explicit ceiling; `null` explicitly forces "no
-   * ceiling", overriding the `PAPERCLIP_MAX_CONCURRENT_AGENT_RUNS` boot
+   * Integer 0..50 sets an explicit ceiling; 0 pauses admissions (no new run
+   * admitted, running runs untouched, queued stays queued); `null` explicitly
+   * forces "no ceiling", overriding the `PAPERCLIP_MAX_CONCURRENT_AGENT_RUNS` boot
    * default; absent leaves the env var (if any) in control. See
    * `FleetMaxConcurrentRunsStatus` for the resolved effective value and its
    * source — this field is the stored override only, not the effective one.

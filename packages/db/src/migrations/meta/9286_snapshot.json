@@ -22568,156 +22568,6 @@
             "type": "stored"
           }
         },
-        "context_task_key": {
-          "name": "context_task_key",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": false,
-          "generated": {
-            "as": "\"heartbeat_runs\".\"context_snapshot\" ->> 'taskKey'",
-            "type": "stored"
-          }
-        },
-        "context_comment_id": {
-          "name": "context_comment_id",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": false,
-          "generated": {
-            "as": "\"heartbeat_runs\".\"context_snapshot\" ->> 'commentId'",
-            "type": "stored"
-          }
-        },
-        "context_wake_comment_id": {
-          "name": "context_wake_comment_id",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": false,
-          "generated": {
-            "as": "\"heartbeat_runs\".\"context_snapshot\" ->> 'wakeCommentId'",
-            "type": "stored"
-          }
-        },
-        "context_wake_comment_ids": {
-          "name": "context_wake_comment_ids",
-          "type": "jsonb",
-          "primaryKey": false,
-          "notNull": false,
-          "generated": {
-            "as": "\"heartbeat_runs\".\"context_snapshot\" -> 'wakeCommentIds'",
-            "type": "stored"
-          }
-        },
-        "context_wake_reason": {
-          "name": "context_wake_reason",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": false,
-          "generated": {
-            "as": "\"heartbeat_runs\".\"context_snapshot\" ->> 'wakeReason'",
-            "type": "stored"
-          }
-        },
-        "context_wake_source": {
-          "name": "context_wake_source",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": false,
-          "generated": {
-            "as": "\"heartbeat_runs\".\"context_snapshot\" ->> 'wakeSource'",
-            "type": "stored"
-          }
-        },
-        "context_wake_trigger_detail": {
-          "name": "context_wake_trigger_detail",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": false,
-          "generated": {
-            "as": "\"heartbeat_runs\".\"context_snapshot\" ->> 'wakeTriggerDetail'",
-            "type": "stored"
-          }
-        },
-        "result_list_summary": {
-          "name": "result_list_summary",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": false,
-          "generated": {
-            "as": "\"heartbeat_runs\".\"result_json\" ->> 'summary'",
-            "type": "stored"
-          }
-        },
-        "result_list_result": {
-          "name": "result_list_result",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": false,
-          "generated": {
-            "as": "\"heartbeat_runs\".\"result_json\" ->> 'result'",
-            "type": "stored"
-          }
-        },
-        "result_list_message": {
-          "name": "result_list_message",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": false,
-          "generated": {
-            "as": "\"heartbeat_runs\".\"result_json\" ->> 'message'",
-            "type": "stored"
-          }
-        },
-        "result_list_error": {
-          "name": "result_list_error",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": false,
-          "generated": {
-            "as": "\"heartbeat_runs\".\"result_json\" ->> 'error'",
-            "type": "stored"
-          }
-        },
-        "result_list_total_cost_usd": {
-          "name": "result_list_total_cost_usd",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": false,
-          "generated": {
-            "as": "\"heartbeat_runs\".\"result_json\" ->> 'total_cost_usd'",
-            "type": "stored"
-          }
-        },
-        "result_list_cost_usd": {
-          "name": "result_list_cost_usd",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": false,
-          "generated": {
-            "as": "\"heartbeat_runs\".\"result_json\" ->> 'cost_usd'",
-            "type": "stored"
-          }
-        },
-        "result_list_cost_usd_camel": {
-          "name": "result_list_cost_usd_camel",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": false,
-          "generated": {
-            "as": "\"heartbeat_runs\".\"result_json\" ->> 'costUsd'",
-            "type": "stored"
-          }
-        },
-        "result_ledger_summary": {
-          "name": "result_ledger_summary",
-          "type": "jsonb",
-          "primaryKey": false,
-          "notNull": false,
-          "generated": {
-            "as": "\n        case\n          when \"heartbeat_runs\".\"result_json\" is null then null\n          else\n            case when (\"heartbeat_runs\".\"result_json\" -> 'conversationReset') is null or (\"heartbeat_runs\".\"result_json\" -> 'conversationReset') = 'null'::jsonb then '{}'::jsonb else jsonb_set('{}'::jsonb, '{conversationReset}', \"heartbeat_runs\".\"result_json\" -> 'conversationReset', true) end\n            || case when (coalesce(\"heartbeat_runs\".\"result_json\" -> 'billingType', \"heartbeat_runs\".\"result_json\" -> 'billing_type')) is null or (coalesce(\"heartbeat_runs\".\"result_json\" -> 'billingType', \"heartbeat_runs\".\"result_json\" -> 'billing_type')) = 'null'::jsonb then '{}'::jsonb else jsonb_set('{}'::jsonb, '{billingType}', coalesce(\"heartbeat_runs\".\"result_json\" -> 'billingType', \"heartbeat_runs\".\"result_json\" -> 'billing_type'), true) end\n            || case when (coalesce(\"heartbeat_runs\".\"result_json\" -> 'billing_type', \"heartbeat_runs\".\"result_json\" -> 'billingType')) is null or (coalesce(\"heartbeat_runs\".\"result_json\" -> 'billing_type', \"heartbeat_runs\".\"result_json\" -> 'billingType')) = 'null'::jsonb then '{}'::jsonb else jsonb_set('{}'::jsonb, '{billing_type}', coalesce(\"heartbeat_runs\".\"result_json\" -> 'billing_type', \"heartbeat_runs\".\"result_json\" -> 'billingType'), true) end\n            || case when (coalesce(\"heartbeat_runs\".\"result_json\" -> 'costUsd', \"heartbeat_runs\".\"result_json\" -> 'cost_usd', \"heartbeat_runs\".\"result_json\" -> 'total_cost_usd')) is null or (coalesce(\"heartbeat_runs\".\"result_json\" -> 'costUsd', \"heartbeat_runs\".\"result_json\" -> 'cost_usd', \"heartbeat_runs\".\"result_json\" -> 'total_cost_usd')) = 'null'::jsonb then '{}'::jsonb else jsonb_set('{}'::jsonb, '{costUsd}', coalesce(\"heartbeat_runs\".\"result_json\" -> 'costUsd', \"heartbeat_runs\".\"result_json\" -> 'cost_usd', \"heartbeat_runs\".\"result_json\" -> 'total_cost_usd'), true) end\n            || case when (coalesce(\"heartbeat_runs\".\"result_json\" -> 'cost_usd', \"heartbeat_runs\".\"result_json\" -> 'costUsd', \"heartbeat_runs\".\"result_json\" -> 'total_cost_usd')) is null or (coalesce(\"heartbeat_runs\".\"result_json\" -> 'cost_usd', \"heartbeat_runs\".\"result_json\" -> 'costUsd', \"heartbeat_runs\".\"result_json\" -> 'total_cost_usd')) = 'null'::jsonb then '{}'::jsonb else jsonb_set('{}'::jsonb, '{cost_usd}', coalesce(\"heartbeat_runs\".\"result_json\" -> 'cost_usd', \"heartbeat_runs\".\"result_json\" -> 'costUsd', \"heartbeat_runs\".\"result_json\" -> 'total_cost_usd'), true) end\n            || case when (coalesce(\"heartbeat_runs\".\"result_json\" -> 'total_cost_usd', \"heartbeat_runs\".\"result_json\" -> 'cost_usd', \"heartbeat_runs\".\"result_json\" -> 'costUsd')) is null or (coalesce(\"heartbeat_runs\".\"result_json\" -> 'total_cost_usd', \"heartbeat_runs\".\"result_json\" -> 'cost_usd', \"heartbeat_runs\".\"result_json\" -> 'costUsd')) = 'null'::jsonb then '{}'::jsonb else jsonb_set('{}'::jsonb, '{total_cost_usd}', coalesce(\"heartbeat_runs\".\"result_json\" -> 'total_cost_usd', \"heartbeat_runs\".\"result_json\" -> 'cost_usd', \"heartbeat_runs\".\"result_json\" -> 'costUsd'), true) end\n            || case when (\"heartbeat_runs\".\"result_json\" -> 'stopReason') is null or (\"heartbeat_runs\".\"result_json\" -> 'stopReason') = 'null'::jsonb then '{}'::jsonb else jsonb_set('{}'::jsonb, '{stopReason}', \"heartbeat_runs\".\"result_json\" -> 'stopReason', true) end\n            || case when (\"heartbeat_runs\".\"result_json\" -> 'effectiveTimeoutSec') is null or (\"heartbeat_runs\".\"result_json\" -> 'effectiveTimeoutSec') = 'null'::jsonb then '{}'::jsonb else jsonb_set('{}'::jsonb, '{effectiveTimeoutSec}', \"heartbeat_runs\".\"result_json\" -> 'effectiveTimeoutSec', true) end\n            || case when (\"heartbeat_runs\".\"result_json\" -> 'effectiveTimeoutMs') is null or (\"heartbeat_runs\".\"result_json\" -> 'effectiveTimeoutMs') = 'null'::jsonb then '{}'::jsonb else jsonb_set('{}'::jsonb, '{effectiveTimeoutMs}', \"heartbeat_runs\".\"result_json\" -> 'effectiveTimeoutMs', true) end\n            || case when (\"heartbeat_runs\".\"result_json\" -> 'timeoutConfigured') is null or (\"heartbeat_runs\".\"result_json\" -> 'timeoutConfigured') = 'null'::jsonb then '{}'::jsonb else jsonb_set('{}'::jsonb, '{timeoutConfigured}', \"heartbeat_runs\".\"result_json\" -> 'timeoutConfigured', true) end\n            || case when (\"heartbeat_runs\".\"result_json\" -> 'timeoutSource') is null or (\"heartbeat_runs\".\"result_json\" -> 'timeoutSource') = 'null'::jsonb then '{}'::jsonb else jsonb_set('{}'::jsonb, '{timeoutSource}', \"heartbeat_runs\".\"result_json\" -> 'timeoutSource', true) end\n            || case when (\"heartbeat_runs\".\"result_json\" -> 'timeoutFired') is null or (\"heartbeat_runs\".\"result_json\" -> 'timeoutFired') = 'null'::jsonb then '{}'::jsonb else jsonb_set('{}'::jsonb, '{timeoutFired}', \"heartbeat_runs\".\"result_json\" -> 'timeoutFired', true) end\n        end\n      ",
-            "type": "stored"
-          }
-        },
         "created_at": {
           "name": "created_at",
           "type": "timestamp with time zone",
@@ -25069,6 +24919,34 @@
         }
       },
       "indexes": {
+        "issue_comments_agent_client_request_uq": {
+          "name": "issue_comments_agent_client_request_uq",
+          "columns": [
+            {
+              "expression": "issue_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "author_agent_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "client_request_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": true,
+          "where": "\"issue_comments\".\"client_request_id\" is not null and \"issue_comments\".\"author_agent_id\" is not null",
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        },
         "issue_comments_issue_idx": {
           "name": "issue_comments_issue_idx",
           "columns": [
@@ -48066,6 +47944,6 @@
     "tables": {},
     "columns": {}
   },
-  "id": "61a362c7-4267-4804-bb94-7a41e8c07545",
+  "id": "a71763d2-4104-4c4f-a0d5-ec28b74f68e9",
   "prevId": "36e742cd-c6a1-4b0e-91cb-5237a24817dd"
 }

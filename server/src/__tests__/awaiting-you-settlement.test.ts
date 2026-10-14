@@ -426,7 +426,7 @@ describeEmbeddedPostgres("awaiting-you settlement sweep", () => {
     return companyId;
   }
 
-  async function seedAgent(companyId: string, status = "active") {
+  async function seedAgent(companyId: string, status = "idle") {
     const agentId = randomUUID();
     await db.insert(agents).values({
       id: agentId,
@@ -455,14 +455,47 @@ describeEmbeddedPostgres("awaiting-you settlement sweep", () => {
     return issueId;
   }
 
+  /**
+   * SPA-11924: a decision interaction in an arbitrary resolution state.
+   * `answered` is the affirmative baseline; `expired`/`withdrawn`/`cancelled`
+   * are administrative (nobody answered) and must never close a card.
+   */
+  function resolvedInteraction(
+    filerId: string | null,
+    status: string,
+    result?: Record<string, unknown>,
+  ) {
+    const base = answeredQuestionInteraction(filerId);
+    return {
+      ...base,
+      status,
+      ...(result === undefined ? {} : { result }),
+    };
+  }
+
+  /** An accepted `request_confirmation` — the affirmative work receipt. */
+  function acceptedInteraction(filerId: string | null) {
+    const base = answeredQuestionInteraction(filerId);
+    return {
+      ...base,
+      kind: "request_confirmation",
+      status: "accepted",
+      result: { version: 1, outcome: "accepted" },
+    };
+  }
+
   function makeDeps(lists: Map<string, ReturnType<typeof answeredQuestionInteraction>[]>) {
     const comments: { issueId: string; body: string }[] = [];
     const wakeups: { agentId: string; opts: Record<string, unknown> }[] = [];
     const unblocked: string[] = [];
+    // SPA-11924: the settlement arm must hand the auto-unblock wake a provenance
+    // mutation, so the recorded call keeps its second argument too.
+    const unblockCalls: { blockerIssueId: string; opts?: Record<string, unknown> }[] = [];
     return {
       comments,
       wakeups,
       unblocked,
+      unblockCalls,
       deps: {
         issuesSvc: {
           update: async (id: string, data: { assigneeAgentId?: string | null; assigneeUserId?: string | null; status?: string }) =>
@@ -478,8 +511,12 @@ describeEmbeddedPostgres("awaiting-you settlement sweep", () => {
           wakeups.push({ agentId, opts });
           return null;
         },
-        unblockDependentsFn: async (blockerIssueId: string) => {
+        unblockDependentsFn: async (
+          blockerIssueId: string,
+          opts?: Record<string, unknown>,
+        ) => {
           unblocked.push(blockerIssueId);
+          unblockCalls.push({ blockerIssueId, opts });
           return null;
         },
       },
@@ -488,7 +525,10 @@ describeEmbeddedPostgres("awaiting-you settlement sweep", () => {
 
   it("hands a fully-answered card back to its live filing agent", async () => {
     const companyId = await seedCompany(randomUUID());
-    const filerId = await seedAgent(companyId, "active");
+    // SPA-11924: `idle` is the status a healthy, not-currently-running filer
+    // actually holds. The old default of "active" was a value no write path in
+    // the engine ever stored, so it proved nothing about production.
+    const filerId = await seedAgent(companyId, "idle");
     const issueId = await seedUserOwnedCard(companyId, filerId);
     // Negative: a second candidate with a still-pending decision must be skipped.
     const pendingIssueId = await seedUserOwnedCard(companyId, filerId);
@@ -512,16 +552,16 @@ describeEmbeddedPostgres("awaiting-you settlement sweep", () => {
     expect(pending).toMatchObject({ assigneeAgentId: null, assigneeUserId: "local-board" });
   }, 90_000);
 
-  it("auto-closes a fully-answered card with no live filer and wakes dependents", async () => {
+  it("auto-closes an accepted card with no live filer and wakes dependents", async () => {
     const companyId = await seedCompany(randomUUID());
     const issueId = await seedUserOwnedCard(companyId, null);
     // Negative: a card with no decision interactions at all must be skipped.
     const emptyIssueId = await seedUserOwnedCard(companyId, null);
     const lists = new Map([
-      [issueId, [answeredQuestionInteraction(null)]],
+      [issueId, [acceptedInteraction(null)]],
       [emptyIssueId, []],
     ]);
-    const { comments, wakeups, unblocked, deps } = makeDeps(lists);
+    const { comments, wakeups, unblocked, unblockCalls, deps } = makeDeps(lists);
 
     const result = await settleSettledAwaitingYouIssues(db, deps as never);
 
@@ -530,10 +570,185 @@ describeEmbeddedPostgres("awaiting-you settlement sweep", () => {
     const [issue] = await db.select().from(issues).where(eq(issues.id, issueId));
     expect(issue?.status).toBe("done");
     expect(unblocked).toEqual([issueId]);
+    // SPA-11924: the settlement arm must stamp provenance on the wake, so a
+    // reader can tell "blocker settled unexecuted" from "blocker completed".
+    expect(unblockCalls).toHaveLength(1);
+    expect(unblockCalls[0]?.blockerIssueId).toBe(issueId);
+    expect(JSON.stringify(unblockCalls[0])).toContain("blocker_settled_unexecuted");
     expect(wakeups).toEqual([]);
     expect(comments.some((c) => c.issueId === issueId)).toBe(true);
     const [empty] = await db.select().from(issues).where(eq(issues.id, emptyIssueId));
     expect(empty?.status).toBe("todo");
+  }, 90_000);
+
+  it("hands back to an idle filer and to a running filer", async () => {
+    // SPA-11924 regression: the hand-back arm used to require status "active",
+    // a value the engine never writes, so it was dead code and every answered
+    // user-owned card was auto-closed instead.
+    const companyId = await seedCompany(randomUUID());
+    const idleFilerId = await seedAgent(companyId, "idle");
+    const runningFilerId = await seedAgent(companyId, "running");
+    const idleIssueId = await seedUserOwnedCard(companyId, idleFilerId);
+    const runningIssueId = await seedUserOwnedCard(companyId, runningFilerId);
+    const lists = new Map([
+      [idleIssueId, [answeredQuestionInteraction(idleFilerId)]],
+      [runningIssueId, [answeredQuestionInteraction(runningFilerId)]],
+    ]);
+    const { wakeups, unblocked, deps } = makeDeps(lists);
+
+    const result = await settleSettledAwaitingYouIssues(db, deps as never);
+
+    expect(result).toMatchObject({ scanned: 2, handedBack: 2, autoClosed: 0, keptOpen: 0, failed: 0 });
+    expect(wakeups.map((w) => w.agentId).sort()).toEqual([idleFilerId, runningFilerId].sort());
+    expect(unblocked).toEqual([]);
+    const [idleIssue] = await db.select().from(issues).where(eq(issues.id, idleIssueId));
+    expect(idleIssue).toMatchObject({ assigneeAgentId: idleFilerId, assigneeUserId: null });
+    const [runningIssue] = await db.select().from(issues).where(eq(issues.id, runningIssueId));
+    expect(runningIssue).toMatchObject({ assigneeAgentId: runningFilerId, assigneeUserId: null });
+  }, 90_000);
+
+  it("does not hand back to a paused filer and does not close without a receipt", async () => {
+    // SPA-11924: `paused` is assignable but NOT invokable. Handing the card to
+    // a paused agent while clearing the human owner would strand it with
+    // nobody, so paused must take neither arm.
+    const companyId = await seedCompany(randomUUID());
+    const pausedFilerId = await seedAgent(companyId, "paused");
+    const issueId = await seedUserOwnedCard(companyId, pausedFilerId);
+    const lists = new Map([[issueId, [answeredQuestionInteraction(pausedFilerId)]]]);
+    const { comments, wakeups, unblocked, deps } = makeDeps(lists);
+
+    const result = await settleSettledAwaitingYouIssues(db, deps as never);
+
+    expect(result).toMatchObject({ scanned: 1, handedBack: 0, autoClosed: 0, failed: 0 });
+    expect(result.unprovenIssueIds).toEqual([issueId]);
+    expect(wakeups).toEqual([]);
+    expect(unblocked).toEqual([]);
+    expect(comments).toEqual([]);
+    const [issue] = await db.select().from(issues).where(eq(issues.id, issueId));
+    expect(issue).toMatchObject({ status: "todo", assigneeAgentId: null, assigneeUserId: "local-board" });
+  }, 90_000);
+
+  it("does not settle an expired-only card (the SPA-11439 PHI go-live shape)", async () => {
+    // `expired` means nobody ever answered. Settling on it closes a PHI go-live
+    // sign-off that no human ever granted.
+    const companyId = await seedCompany(randomUUID());
+    const filerId = await seedAgent(companyId, "running");
+    const issueId = await seedUserOwnedCard(companyId, filerId);
+    const expired = resolvedInteraction(filerId, "expired", {
+      version: 1,
+      outcome: "expired",
+      reason: "no human response",
+    });
+    const lists = new Map([[issueId, [expired]]]);
+    const { comments, wakeups, unblocked, deps } = makeDeps(lists);
+
+    const result = await settleSettledAwaitingYouIssues(db, deps as never);
+
+    expect(result).toMatchObject({ scanned: 1, handedBack: 0, autoClosed: 0, keptOpen: 0, failed: 0 });
+    expect(result.issueIds).toEqual([]);
+    expect(result.unprovenIssueIds).toEqual([]);
+    expect(wakeups).toEqual([]);
+    expect(unblocked).toEqual([]);
+    expect(comments).toEqual([]);
+    const [issue] = await db.select().from(issues).where(eq(issues.id, issueId));
+    expect(issue).toMatchObject({ status: "todo", assigneeAgentId: null, assigneeUserId: "local-board" });
+  }, 90_000);
+
+  it("withholds auto-close when there is no accepted work receipt", async () => {
+    // SPA-11924: `answered` releases the human owner but is not evidence the
+    // work happened. `rejected` means the work should NOT have proceeded, so
+    // `done` would misrepresent the deliverable. Neither may close.
+    const companyId = await seedCompany(randomUUID());
+    const answeredIssueId = await seedUserOwnedCard(companyId, null);
+    const rejectedIssueId = await seedUserOwnedCard(companyId, null);
+    const lists = new Map([
+      [answeredIssueId, [answeredQuestionInteraction(null)]],
+      [rejectedIssueId, [resolvedInteraction(null, "rejected")]],
+    ]);
+    const { comments, wakeups, unblocked, deps } = makeDeps(lists);
+
+    const result = await settleSettledAwaitingYouIssues(db, deps as never);
+
+    expect(result).toMatchObject({ scanned: 2, handedBack: 0, autoClosed: 0, failed: 0 });
+    expect(result.issueIds).toEqual([]);
+    expect(result.unprovenIssueIds.sort()).toEqual([answeredIssueId, rejectedIssueId].sort());
+    // No card comment and no dependent release: the blocker is not resolved.
+    expect(comments).toEqual([]);
+    expect(unblocked).toEqual([]);
+    expect(wakeups).toEqual([]);
+    const [answered] = await db.select().from(issues).where(eq(issues.id, answeredIssueId));
+    expect(answered?.status).toBe("todo");
+    const [rejected] = await db.select().from(issues).where(eq(issues.id, rejectedIssueId));
+    expect(rejected?.status).toBe("todo");
+  }, 90_000);
+
+  it("does not close on a withdrawn or cancelled interaction", async () => {
+    // Both mean the filing agent gave up; nobody decided anything.
+    const companyId = await seedCompany(randomUUID());
+    const withdrawnIssueId = await seedUserOwnedCard(companyId, null);
+    const cancelledIssueId = await seedUserOwnedCard(companyId, null);
+    const lists = new Map([
+      [withdrawnIssueId, [resolvedInteraction(null, "withdrawn")]],
+      [cancelledIssueId, [resolvedInteraction(null, "cancelled")]],
+    ]);
+    const { comments, unblocked, deps } = makeDeps(lists);
+
+    const result = await settleSettledAwaitingYouIssues(db, deps as never);
+
+    expect(result).toMatchObject({ scanned: 2, handedBack: 0, autoClosed: 0, keptOpen: 0, failed: 0 });
+    expect(result.issueIds).toEqual([]);
+    expect(comments).toEqual([]);
+    expect(unblocked).toEqual([]);
+    const [withdrawn] = await db.select().from(issues).where(eq(issues.id, withdrawnIssueId));
+    expect(withdrawn?.status).toBe("todo");
+    const [cancelled] = await db.select().from(issues).where(eq(issues.id, cancelledIssueId));
+    expect(cancelled?.status).toBe("todo");
+  }, 90_000);
+
+  it("does not treat an accepted row whose result outcome disagrees as a receipt", async () => {
+    // Fail-closed cross-check: the transport status is "accepted" but the
+    // recorded outcome says otherwise, so the row is not a close receipt.
+    const companyId = await seedCompany(randomUUID());
+    const issueId = await seedUserOwnedCard(companyId, null);
+    const bogus = resolvedInteraction(null, "accepted", {
+      version: 1,
+      outcome: "expired",
+      reason: "superseded by a newer request",
+    });
+    const lists = new Map([[issueId, [bogus]]]);
+    const { comments, unblocked, deps } = makeDeps(lists);
+
+    const result = await settleSettledAwaitingYouIssues(db, deps as never);
+
+    expect(result).toMatchObject({ scanned: 1, handedBack: 0, autoClosed: 0, failed: 0 });
+    expect(result.unprovenIssueIds).toEqual([issueId]);
+    expect(unblocked).toEqual([]);
+    expect(comments).toEqual([]);
+    const [issue] = await db.select().from(issues).where(eq(issues.id, issueId));
+    expect(issue?.status).toBe("todo");
+  }, 90_000);
+
+  it("hands back a mixed expired+answered card to a live filer instead of closing it", async () => {
+    // The SPA-10394 shape: 5 interactions, 3 already expired, filer running.
+    const companyId = await seedCompany(randomUUID());
+    const filerId = await seedAgent(companyId, "running");
+    const issueId = await seedUserOwnedCard(companyId, filerId);
+    const expired = resolvedInteraction(filerId, "expired", {
+      version: 1,
+      outcome: "expired",
+      reason: "no human response",
+    });
+    const lists = new Map([[issueId, [expired, expired, expired, answeredQuestionInteraction(filerId)]]]);
+    const { wakeups, unblocked, deps } = makeDeps(lists);
+
+    const result = await settleSettledAwaitingYouIssues(db, deps as never);
+
+    expect(result).toMatchObject({ scanned: 1, handedBack: 1, autoClosed: 0, failed: 0 });
+    expect(result.issueIds).toEqual([issueId]);
+    expect(wakeups.map((w) => w.agentId)).toEqual([filerId]);
+    expect(unblocked).toEqual([]);
+    const [issue] = await db.select().from(issues).where(eq(issues.id, issueId));
+    expect(issue).toMatchObject({ assigneeAgentId: filerId, assigneeUserId: null });
   }, 90_000);
 
   it("keeps a manual-action card open", async () => {
@@ -545,7 +760,7 @@ describeEmbeddedPostgres("awaiting-you settlement sweep", () => {
     expect(readRequiresManualAction(null)).toBe(false);
 
     const companyId = await seedCompany(randomUUID());
-    const filerId = await seedAgent(companyId, "active");
+    const filerId = await seedAgent(companyId, "idle");
     const issueId = await seedUserOwnedCard(companyId, filerId);
     const manual = {
       ...answeredQuestionInteraction(filerId),
@@ -579,7 +794,7 @@ describeEmbeddedPostgres("awaiting-you settlement sweep", () => {
 
   it("settles once the manual-action flag is cleared", async () => {
     const companyId = await seedCompany(randomUUID());
-    const filerId = await seedAgent(companyId, "active");
+    const filerId = await seedAgent(companyId, "idle");
     const issueId = await seedUserOwnedCard(companyId, filerId);
     const base = answeredQuestionInteraction(filerId);
     const manual = {
