@@ -15,7 +15,7 @@ const agentStatusById: Record<string, string> = {
 
 const mockIssueService = vi.hoisted(() => ({
   getById: vi.fn(),
-  findOpenAncestorCreatedByAgent: vi.fn(),
+  findOpenDelegationCycleAncestor: vi.fn(),
   update: vi.fn(),
   create: vi.fn(),
   createChild: vi.fn(),
@@ -203,8 +203,8 @@ function makeIssue(overrides: Record<string, unknown> = {}) {
 describe("issue assignee invokability guard", () => {
   beforeEach(() => {
     mockIssueService.getById.mockReset();
-    mockIssueService.findOpenAncestorCreatedByAgent.mockReset();
-    mockIssueService.findOpenAncestorCreatedByAgent.mockResolvedValue(null);
+    mockIssueService.findOpenDelegationCycleAncestor.mockReset();
+    mockIssueService.findOpenDelegationCycleAncestor.mockResolvedValue(null);
     mockIssueService.update.mockReset();
     mockIssueService.create.mockReset();
     mockIssueService.createChild.mockReset();
@@ -277,22 +277,40 @@ describe("issue assignee invokability guard", () => {
 describe("agent delegation cycle guard", () => {
   beforeEach(() => {
     mockIssueService.getById.mockReset();
-    mockIssueService.findOpenAncestorCreatedByAgent.mockReset();
-    mockIssueService.findOpenAncestorCreatedByAgent.mockResolvedValue(null);
+    mockIssueService.findOpenDelegationCycleAncestor.mockReset();
+    mockIssueService.findOpenDelegationCycleAncestor.mockResolvedValue(null);
     mockIssueService.create.mockReset();
     mockIssueService.createChild.mockReset();
+    mockIssueService.update.mockReset();
+    mockIssueService.addComment.mockReset();
+    mockHeartbeatService.wakeup.mockClear();
   });
 
-  it("refuses an agent child assigned to the creator of an open ancestor", async () => {
-    const parent = makeIssue();
-    mockIssueService.getById.mockResolvedValue(parent);
-    mockIssueService.findOpenAncestorCreatedByAgent.mockResolvedValue({
+  /**
+   * The shape the guard exists for: the proposed assignee created an open
+   * ancestor AND that ancestor is assigned to the acting agent. The agent
+   * holding work from the proposed assignee is now filing new work back to it.
+   */
+  function openAssignmentFromProposedAssignee(
+    overrides: Record<string, unknown> = {},
+  ) {
+    return {
       id: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
       identifier: "PAP-100",
       parentId: null,
       createdByAgentId: IDLE_AGENT_ID,
+      assigneeAgentId: AGENT_ACTOR_ID,
       status: "in_progress",
-    });
+      ...overrides,
+    };
+  }
+
+  it("refuses an agent child assigned to the delegator that still holds the actor's open work", async () => {
+    const parent = makeIssue();
+    mockIssueService.getById.mockResolvedValue(parent);
+    mockIssueService.findOpenDelegationCycleAncestor.mockResolvedValue(
+      openAssignmentFromProposedAssignee(),
+    );
 
     const res = await request(createApp(agentActor()))
       .post(`/api/issues/${parent.id}/children`)
@@ -306,7 +324,101 @@ describe("agent delegation cycle guard", () => {
     expect(res.body.error).toContain("Delegation cycle");
     expect(res.body.details).toMatchObject({ code: "delegation_cycle" });
     expect(mockIssueService.createChild).not.toHaveBeenCalled();
-    expect(mockIssueService.findOpenAncestorCreatedByAgent).toHaveBeenCalledWith(parent.id, IDLE_AGENT_ID);
+    expect(mockIssueService.findOpenDelegationCycleAncestor).toHaveBeenCalledWith(
+      parent.id,
+      IDLE_AGENT_ID,
+      AGENT_ACTOR_ID,
+    );
+  });
+
+  /**
+   * SPA-11956, the measured shape that started this fix: LaQuesha files a
+   * parented child under an open ancestor Dex created, assigned to Dex. Dex
+   * never delegated that ancestor to LaQuesha — it is standing ownership
+   * (law 20), so there is no ping-pong and the create must succeed WITH the
+   * parent attached. The parent chain is what carries workspace inheritance,
+   * so dropping it to dodge a 409 is the defect, not the escape.
+   */
+  it("allows the parented re-route when the ancestor creator holds the work itself", async () => {
+    const parent = makeIssue();
+    mockIssueService.getById.mockResolvedValue(parent);
+    mockIssueService.createChild.mockResolvedValue({
+      issue: makeIssue({ id: "cccccccc-cccc-4ccc-8ccc-cccccccccccc", parentId: parent.id, assigneeAgentId: IDLE_AGENT_ID }),
+      parentBlockerAdded: false,
+    });
+
+    const res = await request(createApp(agentActor()))
+      .post(`/api/issues/${parent.id}/children`)
+      .send({
+        title: "Route the git ops card",
+        description: "Dex owns git ops and created the ancestor himself",
+        assigneeAgentId: IDLE_AGENT_ID,
+      });
+
+    expect(res.status).toBe(201);
+    expect(mockIssueService.createChild).toHaveBeenCalledWith(
+      parent.id,
+      expect.objectContaining({ assigneeAgentId: IDLE_AGENT_ID }),
+    );
+    expect(mockIssueService.findOpenDelegationCycleAncestor).toHaveBeenCalledWith(
+      parent.id,
+      IDLE_AGENT_ID,
+      AGENT_ACTOR_ID,
+    );
+  });
+
+  /**
+   * The same refusal must hold on the company-scoped create path — that is
+   * the second (and only other) guarded call site, and it is the one that
+   * carries a client-supplied parentIssueId.
+   */
+  it("refuses the same cycle on the company-scoped create path", async () => {
+    const parent = makeIssue();
+    mockIssueService.getById.mockResolvedValue(parent);
+    mockIssueService.findOpenDelegationCycleAncestor.mockResolvedValue(
+      openAssignmentFromProposedAssignee(),
+    );
+
+    const res = await request(createApp(agentActor()))
+      .post(`/api/companies/company-1/issues`)
+      .send({
+        title: "Hand it back",
+        description: "Bounce",
+        parentId: parent.id,
+        assigneeAgentId: IDLE_AGENT_ID,
+      });
+
+    expect(res.status).toBe(409);
+    expect(res.body.details).toMatchObject({ code: "delegation_cycle" });
+    expect(mockIssueService.create).not.toHaveBeenCalled();
+    expect(mockIssueService.findOpenDelegationCycleAncestor).toHaveBeenCalledWith(
+      parent.id,
+      IDLE_AGENT_ID,
+      AGENT_ACTOR_ID,
+    );
+  });
+
+  it("allows the parented re-route on the company-scoped create path", async () => {
+    const parent = makeIssue();
+    mockIssueService.getById.mockResolvedValue(parent);
+    mockIssueService.create.mockResolvedValue(
+      makeIssue({ id: "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee", parentId: parent.id, assigneeAgentId: IDLE_AGENT_ID }),
+    );
+
+    const res = await request(createApp(agentActor()))
+      .post(`/api/companies/company-1/issues`)
+      .send({
+        title: "Route the git ops card",
+        description: "Standing ownership, not a ping-pong",
+        parentId: parent.id,
+        assigneeAgentId: IDLE_AGENT_ID,
+      });
+
+    expect(res.status).toBe(201);
+    expect(mockIssueService.create).toHaveBeenCalledWith(
+      expect.any(String),
+      expect.objectContaining({ parentId: parent.id, assigneeAgentId: IDLE_AGENT_ID }),
+    );
   });
 
   it("allows the same child when no open ancestor was created by the assignee", async () => {
@@ -346,6 +458,31 @@ describe("agent delegation cycle guard", () => {
       });
 
     expect(res.status).toBe(201);
-    expect(mockIssueService.findOpenAncestorCreatedByAgent).not.toHaveBeenCalled();
+    expect(mockIssueService.findOpenDelegationCycleAncestor).not.toHaveBeenCalled();
+  });
+
+  /**
+   * The guard is create-only by design: the assignee path on PATCH is not
+   * consulted, which is what keeps a re-route possible for an agent that
+   * does hold work from the proposed assignee. Pinned here so a future change
+   * that closes it also has to close a sanctioned alternative.
+   */
+  it("leaves the PATCH assignee path unguarded", async () => {
+    const existing = makeIssue({ assigneeAgentId: null });
+    const updated = makeIssue({ assigneeAgentId: IDLE_AGENT_ID });
+    mockIssueService.getById.mockResolvedValue(existing);
+    mockIssueService.update.mockResolvedValue(updated);
+    // The chain WOULD refuse on create — PATCH must not consult it at all.
+    mockIssueService.findOpenDelegationCycleAncestor.mockResolvedValue(
+      openAssignmentFromProposedAssignee(),
+    );
+
+    const res = await request(createApp(agentActor()))
+      .patch(`/api/issues/${existing.id}`)
+      .send({ assigneeAgentId: IDLE_AGENT_ID });
+
+    expect(res.status).toBe(200);
+    expect(mockIssueService.update).toHaveBeenCalled();
+    expect(mockIssueService.findOpenDelegationCycleAncestor).not.toHaveBeenCalled();
   });
 });

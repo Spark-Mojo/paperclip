@@ -17,7 +17,11 @@ test("generated Capability inventory has full source coverage", async () => {
     readRows("eval-traceability.yaml"),
   ]);
 
-  assert.equal(capabilities.length, 155);
+  // Counted from the GENERATED contract (generated/capability/capabilities.yaml), which
+  // mirrors every heading in the 8 skill/reference sources. Distinct from the spec
+  // inventory's own baseline (scripts/lib/capability-inventory.mjs), which is a
+  // different generator and a different row set — do not assume the two agree.
+  assert.equal(capabilities.length, 157);
   assert.equal(tools.length, 42);
   assert.equal(evals.length, 106);
   assert.equal(new Set(evals.map((row) => row.group)).size, 16);

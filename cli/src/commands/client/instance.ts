@@ -51,7 +51,7 @@ export function addFleetMaxConcurrentRunsCommands(instance: Command): void {
       .command("set")
       .description("Set an instance-wide setting")
       .argument("<key>", `Setting key (supported: ${SUPPORTED_KEYS.join(", ")})`)
-      .argument("<value>", 'New value. For fleet-max-concurrent-runs: an integer 1..50, or "none" for no ceiling')
+      .argument("<value>", 'New value. For fleet-max-concurrent-runs: an integer 0..50 (0 pauses admissions), or "none" for no ceiling')
       .action(async (key: string, value: string, opts: InstanceCommandOptions) => {
         try {
           assertSupportedKey(key);
@@ -81,10 +81,18 @@ function assertSupportedKey(key: string): void {
 export function parseFleetMaxConcurrentRunsValue(raw: string): number | null {
   const trimmed = raw.trim();
   if (trimmed.toLowerCase() === "none") return null;
-  const parsed = Number(trimmed);
-  if (!Number.isInteger(parsed) || parsed < 1 || parsed > 50) {
+  // An empty/blank argument must not fall through Number("") === 0 and be
+  // silently accepted as the new 0-pause value (caught by the CLI negative
+  // control when min moved 1 -> 0).
+  if (trimmed === "") {
     throw new Error(
-      `Invalid value "${raw}" for fleet-max-concurrent-runs. Use an integer 1..50, or "none" for no ceiling.`,
+      `Invalid value "${raw}" for fleet-max-concurrent-runs. Use an integer 0..50 (0 pauses admissions), or "none" for no ceiling.`,
+    );
+  }
+  const parsed = Number(trimmed);
+  if (!Number.isInteger(parsed) || parsed < 0 || parsed > 50) {
+    throw new Error(
+      `Invalid value "${raw}" for fleet-max-concurrent-runs. Use an integer 0..50 (0 pauses admissions), or "none" for no ceiling.`,
     );
   }
   return parsed;

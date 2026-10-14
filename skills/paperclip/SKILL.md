@@ -544,7 +544,19 @@ curl -s -X POST -H "Authorization: Bearer $PAPERCLIP_API_KEY" \
 
 Exact response fields are documented in `skills/paperclip/references/api-reference.md`.
 
+## Engine Restarts And Installs
+
+**Never restart the Paperclip engine service yourself, and never install an engine version whose activation requires a restart.** A `systemctl --user restart` of the engine unit (`paperclip.service` on this host; some installs render it as `paperclipai.service`) stops the control plane, which kills every live agent run on it — including yours, mid-work, with no closing comment. Engine restarts have each killed 20+ runs; that is why this rule exists.
+
+- **Never run** `systemctl --user restart paperclip.service` / `paperclipai.service`, `paperclipai service restart`, or any equivalent restart, stop, or kill of the engine unit — not to "make a fix take effect", not to clear a stuck state, not for any reason.
+- **Never install** an engine update that activates on restart (a pinned git install advances only on an explicit install). If your task requires a newer engine, stage the work (branch, PR, card notes naming the exact install command and its pinned ref) and hand the install+restart to the monitor session's **daily drained window**.
+- A merged engine fix is **installed** (recorded in the install manifest) long before it is **live** (running process picked it up). That gap is normal. Check liveness with `GET /api/health` (`installedCommit` + `processStartedAt`), never by restarting. "Not yet activated" is the expected state, not a defect.
+- The **only** sanctioned restart path is the drain-then-restart command (`scripts/drain-then-restart.sh`): record the fleet cap, PATCH it to 0 to pause admissions (running runs are never killed), wait until the live process reports zero in-flight runs, restart, probe the board UI and health, then restore the cap. It is run by the monitor session in the daily drained window, when the drain will not strand anyone's work. If runs are still live at the drain timeout, it exits nonzero naming them — resolve them, then re-run.
+- On the Spark Mojo fleet this rule is fleet law (see the fleet context's engine merge→live clause). If your task seems to require breaking it, escalate to your manager instead.
+
 ## Critical Rules
+
+- **Never restart or restart-requiring-install the engine yourself** — see **Engine Restarts And Installs**. Stage the install and hand the restart to the monitor session's daily drained window.
 
 - **Never retry a 409.** The task belongs to someone else.
 - **Never look for unassigned work.** No assignments = exit.

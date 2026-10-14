@@ -260,6 +260,16 @@ import {
   PROVIDER_TRACE_MAX_BYTES,
 } from "./provider-trace-store.js";
 import { getServerAdapter, runningProcesses } from "../adapters/index.js";
+import {
+  killRunScopeProcessTree,
+  listAgentRunScopeUnits,
+  listRunScopeGroupMembers,
+  readRunScopeProcessIdentity,
+  reconcileStaleRunScopes as reconcileAgentRunScopes,
+  stopRunScope,
+  type AgentRunScopeUnit,
+  type ReconcileStaleRunScopesResult,
+} from "@paperclipai/adapter-utils/run-resource-scope";
 import type {
   AdapterExecutionResult,
   AdapterInvocationMeta,
@@ -461,6 +471,7 @@ import {
   gateProjectExecutionWorkspacePolicy,
   issueExecutionWorkspaceModeForPersistedWorkspace,
   isUnrunnableWorktreeCombo,
+  isRepoRequiredButAgentHomeCwd,
   parseIssueExecutionWorkspaceSettings,
   parseProjectExecutionWorkspacePolicy,
   resolveEffectiveWorkspaceStrategyType,
@@ -670,7 +681,7 @@ const HEARTBEAT_MAX_CONCURRENT_RUNS_MAX = 50;
 // exactly the per-agent behaviour: no fleet count, no fleet lock, no ordering
 // change. `heartbeat.maxConcurrentRuns` is per agent, so with N agents at a
 // per-agent cap of 1 the instance can still run N at once; this knob bounds
-// the instance on a constrained host. Clamped to 1..50 when set; unparseable
+// the instance on a constrained host. Clamped to 0..50 when set (0 = pause); unparseable
 // values mean "no ceiling" (for the env var — see resolveFleetMaxConcurrentRuns
 // for the DB value, which never falls back to "no ceiling" on a bad write).
 //
@@ -684,7 +695,7 @@ const HEARTBEAT_MAX_CONCURRENT_RUNS_MAX = 50;
 // pass immediately (see the instance-settings route); lowering it never kills
 // a running run, it only withholds new admissions until the count falls back
 // under the new ceiling.
-const HEARTBEAT_FLEET_MAX_CONCURRENT_RUNS_MIN = 1;
+const HEARTBEAT_FLEET_MAX_CONCURRENT_RUNS_MIN = 0;
 const HEARTBEAT_FLEET_MAX_CONCURRENT_RUNS_MAX = 50;
 
 /** No ceiling. The fleet term is skipped unless an operator opts in. */
@@ -768,7 +779,7 @@ export function normalizeFleetMaxConcurrentRuns(value: unknown): number | null {
  *   env var.
  * - `dbValue === null` -- an explicit DB "no ceiling" override. Wins over the
  *   env var even if the env var is set, because it is a deliberate choice.
- * - `dbValue` parses to a finite number -- clamped 1..50, wins over the env
+ * - `dbValue` parses to a finite number -- clamped 0..50, wins over the env
  *   var.
  * - `dbValue` is anything else (a string, object, boolean, NaN, ...) -- an
  *   unparseable/malformed DB value. This must never be silently read as "no
@@ -916,6 +927,10 @@ const PAPERCLIP_HARNESS_CHECKOUT_KEY = "paperclipHarnessCheckedOut";
 const PAPERCLIP_EXTERNAL_CHAT_EXECUTION_BOUND_KEY =
   "paperclipExternalChatExecutionBound";
 const DETACHED_PROCESS_ERROR_CODE = "process_detached";
+/** `true` for an integer pid / pgid that could name a real process. */
+function isLiveProcessId(value: number | null | undefined): value is number {
+  return typeof value === "number" && Number.isInteger(value) && value > 0;
+}
 const NATIVE_OWNERSHIP_UNVERIFIED_MESSAGE =
   "Native execution ownership could not be verified; automatic recovery is blocked";
 // The reaper sweeps at most this many pending_cleanup leases per tick.
@@ -1307,7 +1322,8 @@ function readHeartbeatRunErrorFamily(
   if (
     run.errorCode === "codex_transient_upstream" ||
     run.errorCode === "claude_transient_upstream" ||
-    run.errorCode === "codex_harness_crash"
+    run.errorCode === "codex_harness_crash" ||
+    run.errorCode === "model_stream_stalled"
   ) {
     return "transient_upstream";
   }
@@ -3547,6 +3563,52 @@ export async function assertGitSensitiveAdapterWorkspaceValid(input: {
       "missing_git_metadata",
       `Issue ${issue.identifier ?? issue.id} expected a git workspace for ${input.adapterType}, but "${effectiveCwd}" has no .git metadata.`,
     );
+  }
+
+  // SPA-11739: a repo-bound `agent_default` card is the miscategorised-code-card
+  // shape, and none of the guards above can see it — `workspaceExpectation` is
+  // computed from project/strategy binding only (so it is false on the exact
+  // project-less shape this card reports), and `agentDefaultBypassRequested` is
+  // true for ANY explicit `agent_default` request, deliberate or miscategorised.
+  // Distinguish the two by the repo binding itself, which neither the project
+  // binding nor the bypass can fake away: a run whose issue or persisted
+  // workspace carries a repo URL cannot usefully run from a non-git cwd, so it
+  // must fail with a named remediation instead of launching in silence. A
+  // genuinely non-code `agent_default` card carries no repo URL on any surface
+  // (SPA-8036 / SPA-8019 Option A), so this predicate stays false and the
+  // deliberate bypass is unchanged (pinned by the tests directly below and the
+  // SPA-9139 cases above).
+  // The repo binding itself is the discriminator, and the predicate owns the
+  // whole decision: the outer condition here is only a cheap pre-filter (mode
+  // + a cwd to inspect), never a second repo test — otherwise a persisted row
+  // carrying a repoUrl but no persisted cwd would be silently skipped while
+  // the predicate claims to cover it.
+  if (
+    input.requestedExecutionWorkspaceMode === "agent_default" &&
+    effectiveCwd
+  ) {
+    const cwdIsAgentFallback = sameResolvedPath(effectiveCwd, agentFallbackCwd);
+    const cwdHasGitMetadata = cwdIsAgentFallback ? false : await hasGitMetadata(effectiveCwd);
+    if (
+      isRepoRequiredButAgentHomeCwd({
+        requestedExecutionWorkspaceMode: input.requestedExecutionWorkspaceMode,
+        resolvedWorkspaceRepoUrl: input.resolvedWorkspace.repoUrl,
+        persistedExecutionWorkspaceRepoUrl: input.persistedExecutionWorkspace?.repoUrl ?? null,
+        effectiveCwd,
+        cwdIsAgentFallback,
+        cwdHasGitMetadata,
+      })
+    ) {
+      const boundRepoUrl =
+        readNonEmptyString(input.resolvedWorkspace.repoUrl) ??
+        readNonEmptyString(input.persistedExecutionWorkspace?.repoUrl) ??
+        null;
+      fail(
+        "repo_required_but_agent_home_cwd",
+        `Issue ${issue.identifier ?? issue.id} is bound to repository "${boundRepoUrl}" but its executionWorkspaceSettings.mode is "agent_default", which resolves no git workspace — ${input.adapterType} would launch from the non-git cwd "${effectiveCwd}". Repair: file a workspace-repair card to re-bind the issue to an isolated git_worktree of that repository (git-ops owner), or, if this card genuinely needs no repository, clear the repo binding / set executionWorkspaceSettings.mode to a project workspace.`,
+        { repoRequiredButAgentHomeCwd: { boundRepoUrl } },
+      );
+    }
   }
 
   const expectedManagedBranchName =
@@ -9893,6 +9955,19 @@ export function heartbeatService(
   options: HeartbeatServiceOptions = {},
 ) {
   let shutdownInProgress = false;
+  // SPA-11948: the most recent hot-restart adoption report, captured so the
+  // boot sweep that runs immediately after (this engine's
+  // `reconcileStaleRunScopes`) can pass the adopted ids into the reaper's
+  // owned set without re-running the intent read or re-writing the report.
+  let lastHotRestartAdoption:
+    | {
+        adoptedRunIds: string[];
+        finalizedWhileDownRunIds: string[];
+        lostRunIds: string[];
+        skippedRunIds: string[];
+        mode: string;
+      }
+    | null = null;
   const instanceSettings = instanceSettingsService(db);
   const getCurrentUserRedactionOptions = async () => ({
     enabled: (await instanceSettings.getGeneral()).censorUsernameInLogs,
@@ -15467,6 +15542,17 @@ export function heartbeatService(
     });
     await removeHotRestartIntent(undefined, intent);
 
+    // SPA-11948: capture the report for the next boot step (stale-scope
+    // reconciliation), which needs the adopted ids to keep the reaper from
+    // killing work the previous engine handed off.
+    lastHotRestartAdoption = {
+      mode: "reported",
+      adoptedRunIds,
+      finalizedWhileDownRunIds,
+      lostRunIds,
+      skippedRunIds,
+    };
+
     logger.info(
       {
         previousServerPid: report.previousServerPid,
@@ -19382,6 +19468,157 @@ export function heartbeatService(
     });
   }
 
+  /**
+   * SPA-11948. Reap the `paperclip-agent-*.scope` units a previous engine left
+   * behind across a restart, and durably move their run rows out of `running`.
+   *
+   * Order of operations at boot is load-bearing:
+   *   1. `recoverNativeRunsAfterRestart` — restores durable native state.
+   *   2. `reconcileHotRestartAdoption` — claims runs the previous engine
+   *      handed off, so the reaper must skip them.
+   *   3. `reconcileStaleRunScopes` (this method) — stops and kills the cgroups
+   *      the previous engine left behind, on units this one does NOT own.
+   *   4. `reapOrphanedRuns` — clears the `running` rows the reaper detached
+   *      above plus any other rows that lost their live process.
+   *   5. `resumeQueuedRuns` — only now may queued work be admitted, so a
+   *      foreign scope cannot hold a cap slot during admission.
+   *
+   * The unit -> run correlation, the ambiguity skip, the identity-mismatch
+   * refusal and the owned-set are owned by the adapter seam
+   * (`packages/adapter-utils/run-resource-scope`). This method only (a) projects
+   * the live run rows into the candidates the adapter expects, (b) feeds the
+   * live-registry + adopted ids into the owned set, and (c) durably
+   * transitions each detached run out of `running` with `process_detached` and
+   * a finishedAt so the next boot and the UI can both explain why it died.
+   *
+   * The optional `deps` argument exists so the boot-step regression test can
+   * inject deterministic seams without touching real systemd or `/proc`; in
+   * production `index.ts` calls this with no arguments and the production
+   * helpers from `@paperclipai/adapter-utils/run-resource-scope` are used.
+   */
+  async function reconcileStaleRunScopes(
+    deps?: Partial<{
+      listUnits: () => Promise<AgentRunScopeUnit[]>;
+      stopUnit: (unit: string) => Promise<void>;
+      killProcessTree: (pids: number[]) => void;
+      readProcessIdentity: (pid: number) => Promise<{ startedAt: string } | null>;
+      listGroupMembers: (pgid: number) => Promise<number[]>;
+    }>,
+    now: Date = new Date(),
+  ) {
+    // Only `running` rows are candidates. Queued runs are deliberately not
+    // enumerated: a queued run was never attached to a cgroup, and admitting
+    // a foreign `paperclip-agent-*.scope` whose only claim is a queued row
+    // would let the boot sweep race a future spawn.
+    const rows = await db
+      .select({
+        id: heartbeatRuns.id,
+        processPid: heartbeatRuns.processPid,
+        processGroupId: heartbeatRuns.processGroupId,
+        processStartedAt: heartbeatRuns.processStartedAt,
+      })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.status, "running"));
+
+    const adopted = (() => {
+      try {
+        // Hot-restart adoption runs immediately before this method, so any
+        // run that survived the previous engine must be passed in as owned.
+        // If adoption has not yet run, its report is empty and every running
+        // row is treated as foreign, which the reaper's ambiguity skip turns
+        // into a no-op for anything a future adoption will claim.
+        return lastHotRestartAdoption?.adoptedRunIds ?? [];
+      } catch {
+        return [];
+      }
+    })();
+
+    const candidates = rows
+      .filter((row) => isLiveProcessId(row.processPid) || isLiveProcessId(row.processGroupId))
+      .map((row) => ({
+        runId: row.id,
+        processPid: row.processPid,
+        processGroupId: row.processGroupId,
+        processStartedAt:
+          row.processStartedAt instanceof Date
+            ? row.processStartedAt.toISOString()
+            : null,
+      }));
+
+    // The live registry is what makes a child of THIS engine instance owned:
+    // hot-restart adoption covers the previous engine's survivors, and any
+    // child we ourselves forked enters the registry at spawn time.
+    const registryOwned = new Set<string>();
+    for (const [runId, entry] of runningProcesses.entries()) {
+      if (entry?.child?.pid !== undefined) registryOwned.add(runId);
+    }
+    const ownedRunIds = [...new Set([...adopted, ...registryOwned])];
+
+    let result: ReconcileStaleRunScopesResult;
+    try {
+      result = await reconcileAgentRunScopes({
+        runs: candidates,
+        ownedRunIds,
+        listUnits: deps?.listUnits ?? listAgentRunScopeUnits,
+        readProcessIdentity: deps?.readProcessIdentity ?? readRunScopeProcessIdentity,
+        listGroupMembers: deps?.listGroupMembers ?? listRunScopeGroupMembers,
+        stopUnit: deps?.stopUnit ?? stopRunScope,
+        killProcessTree: deps?.killProcessTree ?? killRunScopeProcessTree,
+      });
+    } catch (err) {
+      logger.warn(
+        { err },
+        "stale agent run scope reconciliation failed; periodic reaper will retry",
+      );
+      return { units: [] as string[], detachedRunIds: [] as string[] };
+    }
+
+    if (result.detachedRunIds.length > 0) {
+      const fromStatuses = ["running"];
+      await db.transaction(async (tx) => {
+        for (const runId of result.detachedRunIds) {
+          const written = await setRunStatusFromLive(
+            runId,
+            "interrupted",
+            fromStatuses,
+            {
+              error:
+                "Stale run scope reaped: previous engine left the process group alive across the restart and no live registry entry adopted it",
+              errorCode: DETACHED_PROCESS_ERROR_CODE,
+              finishedAt: now,
+              processPid: null,
+              processGroupId: null,
+              processStartedAt: null,
+            },
+          );
+          const run = written.run;
+          if (!written.updated || !run) continue;
+          await appendRunEvent(run, {
+            eventType: "lifecycle",
+            stream: "system",
+            level: "warn",
+            message: "Stale run scope reaped at startup",
+            payload: {
+              units: result.units,
+              previousProcessPid: candidates.find((candidate) => candidate.runId === run.id)?.processPid ?? null,
+              previousProcessGroupId:
+                candidates.find((candidate) => candidate.runId === run.id)?.processGroupId ?? null,
+            },
+          });
+        }
+      });
+    }
+
+    if (result.units.length > 0) {
+      logger.info(
+        { units: result.units, detachedRunIds: result.detachedRunIds },
+        "stale agent run scopes reaped at startup",
+      );
+    }
+
+    return result;
+  }
+
   async function reapOrphanedRuns(opts?: { staleThresholdMs?: number }) {
     const staleThresholdMs = opts?.staleThresholdMs ?? 0;
     const now = new Date();
@@ -20051,7 +20288,36 @@ export function heartbeatService(
       ),
     ];
 
-    for (const agentId of orderedAgentIds) {
+    // SPA-11872: an agent whose deferred wake stranded behind a since-freed
+    // issue lock has no queued run, so the sweep above cannot see it. Append
+    // those agents (same candidate gate as the slot-free drain) so the
+    // public sweep drains them too.
+    const strandedWakeAgentIds = (
+      await db
+        .selectDistinct({ agentId: agentWakeupRequests.agentId })
+        .from(agentWakeupRequests)
+        .innerJoin(
+          issues,
+          and(
+            eq(issues.companyId, agentWakeupRequests.companyId),
+            sql`${issues.id}::text = ${agentWakeupRequests.payload}->>'issueId'`,
+            eq(issues.assigneeAgentId, agentWakeupRequests.agentId),
+          ),
+        )
+        .innerJoin(
+          companies,
+          and(eq(companies.id, issues.companyId), eq(companies.status, "active")),
+        )
+        .where(
+          and(
+            eq(agentWakeupRequests.status, "deferred_issue_execution"),
+            isNull(agentWakeupRequests.runId),
+            isNull(issues.executionRunId),
+            sql`${agentWakeupRequests.payload}->>'issueId' is not null`,
+          ),
+        )
+    ).map((row) => row.agentId);
+    for (const agentId of [...new Set([...orderedAgentIds, ...strandedWakeAgentIds])]) {
       await startNextQueuedRunForAgent(agentId);
     }
   }
@@ -20221,6 +20487,17 @@ export function heartbeatService(
     return recovery.reconcileStrandedAssignedIssues({
       issueCreatedAtGte: await getWorktreeExecutionCutoff(),
     });
+  }
+
+  /**
+   * SPA-12218: re-wake issues left `in_progress` with no live execution path
+   * because the startup backstop terminalized their run as
+   * `orphaned_running_run`. Startup-only, so unlike the stranded sweep it takes
+   * no worktree cutoff: every orphan the backstop just wrote is in scope,
+   * including cards older than the cutoff.
+   */
+  async function reconcileOrphanedRunIssues() {
+    return recovery.reconcileOrphanedRunIssues();
   }
 
   function idleTodoPullIdempotencyKey(issueId: string, updatedAt: Date) {
@@ -20555,14 +20832,21 @@ export function heartbeatService(
           interactionSvc.listForIssue(issueId),
         enqueueWakeupFn: (agentId, opts) =>
           enqueueWakeup(agentId, opts as WakeupOptions),
-        unblockDependentsFn: (blockerIssueId) =>
-          autoUnblockReadyDependents(blockerIssueId),
+        unblockDependentsFn: (blockerIssueId, unblockOpts) =>
+          autoUnblockReadyDependents(blockerIssueId, unblockOpts),
         logFn: (obj, msg) => logger.warn(obj, msg),
       },
     );
   }
 
-  async function autoUnblockReadyDependents(blockerIssueId: string) {
+  async function autoUnblockReadyDependents(
+    blockerIssueId: string,
+    // SPA-11924: the human PATCH path stamps `mutation: "blocker_done"` on the
+    // dependents-resolved wake. This arm used to carry no mutation at all, so a
+    // settlement-driven wake was the only one a reader could not distinguish
+    // from a completed blocker. Callers pass their own provenance.
+    opts?: { mutation?: string },
+  ) {
     const enabled = resolveIdleTodoPullCanary(runtimeEnv.PAPERCLIP_AUTO_UNBLOCK_READY_DEPENDENTS).enabled && resolveIdleTodoPullGate().enabled;
     const result = { enabled, checked: 0, unblocked: 0, notReadySkipped: 0, deferredOrFailed: 0, issueIds: [] as string[] };
     if (!enabled || (await getSchedulingSuppression()).suppressed) return result;
@@ -20579,7 +20863,7 @@ export function heartbeatService(
       try {
         await enqueueWakeup(transitioned.agentId, {
           source: "automation", triggerDetail: "system", reason: ISSUE_BLOCKERS_RESOLVED_WAKE_REASON,
-          payload: { issueId: candidate.id, resolvedBlockerIssueId: blockerIssueId, blockerIssueIds: transitioned.blockerIssueIds },
+          payload: { issueId: candidate.id, resolvedBlockerIssueId: blockerIssueId, blockerIssueIds: transitioned.blockerIssueIds, ...(opts?.mutation ? { mutation: opts.mutation } : {}) },
           idempotencyKey: buildIssueBlockersResolvedWakeStateKey({ dependentIssueId: candidate.id, blockerIssueIds: transitioned.blockerIssueIds, blockedTransitionAt: transitioned.blockedTransitionAt }),
           requestedByActorType: "system",
           contextSnapshot: { issueId: candidate.id, taskId: candidate.id, wakeReason: ISSUE_BLOCKERS_RESOLVED_WAKE_REASON },
@@ -20730,6 +21014,98 @@ export function heartbeatService(
     }
   }
 
+  // SPA-11872: a wake parked in `deferred_issue_execution` behind an issue
+  // execution lock is only revisited by the cancel-time release drain. If the
+  // wake parked after that drain ran (the SPA-11657 strand: cancel at
+  // 04:48:22, wake parked 04:48:24), nothing re-fires it. Re-admit those
+  // wakes here at slot-free. MUST run outside withAgentStartLock: the promote
+  // emits a run_queued post-commit effect that calls back into
+  // startNextQueuedRunForAgent, and withAgentStartLock is a sequence barrier,
+  // not a mutex — re-entry inside it deadlocks for the 30s stale window.
+  const drainingStrandedWakesForAgent = new Set<string>();
+
+  async function drainStrandedDeferredWakesForAgent(agentId: string) {
+    if (drainingStrandedWakesForAgent.has(agentId)) return;
+    drainingStrandedWakesForAgent.add(agentId);
+    try {
+      const agent = await getAgent(agentId);
+      if (!agent) return;
+      const invokability = await getAgentInvokability(agent);
+      if (!invokability.invokable) return;
+      const policy = parseHeartbeatPolicy(agent);
+      const runningCount = await countRunningRunsForAgent(agentId);
+      if (runningCount >= policy.maxConcurrentRuns) return;
+
+      // Oldest first, bounded. Same candidate gate as the strandedQueues
+      // sweep in resumeQueuedRuns, minus its legacy-runtimeMode gate (native
+      // runs must drain too — that gate is the SPA-11657 hole).
+      const candidates = await db
+        .select({ wake: agentWakeupRequests })
+        .from(agentWakeupRequests)
+        .innerJoin(
+          issues,
+          and(
+            eq(issues.companyId, agentWakeupRequests.companyId),
+            sql`${issues.id}::text = ${agentWakeupRequests.payload}->>'issueId'`,
+            eq(issues.assigneeAgentId, agentWakeupRequests.agentId),
+          ),
+        )
+        .innerJoin(
+          companies,
+          and(eq(companies.id, issues.companyId), eq(companies.status, "active")),
+        )
+        .where(
+          and(
+            eq(agentWakeupRequests.status, "deferred_issue_execution"),
+            eq(agentWakeupRequests.agentId, agentId),
+            isNull(agentWakeupRequests.runId),
+            isNull(issues.executionRunId),
+          ),
+        )
+        .orderBy(asc(agentWakeupRequests.requestedAt))
+        .limit(10);
+
+      for (const { wake } of candidates) {
+        const issueId = String(wake.payload?.issueId ?? "");
+        if (!issueId) continue;
+        // Re-read the lock immediately before the release: a concurrent
+        // claim may have taken it between the candidate query and here.
+        const [issue] = await db
+          .select({ executionRunId: issues.executionRunId })
+          .from(issues)
+          .where(and(eq(issues.id, issueId), eq(issues.companyId, agent.companyId)));
+        if (!issue || issue.executionRunId) continue;
+        // Release source: the issue's latest run on ANY agent (the SPA-8631
+        // promote passes the cancelled old-assignee run as source). The
+        // wake-queue promote owns every guard: terminal retirement,
+        // execution blockers, pause holds, and the CAS wake claim that
+        // makes re-admission idempotent.
+        const [latestRun] = await db
+          .select({ id: heartbeatRuns.id, companyId: heartbeatRuns.companyId })
+          .from(heartbeatRuns)
+          .where(
+            and(
+              eq(heartbeatRuns.companyId, agent.companyId),
+              sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${issueId}`,
+            ),
+          )
+          .orderBy(desc(heartbeatRuns.createdAt), desc(heartbeatRuns.id))
+          .limit(1);
+        if (!latestRun) continue;
+        await releaseIssueExecutionAndPromote(latestRun, {
+          suppressImmediateRecovery: true,
+        }).catch((err) => {
+          logger.warn(
+            { err, wakeId: wake.id, issueId, agentId },
+            "failed to re-admit stranded deferred wake at slot-free",
+          );
+        });
+      }
+    } finally {
+      drainingStrandedWakesForAgent.delete(agentId);
+    }
+  }
+
   async function startNextQueuedRunForAgent(
     agentId: string,
   ): Promise<Array<typeof heartbeatRuns.$inferSelect>> {
@@ -20740,6 +21116,8 @@ export function heartbeatService(
     // Running it inline would claim slots the owner's budget never saw and wait
     // on per-agent locks while holding the fleet lock.
     if (deferFleetRunAdmission(agentId)) return [];
+
+    await drainStrandedDeferredWakesForAgent(agentId);
 
     // Read once per admission; null (the default) keeps admission exactly as
     // before: per-agent cap only, no fleet count, no fleet lock.
@@ -30873,6 +31251,7 @@ export function heartbeatService(
 
     prepareHotRestartShutdown,
     reconcileHotRestartAdoption,
+    reconcileStaleRunScopes,
     recoverNativeRunsAfterRestart,
     reapOrphanedRuns,
     sweepPendingCleanupLeases,
@@ -30894,6 +31273,11 @@ export function heartbeatService(
     retryScheduledRetryNow,
 
     resumeQueuedRuns,
+
+    // SPA-11872: the per-agent slot-free admission entry (what run completion
+    // and the wake paths call). Exposed so the stranded-wake regression can
+    // drive the exact production admission seam.
+    startNextQueuedRunForAgent,
 
     // SPA-10137: live fleet-cap read + the matching cache invalidation. The
     // instance-settings route calls these so a cap write takes effect
@@ -30920,6 +31304,7 @@ export function heartbeatService(
     },
 
     reconcileStrandedAssignedIssues,
+    reconcileOrphanedRunIssues,
     pullIdleAgentTodoIssues,
     autoUnblockReadyDependents,
     sweepSettledAwaitingYouIssues,

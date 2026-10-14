@@ -7272,12 +7272,27 @@ export function issueService(db: Db) {
     projectId: string | null | undefined,
     executionWorkspaceId: string,
     dbOrTx: DbReader = db,
+    options?: {
+      projectWorkspaceId?: string | null;
+      /**
+       * When `true`, the caller is asserting this pin came from an explicit
+       * `executionWorkspaceId` argument rather than from inherited workspace
+       * linkage. SPA-11953 (second shape) refuses a caller-supplied pin
+       * whose execution workspace belongs to a different project workspace
+       * than the child — explicit pins are intent, never silently dropped.
+       * Inherited pins are reconciled (cleared) earlier in `create`, so by the
+       * time this assertion runs the only pin reaching it is either a true
+       * caller-supplied pin or a same-repo inherited pin.
+       */
+      callerSuppliedExecutionWorkspaceId?: boolean;
+    },
   ) {
     const workspace = await dbOrTx
       .select({
         id: executionWorkspaces.id,
         companyId: executionWorkspaces.companyId,
         projectId: executionWorkspaces.projectId,
+        projectWorkspaceId: executionWorkspaces.projectWorkspaceId,
       })
       .from(executionWorkspaces)
       .where(eq(executionWorkspaces.id, executionWorkspaceId))
@@ -7288,6 +7303,16 @@ export function issueService(db: Db) {
     if (projectId && workspace.projectId !== projectId) {
       throw unprocessable(
         "Execution workspace must belong to the selected project",
+      );
+    }
+    if (
+      options?.callerSuppliedExecutionWorkspaceId === true &&
+      options.projectWorkspaceId &&
+      (workspace.projectWorkspaceId == null ||
+        workspace.projectWorkspaceId !== options.projectWorkspaceId)
+    ) {
+      throw unprocessable(
+        `Selected project workspace ${options.projectWorkspaceId} differs from caller-supplied execution workspace's project workspace ${workspace.projectWorkspaceId ?? "(legacy null)"} (execution workspace ${executionWorkspaceId}). Pick an execution workspace that belongs to the selected project workspace, or omit executionWorkspaceId to let the issue provision a fresh workspace for the selected project workspace.`,
       );
     }
     return workspace;
@@ -8505,24 +8530,37 @@ export function issueService(db: Db) {
 
     /**
      * Walk the full parent chain from `parentIssueId` (inclusive) looking for
-     * a still-open ancestor created by `agentId`. Used to refuse agent
-     * delegation cycles: an agent assigning a new child to the agent that
-     * created an open ancestor is handing the same work back to its own
-     * delegator (A→B→A hot-potato). One recursive query covers the entire
-     * chain regardless of depth; `UNION` (not `UNION ALL`) deduplicates
-     * revisited rows, so a parent graph corrupted into a loop terminates
-     * instead of recursing forever.
+     * a still-open ancestor that `agentId` created AND assigned to
+     * `actorAgentId`. That pair is a live delegation edge: `agentId`
+     * delegated work to the actor, and the actor is now filing new work
+     * assigned back to `agentId` while still holding it — the hot-potato
+     * shape that grows an unowned blocked chain and tells no human.
+     *
+     * Both conjuncts are load-bearing. A bare creation edge also matches an
+     * agent that merely owns a class of work and files cards in chains
+     * (standing ownership, e.g. the git-ops owner), and intake
+     * decompositions filed by the actor's router — neither is a ping-pong,
+     * and refusing them forces the caller to abandon the parent chain, which
+     * is what carries workspace inheritance.
+     *
+     * One recursive query covers the entire chain regardless of depth;
+     * `UNION` (not `UNION ALL`) deduplicates revisited rows, so a parent
+     * graph corrupted into a loop terminates instead of recursing forever.
+     * An unidentified actor cannot hold an assignment, so it never matches.
      */
-    findOpenAncestorCreatedByAgent: async (
+    findOpenDelegationCycleAncestor: async (
       parentIssueId: string,
       agentId: string,
+      actorAgentId: string | null,
     ): Promise<{
       id: string;
       identifier: string | null;
       parentId: string | null;
       createdByAgentId: string | null;
+      assigneeAgentId: string | null;
       status: string;
     } | null> => {
+      if (!actorAgentId) return null;
       const rows = await db.execute(sql`
         WITH RECURSIVE ancestors(id, parent_id) AS (
           SELECT id, parent_id FROM issues WHERE id = ${parentIssueId}
@@ -8531,10 +8569,11 @@ export function issueService(db: Db) {
           FROM issues parent
           JOIN ancestors ON parent.id = ancestors.parent_id
         )
-        SELECT i.id, i.identifier, i.parent_id, i.created_by_agent_id, i.status
+        SELECT i.id, i.identifier, i.parent_id, i.created_by_agent_id, i.assignee_agent_id, i.status
         FROM issues i
         JOIN ancestors a ON a.id = i.id
         WHERE i.created_by_agent_id = ${agentId}
+          AND i.assignee_agent_id = ${actorAgentId}
           AND i.status NOT IN ('done', 'cancelled')
         LIMIT 1
       `);
@@ -8551,6 +8590,10 @@ export function issueService(db: Db) {
         createdByAgentId:
           typeof first.created_by_agent_id === "string"
             ? first.created_by_agent_id
+            : null,
+        assigneeAgentId:
+          typeof first.assignee_agent_id === "string"
+            ? first.assignee_agent_id
             : null,
         status: String(first.status),
       };
@@ -10121,6 +10164,22 @@ export function issueService(db: Db) {
         let executionWorkspaceSettings =
           (issueData.executionWorkspaceSettings as
             Record<string, unknown> | null | undefined) ?? null;
+        // SPA-11953 (second shape): flag when the execution workspace pin we
+        // are about to persist was INHERITED from a source issue, so the
+        // post-resolution reconciliation step (after projectWorkspaceId is
+        // finally resolved against the project's defaults) can drop a
+        // cross-repo inherited pin while leaving a CALLER-SUPPLIED pin
+        // alone. Caller-supplied pins with a mismatched projectWorkspaceId
+        // are refused by `assertValidExecutionWorkspace` further below — an
+        // explicit pin is intent, never silently discarded.
+        let inheritedExecutionWorkspacePin = false;
+        let inheritedSourceProjectWorkspaceId: string | null = null;
+        let pendingDropReceipt: {
+          parentIssueId: string | null;
+          droppedExecutionWorkspaceId: string;
+          sourceProjectWorkspaceId: string | null;
+          resolvedProjectWorkspaceId: string | null;
+        } | null = null;
         const workspaceInheritanceIssueId = skipExecutionWorkspaceInheritance
           ? null
           : (inheritExecutionWorkspaceFromIssueId ??
@@ -10165,6 +10224,7 @@ export function issueService(db: Db) {
               .select({
                 id: executionWorkspaces.id,
                 mode: executionWorkspaces.mode,
+                projectWorkspaceId: executionWorkspaces.projectWorkspaceId,
               })
               .from(executionWorkspaces)
               .where(
@@ -10187,6 +10247,13 @@ export function issueService(db: Db) {
                   sourceWorkspace.mode,
                 ),
               };
+              inheritedExecutionWorkspacePin = true;
+              // SPA-11953 (second shape): capture the source workspace's
+              // projectWorkspaceId here so the post-resolution reconciliation
+              // step below can compare against the child's resolved value
+              // without re-querying the same row inside the same tx.
+              inheritedSourceProjectWorkspaceId =
+                sourceWorkspace.projectWorkspaceId ?? null;
             }
           }
         }
@@ -10306,12 +10373,81 @@ export function issueService(db: Db) {
             tx,
           );
         }
+        // SPA-11953 (second shape): an inherited execution workspace pin
+        // whose source projectWorkspaceId does not match the child's
+        // resolved projectWorkspaceId must be DROPPED here, not later in the
+        // heartbeat allocator. The child's projectWorkspaceId may have been
+        // inherited from the source project (10151-10157) or resolved from
+        // the project's primary workspace (10266-10300); the comparison
+        // runs against whichever value is final at this point. A CALLER-
+        // SUPPLIED pin with a mismatched projectWorkspaceId is REFUSED
+        // further below — explicit pins are intent, never silently dropped.
+        // `sourceWorkspace.projectWorkspaceId` may be NULL on legacy rows; we
+        // treat null-vs-set as a mismatch because we have no proof the legacy
+        // row belongs to this child's repo, and the cost of a wrong skip
+        // (one extra clone) is strictly less than the cost of a wrong inherit
+        // (the deterministic `setup_failed` this card fixes).
+        if (inheritedExecutionWorkspacePin && executionWorkspaceId) {
+          // SPA-11953 (second shape): the source workspace's projectWorkspaceId
+          // was captured at the inheritance site (so we don't re-query the
+          // same row inside the same tx). Compare against the child's now-
+          // resolved `projectWorkspaceId`. Null source is treated as a
+          // mismatch because we have no proof the legacy row belongs to this
+          // child's repo; the cost of a wrong skip is one extra clone, the
+          // cost of a wrong inherit is the deterministic `setup_failed` this
+          // card fixes.
+          const sourceProjectWorkspaceId = inheritedSourceProjectWorkspaceId;
+          if (
+            sourceProjectWorkspaceId == null ||
+            sourceProjectWorkspaceId !== projectWorkspaceId
+          ) {
+            const droppedExecutionWorkspaceId = executionWorkspaceId;
+            executionWorkspaceId = null;
+            executionWorkspacePreference = null;
+            executionWorkspaceSettings = null;
+            // SPA-11953 second shape: the inherited pin was just nulled, so
+            // the child is now in the same state as a freshly-created issue
+            // with no inherited/explicit pin. Re-run the project policy
+            // default-fill (mirroring the block above at :10289-10301) so the
+            // child ends up with the project's default settings, not a
+            // settings=null column. The block above was skipped at the time
+            // because the inherited pin was still set, so its work is owed
+            // here.
+            if (issueData.projectId) {
+              executionWorkspaceSettings =
+                defaultIssueExecutionWorkspaceSettingsForProject(
+                  gateProjectExecutionWorkspacePolicy(
+                    await loadProjectPolicyOnce(),
+                    isolatedWorkspacesEnabled,
+                  ),
+                ) as Record<string, unknown> | null;
+            }
+            // Receipt is deferred and emitted AFTER the issue insert below;
+            // logging inside the open tx would publish a "dropped" receipt
+            // for an issue that later rolls back (e.g. a downstream
+            // constraint failure), which would mislead the monitor's
+            // worktree-path-collision-across-repos ledger class.
+            pendingDropReceipt = {
+              parentIssueId:
+                inheritExecutionWorkspaceFromIssueId ?? issueData.parentId ?? null,
+              droppedExecutionWorkspaceId,
+              sourceProjectWorkspaceId,
+              resolvedProjectWorkspaceId: projectWorkspaceId,
+            };
+          }
+        }
         if (executionWorkspaceId) {
           await assertValidExecutionWorkspace(
             companyId,
             issueData.projectId,
             executionWorkspaceId,
             tx,
+            {
+              projectWorkspaceId,
+              callerSuppliedExecutionWorkspaceId:
+                !inheritedExecutionWorkspacePin &&
+                issueData.executionWorkspaceId !== undefined,
+            },
           );
         }
         if (
@@ -10455,6 +10591,17 @@ export function issueService(db: Db) {
           [enriched],
           tx,
         );
+        if (pendingDropReceipt) {
+          logger.info(
+            {
+              companyId,
+              issueId: issue.id,
+              identifier: issue.identifier,
+              ...pendingDropReceipt,
+            },
+            "issues.create dropped inherited cross-repo execution workspace pin (SPA-11953)",
+          );
+        }
         return withRelations;
       };
       if (dbOrTx === db) return db.transaction(persist);
@@ -10984,6 +11131,7 @@ export function issueService(db: Db) {
         const decision = await gate.evaluateDoneGate({
           id: existing.id,
           companyId: existing.companyId,
+          identifier: existing.identifier,
           // SPA-9038: the card's own description can carry binding PR links.
           description: typeof issueData.description === "string"
             ? issueData.description
@@ -11374,6 +11522,30 @@ export function issueService(db: Db) {
           }
           if (updated.status === "done" || updated.status === "cancelled") {
             await finalizeSummarySlotsForTerminalIssue(tx, updated);
+            // SPA-11805 A2: a terminal transition retires pending execution
+            // work for the issue. Drain only unclaimed rows
+            // (`deferred_issue_execution`/`queued` with no run bound): a wake
+            // armed before the close must die at the close, and a claimed or
+            // running row belongs to a live run that the close must not kill.
+            await tx
+              .update(agentWakeupRequests)
+              .set({
+                status: "cancelled",
+                finishedAt: new Date(),
+                error: "issue_terminal",
+                updatedAt: new Date(),
+              })
+              .where(
+                and(
+                  eq(agentWakeupRequests.companyId, updated.companyId),
+                  inArray(agentWakeupRequests.status, [
+                    "deferred_issue_execution",
+                    "queued",
+                  ]),
+                  isNull(agentWakeupRequests.runId),
+                  wakeRequestTargetsIssue(updated.id),
+                ),
+              );
             // Every terminal transition funnels through here, including direct
             // service callers (tree control, recovery, pipelines, status cards)
             // that never touch the HTTP routes, so pending interaction cards
@@ -12991,6 +13163,27 @@ export function issueService(db: Db) {
         }
       }
       if (!comment) {
+        // SPA-11706 D1: the agent-keyed idempotency constraint is enforced by the
+        // DATABASE, not by a pre-SELECT. A read-then-write lookup cannot be correct
+        // here: two concurrent identical retries both miss the read and both reach
+        // the insert, and the loser would surface a 23505 as a 500 — the very
+        // symptom this fixes. `ON CONFLICT DO NOTHING` makes the race safe by
+        // construction: the loser inserts nothing, then reads the winner's row back.
+        //
+        // `onConflictDoNothing` in drizzle 0.45.2 reads `where` (not `targetWhere`),
+        // so the inference predicate is passed as `where`; `targetWhere` is silently
+        // dropped by that version and Postgres then reports 42P10.
+        const agentKeyedReplay =
+          actor.agentId && options?.clientRequestId
+            ? {
+                target: [
+                  issueComments.issueId,
+                  issueComments.authorAgentId,
+                  issueComments.clientRequestId,
+                ] as const,
+                where: sql`${issueComments.clientRequestId} is not null and ${issueComments.authorAgentId} is not null`,
+              }
+            : null;
         [comment] = await dbOrTx
           .insert(issueComments)
           .values({
@@ -13010,7 +13203,27 @@ export function issueService(db: Db) {
               ? { createdAt }
               : {}),
           })
+          .onConflictDoNothing(agentKeyedReplay ?? undefined)
           .returning();
+        if (!comment && agentKeyedReplay) {
+          const [winner] = await dbOrTx
+            .select()
+            .from(issueComments)
+            .where(
+              and(
+                eq(issueComments.issueId, issueId),
+                eq(issueComments.authorAgentId, actor.agentId!),
+                eq(issueComments.clientRequestId, options!.clientRequestId!),
+              ),
+            );
+          if (!winner) {
+            throw new Error("Failed to create issue comment");
+          }
+          if (winner.body !== redactedBody) {
+            throw conflict("Idempotency key was already used for different content");
+          }
+          comment = winner;
+        }
       }
       if (!comment) throw new Error("Failed to create issue comment");
 
