@@ -6814,11 +6814,32 @@ export function issueRoutes(
         relaxedUnresolvedBlockerIssueIds?.length ??
         readiness.unresolvedBlockerCount;
       if (unresolvedBlockerCount > 0) {
+        // SPA-12214 (observability only): name WHY each blocker is
+        // unresolved. Same vocabulary as `listUnresolvedBlockerDetails` —
+        // a blocker behind the workspace-finalize barrier reads
+        // `pending_finalize`, anything else reads `not_done`. The guard
+        // predicate is unchanged: it still 409s on the same ids.
+        // NOTE the relaxed path: when the request supplied an explicit
+        // post-mutation set, `readiness.pendingFinalizeBlockerIssueIds`
+        // describes the STORED set, not the relaxed one — so only stored-set
+        // ids can read `pending_finalize`. Ids unique to the relaxed set
+        // (kept open blockers) correctly read `not_done`.
+        const pendingFinalizeIds = new Set(
+          readiness.pendingFinalizeBlockerIssueIds,
+        );
         res.status(409).json({
           error: "Issue follow-up blocked by unresolved blockers",
           details: {
             issueId: issue.id,
             unresolvedBlockerIssueIds,
+            unresolvedBlockers: unresolvedBlockerIssueIds.map(
+              (blockerIssueId) => ({
+                issueId: blockerIssueId,
+                reason: pendingFinalizeIds.has(blockerIssueId)
+                  ? "pending_finalize"
+                  : "not_done",
+              }),
+            ),
           },
         });
         return false;
