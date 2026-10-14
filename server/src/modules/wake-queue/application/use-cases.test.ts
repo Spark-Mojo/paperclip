@@ -1045,7 +1045,7 @@ function createFakeAdmissionWriter(overrides: Partial<WakeAdmissionWriter> = {})
   return {
     coalesceIntoActiveExecutionRun: vi.fn(async () => ({ id: "merged-run-1" })),
     mergeIntoExistingDeferredWake: vi.fn(async () => {}),
-    insertNewDeferredWake: vi.fn(async () => {}),
+    insertNewDeferredWake: vi.fn(async () => "deferred-new-1"),
     ...overrides,
   };
 }
@@ -1111,7 +1111,7 @@ describe("admitWakeBehindIssueExecution", () => {
         }),
       );
 
-      expect(result).toEqual({ kind: "deferred" });
+      expect(result).toEqual({ kind: "deferred", deferredWakeId: "deferred-new-1" });
       expect(writer.coalesceIntoActiveExecutionRun).not.toHaveBeenCalled();
       expect(reader.findExistingDeferredWake).not.toHaveBeenCalled();
       expect(writer.mergeIntoExistingDeferredWake).not.toHaveBeenCalled();
@@ -1157,7 +1157,7 @@ describe("admitWakeBehindIssueExecution", () => {
       }),
     );
 
-    expect(result).toEqual({ kind: "deferred" });
+    expect(result).toEqual({ kind: "deferred", deferredWakeId: "deferred-new-1" });
     expect(reader.matchesActiveWakeActor).toHaveBeenCalledExactlyOnceWith(
       SCOPE,
       {
@@ -1259,7 +1259,9 @@ describe("admitWakeBehindIssueExecution", () => {
       }),
     );
 
-    expect(result).toEqual({ kind: "deferred" });
+    // The merge target is the wake the reader found, so the re-drive after this
+    // transaction commits targets that row and not a wake that was never written.
+    expect(result).toEqual({ kind: "deferred", deferredWakeId: "existing-deferred-wake" });
     expect(
       writer.mergeIntoExistingDeferredWake,
     ).toHaveBeenCalledExactlyOnceWith(
@@ -1302,7 +1304,7 @@ describe("admitWakeBehindIssueExecution", () => {
       reader: createFakeAdmissionReader(), writer, helpers: createFakeAdmissionHelpers(),
     });
     expect(await admit(SCOPE, admissionInput({ payload: { issueId: "issue-1", manualUserWake: true } })))
-      .toEqual({ kind: "deferred" });
+      .toEqual({ kind: "deferred", deferredWakeId: "deferred-new-1" });
     expect(writer.coalesceIntoActiveExecutionRun).not.toHaveBeenCalled();
     expect(writer.insertNewDeferredWake).toHaveBeenCalledTimes(1);
   });
@@ -1372,7 +1374,7 @@ describe("admitWakeBehindIssueExecution", () => {
 
     const result = await admit(SCOPE, admissionInput());
 
-    expect(result).toEqual({ kind: "deferred" });
+    expect(result).toEqual({ kind: "deferred", deferredWakeId: "deferred-1" });
     expect(mergeIntoExistingDeferredWake).toHaveBeenCalledTimes(1);
     const call = mergeIntoExistingDeferredWake.mock.calls[0]![1];
     expect(call.existingDeferredWakeId).toBe("deferred-1");
@@ -1390,7 +1392,7 @@ describe("admitWakeBehindIssueExecution", () => {
 
     const result = await admit(SCOPE, admissionInput());
 
-    expect(result).toEqual({ kind: "deferred" });
+    expect(result).toEqual({ kind: "deferred", deferredWakeId: "deferred-new-1" });
     expect(writer.insertNewDeferredWake).toHaveBeenCalledTimes(1);
     expect(writer.coalesceIntoActiveExecutionRun).not.toHaveBeenCalled();
     expect(writer.mergeIntoExistingDeferredWake).not.toHaveBeenCalled();

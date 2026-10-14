@@ -401,7 +401,12 @@ import {
   readManagedWorktreeInstanceOwnership,
   WORKTREE_INSTANCE_ROOT_METADATA_KEY,
 } from "./workspace-instance-cleanup.js";
-import { issueService } from "./issues.js";
+import { issueService, TERMINAL_HEARTBEAT_RUN_STATUSES } from "./issues.js";
+import {
+  DEFERRED_WAKE_BACKSTOP_CANDIDATE_LIMIT,
+  decideDeferredWakeBackstop,
+  readDeferredWakeBlockingReference,
+} from "./deferred-wake-backstop.js";
 import { issueThreadInteractionService } from "./issue-thread-interactions.js";
 import { settleSettledAwaitingYouIssues } from "./awaiting-you-settlement.js";
 import {
@@ -13433,6 +13438,25 @@ export function heartbeatService(
     void reportRunFailure(db, updated);
   }
 
+  async function releaseTerminalLocalLeases(
+    tx: Parameters<Parameters<Db["transaction"]>[0]>[0],
+    run: typeof heartbeatRuns.$inferSelect,
+  ) {
+    if (!isHeartbeatRunTerminalStatus(run.status) || isNativeRunnerOwnershipHeld(run)) return;
+    await tx.update(environmentLeases).set({
+      status: "released",
+      releasedAt: new Date(),
+      cleanupStatus: "success",
+      updatedAt: new Date(),
+    }).where(and(
+      eq(environmentLeases.heartbeatRunId, run.id),
+      eq(environmentLeases.companyId, run.companyId),
+      eq(environmentLeases.status, "active"),
+      eq(environmentLeases.leasePolicy, "ephemeral"),
+      eq(environmentLeases.provider, "local"),
+    ));
+  }
+
   async function setRunStatus(
     runId: string,
     status: string,
@@ -13462,7 +13486,9 @@ export function heartbeatService(
         },
       };
     }
-    const updated =
+    const updated = await db.transaction(async (tx) => {
+      const db = tx as unknown as Db;
+      const updated =
       previousStatus &&
       legacyExecutionNeedsReconciliation({
         ...previousStatus,
@@ -13486,6 +13512,9 @@ export function heartbeatService(
             .where(eq(heartbeatRuns.id, runId))
             .returning()
             .then((rows) => rows[0] ?? null);
+      if (updated) await releaseTerminalLocalLeases(tx, updated);
+      return updated;
+    });
 
     if (updated) {
       publishLiveEvent({
@@ -13546,7 +13575,9 @@ export function heartbeatService(
         },
       };
     }
-    const updated =
+    const updated = await db.transaction(async (tx) => {
+      const db = tx as unknown as Db;
+      const updated =
       previousStatus &&
       legacyExecutionNeedsReconciliation({
         ...previousStatus,
@@ -13579,6 +13610,9 @@ export function heartbeatService(
             )
             .returning()
             .then((rows) => rows[0] ?? null);
+      if (updated) await releaseTerminalLocalLeases(tx, updated);
+      return updated;
+    });
 
     if (updated) {
       publishLiveEvent({
@@ -18234,6 +18268,15 @@ export function heartbeatService(
                       ),
                     )
                     .returning();
+                  // SPA-9351: this admission cancel writes the run row
+                  // directly instead of through setRunStatus, so it must
+                  // release the run's local ephemeral lease itself. The lease
+                  // is acquired before dispatch (environment-runtime.ts:1103),
+                  // so without this the lease stays active and the card
+                  // strands behind `execution_owner_active`.
+                  if (cancelled) {
+                    await releaseTerminalLocalLeases(tx, cancelled);
+                  }
                   if (!cancelled) return { kind: "stale" as const, run: null };
                   await tx
                     .update(agentWakeupRequests)
@@ -18341,6 +18384,11 @@ export function heartbeatService(
                     ),
                   )
                   .returning();
+                // SPA-9351: direct admission cancel — release the local
+                // ephemeral lease in the same transaction as the run write.
+                if (cancelled) {
+                  await releaseTerminalLocalLeases(tx, cancelled);
+                }
                 await tx
                   .update(agentWakeupRequests)
                   .set({
@@ -20318,6 +20366,212 @@ export function heartbeatService(
     for (const agentId of [...new Set([...orderedAgentIds, ...strandedWakeAgentIds])]) {
       await startNextQueuedRunForAgent(agentId);
     }
+  }
+
+  /**
+   * SPA-9351: backstop for deferred wakes whose blocking run has already ended.
+   *
+   * Promotion is otherwise purely event-driven (the run-end release drains the
+   * queue), so a row that was already stale when that release shipped is never
+   * promoted. The pre-existing re-drives above are filtered to comment-queue
+   * wakes and resolve the blocker as the *wake agent's* latest run — which is
+   * exactly how SPA-9280 slipped through: its wake addresses the reassigned
+   * assignee, who has no run on the card, so the lookup finds nothing and the
+   * sweep skips it on every tick forever.
+   *
+   * This resolves the blocker from the wake's own recorded reference
+   * (`payload.interruptedRunId`), promotes through the same release admission
+   * so pause holds, leases and invokability still apply, and never displaces a
+   * newer live execution owner.
+   */
+  async function reconcileStaleDeferredWakes() {
+    const result = {
+      checked: 0,
+      promoted: 0,
+      suppressed: 0,
+      candidateLimitSkipped: 0,
+      wakeIds: [] as string[],
+    };
+
+    const candidates = await db
+      .select({ wake: agentWakeupRequests, companyStatus: companies.status })
+      .from(agentWakeupRequests)
+      .innerJoin(
+        issues,
+        and(
+          eq(issues.companyId, agentWakeupRequests.companyId),
+          sql`${issues.id}::text = ${agentWakeupRequests.payload}->>'issueId'`,
+        ),
+      )
+      .innerJoin(companies, eq(companies.id, issues.companyId))
+      .where(
+        and(
+          eq(agentWakeupRequests.status, "deferred_issue_execution"),
+          isNull(agentWakeupRequests.finishedAt),
+        ),
+      )
+      .orderBy(asc(agentWakeupRequests.requestedAt))
+      .limit(DEFERRED_WAKE_BACKSTOP_CANDIDATE_LIMIT);
+
+    for (const { wake, companyStatus } of candidates) {
+      result.checked += 1;
+      const issueId = readNonEmptyString(wake.payload?.issueId);
+      if (!issueId) {
+        result.suppressed += 1;
+        continue;
+      }
+      const reference = readDeferredWakeBlockingReference(wake.payload);
+
+      // Resolve the blocking run from the WAKE's reference, never from the
+      // wake agent's run history: after a reassignment the addressee may have
+      // no run on this card at all, which is the bug being fixed.
+      let blockingRunId: string | null = null;
+      let blockingRunStatus: string | null = null;
+      let blockingRunRow: typeof heartbeatRuns.$inferSelect | null = null;
+      let recoveryActionRunStatus: string | null = null;
+      let referenceUnresolvable = false;
+
+      if (reference.kind === "run") {
+        const [row] = await db
+          .select()
+          .from(heartbeatRuns)
+          .where(
+            and(
+              eq(heartbeatRuns.companyId, wake.companyId),
+              eq(heartbeatRuns.id, reference.runId),
+            ),
+          )
+          .limit(1);
+        if (row) {
+          blockingRunId = row.id;
+          blockingRunStatus = row.status;
+          blockingRunRow = row;
+        } else {
+          referenceUnresolvable = true;
+        }
+      } else if (reference.kind === "recovery_action") {
+        const [action] = await db
+          .select({ evidence: issueRecoveryActions.evidence })
+          .from(issueRecoveryActions)
+          .where(
+            and(
+              eq(issueRecoveryActions.companyId, wake.companyId),
+              eq(issueRecoveryActions.id, reference.recoveryActionId),
+            ),
+          )
+          .limit(1);
+        const evidenceRunId = readNonEmptyString(
+          (parseObject(action?.evidence).runId as string | undefined) ??
+            (parseObject(action?.evidence).sourceRunId as string | undefined),
+        );
+          if (action && evidenceRunId) {
+            const [row] = await db
+              .select()
+              .from(heartbeatRuns)
+              .where(
+                and(
+                  eq(heartbeatRuns.companyId, wake.companyId),
+                  eq(heartbeatRuns.id, evidenceRunId),
+                ),
+              )
+              .limit(1);
+          if (row) {
+            blockingRunId = row.id;
+            recoveryActionRunStatus = row.status;
+            blockingRunRow = row;
+          } else {
+            referenceUnresolvable = true;
+          }
+        } else {
+          referenceUnresolvable = true;
+        }
+      }
+
+      const [issue] = await db
+        .select({
+          status: issues.status,
+          assigneeAgentId: issues.assigneeAgentId,
+          executionRunId: issues.executionRunId,
+        })
+        .from(issues)
+        .where(eq(issues.id, issueId))
+        .limit(1);
+
+      // The actionless path has no run to join, so its one remaining proof is
+      // whether a genuine recovery action or retained execution lease holds the
+      // issue right now. The drain re-checks this under the issue lock too.
+      const currentRecoveryBlockerActive =
+        reference.kind === "actionless_recovery"
+          ? (await getExecutionBlocker(db, wake.companyId, issueId)) !== null
+          : false;
+
+      const decision = decideDeferredWakeBackstop({
+        wakeStatus: wake.status,
+        blockingReference: reference,
+        blockingRunStatus,
+        recoveryActionRunStatus,
+        issueExecutionRunId: issue?.executionRunId ?? null,
+        blockingRunStillHoldsLock:
+          issue?.executionRunId != null && issue.executionRunId === blockingRunId,
+        issueStatus: issue?.status ?? "",
+        wakeAgentIsAssignee: issue?.assigneeAgentId === wake.agentId,
+        wakeCompanyIsActive: companyStatus === "active",
+        referenceUnresolvable,
+        currentRecoveryBlockerActive,
+      });
+
+      if (decision.kind === "suppressed") {
+        result.suppressed += 1;
+        continue;
+      }
+
+      // An actionless wait has no finishing run to release, so it drains the
+      // queue directly under the issue lock instead. Both routes keep every
+      // guard and both read success back off the wake row, because a bare
+      // status flip would leave the wake in `queued` with nothing dispatching.
+      let released = false;
+      if (decision.blockingRunId === null) {
+        released = await reconcileDeferredWakeAfterDeferral(wake.id).catch((err) => {
+          logger.warn({ err, wakeId: wake.id }, "deferred-wake backstop failed to promote an actionless wait");
+          return false;
+        });
+      } else if (blockingRunRow) {
+        await releaseIssueExecutionAndPromote(blockingRunRow, {
+          suppressImmediateRecovery: true,
+        }).catch((err) => {
+          logger.warn(
+            { err, wakeId: wake.id, runId: decision.blockingRunId },
+            "deferred-wake backstop failed to promote",
+          );
+        });
+        const [after] = await db
+          .select({ status: agentWakeupRequests.status, runId: agentWakeupRequests.runId })
+          .from(agentWakeupRequests)
+          .where(
+            and(
+              eq(agentWakeupRequests.id, wake.id),
+              eq(agentWakeupRequests.companyId, wake.companyId),
+            ),
+          )
+          .limit(1);
+        released = (after?.status === "queued" || after?.status === "claimed") && Boolean(after.runId);
+      }
+
+      if (released) {
+        result.promoted += 1;
+        result.wakeIds.push(wake.id);
+      } else {
+        result.suppressed += 1;
+      }
+    }
+
+    if (result.promoted > 0) {
+      logger.warn(
+        { ...result, wakeIds: undefined },
+        "deferred-wake backstop promoted wakes whose blocking run had already ended (SPA-9351)",
+      );
+    }
+    return result;
   }
 
   async function recoverActiveSessionGoals() {
@@ -27768,6 +28022,57 @@ export function heartbeatService(
     }
   }
 
+  /**
+   * SPA-9351 shape 3: re-admit one deferred wake after its deferral committed.
+   *
+   * Admission reads the issue's live holder before it writes the deferred row,
+   * so a run that ends between that read and the commit leaves the row with no
+   * run-end event left to wait for. This re-drives that exact wake id through
+   * the wake-queue drain under the issue's own row lock, which re-applies the
+   * live-owner, assignee, terminal-card, recovery-blocker, pause-hold, and
+   * invokability guards, and claims the row with the same compare-and-set the
+   * release path uses — so a concurrent sweep and this call cannot both
+   * dispatch it. It never synthesizes a finishing run and never clears a lock
+   * a live run still holds.
+   */
+  async function reconcileDeferredWakeAfterDeferral(wakeId: string): Promise<boolean> {
+    const [wake] = await db
+      .select({
+        id: agentWakeupRequests.id,
+        companyId: agentWakeupRequests.companyId,
+        agentId: agentWakeupRequests.agentId,
+        status: agentWakeupRequests.status,
+        issueId: sql`${agentWakeupRequests.payload}->>'issueId'`,
+      })
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.id, wakeId))
+      .limit(1);
+    const issueId = readNonEmptyString(wake?.issueId);
+    if (!wake || wake.status !== "deferred_issue_execution" || !issueId) return false;
+
+    const { outcome, postCommitEffects } = await wakeQueue
+      .drainDeferredWakeQueue({
+        companyId: wake.companyId,
+        issueId,
+        wakeAgentId: wake.agentId,
+        wakeId: wake.id,
+        now: new Date(),
+      })
+      .catch((err) => {
+        logger.warn({ err, wakeId }, "deferred-wake post-deferral re-admission failed");
+        return { outcome: { kind: "not_promoted" as const }, postCommitEffects: [] };
+      });
+    await applyWakeQueuePostCommitEffects(postCommitEffects);
+    if (outcome.kind !== "promoted") return false;
+
+    const [after] = await db
+      .select({ status: agentWakeupRequests.status, runId: agentWakeupRequests.runId })
+      .from(agentWakeupRequests)
+      .where(and(eq(agentWakeupRequests.id, wakeId), eq(agentWakeupRequests.companyId, wake.companyId)))
+      .limit(1);
+    return (after?.status === "queued" || after?.status === "claimed") && Boolean(after.runId);
+  }
+
   async function releaseIssueExecutionAndPromote(
     run: Pick<typeof heartbeatRuns.$inferSelect, "id" | "companyId">,
     options: { suppressImmediateRecovery?: boolean } = {},
@@ -28333,6 +28638,11 @@ export function heartbeatService(
       const agentNameKey = normalizeAgentNameKey(agent.name);
 
       const cancelledRunsToEmit: (typeof heartbeatRuns.$inferSelect)[] = [];
+      // Deferred rows this admission established. The live holder that forced
+      // the deferral can end before this transaction commits, and then no
+      // run-end event exists to promote the row, so each one is re-driven once
+      // after the commit.
+      const deferredWakeIdsForFreshAdmission: string[] = [];
 
       const outcome = await db
         .transaction(async (tx) => {
@@ -28893,6 +29203,11 @@ export function heartbeatService(
 
             if (!cancelled) return false;
 
+            // SPA-9351: direct admission cancel — release the local ephemeral
+            // lease in the same transaction as the run write, so a retry that
+            // never became due cannot leave an active lease behind.
+            await releaseTerminalLocalLeases(tx, cancelled);
+
             if (scheduledRun.wakeupRequestId) {
               await tx
                 .update(agentWakeupRequests)
@@ -29026,6 +29341,11 @@ export function heartbeatService(
               .returning();
             if (cancelled.length > 0) {
               cancelledRunsToEmit.push(cancelled[0]);
+              // SPA-9351: direct admission cancel — release the local ephemeral
+              // lease in the same transaction as the run write. A queued holder
+              // holds an acquired lease, and leaving it active strands the card
+              // behind `execution_owner_active`.
+              await releaseTerminalLocalLeases(tx, cancelled[0]);
               if (activeExecutionRun.wakeupRequestId) {
                 await tx
                   .update(agentWakeupRequests)
@@ -29118,6 +29438,9 @@ export function heartbeatService(
                   .returning();
                 if (staleCancelled.length > 0) {
                   cancelledRunsToEmit.push(staleCancelled[0]);
+                  // SPA-9351: direct admission cancel — release the local
+                  // ephemeral lease in the same transaction as the run write.
+                  await releaseTerminalLocalLeases(tx, staleCancelled[0]);
                   if (legacyRun.wakeupRequestId) {
                     await tx
                       .update(agentWakeupRequests)
@@ -29440,6 +29763,9 @@ export function heartbeatService(
               };
             }
             if (admission.kind === "deferred") {
+              if (admission.deferredWakeId) {
+                deferredWakeIdsForFreshAdmission.push(admission.deferredWakeId);
+              }
               return { kind: "deferred" as const };
             }
             // admission.kind === "proceed": no active run absorbed this wake,
@@ -29817,6 +30143,18 @@ export function heartbeatService(
           });
           await applyWakeQueuePostCommitEffects(postCommitEffects);
         }
+      }
+
+      // SPA-9351 shape 3. The deferral decision above read the live holder
+      // before this row committed; a holder that ended in between leaves the row
+      // with no run-end event left to wait for, which is the whole stranding.
+      // Re-drive it now, after the commit, through the guarded drain. It is
+      // error-isolated: a failure here must never change this wake's outcome,
+      // and the startup and periodic sweeps remain the durable backstop.
+      for (const deferredWakeId of new Set(deferredWakeIdsForFreshAdmission)) {
+        await reconcileDeferredWakeAfterDeferral(deferredWakeId).catch((err) => {
+          logger.warn({ err, wakeId: deferredWakeId }, "post-deferral re-admission failed");
+        });
       }
 
       if (outcome.kind === "durable") {
@@ -31271,6 +31609,8 @@ export function heartbeatService(
     retryScheduledRetryNow,
 
     resumeQueuedRuns,
+    reconcileStaleDeferredWakes,
+    reconcileDeferredWakeAfterDeferral,
 
     // SPA-11872: the per-agent slot-free admission entry (what run completion
     // and the wake paths call). Exposed so the stranded-wake regression can

@@ -2010,6 +2010,13 @@
       "when": 1791904600000,
       "tag": "9287_orphaned_run_rewake_idempotency",
       "breakpoints": true
+    },
+    {
+      "idx": 9288,
+      "version": "7",
+      "when": 1791904600001,
+      "tag": "9288_stranded_rewake_idempotency",
+      "breakpoints": true
     }
   ]
 }

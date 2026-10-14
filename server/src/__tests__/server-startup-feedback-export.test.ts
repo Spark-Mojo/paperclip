@@ -71,6 +71,9 @@ const {
     // SPA-11948: stale `paperclip-agent-*.scope` reconciliation at boot.
     reconcileStaleRunScopes: vi.fn(async () => ({ units: [], detachedRunIds: [] })),
     reapOrphanedRuns: vi.fn(async () => ({ reaped: 0, runIds: [] })),
+    reclaimTerminalEnvironmentLeases: vi.fn(async () => ({ reclaimed: 0, driverFailures: [] })),
+    reclaimTerminalEnvironmentLeasesForRestart: vi.fn(async () => ({ releasedRestartOrphans: [], replacedRunIds: [], replacementDispatchFailures: [] })),
+    reconcileStaleDeferredWakes: vi.fn(async () => ({ checked: 0, promoted: 0 })),
     promoteDueScheduledRetries: vi.fn(async () => ({ promoted: 0, runIds: [] })),
     resumeQueuedRuns: vi.fn(async () => undefined),
     recoverPendingSessionGoalActions: vi.fn(async () => ({ scanned: 0, enqueued: 0, alreadyQueued: 0, invalid: 0 })),
