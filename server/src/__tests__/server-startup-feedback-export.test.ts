@@ -89,6 +89,17 @@ const {
     reconcileTaskWatchdogs: vi.fn(async () => ({ triggered: 0 })),
     scanSilentActiveRuns: vi.fn(async () => ({ created: 0, escalated: 0 })),
     sweepStaleIssueLocks: vi.fn(async () => ({ cleared: 0 })),
+    // SPA-12319: periodic orphan handback. Startup calls it after the sweep;
+    // the periodic tick must call it after the sweep too. Shape mirrors the
+    // service return ({ scanned, rewoken, skipped, deferredForNextBoot,
+    // issueIds }).
+    reconcileOrphanedRunIssues: vi.fn(async () => ({ scanned: 0, rewoken: 0, skipped: 0, deferredForNextBoot: 0, issueIds: [] })),
+    reclaimTerminalEnvironmentLeases: vi.fn(async () => ({ reclaimed: 0, skippedUnknownOwner: 0, skippedLiveOwners: 0, skippedCrossCompany: 0, skippedOwnershipChanged: 0, driverFailures: [] })),
+    reclaimTerminalEnvironmentLeasesForRestart: vi.fn(async () => ({ releasedRestartOrphans: [], replacedRunIds: [], replacementDispatchFailures: [] })),
+    // SPA-12319: the periodic recovery chain between the reaper and the
+    // stale-lock sweep calls these inline; the mock must carry them so the
+    // chain reaches the sweep instead of throwing on undefined.
+    sweepSettledAwaitingYouIssues: vi.fn(async () => ({ handedBack: 0, autoClosed: 0 })),
     sweepPendingCleanupLeases: vi.fn(async () => ({ swept: 0, destroyed: 0, capped: 0 })),
     sweepExpiredRuntimeStatuses: vi.fn(() => 0),
     tickTimers: vi.fn(async () => ({ checked: 0, enqueued: 0, skipped: 0 })),
@@ -567,6 +578,74 @@ describe("startServer feedback export wiring", () => {
       storageService: { id: "storage-service" },
       serverPort: 3210,
     });
+  });
+
+  it("reconciles orphaned runs after the stale-lock sweep at startup and on periodic recovery", async () => {
+    // SPA-12319: the periodic tick must call `reconcileOrphanedRunIssues`
+    // after `sweepStaleIssueLocks`, mirroring the load-bearing startup
+    // ordering (sweep terminalizes first; the reconciler keys on errorCode
+    // `orphaned_running_run`). The interval callback only SCHEDULES the
+    // recovery chain via `trackHeartbeatSchedulerWork` (fire-and-forget), so
+    // the test flushes tracked work instead of assuming one setImmediate is
+    // enough. Pattern mirrors the retired-review-detector test otherwise.
+    loadConfigMock.mockReturnValue(buildTestConfig({
+      heartbeatSchedulerEnabled: true,
+      heartbeatSchedulerIntervalMs: 30000,
+    }));
+    const order: string[] = [];
+    const restore = [
+      restoreImpl(heartbeatServiceMock.sweepStaleIssueLocks, async () => {
+        order.push("sweep");
+        return { cleared: 0 };
+      }),
+      restoreImpl(heartbeatServiceMock.reconcileOrphanedRunIssues, async () => {
+        order.push("reconcile");
+        return { scanned: 0, rewoken: 0, skipped: 0, deferredForNextBoot: 0, issueIds: [] };
+      }),
+    ];
+    let intervalCallback: (() => void) | null = null;
+    const setIntervalSpy = vi.spyOn(globalThis, "setInterval").mockImplementation(((
+      callback: () => void,
+      interval: number,
+    ) => {
+      // The engine registers the execution-control sweep (15s) before the
+      // heartbeat-scheduler interval (config.heartbeatSchedulerIntervalMs,
+      // 30000 in this test). Capture the scheduler interval by its period,
+      // so invoking the callback drives the recovery chain under test
+      // instead of an unrelated sweep.
+      if (interval === 30000) intervalCallback = callback;
+      return 1 as unknown as ReturnType<typeof setInterval>;
+    }) as typeof setInterval);
+    try {
+      await startServer();
+      // Startup runs inline: sweep-then-reconcile in order.
+      expect(heartbeatServiceMock.sweepStaleIssueLocks).toHaveBeenCalledTimes(1);
+      expect(heartbeatServiceMock.reconcileOrphanedRunIssues).toHaveBeenCalledTimes(1);
+      expect(order).toEqual(["sweep", "reconcile"]);
+      // Periodic path only schedules recovery work; flush until the chain runs.
+      // The tracked chain is fire-and-forget off the tick promise: the outer
+      // async callback runs on a tracked promise, and `sweepStaleIssueLocks`
+      // sits ~8 `.then` hops down the gated recovery chain
+      // (reap -> leases x2 -> promote/admit -> dependency -> awaiting-you ->
+      // idle-pull -> watchdogs -> silent-scan -> sweep). Each hop needs its
+      // own macrotask turn, so pump the queue with a bounded round loop:
+      // fail loudly instead of hanging the suite if the wiring is broken.
+      expect(intervalCallback).not.toBeNull();
+      intervalCallback?.();
+      for (let round = 0; round < 400; round += 1) {
+        await new Promise<void>((resolve) => { setTimeout(resolve, 0); });
+        if (
+          heartbeatServiceMock.sweepStaleIssueLocks.mock.calls.length >= 2 &&
+          heartbeatServiceMock.reconcileOrphanedRunIssues.mock.calls.length >= 2
+        ) break;
+      }
+      expect(heartbeatServiceMock.sweepStaleIssueLocks).toHaveBeenCalledTimes(2);
+      expect(heartbeatServiceMock.reconcileOrphanedRunIssues).toHaveBeenCalledTimes(2);
+      expect(order).toEqual(["sweep", "reconcile", "sweep", "reconcile"]);
+    } finally {
+      for (const undo of restore) undo();
+      setIntervalSpy.mockRestore();
+    }
   });
 
   it("never invokes the retired review detector at startup or on periodic recovery", async () => {

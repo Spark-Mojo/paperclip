@@ -2,10 +2,12 @@ import { randomUUID } from "node:crypto";
 import { eq } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
+  activityLog,
   agentWakeupRequests,
   agents,
   companies,
   createDb,
+  heartbeatRunEvents,
   heartbeatRuns,
   issueTreeHolds,
   issues,
@@ -55,6 +57,7 @@ describeEmbeddedPostgres("recovery reconcileOrphanedRunIssues (SPA-12218 startup
   }, 20_000);
 
   afterEach(async () => {
+    await db.delete(activityLog);
     await db.delete(issueTreeHolds);
     await db.delete(issues);
     await db.delete(agentWakeupRequests);
@@ -153,6 +156,8 @@ describeEmbeddedPostgres("recovery reconcileOrphanedRunIssues (SPA-12218 startup
     createdAt: Date;
     /** SPA-12218: bind the run by `issueId`, by `taskId`, or with a disagreeing pair. */
     contextIssueKey?: "issueId" | "taskId" | "disagreeing";
+    /** SPA-12319: a dead recorded pid so the sweep terminalizes via process-death authority. */
+    processPid?: number | null;
   }) {
     const runId = randomUUID();
     const contextKey = input.contextIssueKey ?? "issueId";
@@ -168,6 +173,7 @@ describeEmbeddedPostgres("recovery reconcileOrphanedRunIssues (SPA-12218 startup
       errorCode: input.errorCode ?? null,
       invocationSource: "manual",
       contextSnapshot,
+      processPid: input.processPid ?? null,
       createdAt: input.createdAt,
       startedAt: input.createdAt,
       finishedAt: input.status === "running" || input.status === "queued" ? null : input.createdAt,
@@ -1049,5 +1055,145 @@ describeEmbeddedPostgres("recovery reconcileOrphanedRunIssues (SPA-12218 startup
 
     expect(result.rewoken).toBe(0);
     expect(enqueueWakeup).not.toHaveBeenCalled();
+  });
+
+  // --- SPA-12319 sweep-path orphan handback ---
+  //
+  // The measured SPA-12311 shape: an `in_progress` issue still holds a lock on
+  // a `running` run whose process is gone, with the run's contextSnapshot
+  // bound to the issue. `sweepStaleIssueLocks` terminalizes the run via
+  // process-death authority (status `interrupted`, errorCode
+  // `orphaned_running_run`) and clears the lock; `reconcileOrphanedRunIssues`
+  // is then the single owner of the handback — it must re-wake the issue.
+  // No second wake path exists inside the sweep and the reconciler is never
+  // routed via the run-end-state guard.
+
+  it("SPA-12319: sweep terminalizes the orphan, then the reconciler re-wakes the issue", async () => {
+    const { companyId, agentId } = await seedCompany();
+    const issueId = await seedIssue({
+      companyId,
+      agentId,
+      status: "in_progress",
+      title: "Sweep-path orphan — terminalize then hand back",
+    });
+    const runId = await seedRun({
+      companyId,
+      agentId,
+      issueId,
+      status: "running",
+      createdAt: new Date("2026-10-13T14:46:35.000Z"),
+      // A pid this large never maps to a live process, so isPidAlive returns
+      // false and the run is an orphan under process-death authority.
+      processPid: 2_000_000_000,
+    });
+    await db.update(issues).set({ checkoutRunId: runId, executionRunId: runId }).where(eq(issues.id, issueId));
+
+    const { service, enqueueWakeup } = recoveryServiceForTest();
+
+    const swept = await service.sweepStaleIssueLocks();
+    expect(swept.terminalizedRunIds).toEqual([runId]);
+    expect(swept.cleared).toBe(1);
+
+    const terminalized = await db
+      .select({ status: heartbeatRuns.status, errorCode: heartbeatRuns.errorCode })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, runId))
+      .then((rows) => rows[0]);
+    expect(terminalized).toEqual({ status: "interrupted", errorCode: ORPHANED_RUN_ERROR_CODE });
+
+    const lock = await db
+      .select({ checkoutRunId: issues.checkoutRunId, executionRunId: issues.executionRunId })
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0]);
+    expect(lock).toEqual({ checkoutRunId: null, executionRunId: null });
+
+    const rewoke = await service.reconcileOrphanedRunIssues();
+    expect(rewoke).toMatchObject({ scanned: 1, rewoken: 1, issueIds: [issueId] });
+
+    // "Not left with zero runs and no wake": exactly one persisted wake whose
+    // payload carries the interrupted run id, and the sweep's run-event for it.
+    expect(enqueueWakeup).toHaveBeenCalledTimes(1);
+    expect(enqueueWakeup.mock.calls[0]?.[0]).toBe(agentId);
+    const persisted = await db
+      .select({ payload: agentWakeupRequests.payload, idempotencyKey: agentWakeupRequests.idempotencyKey })
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.companyId, companyId));
+    expect(persisted).toHaveLength(1);
+    expect((persisted[0]?.payload as { orphanedRunId?: string } | null)?.orphanedRunId).toBe(runId);
+    expect(persisted[0]?.idempotencyKey).toBe(`issue_orphaned_run_rewake:${runId}`);
+    const events = await db
+      .select({ runId: heartbeatRunEvents.runId, message: heartbeatRunEvents.message })
+      .from(heartbeatRunEvents)
+      .where(eq(heartbeatRunEvents.runId, runId));
+    expect(events.length).toBeGreaterThanOrEqual(1);
+    expect(events[0]?.message).toContain("process and sandbox gone");
+  });
+
+  it("SPA-12319: a done issue is NOT re-woken after the sweep", async () => {
+    // Mirrors the reuse-lease test: issue-terminal authority terminalizes the
+    // run for a `done` issue, but the reconciler's candidate set is active
+    // statuses only, so the dead card must never be re-woken.
+    const { companyId, agentId } = await seedCompany();
+    const issueId = await seedIssue({
+      companyId,
+      agentId,
+      status: "done",
+      title: "Sweep-path terminal issue — must not be re-woken",
+    });
+    const runId = await seedRun({
+      companyId,
+      agentId,
+      issueId,
+      status: "running",
+      createdAt: new Date("2026-10-13T14:46:35.000Z"),
+      processPid: 2_000_000_000,
+    });
+    await db.update(issues).set({ checkoutRunId: runId, executionRunId: runId }).where(eq(issues.id, issueId));
+
+    const { service, enqueueWakeup } = recoveryServiceForTest();
+
+    const swept = await service.sweepStaleIssueLocks();
+    expect(swept.terminalizedRunIds).toEqual([runId]);
+
+    const rewoke = await service.reconcileOrphanedRunIssues();
+    expect(rewoke.rewoken).toBe(0);
+    expect(rewoke.issueIds).not.toContain(issueId);
+    expect(enqueueWakeup).not.toHaveBeenCalled();
+    await expect(countPersistedWakes(companyId)).resolves.toHaveLength(0);
+  });
+
+  it("SPA-12319: sweep then reconciler twice yields exactly one persisted wake", async () => {
+    const { companyId, agentId } = await seedCompany();
+    const issueId = await seedIssue({
+      companyId,
+      agentId,
+      status: "in_progress",
+      title: "Sweep-path no-double-wake",
+    });
+    const runId = await seedRun({
+      companyId,
+      agentId,
+      issueId,
+      status: "running",
+      createdAt: new Date("2026-10-13T14:46:35.000Z"),
+      processPid: 2_000_000_000,
+    });
+    await db.update(issues).set({ checkoutRunId: runId, executionRunId: runId }).where(eq(issues.id, issueId));
+
+    const { service, enqueueWakeup } = recoveryServiceForTest();
+
+    const swept = await service.sweepStaleIssueLocks();
+    expect(swept.terminalizedRunIds).toEqual([runId]);
+
+    const first = await service.reconcileOrphanedRunIssues();
+    const second = await service.reconcileOrphanedRunIssues();
+
+    expect(first).toMatchObject({ rewoken: 1, issueIds: [issueId] });
+    expect(second.rewoken).toBe(0);
+    expect(second.issueIds).not.toContain(issueId);
+    // Run-keyed idempotency receipt `issue_orphaned_run_rewake:<runId>`.
+    expect(enqueueWakeup).toHaveBeenCalledTimes(1);
+    await expect(countPersistedWakes(companyId)).resolves.toHaveLength(1);
   });
 });
