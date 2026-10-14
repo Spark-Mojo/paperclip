@@ -7,10 +7,13 @@ import {
   agents,
   companies,
   createDb,
+  executionWorkspaces,
   heartbeatRuns,
   issueRelations,
   issues,
   projects,
+  projectWorkspaces,
+  workspaceOperations,
 } from "@paperclipai/db";
 import { LOW_TRUST_REVIEW_PRESET } from "@paperclipai/shared";
 import {
@@ -387,5 +390,122 @@ describeEmbeddedPostgres("issue blocker diagnostics route", () => {
     expect(res.body.omittedUnauthorizedBlockerCount).toBeNull();
     expect(res.body.diagnosis).toContain("truncated at 100 blockers");
     expect(res.body.caps).toEqual({ maxBlockers: 100 });
+  });
+
+  // SPA-12214 — the 409 transition guard must say WHY a blocker is
+  // unresolved. A `done` blocker stuck behind the workspace-finalize barrier
+  // refuses with reason `pending_finalize`; any other unresolved blocker
+  // (here: `cancelled`) refuses with reason `not_done` — the same vocabulary
+  // `listUnresolvedBlockerDetails` already computes. No behaviour change:
+  // the guard still 409s on the same predicate; only the refusal body gains
+  // the per-blocker reason.
+  it("409 names pending_finalize for a done blocker awaiting workspace finalize", async () => {
+    const company = await seedCompany(db);
+    const agent = await seedAgent(db, company.id);
+    const project = await seedProject(db, company.id, "Core");
+    const [projectWorkspace] = await db.insert(projectWorkspaces).values({
+      companyId: company.id,
+      projectId: project.id,
+      name: "Shared workspace",
+      sourceType: "local_path",
+      visibility: "default",
+      isPrimary: true,
+    }).returning();
+    const [executionWorkspace] = await db.insert(executionWorkspaces).values({
+      companyId: company.id,
+      projectId: project.id,
+      projectWorkspaceId: projectWorkspace!.id,
+      mode: "isolated_workspace",
+      strategyType: "git_worktree",
+      name: "Blocker workspace",
+      status: "active",
+      providerType: "git_worktree",
+    }).returning();
+    const blocker = await seedIssue(db, {
+      companyId: company.id,
+      projectId: project.id,
+      title: "Done but not finalized",
+      status: "done",
+    });
+    await db.update(issues)
+      .set({ executionWorkspaceId: executionWorkspace!.id })
+      .where(eq(issues.id, blocker.id));
+    const dependent = await seedIssue(db, {
+      companyId: company.id,
+      projectId: project.id,
+      title: "Finalize-gated dependent",
+      status: "blocked",
+      assigneeAgentId: agent.id,
+    });
+    await blockIssue(db, company.id, blocker.id, dependent.id);
+    // The blocker touched its workspace but never recorded a successful
+    // workspace_finalize — the resolver holds the dependent as
+    // pending-finalize.
+    await db.insert(workspaceOperations).values({
+      companyId: company.id,
+      executionWorkspaceId: executionWorkspace!.id,
+      issueId: blocker.id,
+      phase: "worktree_prepare",
+      status: "succeeded",
+      startedAt: new Date("2026-10-13T20:00:00.000Z"),
+    });
+    const [run] = await db.insert(heartbeatRuns).values({
+      companyId: company.id,
+      agentId: agent.id,
+      status: "running",
+      contextSnapshot: { issueId: dependent.id },
+    }).returning();
+
+    const res = await request(createApp(db, agentActor(company, agent, run!.id)))
+      .patch(`/api/issues/${dependent.id}`)
+      .send({ status: "todo" });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(409);
+    expect(res.body.error).toMatch(/unresolved blockers/i);
+    expect(res.body.details.unresolvedBlockerIssueIds).toContain(blocker.id);
+    expect(res.body.details.unresolvedBlockers).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ issueId: blocker.id, reason: "pending_finalize" }),
+      ]),
+    );
+  });
+
+  it("409 names not_done for a cancelled blocker", async () => {
+    const company = await seedCompany(db);
+    const agent = await seedAgent(db, company.id);
+    const project = await seedProject(db, company.id, "Core");
+    const blocker = await seedIssue(db, {
+      companyId: company.id,
+      projectId: project.id,
+      title: "Cancelled blocker",
+      status: "cancelled",
+    });
+    const dependent = await seedIssue(db, {
+      companyId: company.id,
+      projectId: project.id,
+      title: "Cancelled-gated dependent",
+      status: "blocked",
+      assigneeAgentId: agent.id,
+    });
+    await blockIssue(db, company.id, blocker.id, dependent.id);
+    const [run] = await db.insert(heartbeatRuns).values({
+      companyId: company.id,
+      agentId: agent.id,
+      status: "running",
+      contextSnapshot: { issueId: dependent.id },
+    }).returning();
+
+    const res = await request(createApp(db, agentActor(company, agent, run!.id)))
+      .patch(`/api/issues/${dependent.id}`)
+      .send({ status: "todo" });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(409);
+    expect(res.body.error).toMatch(/unresolved blockers/i);
+    expect(res.body.details.unresolvedBlockerIssueIds).toContain(blocker.id);
+    expect(res.body.details.unresolvedBlockers).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ issueId: blocker.id, reason: "not_done" }),
+      ]),
+    );
   });
 });
