@@ -1,0 +1,61 @@
+# SPA-9434 gates
+
+## 2026-10-08 CI diagnosis and correction
+
+Pinned PR read: H=5ace7e13bfe1b27a97c06acfcd25620297616899, B=b7a3a892d8add53f1b2e6166fdce6f7d0d6756f4. Ancestor A=a7758a4a6d32a6b879e2831a0644d2e4e3178224 (`git merge-base --is-ancestor A B` exit 0). Head run 37171692766 compared with ancestor run 37102675212 using `gh run view RUN -R Spark-Mojo/paperclip --log-failed`. Paginated B check inventory returned total_count=86, 86 entries, no ci jobs: ancestor comparison is necessary, not an exact-base CI claim.
+
+- policy: same three git-push scanner lines in both runs.
+- serialized 5/9: same openapi-routes mounted-route coverage failure.
+- serialized 6/9 and 7/9: same issue-watchdogs and permissions-upgrade root-task project-required 422 failures.
+- server 11/12: same plugin-orchestration project-required 422 failure.
+- server 12/12: same status-cards authoring test, line 406, expected 201 received 422. This is NOT the head-only regression.
+- workspaces-b: both runs have write EPIPE (errno -32) after tests; no allocator assertion implicated.
+- verify and e2e: downstream policy-result failure. Head e2e shards all succeeded; aggregate exits on POLICY_RESULT=failure.
+- vendor review: fork exception, not a code regression.
+- serialized 1/9: actual head-only failure. The missing-project-id recovery test receives setup_failed instead of workspace_validation_failed. New selected-workspace validation runs against an empty candidate set before the existing missing-project validator. Guard selection validation with workspaceProjectId to preserve the typed rejection. Missing selected workspaces on a real project remain fail-closed.
+
+Ancestor-to-base diff is empty for pr.yml, status-cards test/route, openapi-routes test, permissions-upgrade test, issue-watchdogs test and plugin-orchestration test. Full causal non-touch evidence for every base-red exemption remains to be reviewed; this comparison alone is NOT merge authorization.
+
+Gate 4: Preserve typed missing-project rejection before adapter launch.
+  CHECK: timeout 240 pnpm exec vitest run server/src/__tests__/heartbeat-process-recovery.test.ts -t 'blocks a git-sensitive local adapter before launch when a project-workspace-linked issue is missing its project id'
+  EXPECT: Tests  1 passed
+  RESULT: exit 0, 1 passed / 323 skipped; WorkspaceValidationFailure reason=missing_project_id; adapter never called.
+  NEGATIVE: run the identical CHECK with only workspaceProjectId guard removed.
+  RESULT: exit 1, expected workspace_validation_failed, received setup_failed. Guard restored afterward.
+
+The regression test now uses existing runtimeEnv:{} seam. Before that change, local worktree scheduling suppression kept the fixture queued (two failed attempts, not behavioral evidence). No assertion was weakened. Allocator suite CHECK above: exit 0, 174 passed. `timeout 120 pnpm --filter @paperclipai/server exec tsc --noEmit`: exit 0. CI rerun and fresh independent final-head verification remain required; no rollout performed.
+
+
+Gate 1: A selected registered project workspace is the only repository materialized; invalid selection refuses allocation.
+  CHECK: timeout 180 pnpm exec vitest run server/src/__tests__/heartbeat-workspace-session.test.ts
+  EXPECT: Test Files  1 passed
+   RESULT: exit 0; Test Files 1 passed, Tests 174 passed (2026-10-03, current head); selected ID missing even when no project workspace rows are registered is refused.
+   NEGATIVE: timeout 180 pnpm exec vitest run server/src/__tests__/spa-9434-negative.test.ts
+   RESULT: exit 1; selected missing repo cannot be accepted: expected no throw, received selected project workspace not available (2026-10-03). Disposable fixture removed after control.
+
+Gate 2: A pre-existing pinned worktree of the wrong repo is refused; clearing the issue binding permits fresh allocation without altering the old tree.
+  CHECK: timeout 180 pnpm exec vitest run server/src/__tests__/heartbeat-workspace-session.test.ts
+   EXPECT: Tests  174 passed
+  RESULT: exit 0; Tests 174 passed (2026-10-03).
+   NEGATIVE: timeout 180 pnpm exec vitest run server/src/__tests__/spa-9434-negative.test.ts
+   RESULT: exit 1; wrong pinned repo cannot be reused: expected no throw, received clear-binding instruction (2026-10-03). Disposable fixture removed after control.
+
+Gate 3: Static correctness.
+  CHECK: timeout 240 pnpm --filter @paperclipai/server typecheck
+  EXPECT: exit 0
+   RESULT: exit 1: runner prerequisite cargo: not found. After `timeout 90 pnpm --filter @paperclipai/plugin-sdk ensure-build-deps` exit 0, `timeout 120 pnpm --filter @paperclipai/server exec tsc --noEmit` exited 0 again (2026-10-03); full typecheck remains unavailable without cargo.
+   NEGATIVE: not run; full gate unproven.
+
+Live allocator receipt (2026-10-03): `GET /api/issues/2febeb4c-4c53-43bf-9638-84c3422f1027` returned projectWorkspaceId=3375d9ba-6c6a-41bc-932e-0b94ea621964, executionWorkspaceId=e57b5e1f-90a0-433f-8b04-fea4c87a59ab, preference=reuse_existing. `GET /api/execution-workspaces/e57b5e1f-90a0-433f-8b04-fea4c87a59ab` returned same projectWorkspaceId, repoUrl=https://github.com/Spark-Mojo/paperclip.git, baseRef=origin/rebuild/v2026.916.0-survivors, branchName=SPA-9434-engine-allocator-has-no-per-card-repo-override-a-card-whose-project-workspace-is-the-wrong-repo-cannot-get-an-e, status=active. `git status --short --branch` on this tree confirmed the matching branch. Earlier failed run reported platform managed-cache scan timeout; live read does not prove that run's cause or a successful migration of a different pinned card.
+
+PR #143 verified PASS (NO-CHECK transport) on head bd78ac57419a5a2d3203db2023d5956824d4c207; transport comment https://github.com/Spark-Mojo/paperclip/pull/143#issuecomment-5969538083. Pinned base b7a3a892d8add53f1b2e6166fdce6f7d0d6756f4, mergeable true, rulesets [] and branch protection 404; base check-runs 0. Head has multiple red CI jobs; no base-bound workflow run (`gh run list -R Spark-Mojo/paperclip --workflow pr.yml --branch rebuild/v2026.916.0-survivors --limit 5 --json databaseId,conclusion,headSha` returned []). SPA-9702 ancestor matching-signature and non-touch evidence not established. Do not hand off to Dex until that proof or head-green checks exist.
+
+CI classification (2026-10-04; H=bd78ac57419a5a2d3203db2023d5956824d4c207, B=b7a3a892d8add53f1b2e6166fdce6f7d0d6756f4, PR run 37124935028): 11 failed checks consist of vendor `review` (explicit fork exception), `ci / policy` (git push string scanner), 4 serialized server shards (1/9, 5/9, 6/9, 7/9), 3 general groups (server 11/12, 12/12, workspaces-b), and 2 downstream aggregators (`ci / verify`, `ci / e2e`). On a detached disposable checkout of exact B, `timeout 30 node scripts/check-no-git-push.mjs` exited 1 with the same three flagged source/test lines as H's `ci / policy`; policy scanner and flagged lines are untouched by the PR's own commit. This is local base-reproduction evidence, NOT a same-check CI run and therefore not a SPA-9702 exemption. Base B has 22 check-runs, none `ci / ...` (scheduled Release); ancestor 916919bb7cbdbdfddaac59e31bf6b2e94bcf637c has 44 check-runs, none matching PR CI. The seven test failures are `heartbeat-process-recovery.test.ts` (1/9), `openapi-routes.test.ts` (5/9), `issue-watchdogs-routes.test.ts` (6/9), `permissions-upgrade-boundary-routes.test.ts` (7/9), `plugin-orchestration-apis.test.ts` (server 11/12), `status-cards.test.ts` (server 12/12), and `EPIPE` after 59 passing files (workspaces-b). Four failures show root issue create 422 `agent_root_issue_requires_project`; the others remain unclassified until re-run against B. No same-check base signature exists; none of the seven is exempted.
+
+Critical integration finding: H is the child of 916919bb7cbdbdfddaac59e31bf6b2e94bcf637c, which is an ancestor of B. `git diff B..H --stat` shows 26 files changed, 4,607 deletions, including SPA-9437's `workspace-runtime.ts` rebind implementation and ~700 lines of its tests, plus unrelated fleet-cap and stale-blocker work. GitHub `mergeable=MERGEABLE` does not certify the resulting tree preserves these features. The branch must integrate B without a force-push and review the resulting tree/diff before re-verification; current H is NOT merge-ready. The previous NO-CHECK verification is invalid after any integration push.
+
+Integration receipt (2026-10-04): merged pinned B into card-bound branch without switching it or force-pushing; commit 418c6201e7f0d151c82f73d268631bb3f2b515a4 pushed to PR #143. `git diff B..HEAD --stat` now reports only 2 files / 91 insertions / 1 deletion (heartbeat service and its test); `git diff --cached B -- server/src/services/workspace-runtime.ts server/src/__tests__/workspace-runtime.test.ts` was empty before commit. Focused allocator vitest exit 0 (174 passed), direct server `tsc --noEmit` exit 0. On integrated head, `timeout 180 pnpm exec vitest run server/src/__tests__/openapi-routes.test.ts` exit 1: two missing fleet-max-concurrent-runs routes, unaffected by the PR's own delta. Disposable B checkout lacked vitest dependencies; `timeout 180 pnpm exec vitest run server/src/__tests__/openapi-routes.test.ts` exited 254 (`Command vitest not found`), NOT evidence of signature reproduction. Do not call the old bd78ac5 verifier receipt valid for 418c620. CI and fresh verification still needed. No rollout.
+
+Rollout plan (NOT authorized to execute unattended): after a new conflict-free head preserves B's features, CI is green or every red meets all SPA-9702 exemption clauses, and a fresh independent verifier PASS is transported before Dex's SHA-bound merge, stop. With James awake, pin the deployed engine commit and capture pre-change issue/workspace bindings; canary a single disposable/non-production card whose project has both registered repos, select the non-primary workspace and allocate one isolated run; read back issue and execution-workspace projectWorkspaceId, repoUrl, baseRef, branch and cwd git identity, checking no old worktree was changed. Test an already-pinned mismatch only with an owner-coordinated card after confirming its old tree is clean and pushed; preserve its old row/tree, clear binding, run allocation and compare identity again. On mismatch, pause new allocation / revert deployment using the sanctioned engine rollout path with James; never repoint or delete an unrelated card's worktree. Rollout and live activation remain James-gated.
+
+Supported migration for an already-pinned card: register the target repository as a workspace in that card's project, then PATCH that issue with the selected projectWorkspaceId, executionWorkspaceId:null, executionWorkspacePreference:null, and executionWorkspaceSettings:{mode:"isolated_workspace"}; GET issue back; start a new run; GET its newly bound execution workspace and check repoUrl, projectWorkspaceId, baseRef, branch, and git status. Preserve the old workspace row and worktree. Do not apply this to SPA-9375 without its owner/branch coordination.
