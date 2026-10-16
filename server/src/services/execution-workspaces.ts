@@ -4435,6 +4435,12 @@ export function normalizeRepoIdentityForComparison(rawUrl: string | null | undef
   // trusted; anything else (brackets, colons, empty) is ambiguous -> null,
   // and null always means skip, never move.
   if (!REPO_IDENTITY_HOST_RE.test(identity.host)) return null;
+  // Final-audit finding: `new URL` canonicalizes alternate IPv4 spellings
+  // (127.1, 0x7f.0.0.1, 2130706433 -> 127.0.0.1) while the scp parser keeps
+  // them verbatim, so the SAME repo could normalize unequal (a wrongful move).
+  // Trust only real DNS names: any all-digit or hex label (every IPv4
+  // spelling has one) is ambiguous -> null -> skip.
+  if (identity.host.split(".").some((label) => /^(?:\d+|0x[0-9a-f]*)$/i.test(label))) return null;
   return `${identity.host}/${identity.owner}/${identity.name}`;
 }
 

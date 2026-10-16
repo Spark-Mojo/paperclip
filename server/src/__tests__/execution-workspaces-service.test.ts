@@ -174,11 +174,19 @@ describe("normalizeRepoIdentityForComparison SPA-12426", () => {
     expect(normalizeRepoIdentityForComparison("https://[2001:db8::1]/owner/repo.git")).toBeNull();
   });
 
-  it("still resolves plain DNS and IPv4 hosts", () => {
-    expect(normalizeRepoIdentityForComparison("git@10.0.0.5:owner/repo.git")).toBe(
-      normalizeRepoIdentityForComparison("https://10.0.0.5/owner/repo.git"),
-    );
+  it("returns null for every IPv4 spelling, so scp and scheme forms can never disagree (final audit)", () => {
+    for (const u of [
+      "git@127.1:owner/repo.git", "https://127.1/owner/repo.git",
+      "https://2130706433/owner/repo.git", "git@0x7f.0.0.1:owner/repo.git",
+      "git@10.0.0.5:owner/repo.git", "https://10.0.0.5/owner/repo.git",
+    ]) expect(normalizeRepoIdentityForComparison(u)).toBeNull();
+  });
+
+  it("still resolves DNS hosts, including ones with digits in a label", () => {
     expect(normalizeRepoIdentityForComparison("https://github.com/owner/repo.git")).not.toBeNull();
+    expect(normalizeRepoIdentityForComparison("git@git.1password.example:owner/repo.git")).toBe(
+      normalizeRepoIdentityForComparison("https://git.1password.example/owner/repo.git"),
+    );
   });
 
   it("treats an ssh URL with an explicit port and the plain https form of the same repo as equal", () => {
