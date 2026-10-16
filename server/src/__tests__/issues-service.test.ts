@@ -3952,6 +3952,150 @@ describeEmbeddedPostgres("issueService.create workspace inheritance", () => {
     },
   );
 
+  it("does NOT inherit an adapter-managed parent pin when the child project defaults to isolated_workspace (SPA-12777)", async () => {
+    const companyId = randomUUID();
+    const projectId = randomUUID();
+    const parentIssueId = randomUUID();
+    const projectWorkspaceId = randomUUID();
+    const executionWorkspaceId = randomUUID();
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await instanceSettingsService(db).updateExperimental({ enableIsolatedWorkspaces: true });
+
+    await db.insert(projects).values({
+      id: projectId,
+      companyId,
+      name: "Workspace project",
+      status: "in_progress",
+      executionWorkspacePolicy: {
+        enabled: true,
+        defaultMode: "isolated_workspace",
+      },
+    });
+
+    await db.insert(projectWorkspaces).values({
+      id: projectWorkspaceId,
+      companyId,
+      projectId,
+      name: "Primary workspace",
+    });
+
+    await db.insert(executionWorkspaces).values({
+      id: executionWorkspaceId,
+      companyId,
+      projectId,
+      projectWorkspaceId,
+      mode: "adapter_managed",
+      strategyType: "project_primary",
+      name: "Adapter home",
+      status: "active",
+      providerType: "local_fs",
+    });
+
+    await db.insert(issues).values({
+      id: parentIssueId,
+      companyId,
+      projectId,
+      projectWorkspaceId,
+      title: "Parent issue",
+      status: "todo",
+      priority: "medium",
+      executionWorkspaceId,
+      executionWorkspacePreference: "reuse_existing",
+      executionWorkspaceSettings: {
+        mode: "agent_default",
+      },
+    });
+
+    const child = await svc.create(companyId, {
+      parentId: parentIssueId,
+      title: "Child issue",
+    });
+
+    expect(child.parentId).toBe(parentIssueId);
+    expect(child.executionWorkspaceId).toBeNull();
+    expect(child.executionWorkspaceSettings).toEqual({
+      mode: "isolated_workspace",
+    });
+  });
+
+  it("inherits an adapter-managed parent pin when the child project defaults to adapter_default (SPA-12777)", async () => {
+    const companyId = randomUUID();
+    const projectId = randomUUID();
+    const parentIssueId = randomUUID();
+    const projectWorkspaceId = randomUUID();
+    const executionWorkspaceId = randomUUID();
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await instanceSettingsService(db).updateExperimental({ enableIsolatedWorkspaces: true });
+
+    await db.insert(projects).values({
+      id: projectId,
+      companyId,
+      name: "Workspace project",
+      status: "in_progress",
+      executionWorkspacePolicy: {
+        enabled: true,
+        defaultMode: "adapter_default",
+      },
+    });
+
+    await db.insert(projectWorkspaces).values({
+      id: projectWorkspaceId,
+      companyId,
+      projectId,
+      name: "Primary workspace",
+    });
+
+    await db.insert(executionWorkspaces).values({
+      id: executionWorkspaceId,
+      companyId,
+      projectId,
+      projectWorkspaceId,
+      mode: "adapter_managed",
+      strategyType: "project_primary",
+      name: "Adapter home",
+      status: "active",
+      providerType: "local_fs",
+    });
+
+    await db.insert(issues).values({
+      id: parentIssueId,
+      companyId,
+      projectId,
+      projectWorkspaceId,
+      title: "Parent issue",
+      status: "todo",
+      priority: "medium",
+      executionWorkspaceId,
+      executionWorkspacePreference: "reuse_existing",
+      executionWorkspaceSettings: {
+        mode: "agent_default",
+      },
+    });
+
+    const child = await svc.create(companyId, {
+      parentId: parentIssueId,
+      title: "Child issue",
+    });
+
+    expect(child.parentId).toBe(parentIssueId);
+    expect(child.executionWorkspaceId).toBe(executionWorkspaceId);
+    expect(child.executionWorkspaceSettings).toEqual({
+      mode: "agent_default",
+    });
+  });
+
   it("createChild applies parent defaults, acceptance criteria, workspace inheritance, and optional parent blocker chaining", async () => {
     const companyId = randomUUID();
     const projectId = randomUUID();

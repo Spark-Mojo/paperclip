@@ -10281,6 +10281,37 @@ export function issueService(db: Db) {
           issueData.executionWorkspaceId !== undefined ||
           issueData.executionWorkspacePreference !== undefined ||
           issueData.executionWorkspaceSettings !== undefined;
+        // Cache the project policy lookup for this insert so the
+        // inheritance-skip check below and the default workspace-settings
+        // block do not re-query the project row. The guard reads
+        // issueData.projectId lazily so the source-project fill above has
+        // already won by the time it runs; a missing projectId returns null
+        // WITHOUT marking loaded, so a later inference cannot be poisoned.
+        let projectPolicyCached: ReturnType<
+          typeof parseProjectExecutionWorkspacePolicy
+        > | null = null;
+        let projectPolicyLoaded = false;
+        const loadProjectPolicyOnce = async () => {
+          if (projectPolicyLoaded) return projectPolicyCached;
+          if (!issueData.projectId) return null;
+          projectPolicyLoaded = true;
+          const projectRow = await tx
+            .select({
+              executionWorkspacePolicy: projects.executionWorkspacePolicy,
+            })
+            .from(projects)
+            .where(
+              and(
+                eq(projects.id, issueData.projectId),
+                eq(projects.companyId, companyId),
+              ),
+            )
+            .then((rows) => rows[0] ?? null);
+          projectPolicyCached = parseProjectExecutionWorkspacePolicy(
+            projectRow?.executionWorkspacePolicy,
+          );
+          return projectPolicyCached;
+        };
         if (workspaceInheritanceIssueId) {
           const workspaceSource = await getWorkspaceInheritanceIssue(
             tx,
@@ -10330,22 +10361,72 @@ export function issueService(db: Db) {
               )
               .then((rows) => rows[0] ?? null);
             if (sourceWorkspace) {
-              executionWorkspaceId = sourceWorkspace.id;
-              executionWorkspacePreference = "reuse_existing";
-              executionWorkspaceSettings = {
-                ...((workspaceSource.executionWorkspaceSettings as
-                  Record<string, unknown> | null | undefined) ?? {}),
-                mode: issueExecutionWorkspaceModeForPersistedWorkspace(
+              // Skip inheriting an adapter-managed (agent_default) source pin
+              // when the child project's resolved defaultMode is NOT
+              // agent_default: the source ran on the adapter home checkout
+              // while the child project wants a real workspace (e.g.
+              // isolated_workspace), so inheriting would strand the child on
+              // the adapter home. Leave the locals unset and let the
+              // project-default fill block below assign the child default.
+              // Carve-out: a child project whose gated policy resolves to
+              // agent_default (defaultMode adapter_default, or gated policy
+              // null) keeps inheriting as today. Explicit overrides never
+              // reach here (guarded above). Cross-project children never
+              // reach here (inheritsSourceProject above).
+              const mappedSourceMode =
+                issueExecutionWorkspaceModeForPersistedWorkspace(
                   sourceWorkspace.mode,
-                ),
-              };
-              inheritedExecutionWorkspacePin = true;
-              // SPA-11953 (second shape): capture the source workspace's
-              // projectWorkspaceId here so the post-resolution reconciliation
-              // step below can compare against the child's resolved value
-              // without re-querying the same row inside the same tx.
-              inheritedSourceProjectWorkspaceId =
-                sourceWorkspace.projectWorkspaceId ?? null;
+                );
+              if (mappedSourceMode === "agent_default") {
+                const childDefaultSettings =
+                  defaultIssueExecutionWorkspaceSettingsForProject(
+                    gateProjectExecutionWorkspacePolicy(
+                      await loadProjectPolicyOnce(),
+                      isolatedWorkspacesEnabled,
+                    ),
+                  );
+                if (
+                  childDefaultSettings != null &&
+                  (childDefaultSettings as { mode?: unknown }).mode !==
+                    "agent_default"
+                ) {
+                  executionWorkspaceId = null;
+                  executionWorkspacePreference = null;
+                  executionWorkspaceSettings = null;
+                  inheritedExecutionWorkspacePin = false;
+                  inheritedSourceProjectWorkspaceId = null;
+                } else {
+                  executionWorkspaceId = sourceWorkspace.id;
+                  executionWorkspacePreference = "reuse_existing";
+                  executionWorkspaceSettings = {
+                    ...((workspaceSource.executionWorkspaceSettings as
+                      Record<string, unknown> | null | undefined) ?? {}),
+                    mode: mappedSourceMode,
+                  };
+                  inheritedExecutionWorkspacePin = true;
+                  // SPA-11953 (second shape): capture the source workspace's
+                  // projectWorkspaceId here so the post-resolution reconciliation
+                  // step below can compare against the child's resolved value
+                  // without re-querying the same row inside the same tx.
+                  inheritedSourceProjectWorkspaceId =
+                    sourceWorkspace.projectWorkspaceId ?? null;
+                }
+              } else {
+                executionWorkspaceId = sourceWorkspace.id;
+                executionWorkspacePreference = "reuse_existing";
+                executionWorkspaceSettings = {
+                  ...((workspaceSource.executionWorkspaceSettings as
+                    Record<string, unknown> | null | undefined) ?? {}),
+                  mode: mappedSourceMode,
+                };
+                inheritedExecutionWorkspacePin = true;
+                // SPA-11953 (second shape): capture the source workspace's
+                // projectWorkspaceId here so the post-resolution reconciliation
+                // step below can compare against the child's resolved value
+                // without re-querying the same row inside the same tx.
+                inheritedSourceProjectWorkspaceId =
+                  sourceWorkspace.projectWorkspaceId ?? null;
+              }
             }
           }
         }
@@ -10381,33 +10462,9 @@ export function issueService(db: Db) {
           companyId,
           issueData.projectId,
         );
-        // Cache the project policy lookup for this insert so the default
-        // workspace-settings block does not re-query the project row.
-        let projectPolicyCached: ReturnType<
-          typeof parseProjectExecutionWorkspacePolicy
-        > | null = null;
-        let projectPolicyLoaded = false;
-        const loadProjectPolicyOnce = async () => {
-          if (projectPolicyLoaded) return projectPolicyCached;
-          projectPolicyLoaded = true;
-          if (!issueData.projectId) return null;
-          const projectRow = await tx
-            .select({
-              executionWorkspacePolicy: projects.executionWorkspacePolicy,
-            })
-            .from(projects)
-            .where(
-              and(
-                eq(projects.id, issueData.projectId),
-                eq(projects.companyId, companyId),
-              ),
-            )
-            .then((rows) => rows[0] ?? null);
-          projectPolicyCached = parseProjectExecutionWorkspacePolicy(
-            projectRow?.executionWorkspacePolicy,
-          );
-          return projectPolicyCached;
-        };
+        // loadProjectPolicyOnce is declared above (before the inheritance
+        // block) so the inheritance-skip check shares the same cache as the
+        // default-fill block below.
 
         if (
           executionWorkspaceSettings == null &&
