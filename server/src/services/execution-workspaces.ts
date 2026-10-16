@@ -55,6 +55,7 @@ import {
 } from "./github-pull-request-merge.js";
 import { visibleIssueCondition } from "./issue-visibility.js";
 import { createGitRemoteAuthProvider } from "./git-credentials.js";
+import { resolveManagedProjectWorkspaceDir } from "../home-paths.js";
 import { readProjectWorkspaceRuntimeConfig } from "./project-workspace-runtime-config.js";
 import { workspaceGitOperationScheduler } from "./workspace-git-operation-scheduler.js";
 import { isRuntimeOwnedGitBranch } from "./execution-workspace-branch-ownership.js";
@@ -4313,6 +4314,57 @@ async function archiveWorkspaceForRebind(
 // `<path>.rebind-retired-<rowId>` directory apart from a normal worktree.
 const EXECUTION_WORKSPACE_REBIND_RETIRED_FROM_PATH_METADATA_KEY = "rebindRetiredFromPath";
 
+// SPA-12426 re-audit finding (i): the SAME pure, non-materializing repo-name
+// derivation `materializeManagedProjectWorkspace` uses to compute its target
+// `cwd` (duplicated here rather than imported — this exact tiny function is
+// already independently duplicated in heartbeat.ts and projects.ts; neither
+// copy is exported, and importing from heartbeat.ts would pull in its
+// clone-capable neighbor). Must stay byte-identical in behavior to those so
+// this predicts the SAME path a real materialization would use.
+function deriveManagedCheckoutRepoNameForComparison(repoUrl: string | null): string | null {
+  const trimmed = repoUrl?.trim();
+  if (!trimmed) return null;
+  try {
+    const parsed = new URL(trimmed);
+    const cleanedPath = parsed.pathname.replace(/\/+$/, "");
+    const repoName = cleanedPath.split("/").filter(Boolean).pop()?.replace(/\.git$/i, "") ?? "";
+    return repoName || null;
+  } catch {
+    return null;
+  }
+}
+
+// SPA-12426 re-audit finding (i): normalize a git remote URL to a bare
+// `host/owner/name`-shaped identity for cross-repo comparison WITHOUT ever
+// resolving a filesystem path (the cold-managed-checkout case has no path to
+// resolve without cloning). Lowercase, strips any scheme, strips
+// `user:pass@`/`user@` credentials (so a token embedded in an HTTPS remote,
+// e.g. `https://x-access-token:<token>@github.com/...`, is discarded before
+// anything downstream could log or return it), strips a trailing `.git` and
+// trailing slashes, and folds scp-like `git@host:owner/name` syntax to
+// `host/owner/name` so it compares equal to the HTTPS form of the same repo.
+function normalizeRepoIdentityForComparison(rawUrl: string | null | undefined): string | null {
+  const trimmed = rawUrl?.trim();
+  if (!trimmed) return null;
+  let value = trimmed;
+  if (!value.includes("://")) {
+    const scpMatch = /^[^/@:]+@([^/:]+):(.+)$/.exec(value);
+    if (scpMatch) {
+      value = `${scpMatch[1]}/${scpMatch[2]}`;
+    }
+  } else {
+    value = value.replace(/^[a-z][a-z0-9+.-]*:\/\//i, "");
+    // Strip everything up to and including the LAST '@' before the first
+    // '/' — the credential portion of `user:pass@host/...`. A greedy
+    // `[^/]*@` backtracks to the rightmost '@' short of the first '/', so
+    // a password containing '@' is still handled correctly.
+    value = value.replace(/^[^/]*@/, "");
+  }
+  value = value.replace(/\.git$/i, "").replace(/\/+$/, "");
+  value = value.toLowerCase();
+  return value || null;
+}
+
 // SPA-12426 audit finding (A): the per-run ephemeral worktree shape
 // (`${worktreeParentDir}/runs/<runId>/`, SPA-9275). `reapOrphanedRunWorktrees`
 // treats EVERY directory directly under a `runs/` dir as a run id and may
@@ -4322,8 +4374,20 @@ const EXECUTION_WORKSPACE_REBIND_RETIRED_FROM_PATH_METADATA_KEY = "rebindRetired
 // The run-id path is keyed by run id already, so it can never collide with a
 // branch-template realize in the first place — there is nothing for this
 // function to clear, ever.
+//
+// Re-audit finding (ii): `basename(dirname(leaf)) === "runs"` alone
+// misfires for a branchTemplate like `runs/{{issue.identifier}}` —
+// sanitizeBranchName keeps `/`, so a perfectly ordinary per-branch worktree
+// can land at `.../runs/SPA-1-x`, whose parent dir is also named `runs`.
+// The real ephemeral shape's leaf segment is never an arbitrary branch
+// name — it is exactly `sanitizeBranchName(heartbeatRunId)`, where run ids
+// are UUIDs, or the `run-<uuid>` fallback. Requiring the leaf's OWN
+// basename to match that shape rules the branch-template case out.
+const RUN_ID_WORKTREE_LEAF_SEGMENT_RE = /^(run-)?[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
 function isEphemeralRunWorktreeLeafPath(leafPath: string): boolean {
-  return path.basename(path.dirname(leafPath)) === "runs";
+  return path.basename(path.dirname(leafPath)) === "runs"
+    && RUN_ID_WORKTREE_LEAF_SEGMENT_RE.test(path.basename(leafPath));
 }
 
 /**
@@ -4331,35 +4395,58 @@ function isEphemeralRunWorktreeLeafPath(leafPath: string): boolean {
  * project-workspace rebind, this decides whether the OLD worktree directory
  * needs to move out of the way, and if so, moves it — never removes it.
  *
- * Part 0 (ephemeral run worktrees, audit finding (A)): never relocates a
+ * Part 0 (ephemeral run worktrees, audit finding (A), path-shape fallback
+ * narrowed by re-audit finding (ii)): never relocates a
  * `${worktreeParentDir}/runs/<runId>/` worktree. Detected first from the
  * row's own `ephemeralLifecycle` metadata flag (SPA-9275; authoritative when
  * present), falling back to the leaf's parent directory being literally
- * named `runs` (the same signal `sweepTerminalIssueRunWorktrees` already
- * uses). Skips with `"ephemeral_run_worktree"` before resolving anything
- * else, so the move target can never be constructed inside a `runs/` dir;
- * the construction site below re-checks the path shape anyway as a second,
- * defense-in-depth guard against a future refactor reordering these checks.
+ * named `runs` AND the leaf's own basename matching the shape realize
+ * actually produces for a run id (a UUID, or `run-<uuid>`) —
+ * `basename(dirname(leaf)) === "runs"` alone is not enough: a branchTemplate
+ * like `runs/{{issue.identifier}}` also lands under a dir named `runs`
+ * (sanitizeBranchName keeps `/`), and that is an ordinary per-branch
+ * worktree, not an ephemeral one. Skips with `"ephemeral_run_worktree"`
+ * before resolving anything else, so the move target can never be
+ * constructed inside a `runs/` dir; the construction site below re-checks
+ * the path shape anyway as a second, defense-in-depth guard against a
+ * future refactor reordering these checks.
  *
  * Part A (cross-repo only, closes audit finding (2)): the OLD worktree only
  * collides with a FUTURE realize when the new project workspace is a
  * DIFFERENT repo — a same-repo rebind's realize reuses this exact path, so
- * there is nothing to clear. Compares the leaf's canonical owning repo root
- * (`resolveGitOwnerRepoRoot`, resolved fresh from the leaf path itself — NOT
- * read off the earlier `inspectGitCloseReadiness` result, which for a
- * worktree leaf is that leaf's OWN toplevel, not the shared main-repo root)
- * against the canonical repo root of the project workspace
- * `nextProjectWorkspaceId` now points at, both normalized through
- * `resolvePathForWorktreeComparison` (the same realpath-based comparison the
- * SPA-11953 fence uses). Equal roots skip with `"same_repo_rebind"`. A
- * `managed_checkout` project workspace stores `cwd = NULL` — its live
- * checkout path is resolved on demand the same way
- * `reopenClosedIsolatedExecutionWorkspaceForIssue` resolves it for a rebuild
- * (`ensureManagedProjectWorkspace`, materializing the checkout if it is not
- * already there). Still unresolvable after that (no next id, no row, no
- * `repoUrl` to materialize from, or materialization itself fails) skips with
+ * there is nothing to clear. When the next project workspace has a
+ * `cwd` (the common, `local_path` case), compares the leaf's canonical
+ * owning repo root (`resolveGitOwnerRepoRoot`, resolved fresh from the leaf
+ * path itself — NOT read off the earlier `inspectGitCloseReadiness` result,
+ * which for a worktree leaf is that leaf's OWN toplevel, not the shared
+ * main-repo root) against the canonical repo root of that `cwd`, both
+ * normalized through `resolvePathForWorktreeComparison` (the same
+ * realpath-based comparison the SPA-11953 fence uses).
+ *
+ * A `managed_checkout` project workspace stores `cwd = NULL` instead. Re-audit
+ * finding (i): this function runs inside the issue-PATCH route's post-commit
+ * await chain, so it must NEVER materialize or clone a managed checkout here
+ * — `ensureManagedProjectWorkspace` can run a full `git clone` with a 10
+ * MINUTE timeout, which would hang the PATCH response on a cold checkout.
+ * Instead: (1) compute the managed checkout's path with the same PURE
+ * resolver `ensureManagedProjectWorkspace`/`materializeManagedProjectWorkspace`
+ * use (`resolveManagedProjectWorkspaceDir` + the same repo-name derivation),
+ * WITHOUT creating or cloning anything; if that path already exists and
+ * already looks like a git checkout (warm), use it exactly like a `cwd`
+ * above. (2) Otherwise (cold — nothing to compare a path against yet)
+ * decide cross-repo by REPO IDENTITY instead of a filesystem path: read the
+ * OLD worktree owner repo's `remote.origin.url` (`git config --get
+ * remote.origin.url` in `ownerRepoRoot`) and normalize it against the next
+ * project workspace's `repoUrl` (`normalizeRepoIdentityForComparison` —
+ * lowercase, strip scheme, strip `user:pass@` credentials, strip a trailing
+ * `.git` and trailing slashes, and fold `git@host:owner/name` scp syntax to
+ * `host/owner/name`). Equal identities skip `"same_repo_rebind"`; different,
+ * confirmed cross-repo. Either side missing or unparsable skips
  * `"new_repo_root_unresolved"` — this function never moves a worktree it
- * cannot prove is cross-repo.
+ * cannot prove is cross-repo. Neither raw URL is ever logged or returned
+ * (either can embed a credential, e.g. an `x-access-token` in an HTTPS
+ * remote) — only the outcome (`same_repo_rebind` / `new_repo_root_unresolved`
+ * / proceeding to move) is observable outside this function.
  *
  * Part B (move, never remove, closes audit finding (3)): a non-forced `git
  * worktree remove` silently deletes gitignored content — `.unlazy/` ledgers,
@@ -4446,46 +4533,73 @@ async function relocateRetiredWorktreeIfCrossRepo(
         .then((rows) => rows[0] ?? null)
     : null;
 
-  let nextProjectWorkspaceCwd = nextProjectWorkspaceRow?.cwd ?? null;
-  if (!nextProjectWorkspaceCwd && nextProjectWorkspaceRow?.projectId) {
-    // SPA-12426 audit finding (B): a `managed_checkout` project workspace
-    // stores `cwd = NULL` — there is no path to compare until the checkout
-    // is materialized. Resolve it the same way
-    // `reopenClosedIsolatedExecutionWorkspaceForIssue` resolves a rebuild's
-    // base cwd, so a managed_checkout target no longer silently falls
-    // through to "unresolved" and reproduces the original SPA-12426
-    // collision on every managed_checkout project.
-    try {
-      const { ensureManagedProjectWorkspace } = await import("./heartbeat.js");
-      const managedWorkspace = await ensureManagedProjectWorkspace({
-        companyId: input.companyId,
-        projectId: nextProjectWorkspaceRow.projectId,
-        repoUrl: nextProjectWorkspaceRow.repoUrl,
-        resolveGitAuth: createGitRemoteAuthProvider(db, input.companyId),
-      });
-      nextProjectWorkspaceCwd = managedWorkspace.cwd;
-    } catch {
-      nextProjectWorkspaceCwd = null;
-    }
-  }
+  // `isCrossRepo`: null means "cannot prove either way" (unresolved). Two
+  // independent ways to reach a verdict, chosen by whether the next project
+  // workspace already has a path to compare against:
+  let isCrossRepo: boolean | null = null;
 
-  let newRepoRoot: string | null = null;
-  if (nextProjectWorkspaceCwd) {
+  if (nextProjectWorkspaceRow?.cwd) {
+    // The common case: a `local_path` (or already-populated) project
+    // workspace. Path-based comparison, as before.
+    let newRepoRoot: string | null = null;
     try {
-      newRepoRoot = await resolveGitOwnerRepoRoot(nextProjectWorkspaceCwd);
+      newRepoRoot = await resolveGitOwnerRepoRoot(nextProjectWorkspaceRow.cwd);
     } catch {
       newRepoRoot = null;
     }
-  }
-  if (!newRepoRoot) {
-    return { worktreeMoved: false, worktreeMoveSkipped: "new_repo_root_unresolved" };
+    if (newRepoRoot) {
+      const [canonicalOwnerRepoRoot, canonicalNewRepoRoot] = await Promise.all([
+        resolvePathForWorktreeComparison(ownerRepoRoot),
+        resolvePathForWorktreeComparison(newRepoRoot),
+      ]);
+      isCrossRepo = canonicalOwnerRepoRoot !== canonicalNewRepoRoot;
+    }
+  } else if (nextProjectWorkspaceRow?.projectId) {
+    // SPA-12426 re-audit finding (i): a `managed_checkout` project
+    // workspace stores `cwd = NULL`. NEVER materialize or clone here — this
+    // function runs inside the issue-PATCH route's post-commit await chain,
+    // and `ensureManagedProjectWorkspace` can run a full `git clone` with a
+    // 10-minute timeout. Compute the SAME path a materialization would use
+    // WITHOUT creating or cloning anything, and use it only if it is
+    // already there (warm).
+    const predictedManagedPath = resolveManagedProjectWorkspaceDir({
+      companyId: input.companyId,
+      projectId: nextProjectWorkspaceRow.projectId,
+      repoName: deriveManagedCheckoutRepoNameForComparison(nextProjectWorkspaceRow.repoUrl),
+    });
+    const alreadyMaterialized = await pathExists(path.join(predictedManagedPath, ".git"));
+    if (alreadyMaterialized) {
+      let newRepoRoot: string | null = null;
+      try {
+        newRepoRoot = await resolveGitOwnerRepoRoot(predictedManagedPath);
+      } catch {
+        newRepoRoot = null;
+      }
+      if (newRepoRoot) {
+        const [canonicalOwnerRepoRoot, canonicalNewRepoRoot] = await Promise.all([
+          resolvePathForWorktreeComparison(ownerRepoRoot),
+          resolvePathForWorktreeComparison(newRepoRoot),
+        ]);
+        isCrossRepo = canonicalOwnerRepoRoot !== canonicalNewRepoRoot;
+      }
+    } else {
+      // Cold: no path exists to compare yet, and this function will not be
+      // the one to create it. Decide by repo IDENTITY instead — never by
+      // cloning. Neither raw URL is ever logged or returned; only the
+      // normalized comparison result is used below.
+      const ownerOriginUrl = await readGitStdout(["config", "--get", "remote.origin.url"], ownerRepoRoot).catch(() => null);
+      const normalizedOwner = normalizeRepoIdentityForComparison(ownerOriginUrl);
+      const normalizedNext = normalizeRepoIdentityForComparison(nextProjectWorkspaceRow.repoUrl);
+      if (normalizedOwner && normalizedNext) {
+        isCrossRepo = normalizedOwner !== normalizedNext;
+      }
+    }
   }
 
-  const [canonicalOwnerRepoRoot, canonicalNewRepoRoot] = await Promise.all([
-    resolvePathForWorktreeComparison(ownerRepoRoot),
-    resolvePathForWorktreeComparison(newRepoRoot),
-  ]);
-  if (canonicalOwnerRepoRoot === canonicalNewRepoRoot) {
+  if (isCrossRepo === null) {
+    return { worktreeMoved: false, worktreeMoveSkipped: "new_repo_root_unresolved" };
+  }
+  if (!isCrossRepo) {
     return { worktreeMoved: false, worktreeMoveSkipped: "same_repo_rebind" };
   }
 

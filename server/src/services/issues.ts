@@ -391,9 +391,12 @@ export async function executeIssuePostCommitActions(
           } else if (
             outcome.worktreeMoveSkipped === "same_repo_rebind"
             || outcome.worktreeMoveSkipped === "path_in_use_by_live_workspace"
+            || outcome.worktreeMoveSkipped === "ephemeral_run_worktree"
           ) {
-            // Expected, benign skips: realize reuses the path (same-repo) or
-            // another live row still owns it — nothing for an operator to do.
+            // Expected, benign skips: realize reuses the path (same-repo),
+            // another live row still owns it, or the path is an SPA-9275
+            // per-run worktree that can never collide with a branch-template
+            // realize by construction — nothing for an operator to do.
             logger.info(
               {
                 companyId: action.companyId,
@@ -407,9 +410,9 @@ export async function executeIssuePostCommitActions(
             );
           } else {
             // Any other skip (new_repo_root_unresolved, row_changed_before_move,
-            // ephemeral_run_worktree, dirty_at_move, ...) means the OLD worktree
-            // is still sitting at the collision path SPA-12426 exists to clear,
-            // or something unexpected happened — worth an operator's attention.
+            // dirty_at_move, ...) means the OLD worktree is still sitting at
+            // the collision path SPA-12426 exists to clear, or something
+            // unexpected happened — worth an operator's attention.
             logger.warn(
               {
                 companyId: action.companyId,
