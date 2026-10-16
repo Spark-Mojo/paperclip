@@ -324,6 +324,7 @@ import { secretService, type MissingRuntimeBinding } from "./secrets.js";
 import {
   resolveDefaultAgentWorkspaceDir,
   resolveManagedProjectWorkspaceDir,
+  resolvePaperclipInstanceRoot,
 } from "../home-paths.js";
 import {
   buildHeartbeatRunIssueComment,
@@ -2861,13 +2862,52 @@ export async function prepareProjectRepositoryWorkspaces(input: {
     if (result.warning) throw new Error(result.warning);
     results.push({ workspaceId: workspace.id, cwd, repoUrl, repoRef: workspace.repoRef });
   }
-  // Retain detached checkout work outside the synchronized repository set.
+  // Retain detached checkouts outside the worktree under the instance root (never
+  // `<cwd>/.paperclip-runtime/...`): an in-worktree retention dir is untracked, so it shows
+  // up as `?? .paperclip-runtime/` in `git status --porcelain` and fails the D138 run-exit
+  // tree-dirty gate (GH #1366).
   const active = new Set(results.map((repo) => path.basename(repo.cwd)));
+  const retentionRoot = path.join(resolvePaperclipInstanceRoot(), "detached-repositories");
+  await fs.mkdir(retentionRoot, { recursive: true });
+  const retainStaleCheckout = async (source: string, receipt: { entry: string; reason: string }) => {
+    const retentionId = randomUUID();
+    const retentionDir = path.join(retentionRoot, retentionId);
+    const receiptPath = path.join(retentionRoot, `${retentionId}.json`);
+    // Receipt first: a crash between move and receipt would leave an unindexed
+    // retained dir. The pending receipt is renamed to final after the move.
+    await fs.writeFile(
+      receiptPath,
+      JSON.stringify({ status: "pending", retainedFrom: source, retainedAt: new Date().toISOString(), ...receipt }),
+    );
+    try {
+      await fs.rename(source, retentionDir);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException)?.code !== "EXDEV") throw error;
+      try {
+        await fs.cp(source, retentionDir, { recursive: true });
+      } catch (copyError) {
+        await fs.rm(retentionDir, { recursive: true, force: true }).catch(() => undefined);
+        throw copyError;
+      }
+      await fs.rm(source, { recursive: true, force: true });
+    }
+    await fs.writeFile(
+      receiptPath,
+      JSON.stringify({ status: "retained", retainedFrom: source, retainedAt: new Date().toISOString(), ...receipt }),
+    );
+  };
   for (const entry of await fs.readdir(root)) {
     if (active.has(entry) || entry.includes(".clone-")) continue;
-    const retained = path.join(input.cwd, ".paperclip-runtime", "detached-repositories", randomUUID());
-    await fs.mkdir(path.dirname(retained), { recursive: true });
-    await fs.rename(path.join(root, entry), retained);
+    await retainStaleCheckout(path.join(root, entry), { entry, reason: "workspace-rescope" });
+  }
+  // Migration (SPA-12535): pre-fix runs parked residue at
+  // `<cwd>/.paperclip-runtime/detached-repositories/<uuid>`, which keeps failing
+  // the D138 tree-dirty gate on already-bitten worktrees. Sweep it to the same
+  // out-of-tree root on the same pass (same-device rename; no GC change).
+  const legacyRoot = path.join(input.cwd, ".paperclip-runtime", "detached-repositories");
+  for (const entry of await fs.readdir(legacyRoot).catch(() => [] as string[])) {
+    if (entry.endsWith(".json")) continue;
+    await retainStaleCheckout(path.join(legacyRoot, entry), { entry, reason: "legacy-in-worktree-sweep" });
   }
   return results;
 }
