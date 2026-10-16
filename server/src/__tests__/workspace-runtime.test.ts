@@ -12146,6 +12146,8 @@ describeEmbeddedPostgres(
         });
         await db.insert(issues).values({
           id: sourceIssueId,
+          // PR #210 final audit: relocation requires the branch to name this card.
+          identifier: (branchName.match(/[A-Za-z]+-\d+/) ?? [null])[0],
           companyId,
           projectId,
           projectWorkspaceId: oldProjectWorkspaceId,
@@ -12197,6 +12199,109 @@ describeEmbeddedPostgres(
         // would have silently deleted.
         expect(await fs.readFile(path.join(movedToPath!, ignoredRelPath), "utf8")).toBe("scratch\n");
         await expect(readGit(oldRepo, ["rev-parse", "--verify", `refs/heads/${branchName}`])).resolves.not.toBe("");
+      } finally {
+        await support.cleanup();
+      }
+    }, 30_000);
+
+    it("skips relocation when the branch does not name this card (shared branch, PR #210 final audit)", async () => {
+      const support = await startEmbeddedPostgresTestDatabase(
+        "paperclip-spa9437-clean-rebind-",
+      );
+      try {
+        const db = createDb(support.connectionString);
+        const companyId = randomUUID();
+        const projectId = randomUUID();
+        const oldProjectWorkspaceId = randomUUID();
+        const newProjectWorkspaceId = randomUUID();
+        const sourceIssueId = randomUUID();
+        const executionWorkspaceId = randomUUID();
+        const branchName = "shared-integration";
+        const ignoredRelPath = "ignored-scratch.txt";
+        const { oldRepo, oldWorktreePath } = await createOldRepoWorktreeWithGitignore(branchName, ignoredRelPath);
+        // Gitignored content: `git status` omits it, so it never trips the
+        // dirty check, but a non-forced `git worktree remove` would have
+        // deleted it with no signal (SPA-12426 finding (3)). A move must
+        // preserve it.
+        await fs.writeFile(path.join(oldWorktreePath, ignoredRelPath), "scratch\n", "utf8");
+        // A genuinely different repo for the NEW project workspace — the
+        // cross-repo precondition (part A) that gates the move at all.
+        const newRepo = await createNewRepo();
+        await db.insert(companies).values({
+          id: companyId,
+          name: "spa9437-co",
+        });
+        await db.insert(projects).values({
+          id: projectId,
+          companyId,
+          name: "spa9437-project",
+        });
+        await db.insert(projectWorkspaces).values([
+          {
+            id: oldProjectWorkspaceId,
+            companyId,
+            projectId,
+            name: "old-workspace",
+            cwd: oldRepo,
+            repoUrl: null,
+            repoRef: "refs/heads/main",
+          },
+          {
+            id: newProjectWorkspaceId,
+            companyId,
+            projectId,
+            name: "new-workspace",
+            cwd: newRepo,
+            repoUrl: null,
+            repoRef: "refs/heads/main",
+          },
+        ]);
+        await db.insert(executionWorkspaces).values({
+          id: executionWorkspaceId,
+          companyId,
+          projectId,
+          projectWorkspaceId: oldProjectWorkspaceId,
+          mode: "isolated_workspace",
+          strategyType: "git_worktree",
+          name: "spa9437-clean",
+          status: "active",
+          cwd: oldWorktreePath,
+          repoUrl: null,
+          baseRef: "refs/heads/main",
+          branchName,
+          providerType: "git_worktree",
+          providerRef: oldWorktreePath,
+          metadata: RUNTIME_OWNED_GIT_BRANCH_METADATA,
+        });
+        await db.insert(issues).values({
+          id: sourceIssueId,
+          // PR #210 final audit: relocation requires the branch to name this card.
+          identifier: "PAP-1",
+          companyId,
+          projectId,
+          projectWorkspaceId: oldProjectWorkspaceId,
+          executionWorkspaceId,
+          title: "SPA-9437 clean rebind archives",
+          status: "todo",
+        } as Partial<typeof issues.$inferInsert>);
+        await db
+          .update(executionWorkspaces)
+          .set({ sourceIssueId })
+          .where(eq(executionWorkspaces.id, executionWorkspaceId));
+        const outcome = await executionWorkspaceService(
+          db,
+        ).retireExecutionWorkspaceAfterProjectWorkspaceRebind({
+          companyId,
+          executionWorkspaceId,
+          sourceIssueId,
+          reason: `project workspace rebind ${oldProjectWorkspaceId} -> ${newProjectWorkspaceId}`,
+          nextProjectWorkspaceId: newProjectWorkspaceId,
+        });
+        expect(outcome.outcome).toBe("retired");
+        if (outcome.outcome !== "retired") throw new Error("unreachable");
+        expect(outcome.worktreeMoved).toBe(false);
+        expect(outcome.worktreeMoveSkipped).toBe("branch_not_card_specific");
+        await expect(fs.stat(oldWorktreePath)).resolves.toBeTruthy();
       } finally {
         await support.cleanup();
       }
@@ -12266,6 +12371,8 @@ describeEmbeddedPostgres(
         });
         await db.insert(issues).values({
           id: sourceIssueId,
+          // PR #210 final audit: relocation requires the branch to name this card.
+          identifier: (branchName.match(/[A-Za-z]+-\d+/) ?? [null])[0],
           companyId,
           projectId,
           projectWorkspaceId: oldProjectWorkspaceId,
@@ -12392,6 +12499,8 @@ describeEmbeddedPostgres(
         ]);
         await db.insert(issues).values({
           id: sourceIssueId,
+          // PR #210 final audit: relocation requires the branch to name this card.
+          identifier: (branchName.match(/[A-Za-z]+-\d+/) ?? [null])[0],
           companyId,
           projectId,
           projectWorkspaceId: oldProjectWorkspaceId,
@@ -12521,6 +12630,8 @@ describeEmbeddedPostgres(
         ]);
         await db.insert(issues).values({
           id: sourceIssueId,
+          // PR #210 final audit: relocation requires the branch to name this card.
+          identifier: (branchName.match(/[A-Za-z]+-\d+/) ?? [null])[0],
           companyId,
           projectId,
           projectWorkspaceId: oldProjectWorkspaceId,
@@ -12627,6 +12738,8 @@ describeEmbeddedPostgres(
         });
         await db.insert(issues).values({
           id: sourceIssueId,
+          // PR #210 final audit: relocation requires the branch to name this card.
+          identifier: (branchName.match(/[A-Za-z]+-\d+/) ?? [null])[0],
           companyId,
           projectId,
           projectWorkspaceId: oldProjectWorkspaceId,
@@ -12738,9 +12851,20 @@ describeEmbeddedPostgres(
           })
           .where(eq(executionWorkspaces.id, executionWorkspaceId));
 
+        const seamIssueId = randomUUID();
+        await db.insert(issues).values({
+          id: seamIssueId,
+          identifier: (branchName.match(/[A-Za-z]+-\d+/) ?? [null])[0],
+          companyId,
+          projectId,
+          title: "SPA-12426 relocate seam",
+          status: "todo",
+        } as Partial<typeof issues.$inferInsert>);
         const moveResult = await __testOnlyRelocateRetiredWorktreeIfCrossRepo(db, {
           companyId,
           executionWorkspaceId,
+          branchName,
+          sourceIssueId: seamIssueId,
           leafPath: oldWorktreePath,
           nextProjectWorkspaceId: newProjectWorkspaceId,
           // The STALE generation archiveWorkspaceForRebind would have
@@ -12828,6 +12952,8 @@ describeEmbeddedPostgres(
         });
         await db.insert(issues).values({
           id: sourceIssueId,
+          // PR #210 final audit: relocation requires the branch to name this card.
+          identifier: (branchName.match(/[A-Za-z]+-\d+/) ?? [null])[0],
           companyId,
           projectId,
           projectWorkspaceId: oldProjectWorkspaceId,
@@ -12930,6 +13056,8 @@ describeEmbeddedPostgres(
         });
         await db.insert(issues).values({
           id: sourceIssueId,
+          // PR #210 final audit: relocation requires the branch to name this card.
+          identifier: (branchName.match(/[A-Za-z]+-\d+/) ?? [null])[0],
           companyId,
           projectId,
           projectWorkspaceId: oldProjectWorkspaceId,
@@ -13041,6 +13169,8 @@ describeEmbeddedPostgres(
         });
         await db.insert(issues).values({
           id: sourceIssueId,
+          // PR #210 final audit: relocation requires the branch to name this card.
+          identifier: (branchName.match(/[A-Za-z]+-\d+/) ?? [null])[0],
           companyId,
           projectId,
           projectWorkspaceId: oldProjectWorkspaceId,
@@ -13150,6 +13280,8 @@ describeEmbeddedPostgres(
         });
         await db.insert(issues).values({
           id: sourceIssueId,
+          // PR #210 final audit: relocation requires the branch to name this card.
+          identifier: (branchName.match(/[A-Za-z]+-\d+/) ?? [null])[0],
           companyId,
           projectId,
           projectWorkspaceId: oldProjectWorkspaceId,
@@ -13260,6 +13392,8 @@ describeEmbeddedPostgres(
         });
         await db.insert(issues).values({
           id: sourceIssueId,
+          // PR #210 final audit: relocation requires the branch to name this card.
+          identifier: (branchName.match(/[A-Za-z]+-\d+/) ?? [null])[0],
           companyId,
           projectId,
           projectWorkspaceId: oldProjectWorkspaceId,
@@ -13359,9 +13493,20 @@ describeEmbeddedPostgres(
         // — simulating the window finding (C) closes.
         await fs.writeFile(path.join(oldWorktreePath, "late-scratch.txt"), "late\n", "utf8");
 
+        const seamIssueId = randomUUID();
+        await db.insert(issues).values({
+          id: seamIssueId,
+          identifier: (branchName.match(/[A-Za-z]+-\d+/) ?? [null])[0],
+          companyId,
+          projectId,
+          title: "SPA-12426 relocate seam",
+          status: "todo",
+        } as Partial<typeof issues.$inferInsert>);
         const moveResult = await __testOnlyRelocateRetiredWorktreeIfCrossRepo(db, {
           companyId,
           executionWorkspaceId,
+          branchName,
+          sourceIssueId: seamIssueId,
           leafPath: oldWorktreePath,
           nextProjectWorkspaceId: newProjectWorkspaceId,
           archivedGeneration: 1,
@@ -13476,6 +13621,8 @@ describeEmbeddedPostgres(
         });
         await db.insert(issues).values({
           id: sourceIssueId,
+          // PR #210 final audit: relocation requires the branch to name this card.
+          identifier: (branchName.match(/[A-Za-z]+-\d+/) ?? [null])[0],
           companyId,
           projectId,
           projectWorkspaceId: oldProjectWorkspaceId,
