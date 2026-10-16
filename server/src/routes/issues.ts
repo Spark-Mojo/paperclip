@@ -58,6 +58,7 @@ import {
 } from "@paperclipai/db";
 import {
   addIssueCommentSchema,
+  issueCommentAuthorTypeSchema,
   acceptIssueThreadInteractionSchema,
   attachmentArtifactWorkProductMetadataSchema,
   cancelIssueThreadInteractionSchema,
@@ -358,6 +359,12 @@ const updateIssueRouteSchema = updateIssueSchema.extend({
   doneOverride: z.object({
     reason: z.string().trim().min(1).max(2_000),
   }).strict().optional(),
+  /**
+   * SPA-12751: preserve PATCH-with-comment authorType through validate()
+   * (Zod strips undeclared fields), so a local-board system note can take
+   * the id-less system-actor path. Same values as the comments endpoint.
+   */
+  authorType: issueCommentAuthorTypeSchema.optional(),
 });
 const queuedCommentMutationTargetSchema = z.object({
   queueId: z.string().min(1),
@@ -817,6 +824,56 @@ function authenticatedActorResponsibleUserId(req: Request) {
   return req.actor.type === "agent"
     ? (req.actor.onBehalfOfUserId ?? null)
     : undefined;
+}
+
+/**
+ * SPA-12751: local-board may post system notes via PATCH-with-comment or the
+ * comments endpoint. The board-key actor carries a userId ("local-board"), so
+ * the service assert (id actor must be user) would 422 an explicit
+ * authorType "system". Map only this exact sentinel: strip the userId from
+ * the actor passed to addComment (and drop the explicit authorType so the
+ * service derives "system" by default). Genuine human user ids and agent
+ * actors keep the 422 behavior.
+ */
+function resolveIssueCommentActorForAuthorType(
+  params: {
+    req: Request;
+    actor: ReturnType<typeof getActorInfo>;
+    requestedAuthorType: unknown;
+  },
+): { actor: { agentId?: string; userId?: string; runId?: string | null; onBehalfOfUserId?: string | null }; authorType: unknown } {
+  const { actor, requestedAuthorType } = params;
+  if (
+    requestedAuthorType === "system" &&
+    actor.actorType === "user" &&
+    actor.actorId === "local-board"
+  ) {
+    logger.warn(
+      {
+        issueId: params.req.params?.id,
+        actorId: actor.actorId,
+        surface: "issue.comment.system_note",
+      },
+      "mapping local-board system note to id-less actor for system authorType",
+    );
+    return {
+      actor: {
+        agentId: actor.agentId ?? undefined,
+        runId: actor.runId,
+        onBehalfOfUserId: authenticatedActorResponsibleUserId(params.req),
+      },
+      authorType: undefined,
+    };
+  }
+  return {
+    actor: {
+      agentId: actor.agentId ?? undefined,
+      userId: actor.actorType === "user" ? actor.actorId : undefined,
+      runId: actor.runId,
+      onBehalfOfUserId: authenticatedActorResponsibleUserId(params.req),
+    },
+    authorType: requestedAuthorType,
+  };
 }
 
 /**
@@ -13147,6 +13204,7 @@ export function issueRoutes(
         hiddenAt: hiddenAtRaw,
         onBehalfOfUserId: _requestedOnBehalfOfUserId,
         doneOverride: doneOverrideRequested,
+        authorType: _commentOnlyAuthorType,
         ...updateFields
       } = req.body;
       // SPA-8957: an agent may never supply the done-gate override — a card
@@ -14833,21 +14891,23 @@ export function issueRoutes(
       let goalCommentSteered = false;
       let lostReviewPathRef: string | null = null;
       if (commentBody) {
+        const commentAuthor =
+          resolveIssueCommentActorForAuthorType({
+            req,
+            actor,
+            requestedAuthorType: (req.body as any).authorType,
+          });
         const commentReferenceSummaryBefore =
           updateReferenceSummaryAfter ??
           (await issueReferencesSvc.listIssueReferenceSummary(issue.id));
         comment ??= await svc.addComment(
           id,
           commentBody,
-          {
-            agentId: actor.agentId ?? undefined,
-            userId: actor.actorType === "user" ? actor.actorId : undefined,
-            runId: actor.runId,
-            onBehalfOfUserId: authenticatedActorResponsibleUserId(req),
-          },
+          commentAuthor.actor,
           {
             authorizationReason: issueMutationAuthorizationReason,
             // SPA-11706 D1: same opt-in key for agents and users alike.
+            authorType: commentAuthor.authorType as any,
             clientRequestId: commentClientRequestId,
             sourceTrust: await sourceTrustForActorWrite(issue, actor),
           },
@@ -15200,6 +15260,7 @@ export function issueRoutes(
             shouldWakeAssigneeForIssueComment({
               selfComment,
               resumeRequested: resumeRequested === true,
+              commentAuthorType: comment.authorType,
               commentCreatedByRunId: comment.createdByRunId,
               issueAtCommentStart: existing,
               reopened,
@@ -18210,10 +18271,23 @@ export function issueRoutes(
         };
 
         const sourceTrust = await sourceTrustForActorWrite(currentIssue, actor);
+        const commentAuthorType =
+          resolveIssueCommentActorForAuthorType({
+            req,
+            actor,
+            requestedAuthorType: req.body.authorType,
+          });
         const commentOptions = {
           authorType:
-            req.body.authorType ??
-            (actor.actorType === "agent" ? "agent" : "user"),
+            commentAuthorType.authorType ??
+            // Sentinel (local-board system note) maps to an id-less actor with
+            // authorType undefined — forward undefined so the service derives
+            // "system"; default only when no authorType was requested.
+            (req.body.authorType !== undefined
+              ? undefined
+              : actor.actorType === "agent"
+                ? "agent"
+                : "user"),
           presentation: commentPresentation,
           metadata: req.body.metadata ?? null,
           attachmentIds: req.body.attachmentIds,
@@ -18231,12 +18305,7 @@ export function issueRoutes(
             const insertedComment = await svc.addComment(
               id,
               req.body.body,
-              {
-                agentId: actor.agentId ?? undefined,
-                userId: actor.actorType === "user" ? actor.actorId : undefined,
-                runId: actor.runId,
-                onBehalfOfUserId: authenticatedActorResponsibleUserId(req),
-              },
+              commentAuthorType.actor,
               {
                 ...commentOptions,
                 authorizationReason: commentAuthorizationReason,
@@ -18322,10 +18391,23 @@ export function issueRoutes(
           requestedByActorId: actor.actorId,
         });
       } else {
+        const elseAuthorType =
+          resolveIssueCommentActorForAuthorType({
+            req,
+            actor,
+            requestedAuthorType: req.body.authorType,
+          });
         const commentOptions = {
           authorType:
-            req.body.authorType ??
-            (actor.actorType === "agent" ? "agent" : "user"),
+            elseAuthorType.authorType ??
+            // Sentinel (local-board system note) maps to an id-less actor with
+            // authorType undefined — forward undefined so the service derives
+            // "system"; default only when no authorType was requested.
+            (req.body.authorType !== undefined
+              ? undefined
+              : actor.actorType === "agent"
+                ? "agent"
+                : "user"),
           presentation: commentPresentation,
           metadata: req.body.metadata ?? null,
           attachmentIds: req.body.attachmentIds,
@@ -18337,12 +18419,7 @@ export function issueRoutes(
           svc.addComment(
             id,
             req.body.body,
-            {
-              agentId: actor.agentId ?? undefined,
-              userId: actor.actorType === "user" ? actor.actorId : undefined,
-              runId: actor.runId,
-              onBehalfOfUserId: authenticatedActorResponsibleUserId(req),
-            },
+            elseAuthorType.actor,
             commentOptions,
             dbOrTx,
           );
@@ -18626,6 +18703,7 @@ export function issueRoutes(
         const shouldWakeAssigneeForComment = shouldWakeAssigneeForIssueComment({
           selfComment,
           resumeRequested: resumeRequested === true,
+          commentAuthorType: comment.authorType,
           commentCreatedByRunId: comment.createdByRunId,
           issueAtCommentStart: issue,
           reopened,
