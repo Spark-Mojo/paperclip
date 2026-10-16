@@ -274,19 +274,126 @@ export function issueRewakeCircuitBreakerNoticeMarker(newestRunId: string): stri
 }
 
 export function buildIssueRewakeCircuitBreakerNotice(input: {
-  noProgressStreak: number;
-  /** Run ids counted toward the streak, newest first. */
+  /** The streak count that tripped the breaker (either tier). */
+  streak: number;
+  /** Run ids counted toward that streak, newest first. */
   runIds: string[];
+  /** Which tier tripped — varies the headline wording only. */
+  kind?: "no_progress" | "comment_only";
 }): string {
   const newestRunId = input.runIds[0] ?? "unknown";
   const runList = input.runIds.map((id) => `\`${id}\``).join(", ") || "(none)";
+  const headline =
+    input.kind === "comment_only"
+      ? `The last ${input.streak} consecutive runs were comment-only: the assignee commented each time (often reporting the same denial or status) but nothing else moved — no status change, work product, document, attachment, interaction, child issue, or scheduled continuation.`
+      : `The last ${input.streak} consecutive runs ended with no issue-visible progress (issue status unchanged, no new comment, no new work product, no delegated child-issue activity).`;
   return [
     issueRewakeCircuitBreakerNoticeMarker(newestRunId),
-    `The last ${input.noProgressStreak} consecutive runs ended with no issue-visible progress (issue status unchanged, no new comment, no new work product, no delegated child-issue activity).`,
+    headline,
     `Runs counted toward this streak, newest first: ${runList}.`,
     "This card was moved to `backlog` so it stops consuming runs for no new information.",
     "To resume automatic work: move the card back to `todo` (or reassign it). Either change counts as new progress and resets this breaker.",
   ].join("\n\n");
+}
+
+/**
+ * Audit re-finding (PR #211 re-audit): ISSUE_PROGRESS_ACTIVITY_ACTIONS counts
+ * ANY actor's comment as progress, including the assignee agent's own. A
+ * stuck agent that comments every run (reporting the same denial or status,
+ * e.g. measured on SPA-12493: 136 issue.comment_added rows against 58
+ * issue.successful_run_handoff_required rows over 2 days) resets the
+ * ordinary no-progress streak every single time — the breaker above would
+ * never trip on the exact case that motivated it.
+ *
+ * Every progress action except the comment itself — still real,
+ * issue-visible movement regardless of who wrote it.
+ */
+export const OTHER_PROGRESS_ACTIVITY_ACTIONS: string[] =
+  ISSUE_PROGRESS_ACTIVITY_ACTIONS.filter((action) => action !== "issue.comment_added");
+
+export const ISSUE_REWAKE_CIRCUIT_BREAKER_COMMENT_ONLY_THRESHOLD_ENV_VAR =
+  "PAPERCLIP_ISSUE_REWAKE_CIRCUIT_BREAKER_COMMENT_ONLY_THRESHOLD";
+
+/** Looser than the no-progress tier: an assignee's own comment is some
+ * signal (even if it is not the disposition the card needs), so this tier
+ * waits for a longer streak before it moves the card. */
+export const ISSUE_REWAKE_CIRCUIT_BREAKER_COMMENT_ONLY_DEFAULT_THRESHOLD = 6;
+const ISSUE_REWAKE_CIRCUIT_BREAKER_COMMENT_ONLY_MIN_THRESHOLD = 3;
+const ISSUE_REWAKE_CIRCUIT_BREAKER_COMMENT_ONLY_MAX_THRESHOLD = 30;
+
+export function normalizeIssueRewakeCircuitBreakerCommentOnlyThreshold(value: unknown): number {
+  const parsed =
+    typeof value === "number"
+      ? value
+      : typeof value === "string" && value.trim() !== ""
+        ? Number(value.trim())
+        : NaN;
+  if (!Number.isFinite(parsed)) {
+    return ISSUE_REWAKE_CIRCUIT_BREAKER_COMMENT_ONLY_DEFAULT_THRESHOLD;
+  }
+  return Math.max(
+    ISSUE_REWAKE_CIRCUIT_BREAKER_COMMENT_ONLY_MIN_THRESHOLD,
+    Math.min(ISSUE_REWAKE_CIRCUIT_BREAKER_COMMENT_ONLY_MAX_THRESHOLD, Math.floor(parsed)),
+  );
+}
+
+/** One activity_log row, scoped the same way the ordinary progress check's
+ * query already is (company/issue/sampled-run-ids/progress-action-list) but
+ * carrying enough of the row to classify the run it belongs to. */
+export interface CommentOnlyStreakActivityRow {
+  runId: string | null;
+  action: string;
+  actorType: string;
+  actorId: string;
+}
+
+function classifyRunForCommentOnlyStreak(
+  runId: string,
+  rows: CommentOnlyStreakActivityRow[],
+  assigneeAgentId: string | null,
+): "comment_only" | "real_progress" | "strict_no_progress" {
+  const runRows = rows.filter((row) => row.runId === runId);
+  if (runRows.some((row) => OTHER_PROGRESS_ACTIVITY_ACTIONS.includes(row.action))) {
+    return "real_progress";
+  }
+  const commentRows = runRows.filter((row) => row.action === "issue.comment_added");
+  if (commentRows.length === 0) return "strict_no_progress";
+  const allCommentsByAssignee = commentRows.every(
+    (row) => assigneeAgentId !== null && row.actorType === "agent" && row.actorId === assigneeAgentId,
+  );
+  return allCommentsByAssignee ? "comment_only" : "real_progress";
+}
+
+/**
+ * Second tier, parallel to evaluateIssueRewakeThrottle's walk (same
+ * stop conditions: a failed/cancelled/missing-finish run, or new issue input
+ * since the newest run, stop the walk entirely) but with a different notion
+ * of "no progress": a run only breaks THIS streak when it logged a real
+ * progress action (anything in OTHER_PROGRESS_ACTIVITY_ACTIONS) or a comment
+ * from someone other than the assignee agent. A run with no progress-list
+ * activity at all, or whose only progress-list activity is the assignee
+ * agent's own comment(s), counts toward the streak exactly like the ordinary
+ * tier's strict no-progress run does.
+ */
+export function evaluateIssueRewakeCommentOnlyStreak(input: {
+  recentTerminalRuns: RecentIssueRunSample[];
+  activityRows: CommentOnlyStreakActivityRow[];
+  hasNewIssueInputSinceLastRun: boolean;
+  assigneeAgentId: string | null;
+}): number {
+  if (input.hasNewIssueInputSinceLastRun) return 0;
+  let streak = 0;
+  for (const run of input.recentTerminalRuns) {
+    if (run.status !== "succeeded" || !run.finishedAt) break;
+    const classification = classifyRunForCommentOnlyStreak(
+      run.id,
+      input.activityRows,
+      input.assigneeAgentId,
+    );
+    if (classification === "real_progress") break;
+    streak += 1;
+  }
+  return streak;
 }
 
 export function evaluateIssueRewakeThrottle(input: IssueRewakeThrottleInput): IssueRewakeThrottleDecision {
