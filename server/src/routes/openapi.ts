@@ -3734,6 +3734,7 @@ registry.registerPath({
     403: r.forbidden,
     404: r.notFound,
     409: r.conflict,
+    422: r.unprocessable,
   },
 });
 
