@@ -55,6 +55,7 @@ import {
 } from "./github-pull-request-merge.js";
 import { visibleIssueCondition } from "./issue-visibility.js";
 import { createGitRemoteAuthProvider } from "./git-credentials.js";
+import { resolveManagedProjectWorkspaceDir } from "../home-paths.js";
 import { readProjectWorkspaceRuntimeConfig } from "./project-workspace-runtime-config.js";
 import { workspaceGitOperationScheduler } from "./workspace-git-operation-scheduler.js";
 import { isRuntimeOwnedGitBranch } from "./execution-workspace-branch-ownership.js";
@@ -4030,14 +4031,59 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
      *
      * Idempotent on rows whose status is already `archived` / `cleanup_failed`
      * / has a `closedAt` — those are skipped, not errored.
+     *
+     * SPA-12426: archiving the row alone is not enough. The project's
+     * `branchTemplate` renders a path from `worktreeParentDir` + branch name
+     * only — it has no repo segment — so once the row is archived, the OLD
+     * worktree directory is left sitting at the EXACT path the NEW repo will
+     * try to realize into on the next run, and that run fails
+     * `workspace_validation_failed` (the SPA-11953 fence: "already exists and
+     * is owned by a different git repository") until a human moves it by
+     * hand. So once (and only once) the archive above actually transitions
+     * the row, and only when the rebind is CROSS-repo (the leaf's owning repo
+     * root differs from the new project workspace's repo root — a same-repo
+     * rebind reuses this exact path on realize, so there is nothing to clear
+     * and moving it would only get in the way), this also relocates the OLD
+     * worktree directory with a non-forced `git worktree move` to a sibling
+     * `<path>.rebind-retired-<rowId>` path — never `git worktree remove`.
+     * Move, not remove, because a non-forced remove deletes gitignored
+     * content (`.unlazy/` ledgers, build scratch, anything the agent left
+     * that was never meant to be committed) with no signal that it happened;
+     * a move preserves it under a clearly-named sibling path instead. The row
+     * is then updated to point `cwd`/`providerRef` at the moved path, so a
+     * later reopen rebuilds there and never collides with path P again.
+     * Relocation is best-effort: it never un-archives the row and never
+     * throws out of this function. Guarded twice against concurrent writers:
+     * (1) SPA-9375 / SPA-12428 — a rebind between two project workspaces of
+     * the SAME repo can leave a second, still-live execution workspace row
+     * pointing at this exact path; relocation is skipped whenever another
+     * live row in the company still points at it. (2) a reopen racing this
+     * retire — the move only runs inside a transaction that re-acquires the
+     * per-workspace lifecycle lock and re-verifies the row is still exactly
+     * the row this call itself just archived (status, closedAt, and lifecycle
+     * generation unchanged); a reopen that won the race bumps the generation
+     * and this call backs off without touching the worktree it rebuilt.
      */
     retireExecutionWorkspaceAfterProjectWorkspaceRebind: async (input: {
       companyId: string;
       executionWorkspaceId: string;
       sourceIssueId: string;
       reason: string;
+      // SPA-12426: the repo the issue's projectWorkspaceId now points at.
+      // Used only to decide cross-repo vs. same-repo (part A below); never
+      // used to pick a realize target.
+      nextProjectWorkspaceId: string | null;
     }): Promise<
-      | { outcome: "retired"; executionWorkspaceId: string; worktreePath: string | null }
+      | {
+          outcome: "retired";
+          executionWorkspaceId: string;
+          worktreePath: string | null;
+          worktreeMoved: boolean;
+          worktreeMovedTo?: string;
+          worktreeMoveError?: string;
+          worktreeMoveSkipped?: string;
+          detachedIssue?: true;
+        }
       | { outcome: "skipped_already_closed"; executionWorkspaceId: string }
       | { outcome: "refused_dirty"; executionWorkspaceId: string; worktreePath: string | null; dirtyReason: string }
       | { outcome: "refused_unpushed"; executionWorkspaceId: string; worktreePath: string | null; unpushedReason: string }
@@ -4100,10 +4146,42 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
         }
       }
       const retired = await archiveWorkspaceForRebind(db, input, row);
+      let worktreeMoved = false;
+      let worktreeMovedTo: string | undefined;
+      let worktreeMoveError: string | undefined;
+      let worktreeMoveSkipped: string | undefined;
+      if (retired.archived && row.providerType === "git_worktree" && leafPath && !leafMissing) {
+        try {
+          const moveResult = await relocateRetiredWorktreeIfCrossRepo(db, {
+            companyId: row.companyId,
+            executionWorkspaceId: row.id,
+            leafPath,
+            nextProjectWorkspaceId: input.nextProjectWorkspaceId,
+            archivedGeneration: retired.generation,
+            branchName: row.branchName ?? null,
+            sourceIssueId: input.sourceIssueId ?? null,
+            // SPA-12426 audit finding (A): the row's own stored flag is the
+            // authoritative signal for an ephemeral per-run worktree (see
+            // SPA-9275); the function also re-derives it from the leaf
+            // path shape as a fallback.
+            ephemeralLifecycle: (row.metadata as Record<string, unknown> | null)?.ephemeralLifecycle === true,
+          });
+          worktreeMoved = moveResult.worktreeMoved;
+          worktreeMovedTo = moveResult.worktreeMovedTo;
+          worktreeMoveError = moveResult.worktreeMoveError;
+          worktreeMoveSkipped = moveResult.worktreeMoveSkipped;
+        } catch (err) {
+          worktreeMoveError = err instanceof Error ? err.message : String(err);
+        }
+      }
       return {
         outcome: "retired",
         executionWorkspaceId: row.id,
         worktreePath: leafPath ?? null,
+        worktreeMoved,
+        ...(worktreeMovedTo ? { worktreeMovedTo } : {}),
+        ...(worktreeMoveError ? { worktreeMoveError } : {}),
+        ...(worktreeMoveSkipped ? { worktreeMoveSkipped } : {}),
         ...(retired.detachedIssue ? { detachedIssue: true as const } : {}),
       };
     },
@@ -4162,6 +4240,15 @@ async function assertBranchRefReachableForRetire(input: {
  * workspace. The transaction's row predicate mirrors the reaper's archive
  * statement: only the snapshot generation may move to `archived`, only
  * when the row is in the live set, and only while `closedAt` is null.
+ *
+ * Returns `archived: true` only when this call actually transitioned the
+ * row — never when a concurrent writer already moved it (the caller uses
+ * this to decide whether it is the one that should relocate the OLD
+ * worktree, SPA-12426). `generation` is the lifecycle generation this call
+ * wrote when it archived (irrelevant when `archived` is false) — the caller
+ * presents this same number back to `relocateRetiredWorktreeIfCrossRepo`'s
+ * re-check, so a reopen that bumps the generation after this commits is
+ * detected before the worktree is touched.
  */
 async function archiveWorkspaceForRebind(
   db: Db,
@@ -4172,10 +4259,11 @@ async function archiveWorkspaceForRebind(
     reason: string;
   },
   row: ExecutionWorkspaceRow,
-): Promise<{ detachedIssue: boolean }> {
+): Promise<{ detachedIssue: boolean; archived: boolean; generation: number }> {
   const snapshotGeneration = readExecutionWorkspaceLifecycleGeneration(
     row.metadata as Record<string, unknown> | null,
   );
+  const nextGeneration = snapshotGeneration + 1;
   const archivedMetadata = bumpExecutionWorkspaceLifecycleGeneration(
     row.metadata as Record<string, unknown> | null,
   );
@@ -4200,7 +4288,7 @@ async function archiveWorkspaceForRebind(
       ))
       .returning()
       .then((rows: Array<ExecutionWorkspaceRow>) => rows[0] ?? null);
-    if (!archived) return { detachedIssue: false };
+    if (!archived) return { detachedIssue: false, archived: false, generation: snapshotGeneration };
     // Clear the issue's binding so the next run's allocator refuses the
     // reuse request (status=archived, SPA-7090) and provisions a fresh
     // workspace bound to the new project workspace.
@@ -4218,8 +4306,578 @@ async function archiveWorkspaceForRebind(
         .then((rows: Array<{ id: string }>) => rows[0] ?? null);
       detachedIssue = Boolean(updated);
     }
-    return { detachedIssue };
+    return { detachedIssue, archived: true, generation: nextGeneration };
+  });
+}
+
+// SPA-12426: the metadata key recording the path a retired worktree was
+// relocated FROM. Written only when `relocateRetiredWorktreeIfCrossRepo`
+// actually moves a worktree, so a human (or a later audit) can tell a
+// `<path>.rebind-retired-<rowId>` directory apart from a normal worktree.
+const EXECUTION_WORKSPACE_REBIND_RETIRED_FROM_PATH_METADATA_KEY = "rebindRetiredFromPath";
+
+// SPA-12426 re-audit finding (i): the SAME pure, non-materializing repo-name
+// derivation `materializeManagedProjectWorkspace` uses to compute its target
+// `cwd` (duplicated here rather than imported — this exact tiny function is
+// already independently duplicated in heartbeat.ts and projects.ts; neither
+// copy is exported, and importing from heartbeat.ts would pull in its
+// clone-capable neighbor). Must stay byte-identical in behavior to those so
+// this predicts the SAME path a real materialization would use.
+function deriveManagedCheckoutRepoNameForComparison(repoUrl: string | null): string | null {
+  const trimmed = repoUrl?.trim();
+  if (!trimmed) return null;
+  try {
+    const parsed = new URL(trimmed);
+    const cleanedPath = parsed.pathname.replace(/\/+$/, "");
+    const repoName = cleanedPath.split("/").filter(Boolean).pop()?.replace(/\.git$/i, "") ?? "";
+    return repoName || null;
+  } catch {
+    return null;
+  }
+}
+
+// SPA-12426 audit re-re-audit: `new URL()` on a scheme form can itself
+// compute the WRONG host when credentials contain a raw, unescaped '/' —
+// verified empirically:
+//   new URL("https://user:80/ss@host.com/org/repo.git").host === "user:80"
+// (port "80" is valid, so the parser never throws; it silently treats
+// "user:80" as the whole authority and "/ss@host.com/org/repo.git" as the
+// path). A password containing '@' but NOT '/' is fine (the parser
+// correctly uses the LAST '@' as the userinfo/host separator), so the
+// defect is specifically a raw '/' inside the credential, not '@'.
+// `parseSchemeRepoAuthority` below guards exactly that: before trusting
+// `new URL()`'s own host, it re-derives "the raw string's authority
+// section" by taking the text between `//` and the FIRST literal '/' in
+// the RAW string (the same boundary a naive/vulnerable parser would use).
+// If that candidate authority contains no '@' but an '@' shows up later
+// (meaning the real credential/host separator got shoved past the first
+// '/'), or if the candidate authority contains more than one '@' (which
+// '@' is the real separator is a judgment call we decline to make, even
+// though WHATWG's "last '@' wins" rule is itself unambiguous), the parse
+// is rejected as ambiguous. Every rejection here returns null, never a
+// best-guess identity: see the module fix rule — a wrongful SKIP (treating
+// an unresolvable repo as "cannot prove cross-repo") reproduces the old,
+// already-tolerated symptom, but a wrongful MOVE does not.
+function parseSchemeRepoAuthority(value: string): { host: string; owner: string; name: string } | null {
+  const schemeMatch = /^[a-z][a-z0-9+.-]*:\/\//i.exec(value);
+  if (!schemeMatch) return null;
+  const rest = value.slice(schemeMatch[0].length);
+  const rawFirstSlashIndex = rest.indexOf("/");
+  if (rawFirstSlashIndex === -1) return null; // no path at all — can't contain owner/name
+  const rawAuthorityCandidate = rest.slice(0, rawFirstSlashIndex);
+  const atCountInCandidate = rawAuthorityCandidate.split("@").length - 1;
+  if (atCountInCandidate > 1) return null; // ambiguous which '@' separates userinfo from host
+  if (atCountInCandidate === 0) {
+    const restAfterCandidate = rest.slice(rawFirstSlashIndex).split(/[?#]/)[0];
+    if (restAfterCandidate.includes("@")) return null; // raw '/' swallowed the real host boundary
+  }
+  let parsed: URL;
+  try {
+    parsed = new URL(value);
+  } catch {
+    return null;
+  }
+  const host = parsed.hostname.toLowerCase(); // hostname only — port is deliberately ignored
+  if (!host) return null;
+  const pathSegments = parsed.pathname.split("/").filter(Boolean);
+  if (pathSegments.length !== 2) return null; // not exactly owner/name
+  const owner = pathSegments[0].toLowerCase();
+  const name = pathSegments[1].replace(/\.git$/i, "").toLowerCase();
+  if (!owner || !name) return null;
+  return { host, owner, name };
+}
+
+// SPA-12426: scp-like `user@host:owner/name(.git)?` syntax (no scheme, no
+// `://`). All three character classes exclude '@', ':', and '/' so that a
+// stray extra '@' (e.g. `a@b@host:owner/name`, ambiguous about which '@'
+// is the real separator) or a credential containing '/' or ':' fails the
+// match outright rather than silently matching something else.
+const SCP_REPO_AUTHORITY_RE = /^[^@:/]+@([^@:/]+):(.+)$/;
+
+function parseScpRepoAuthority(value: string): { host: string; owner: string; name: string } | null {
+  const match = SCP_REPO_AUTHORITY_RE.exec(value);
+  if (!match) return null;
+  const [, host, rawPath] = match;
+  if (rawPath.includes("@")) return null; // ambiguous extra '@' in the path portion
+  const cleanedPath = rawPath.replace(/\/+$/, "");
+  const pathSegments = cleanedPath.split("/").filter(Boolean);
+  if (pathSegments.length !== 2) return null; // not exactly owner/name
+  const owner = pathSegments[0].toLowerCase();
+  const name = pathSegments[1].replace(/\.git$/i, "").toLowerCase();
+  if (!host || !owner || !name) return null;
+  return { host: host.toLowerCase(), owner, name };
+}
+
+// SPA-12426 re-audit finding (i), re-re-audited: normalize a git remote URL
+// to a `host/owner/name`-shaped identity for cross-repo comparison WITHOUT
+// ever resolving a filesystem path (the cold-managed-checkout case has no
+// path to resolve without cloning) and WITHOUT ever trusting a parse this
+// function cannot prove is unambiguous (see `parseSchemeRepoAuthority` /
+// `parseScpRepoAuthority` above — the dangerous direction this closes is
+// the SAME repo normalizing UNEQUAL being safe, and a wrongful EQUAL/
+// resolved verdict on two different repos being the one that is not).
+// Port is ignored (same host on a different port/scheme is the same repo);
+// owner/name are case-folded for comparison, which can only ever cause a
+// wrongful SKIP on a case-sensitive host (two paths differing only by case
+// are actually different repos there), never a wrongful move — the safe
+// direction, per the module fix rule. Neither the raw nor the normalized
+// value is ever logged or returned by this function's callers; only the
+// boolean comparison result is.
+export function normalizeRepoIdentityForComparison(rawUrl: string | null | undefined): string | null {
+  const trimmed = rawUrl?.trim();
+  if (!trimmed) return null;
+  const identity = trimmed.includes("://")
+    ? parseSchemeRepoAuthority(trimmed)
+    : parseScpRepoAuthority(trimmed);
+  if (!identity) return null;
+  // SPA-12426 round-5 audit: the scp parser cannot represent an IPv6 literal
+  // (`git@[::1]:owner/repo` mis-split into host "[" with a garbage owner),
+  // which made the SAME repo normalize non-null and unequal to its scheme
+  // form, i.e. a wrongful move. Only a plain DNS name or IPv4 host is
+  // trusted; anything else (brackets, colons, empty) is ambiguous -> null,
+  // and null always means skip, never move.
+  if (!REPO_IDENTITY_HOST_RE.test(identity.host)) return null;
+  // Final-audit finding: `new URL` canonicalizes alternate IPv4 spellings
+  // (127.1, 0x7f.0.0.1, 2130706433 -> 127.0.0.1) while the scp parser keeps
+  // them verbatim, so the SAME repo could normalize unequal (a wrongful move).
+  // Trust only real DNS names: any all-digit or hex label (every IPv4
+  // spelling has one) is ambiguous -> null -> skip.
+  if (identity.host.split(".").some((label) => /^(?:\d+|0x[0-9a-f]*)$/i.test(label))) return null;
+  return `${identity.host}/${identity.owner}/${identity.name}`;
+}
+
+const REPO_IDENTITY_HOST_RE = /^[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?$/i;
+
+// SPA-12426 audit finding (A): the per-run ephemeral worktree shape
+// (`${worktreeParentDir}/runs/<runId>/`, SPA-9275). `reapOrphanedRunWorktrees`
+// treats EVERY directory directly under a `runs/` dir as a run id and may
+// force-remove or rm -rf it independently of this service, DB-blind at boot.
+// A `<runId>.rebind-retired-<id8>` sibling would still read as "every child
+// dir name is a runId" to that sweep and get force-removed out from under us.
+// The run-id path is keyed by run id already, so it can never collide with a
+// branch-template realize in the first place — there is nothing for this
+// function to clear, ever.
+//
+// Re-audit finding (ii): `basename(dirname(leaf)) === "runs"` alone
+// misfires for a branchTemplate like `runs/{{issue.identifier}}` —
+// sanitizeBranchName keeps `/`, so a perfectly ordinary per-branch worktree
+// can land at `.../runs/SPA-1-x`, whose parent dir is also named `runs`.
+// The real ephemeral shape's leaf segment is never an arbitrary branch
+// name — it is exactly `sanitizeBranchName(heartbeatRunId)`, where run ids
+// are UUIDs, or the `run-<uuid>` fallback. Requiring the leaf's OWN
+// basename to match that shape rules the branch-template case out.
+const RUN_ID_WORKTREE_LEAF_SEGMENT_RE = /^(run-)?[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+function isEphemeralRunWorktreeLeafPath(leafPath: string): boolean {
+  return path.basename(path.dirname(leafPath)) === "runs"
+    && RUN_ID_WORKTREE_LEAF_SEGMENT_RE.test(path.basename(leafPath));
+}
+
+/**
+ * SPA-12426: once `archiveWorkspaceForRebind` has archived a row for a
+ * project-workspace rebind, this decides whether the OLD worktree directory
+ * needs to move out of the way, and if so, moves it — never removes it.
+ *
+ * Part 0 (ephemeral run worktrees, audit finding (A), path-shape fallback
+ * narrowed by re-audit finding (ii)): never relocates a
+ * `${worktreeParentDir}/runs/<runId>/` worktree. Detected first from the
+ * row's own `ephemeralLifecycle` metadata flag (SPA-9275; authoritative when
+ * present), falling back to the leaf's parent directory being literally
+ * named `runs` AND the leaf's own basename matching the shape realize
+ * actually produces for a run id (a UUID, or `run-<uuid>`) —
+ * `basename(dirname(leaf)) === "runs"` alone is not enough: a branchTemplate
+ * like `runs/{{issue.identifier}}` also lands under a dir named `runs`
+ * (sanitizeBranchName keeps `/`), and that is an ordinary per-branch
+ * worktree, not an ephemeral one. Skips with `"ephemeral_run_worktree"`
+ * before resolving anything else, so the move target can never be
+ * constructed inside a `runs/` dir; the construction site below re-checks
+ * the path shape anyway as a second, defense-in-depth guard against a
+ * future refactor reordering these checks.
+ *
+ * Part A (cross-repo only, closes audit finding (2)): the OLD worktree only
+ * collides with a FUTURE realize when the new project workspace is a
+ * DIFFERENT repo — a same-repo rebind's realize reuses this exact path, so
+ * there is nothing to clear. When the next project workspace has a
+ * `cwd` (the common, `local_path` case), compares the leaf's canonical
+ * owning repo root (`resolveGitOwnerRepoRoot`, resolved fresh from the leaf
+ * path itself — NOT read off the earlier `inspectGitCloseReadiness` result,
+ * which for a worktree leaf is that leaf's OWN toplevel, not the shared
+ * main-repo root) against the canonical repo root of that `cwd`, both
+ * normalized through `resolvePathForWorktreeComparison` (the same
+ * realpath-based comparison the SPA-11953 fence uses).
+ *
+ * A `managed_checkout` project workspace stores `cwd = NULL` instead. Re-audit
+ * finding (i): this function runs inside the issue-PATCH route's post-commit
+ * await chain, so it must NEVER materialize or clone a managed checkout here
+ * — `ensureManagedProjectWorkspace` can run a full `git clone` with a 10
+ * MINUTE timeout, which would hang the PATCH response on a cold checkout.
+ * Instead: (1) compute the managed checkout's path with the same PURE
+ * resolver `ensureManagedProjectWorkspace`/`materializeManagedProjectWorkspace`
+ * use (`resolveManagedProjectWorkspaceDir` + the same repo-name derivation),
+ * WITHOUT creating or cloning anything; if that path already exists and
+ * already looks like a git checkout (warm), use it exactly like a `cwd`
+ * above. (2) Otherwise (cold — nothing to compare a path against yet)
+ * decide cross-repo by REPO IDENTITY instead of a filesystem path: read the
+ * OLD worktree owner repo's `remote.origin.url` (`git config --get
+ * remote.origin.url` in `ownerRepoRoot`) and normalize it against the next
+ * project workspace's `repoUrl` (`normalizeRepoIdentityForComparison` —
+ * lowercase, strip scheme, strip `user:pass@` credentials, strip a trailing
+ * `.git` and trailing slashes, and fold `git@host:owner/name` scp syntax to
+ * `host/owner/name`). Equal identities skip `"same_repo_rebind"`; different,
+ * confirmed cross-repo. Either side missing or unparsable skips
+ * `"new_repo_root_unresolved"` — this function never moves a worktree it
+ * cannot prove is cross-repo. Neither raw URL is ever logged or returned
+ * (either can embed a credential, e.g. an `x-access-token` in an HTTPS
+ * remote) — only the outcome (`same_repo_rebind` / `new_repo_root_unresolved`
+ * / proceeding to move) is observable outside this function.
+ *
+ * Part B (move, never remove, closes audit finding (3)): a non-forced `git
+ * worktree remove` silently deletes gitignored content — `.unlazy/` ledgers,
+ * build scratch, anything an agent left that was never meant to be
+ * committed — with no signal that it happened. `git worktree move` to a
+ * sibling `<path>.rebind-retired-<rowId-prefix>` path frees the original
+ * path for the new repo's realize while preserving everything on disk.
+ * Never forced: git refuses the move if the worktree is LOCKED, but
+ * (verified empirically) a non-forced move does NOT refuse a dirty tree the
+ * way `git worktree remove` does — so immediately before the move, inside
+ * the same locked transaction, this re-runs `git status --porcelain
+ * --untracked-files=all` on the leaf and skips with `"dirty_at_move"` if it
+ * is non-empty, rather than relying on git to refuse.
+ *
+ * Part C (one lock, one transaction, closes audit finding (1) — the reopen
+ * race): `archiveWorkspaceForRebind` released the lifecycle advisory lock
+ * when ITS transaction committed, so a reopen could in principle acquire it
+ * and rebuild at `leafPath` before this function ever runs. The live-row
+ * collision check, the dirty re-check, the move, and the row update here all
+ * run inside ONE transaction that re-acquires that same lock and re-reads the
+ * row UNDER the lock, requiring status `archived`, `closedAt` set, and the
+ * lifecycle generation still equal to `archivedGeneration` (the generation
+ * `archiveWorkspaceForRebind` itself just wrote). A reopen that won the race
+ * has already bumped the generation by the time this acquires the lock, so
+ * this backs off with `"row_changed_before_move"` instead of moving a
+ * worktree the reopen already rebuilt. A reopen that loses the race blocks
+ * on the same lock until this transaction commits, then rebuilds at the
+ * MOVED path (this function's row update already pointed `cwd`/`providerRef`
+ * there), never at the freed original path.
+ *
+ * Best-effort throughout: a failure at any step returns a result with
+ * `worktreeMoved: false` and an error/skip reason. It never throws out of
+ * this function and never un-archives the row.
+ */
+/**
+ * True when `branchName` carries `identifier` as a whole token. Used as the
+ * precondition for relocating a retired worktree: a branch rendered from the
+ * card's own identifier cannot be rendered by any other card's template, so
+ * no other live card can reuse this path between the collision check and
+ * the move. A shared branch (project-wide `existingBranch`, or a template
+ * without the identifier) fails this check and keeps today's behaviour.
+ *
+ * Accepted residual (SPA-12426, audited): a DIFFERENT card given a per-issue
+ * `workspaceStrategy.existingBranch` override equal to this card's own
+ * branch name can still reuse the path in that window. That needs a
+ * deliberate override pointing two cards at one card's branch, which is
+ * already a broken configuration (two cards in one worktree). The outcome
+ * is a move, never a delete: content survives at the moved path and the
+ * other card's next realize fails visibly rather than losing work.
+ */
+function branchNamesCard(branchName: string, identifier: string): boolean {
+  const escaped = identifier.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  return new RegExp(`(^|[^A-Za-z0-9])${escaped}($|[^A-Za-z0-9])`, "i").test(branchName);
+}
+
+async function relocateRetiredWorktreeIfCrossRepo(
+  db: Db,
+  input: {
+    companyId: string;
+    executionWorkspaceId: string;
+    leafPath: string;
+    nextProjectWorkspaceId: string | null;
+    archivedGeneration: number;
+    ephemeralLifecycle: boolean;
+    branchName: string | null;
+    sourceIssueId: string | null;
+  },
+): Promise<{
+  worktreeMoved: boolean;
+  worktreeMovedTo?: string;
+  worktreeMoveError?: string;
+  worktreeMoveSkipped?: string;
+}> {
+  // Part 0 / audit finding (A). Checked first, before any filesystem or git
+  // resolution: an ephemeral run worktree's path is keyed by run id, so it
+  // can never collide with a branch-template realize — there is nothing to
+  // clear, and relocating it would hand `reapOrphanedRunWorktrees` a new
+  // child directory under `runs/` that it reads as an orphaned run id.
+  if (input.ephemeralLifecycle || isEphemeralRunWorktreeLeafPath(input.leafPath)) {
+    return { worktreeMoved: false, worktreeMoveSkipped: "ephemeral_run_worktree" };
+  }
+
+  // Final audit of PR #210 (refuted path-race disposition): nothing serializes
+  // a DIFFERENT issue's same-repo realize, which reuses an existing worktree at
+  // its rendered path on filesystem/git checks alone, against this move. That
+  // is only possible when two issues render the same branch, e.g. a project-
+  // wide `workspaceStrategy.existingBranch` or a template without the issue id.
+  // So move only a worktree whose branch names THIS card's identifier as a
+  // whole token. No other card can render that path, and a shared-branch
+  // configuration keeps today's behavior (skip).
+  const cardIdentifier = input.sourceIssueId
+    ? await db
+        .select({ identifier: issues.identifier })
+        .from(issues)
+        .where(eq(issues.id, input.sourceIssueId))
+        .then((rows) => rows[0]?.identifier ?? null)
+    : null;
+  if (!cardIdentifier || !input.branchName || !branchNamesCard(input.branchName, cardIdentifier)) {
+    return { worktreeMoved: false, worktreeMoveSkipped: "branch_not_card_specific" };
+  }
+
+  const { resolveGitOwnerRepoRoot, resolvePathForWorktreeComparison } = await import("./workspace-runtime.js");
+
+  let ownerRepoRoot: string;
+  try {
+    ownerRepoRoot = await resolveGitOwnerRepoRoot(input.leafPath);
+  } catch (err) {
+    return {
+      worktreeMoved: false,
+      worktreeMoveError: `Could not resolve the old worktree's owning repo root`,
+    };
+  }
+
+  const nextProjectWorkspaceRow = input.nextProjectWorkspaceId
+    ? await db
+        .select({
+          cwd: projectWorkspaces.cwd,
+          repoUrl: projectWorkspaces.repoUrl,
+          projectId: projectWorkspaces.projectId,
+        })
+        .from(projectWorkspaces)
+        .where(and(
+          eq(projectWorkspaces.companyId, input.companyId),
+          eq(projectWorkspaces.id, input.nextProjectWorkspaceId),
+        ))
+        .then((rows) => rows[0] ?? null)
+    : null;
+
+  // `isCrossRepo`: null means "cannot prove either way" (unresolved). Two
+  // independent ways to reach a verdict, chosen by whether the next project
+  // workspace already has a path to compare against:
+  let isCrossRepo: boolean | null = null;
+
+  if (nextProjectWorkspaceRow?.cwd) {
+    // The common case: a `local_path` (or already-populated) project
+    // workspace. Path-based comparison, as before.
+    let newRepoRoot: string | null = null;
+    try {
+      newRepoRoot = await resolveGitOwnerRepoRoot(nextProjectWorkspaceRow.cwd);
+    } catch {
+      newRepoRoot = null;
+    }
+    if (newRepoRoot) {
+      const [canonicalOwnerRepoRoot, canonicalNewRepoRoot] = await Promise.all([
+        resolvePathForWorktreeComparison(ownerRepoRoot),
+        resolvePathForWorktreeComparison(newRepoRoot),
+      ]);
+      isCrossRepo = canonicalOwnerRepoRoot !== canonicalNewRepoRoot;
+    }
+  } else if (nextProjectWorkspaceRow?.projectId) {
+    // SPA-12426 re-audit finding (i): a `managed_checkout` project
+    // workspace stores `cwd = NULL`. NEVER materialize or clone here — this
+    // function runs inside the issue-PATCH route's post-commit await chain,
+    // and `ensureManagedProjectWorkspace` can run a full `git clone` with a
+    // 10-minute timeout. Compute the SAME path a materialization would use
+    // WITHOUT creating or cloning anything, and use it only if it is
+    // already there (warm).
+    const predictedManagedPath = resolveManagedProjectWorkspaceDir({
+      companyId: input.companyId,
+      projectId: nextProjectWorkspaceRow.projectId,
+      repoName: deriveManagedCheckoutRepoNameForComparison(nextProjectWorkspaceRow.repoUrl),
+    });
+    const alreadyMaterialized = await pathExists(path.join(predictedManagedPath, ".git"));
+    if (alreadyMaterialized) {
+      let newRepoRoot: string | null = null;
+      try {
+        newRepoRoot = await resolveGitOwnerRepoRoot(predictedManagedPath);
+      } catch {
+        newRepoRoot = null;
+      }
+      if (newRepoRoot) {
+        const [canonicalOwnerRepoRoot, canonicalNewRepoRoot] = await Promise.all([
+          resolvePathForWorktreeComparison(ownerRepoRoot),
+          resolvePathForWorktreeComparison(newRepoRoot),
+        ]);
+        isCrossRepo = canonicalOwnerRepoRoot !== canonicalNewRepoRoot;
+      }
+    } else {
+      // Cold: no path exists to compare yet, and this function will not be
+      // the one to create it. Decide by repo IDENTITY instead — never by
+      // cloning. Neither raw URL is ever logged or returned; only the
+      // normalized comparison result is used below.
+      const ownerOriginUrl = await readGitStdout(["config", "--get", "remote.origin.url"], ownerRepoRoot).catch(() => null);
+      const normalizedOwner = normalizeRepoIdentityForComparison(ownerOriginUrl);
+      const normalizedNext = normalizeRepoIdentityForComparison(nextProjectWorkspaceRow.repoUrl);
+      if (normalizedOwner && normalizedNext) {
+        isCrossRepo = normalizedOwner !== normalizedNext;
+      }
+    }
+  }
+
+  if (isCrossRepo === null) {
+    return { worktreeMoved: false, worktreeMoveSkipped: "new_repo_root_unresolved" };
+  }
+  if (!isCrossRepo) {
+    return { worktreeMoved: false, worktreeMoveSkipped: "same_repo_rebind" };
+  }
+
+  return db.transaction(async (tx: Parameters<Parameters<Db["transaction"]>[0]>[0]) => {
+    await acquireExecutionWorkspaceLifecycleLock(tx, input.executionWorkspaceId);
+    const fresh = await tx
+      .select()
+      .from(executionWorkspaces)
+      .where(eq(executionWorkspaces.id, input.executionWorkspaceId))
+      .then((rows) => rows[0] ?? null);
+    const freshGeneration = fresh
+      ? readExecutionWorkspaceLifecycleGeneration(fresh.metadata as Record<string, unknown> | null)
+      : null;
+    if (
+      !fresh
+      || fresh.status !== "archived"
+      || !fresh.closedAt
+      || freshGeneration !== input.archivedGeneration
+    ) {
+      return { worktreeMoved: false, worktreeMoveSkipped: "row_changed_before_move" };
+    }
+
+    // SPA-9375 / SPA-12428, re-checked here (not just earlier) because this
+    // is the transaction that actually moves the path: a rebind between two
+    // DIFFERENT project workspaces of the SAME repo can leave a second,
+    // still-live row pointing at this exact path. Compared after
+    // path.resolve so a differently formatted stored value still collides.
+    const resolvedLeafPath = path.resolve(input.leafPath);
+    const livePathCollision = await tx
+      .select({ id: executionWorkspaces.id })
+      .from(executionWorkspaces)
+      .where(and(
+        // Host-global on purpose (Mira PR #210): the worktree path and the git
+        // move act on one shared filesystem, so a live row of ANY company at
+        // this path blocks the move.
+        ne(executionWorkspaces.id, input.executionWorkspaceId),
+        isNull(executionWorkspaces.closedAt),
+        sql<boolean>`${executionWorkspaces.status} NOT IN ('archived', 'cleanup_failed')`,
+        or(
+          eq(executionWorkspaces.cwd, input.leafPath),
+          eq(executionWorkspaces.providerRef, input.leafPath),
+          eq(executionWorkspaces.cwd, resolvedLeafPath),
+          eq(executionWorkspaces.providerRef, resolvedLeafPath),
+        ),
+      ))
+      .limit(1)
+      .then((rows) => rows[0] ?? null);
+    if (livePathCollision) {
+      return { worktreeMoved: false, worktreeMoveSkipped: "path_in_use_by_live_workspace" };
+    }
+
+    // Defense in depth for audit finding (A): the Part 0 check above should
+    // already have returned before reaching here, but never let a future
+    // refactor compute a move target inside a `runs/` directory, where
+    // `reapOrphanedRunWorktrees` would read it as an orphaned run id.
+    if (isEphemeralRunWorktreeLeafPath(input.leafPath)) {
+      return { worktreeMoved: false, worktreeMoveSkipped: "ephemeral_run_worktree" };
+    }
+
+    const movedToPath = `${input.leafPath}.rebind-retired-${input.executionWorkspaceId.slice(0, 8)}`;
+    if (existsSync(movedToPath)) {
+      return {
+        worktreeMoved: false,
+        worktreeMoveError: `Refusing to move the retired worktree: target path "${movedToPath}" already exists.`,
+      };
+    }
+
+    // SPA-12426 audit finding (C), verified empirically: unlike
+    // `git worktree remove`, a non-forced `git worktree move` does NOT
+    // refuse a dirty tree — only a LOCKED one. Re-run the same dirty check
+    // retire used earlier, immediately before the move and inside this same
+    // locked transaction, so a worktree that went dirty in the window since
+    // the earlier check is never silently relocated out from under in-flight
+    // work.
+    let dirtyAtMoveStatus: string;
+    try {
+      dirtyAtMoveStatus = (await runExpensiveGitStatus({
+        args: ["status", "--porcelain", "--untracked-files=all"],
+        cwd: input.leafPath,
+        operation: "execution_workspaces.rebind_retire_dirty_at_move",
+        fairnessKeys: [`workspace:${input.executionWorkspaceId}`],
+      })).stdout;
+    } catch (err) {
+      return {
+        worktreeMoved: false,
+        worktreeMoveError: `Could not verify the worktree at "${input.leafPath}" was still clean immediately before moving it`,
+      };
+    }
+    if (dirtyAtMoveStatus.trim().length > 0) {
+      return { worktreeMoved: false, worktreeMoveSkipped: "dirty_at_move" };
+    }
+
+    try {
+      // Non-forced: git refuses if the worktree is locked. Never --force.
+      await runGit(["worktree", "move", input.leafPath, movedToPath], ownerRepoRoot);
+    } catch (err) {
+      return { worktreeMoved: false, worktreeMoveError: "Git refused to move the retired worktree." };
+    }
+
+    try {
+      await tx
+        .update(executionWorkspaces)
+        .set({
+          cwd: movedToPath,
+          providerRef: movedToPath,
+          metadata: sql`COALESCE(${executionWorkspaces.metadata}, '{}'::jsonb) || jsonb_build_object(${EXECUTION_WORKSPACE_REBIND_RETIRED_FROM_PATH_METADATA_KEY}::text, ${input.leafPath}::text)`,
+          updatedAt: new Date(),
+        })
+        .where(and(
+          eq(executionWorkspaces.id, input.executionWorkspaceId),
+          eq(executionWorkspaces.status, "archived"),
+          sql`COALESCE((${executionWorkspaces.metadata} ->> ${EXECUTION_WORKSPACE_LIFECYCLE_GENERATION_METADATA_KEY}::text)::int, 0) = ${input.archivedGeneration}`,
+        ))
+        .returning({ id: executionWorkspaces.id })
+        .then((rows: Array<{ id: string }>) => {
+          // Mira PR #210: zero matched rows is a failure, not a success — the
+          // row must still point at the worktree's real location.
+          if (rows.length !== 1) throw new Error("row update matched no archived row at this generation");
+        });
+    } catch (err) {
+      // Best-effort revert so the row's cwd and the worktree's actual disk
+      // location never disagree with each other.
+      try {
+        await runGit(["worktree", "move", movedToPath, input.leafPath], ownerRepoRoot);
+      } catch (revertErr) {
+        return {
+          worktreeMoved: false,
+          worktreeMoveError:
+            `Row update failed after moving the worktree, and reverting the move also failed: ` +
+            `(row update failed); revert error: ` +
+            `(revert failed)`,
+        };
+      }
+      return {
+        worktreeMoved: false,
+        worktreeMoveError: `Row update failed after moving the worktree; the move was reverted`,
+      };
+    }
+
+    return { worktreeMoved: true, worktreeMovedTo: movedToPath };
   });
 }
 
 export { toExecutionWorkspace };
+
+// SPA-12426: exported ONLY for the "row changed before move" test in
+// workspace-runtime.test.ts. That test needs to call this directly with a
+// deliberately stale `archivedGeneration` to simulate a reopen that won the
+// race between `archiveWorkspaceForRebind`'s transaction committing (which
+// releases the lifecycle advisory lock) and this function's transaction
+// acquiring it — a race the public
+// `retireExecutionWorkspaceAfterProjectWorkspaceRebind` entry point closes
+// before any caller could ever observe the gap, so there is no way to drive
+// this path through the public API alone. Not part of the service's public
+// surface; do not call this from application code.
+export { relocateRetiredWorktreeIfCrossRepo as __testOnlyRelocateRetiredWorktreeIfCrossRepo };

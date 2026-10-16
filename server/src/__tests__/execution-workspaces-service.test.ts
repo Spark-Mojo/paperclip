@@ -39,6 +39,7 @@ import {
   mergeCleanupCommandsExecutedMetadata,
   mergeExecutionWorkspaceConfig,
   metadataHasReopenPendingConsumption,
+  normalizeRepoIdentityForComparison,
   readCleanupCommandsExecutedAt,
   readExecutionWorkspaceConfig,
   readMetadataReopenPendingConsumptionSince,
@@ -156,6 +157,134 @@ describe("execution workspace config helpers", () => {
     )).toEqual({
       source: "project_primary",
     });
+  });
+});
+
+// SPA-12426 audit re-re-audit: `normalizeRepoIdentityForComparison` is the
+// seam `relocateRetiredWorktreeIfCrossRepo` uses to decide cross-repo
+// identity for a COLD managed_checkout (no filesystem path to compare yet).
+// A wrongful MOVE is unsafe (the fix rule this guards); a wrongful SKIP
+// just reproduces the old, already-tolerated symptom. These pure, fast
+// cases exercise the normalizer directly, independent of the embedded-PG
+// suite below.
+describe("normalizeRepoIdentityForComparison SPA-12426", () => {
+  it("returns null for IPv6 or bracketed hosts in either syntax (round-5 audit: scp mis-split caused a wrongful move)", () => {
+    expect(normalizeRepoIdentityForComparison("git@[::1]:owner/repo.git")).toBeNull();
+    expect(normalizeRepoIdentityForComparison("ssh://git@[::1]/owner/repo.git")).toBeNull();
+    expect(normalizeRepoIdentityForComparison("https://[2001:db8::1]/owner/repo.git")).toBeNull();
+  });
+
+  it("returns null for every IPv4 spelling, so scp and scheme forms can never disagree (final audit)", () => {
+    for (const u of [
+      "git@127.1:owner/repo.git", "https://127.1/owner/repo.git",
+      "https://2130706433/owner/repo.git", "git@0x7f.0.0.1:owner/repo.git",
+      "git@10.0.0.5:owner/repo.git", "https://10.0.0.5/owner/repo.git",
+    ]) expect(normalizeRepoIdentityForComparison(u)).toBeNull();
+  });
+
+  it("still resolves DNS hosts, including ones with digits in a label", () => {
+    expect(normalizeRepoIdentityForComparison("https://github.com/owner/repo.git")).not.toBeNull();
+    expect(normalizeRepoIdentityForComparison("git@git.1password.example:owner/repo.git")).toBe(
+      normalizeRepoIdentityForComparison("https://git.1password.example/owner/repo.git"),
+    );
+  });
+
+  it("treats an ssh URL with an explicit port and the plain https form of the same repo as equal", () => {
+    const a = normalizeRepoIdentityForComparison("ssh://git@host:2222/org/repo.git");
+    const b = normalizeRepoIdentityForComparison("https://host/org/repo.git");
+    expect(a).not.toBeNull();
+    expect(a).toBe(b);
+  });
+
+  it("treats scp-style syntax and the https form of the same repo as equal", () => {
+    const a = normalizeRepoIdentityForComparison("git@github.com:acme/same-repo.git");
+    const b = normalizeRepoIdentityForComparison("https://github.com/acme/same-repo");
+    expect(a).not.toBeNull();
+    expect(a).toBe(b);
+  });
+
+  it("returns null for a credential containing a raw '/' that could otherwise make the URL parser compute the wrong host", () => {
+    // Verified empirically: `new URL(...)` on this exact string resolves to
+    // host "user:p" (NOT "github.com") because "p" fails port validation,
+    // throwing — but the sibling case below with a VALID numeric port does
+    // not throw and silently returns the wrong host, so this function must
+    // reject the raw-'/' shape on its own terms rather than relying on
+    // `new URL()` to throw.
+    expect(normalizeRepoIdentityForComparison("https://user:p/ss@github.com/acme/repo.git")).toBeNull();
+  });
+
+  it("returns null for a credential containing a raw '/' even when the bogus port is numeric and new URL() does not throw", () => {
+    // The dangerous case: `new URL("https://user:80/ss@host.com/org/repo.git").host`
+    // is "user:80" — a successful parse with the WRONG host — so this test
+    // fails if the implementation ever starts trusting `new URL()` alone.
+    expect(new URL("https://user:80/ss@host.com/org/repo.git").host).toBe("user:80");
+    expect(normalizeRepoIdentityForComparison("https://user:80/ss@host.com/org/repo.git")).toBeNull();
+  });
+
+  it("returns null for more than one '@' before the path", () => {
+    expect(normalizeRepoIdentityForComparison("a@b@host")).toBeNull();
+    expect(normalizeRepoIdentityForComparison("https://a@b@host/org/repo")).toBeNull();
+  });
+
+  it("returns null for a path that is not exactly owner/name", () => {
+    expect(normalizeRepoIdentityForComparison("https://host/org/repo/extra")).toBeNull();
+    expect(normalizeRepoIdentityForComparison("https://host/org")).toBeNull();
+  });
+
+  it("returns null for an unparsable scheme URL", () => {
+    expect(normalizeRepoIdentityForComparison("https://")).toBeNull();
+    expect(normalizeRepoIdentityForComparison("not a url at all")).toBeNull();
+  });
+
+  it("returns null for a blank or missing value", () => {
+    expect(normalizeRepoIdentityForComparison(null)).toBeNull();
+    expect(normalizeRepoIdentityForComparison(undefined)).toBeNull();
+    expect(normalizeRepoIdentityForComparison("   ")).toBeNull();
+  });
+
+  it("treats two different owners on the same host as unequal", () => {
+    const a = normalizeRepoIdentityForComparison("https://github.com/acme/repo.git");
+    const b = normalizeRepoIdentityForComparison("https://github.com/other-org/repo.git");
+    expect(a).not.toBeNull();
+    expect(b).not.toBeNull();
+    expect(a).not.toBe(b);
+  });
+
+  it("treats two different repo names under the same owner as unequal", () => {
+    const a = normalizeRepoIdentityForComparison("https://github.com/acme/repo-one.git");
+    const b = normalizeRepoIdentityForComparison("https://github.com/acme/repo-two.git");
+    expect(a).not.toBeNull();
+    expect(b).not.toBeNull();
+    expect(a).not.toBe(b);
+  });
+
+  it("treats two different hosts carrying the same owner/name as unequal", () => {
+    const a = normalizeRepoIdentityForComparison("https://github.com/acme/repo.git");
+    const b = normalizeRepoIdentityForComparison("https://gitlab.com/acme/repo.git");
+    expect(a).not.toBeNull();
+    expect(b).not.toBeNull();
+    expect(a).not.toBe(b);
+  });
+
+  it("folds case so a path differing only by case normalizes equal (documented safe direction: this can only cause a SKIP, never a wrongful move)", () => {
+    const a = normalizeRepoIdentityForComparison("https://GitHub.com/Acme/Repo.git");
+    const b = normalizeRepoIdentityForComparison("https://github.com/acme/repo");
+    expect(a).not.toBeNull();
+    expect(a).toBe(b);
+  });
+
+  it("ignores a differing port/scheme between two URLs for the same host/owner/name", () => {
+    const a = normalizeRepoIdentityForComparison("https://host:8443/org/repo.git");
+    const b = normalizeRepoIdentityForComparison("ssh://git@host/org/repo.git");
+    expect(a).not.toBeNull();
+    expect(a).toBe(b);
+  });
+
+  it("never allows credentials embedded in the URL to appear in the normalized identity", () => {
+    const normalized = normalizeRepoIdentityForComparison("https://x-access-token:SUPER-SECRET-TOKEN@github.com/acme/repo.git");
+    expect(normalized).not.toBeNull();
+    expect(normalized).not.toContain("SUPER-SECRET-TOKEN");
+    expect(normalized).toBe("github.com/acme/repo");
   });
 });
 
