@@ -324,6 +324,7 @@ import { secretService, type MissingRuntimeBinding } from "./secrets.js";
 import {
   resolveDefaultAgentWorkspaceDir,
   resolveManagedProjectWorkspaceDir,
+  resolvePaperclipInstanceRoot,
 } from "../home-paths.js";
 import {
   buildHeartbeatRunIssueComment,
@@ -2861,13 +2862,28 @@ export async function prepareProjectRepositoryWorkspaces(input: {
     if (result.warning) throw new Error(result.warning);
     results.push({ workspaceId: workspace.id, cwd, repoUrl, repoRef: workspace.repoRef });
   }
-  // Retain detached checkout work outside the synchronized repository set.
+  // Retain detached checkouts outside the worktree under the instance root (never
+  // `<cwd>/.paperclip-runtime/...`): an in-worktree retention dir is untracked, so it shows
+  // up as `?? .paperclip-runtime/` in `git status --porcelain` and fails the D138 run-exit
+  // tree-dirty gate (GH #1366).
   const active = new Set(results.map((repo) => path.basename(repo.cwd)));
   for (const entry of await fs.readdir(root)) {
     if (active.has(entry) || entry.includes(".clone-")) continue;
-    const retained = path.join(input.cwd, ".paperclip-runtime", "detached-repositories", randomUUID());
-    await fs.mkdir(path.dirname(retained), { recursive: true });
-    await fs.rename(path.join(root, entry), retained);
+    const retentionId = randomUUID();
+    const retentionDir = path.join(resolvePaperclipInstanceRoot(), "detached-repositories", retentionId);
+    await fs.mkdir(path.dirname(retentionDir), { recursive: true });
+    const source = path.join(root, entry);
+    try {
+      await fs.rename(source, retentionDir);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException)?.code !== "EXDEV") throw error;
+      await fs.cp(source, retentionDir, { recursive: true });
+      await fs.rm(source, { recursive: true, force: true });
+    }
+    await fs.writeFile(
+      path.join(path.dirname(retentionDir), `${retentionId}.json`),
+      JSON.stringify({ retainedFrom: source, entry, retainedAt: new Date().toISOString(), reason: "workspace-rescope" }),
+    );
   }
   return results;
 }
