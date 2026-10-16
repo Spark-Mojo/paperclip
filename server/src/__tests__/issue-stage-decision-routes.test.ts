@@ -324,6 +324,42 @@ describeEmbeddedPostgres("issue stage decision routes", () => {
     expect(persisted.executionState.completedStageIds).toContain(stageId1);
   });
 
+  it("approve retry across stage transition is idempotent", async () => {
+    const seeded = await seedCompany("RTY");
+    const { issueId, stageId1, stageId2 } = await seedStageIssue({
+      companyId: seeded.companyId,
+      builderAgentId: seeded.assigneeAgentId,
+      reviewerAgentId: seeded.reviewerAgentId,
+      identifier: "RTY-1",
+      stageCount: 2,
+    });
+    const runId = await seedRun(seeded.companyId, seeded.reviewerAgentId, issueId);
+    const actor = agentActor(seeded.companyId, seeded.reviewerAgentId, runId);
+    const payload = { action: "approve", body: "Stage one looks good, retry me." };
+
+    const first = await request(app(actor))
+      .post(`/api/issues/${issueId}/stage-decision`)
+      .send(payload);
+    expect(first.status, JSON.stringify(first.body)).toBe(200);
+    expect(first.body.duplicate ?? false).toBe(false);
+    let persisted = await readIssue(issueId);
+    expect(persisted.executionState.currentStageId).toBe(stageId2);
+    expect(persisted.executionState.completedStageIds).toContain(stageId1);
+    expect(persisted.executionState.completedStageIds).not.toContain(stageId2);
+
+    const second = await request(app(actor))
+      .post(`/api/issues/${issueId}/stage-decision`)
+      .send(payload);
+    expect(second.status, JSON.stringify(second.body)).toBe(200);
+    expect(second.body.duplicate).toBe(true);
+    expect(second.body.decision.id).toBe(first.body.decision.id);
+    expect(await countDecisions(issueId, seeded.companyId)).toHaveLength(1);
+    persisted = await readIssue(issueId);
+    expect(persisted.executionState.currentStageId).toBe(stageId2);
+    expect(persisted.executionState.completedStageIds).not.toContain(stageId2);
+    expect(persisted.executionState.lastDecisionId).toBe(first.body.decision.id);
+  });
+
   it("rejects a non-participant stranger with 422 and admits the designated participant", async () => {
     const seeded = await seedCompany("STR");
     const { issueId } = await seedStageIssue({
