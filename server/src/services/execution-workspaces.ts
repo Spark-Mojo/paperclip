@@ -4157,6 +4157,11 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
             leafPath,
             nextProjectWorkspaceId: input.nextProjectWorkspaceId,
             archivedGeneration: retired.generation,
+            // SPA-12426 audit finding (A): the row's own stored flag is the
+            // authoritative signal for an ephemeral per-run worktree (see
+            // SPA-9275); the function also re-derives it from the leaf
+            // path shape as a fallback.
+            ephemeralLifecycle: (row.metadata as Record<string, unknown> | null)?.ephemeralLifecycle === true,
           });
           worktreeMoved = moveResult.worktreeMoved;
           worktreeMovedTo = moveResult.worktreeMovedTo;
@@ -4308,10 +4313,33 @@ async function archiveWorkspaceForRebind(
 // `<path>.rebind-retired-<rowId>` directory apart from a normal worktree.
 const EXECUTION_WORKSPACE_REBIND_RETIRED_FROM_PATH_METADATA_KEY = "rebindRetiredFromPath";
 
+// SPA-12426 audit finding (A): the per-run ephemeral worktree shape
+// (`${worktreeParentDir}/runs/<runId>/`, SPA-9275). `reapOrphanedRunWorktrees`
+// treats EVERY directory directly under a `runs/` dir as a run id and may
+// force-remove or rm -rf it independently of this service, DB-blind at boot.
+// A `<runId>.rebind-retired-<id8>` sibling would still read as "every child
+// dir name is a runId" to that sweep and get force-removed out from under us.
+// The run-id path is keyed by run id already, so it can never collide with a
+// branch-template realize in the first place — there is nothing for this
+// function to clear, ever.
+function isEphemeralRunWorktreeLeafPath(leafPath: string): boolean {
+  return path.basename(path.dirname(leafPath)) === "runs";
+}
+
 /**
  * SPA-12426: once `archiveWorkspaceForRebind` has archived a row for a
  * project-workspace rebind, this decides whether the OLD worktree directory
  * needs to move out of the way, and if so, moves it — never removes it.
+ *
+ * Part 0 (ephemeral run worktrees, audit finding (A)): never relocates a
+ * `${worktreeParentDir}/runs/<runId>/` worktree. Detected first from the
+ * row's own `ephemeralLifecycle` metadata flag (SPA-9275; authoritative when
+ * present), falling back to the leaf's parent directory being literally
+ * named `runs` (the same signal `sweepTerminalIssueRunWorktrees` already
+ * uses). Skips with `"ephemeral_run_worktree"` before resolving anything
+ * else, so the move target can never be constructed inside a `runs/` dir;
+ * the construction site below re-checks the path shape anyway as a second,
+ * defense-in-depth guard against a future refactor reordering these checks.
  *
  * Part A (cross-repo only, closes audit finding (2)): the OLD worktree only
  * collides with a FUTURE realize when the new project workspace is a
@@ -4323,10 +4351,15 @@ const EXECUTION_WORKSPACE_REBIND_RETIRED_FROM_PATH_METADATA_KEY = "rebindRetired
  * against the canonical repo root of the project workspace
  * `nextProjectWorkspaceId` now points at, both normalized through
  * `resolvePathForWorktreeComparison` (the same realpath-based comparison the
- * SPA-11953 fence uses). Equal roots skip with `"same_repo_rebind"`. Unable
- * to resolve the new side at all (no id, no row, not a git checkout) skips
- * with `"new_repo_root_unresolved"` — this function never moves a worktree
- * it cannot prove is cross-repo.
+ * SPA-11953 fence uses). Equal roots skip with `"same_repo_rebind"`. A
+ * `managed_checkout` project workspace stores `cwd = NULL` — its live
+ * checkout path is resolved on demand the same way
+ * `reopenClosedIsolatedExecutionWorkspaceForIssue` resolves it for a rebuild
+ * (`ensureManagedProjectWorkspace`, materializing the checkout if it is not
+ * already there). Still unresolvable after that (no next id, no row, no
+ * `repoUrl` to materialize from, or materialization itself fails) skips with
+ * `"new_repo_root_unresolved"` — this function never moves a worktree it
+ * cannot prove is cross-repo.
  *
  * Part B (move, never remove, closes audit finding (3)): a non-forced `git
  * worktree remove` silently deletes gitignored content — `.unlazy/` ledgers,
@@ -4334,18 +4367,21 @@ const EXECUTION_WORKSPACE_REBIND_RETIRED_FROM_PATH_METADATA_KEY = "rebindRetired
  * committed — with no signal that it happened. `git worktree move` to a
  * sibling `<path>.rebind-retired-<rowId-prefix>` path frees the original
  * path for the new repo's realize while preserving everything on disk.
- * Never forced: git itself refuses the move if the worktree is locked or
- * went dirty since the earlier clean check, and that refusal surfaces as
- * `worktreeMoveError` rather than losing anything.
+ * Never forced: git refuses the move if the worktree is LOCKED, but
+ * (verified empirically) a non-forced move does NOT refuse a dirty tree the
+ * way `git worktree remove` does — so immediately before the move, inside
+ * the same locked transaction, this re-runs `git status --porcelain
+ * --untracked-files=all` on the leaf and skips with `"dirty_at_move"` if it
+ * is non-empty, rather than relying on git to refuse.
  *
  * Part C (one lock, one transaction, closes audit finding (1) — the reopen
  * race): `archiveWorkspaceForRebind` released the lifecycle advisory lock
  * when ITS transaction committed, so a reopen could in principle acquire it
  * and rebuild at `leafPath` before this function ever runs. The live-row
- * collision check, the move, and the row update here all run inside ONE
- * transaction that re-acquires that same lock and re-reads the row UNDER the
- * lock, requiring status `archived`, `closedAt` set, and the lifecycle
- * generation still equal to `archivedGeneration` (the generation
+ * collision check, the dirty re-check, the move, and the row update here all
+ * run inside ONE transaction that re-acquires that same lock and re-reads the
+ * row UNDER the lock, requiring status `archived`, `closedAt` set, and the
+ * lifecycle generation still equal to `archivedGeneration` (the generation
  * `archiveWorkspaceForRebind` itself just wrote). A reopen that won the race
  * has already bumped the generation by the time this acquires the lock, so
  * this backs off with `"row_changed_before_move"` instead of moving a
@@ -4366,6 +4402,7 @@ async function relocateRetiredWorktreeIfCrossRepo(
     leafPath: string;
     nextProjectWorkspaceId: string | null;
     archivedGeneration: number;
+    ephemeralLifecycle: boolean;
   },
 ): Promise<{
   worktreeMoved: boolean;
@@ -4373,6 +4410,15 @@ async function relocateRetiredWorktreeIfCrossRepo(
   worktreeMoveError?: string;
   worktreeMoveSkipped?: string;
 }> {
+  // Part 0 / audit finding (A). Checked first, before any filesystem or git
+  // resolution: an ephemeral run worktree's path is keyed by run id, so it
+  // can never collide with a branch-template realize — there is nothing to
+  // clear, and relocating it would hand `reapOrphanedRunWorktrees` a new
+  // child directory under `runs/` that it reads as an orphaned run id.
+  if (input.ephemeralLifecycle || isEphemeralRunWorktreeLeafPath(input.leafPath)) {
+    return { worktreeMoved: false, worktreeMoveSkipped: "ephemeral_run_worktree" };
+  }
+
   const { resolveGitOwnerRepoRoot, resolvePathForWorktreeComparison } = await import("./workspace-runtime.js");
 
   let ownerRepoRoot: string;
@@ -4385,16 +4431,43 @@ async function relocateRetiredWorktreeIfCrossRepo(
     };
   }
 
-  const nextProjectWorkspaceCwd = input.nextProjectWorkspaceId
+  const nextProjectWorkspaceRow = input.nextProjectWorkspaceId
     ? await db
-        .select({ cwd: projectWorkspaces.cwd })
+        .select({
+          cwd: projectWorkspaces.cwd,
+          repoUrl: projectWorkspaces.repoUrl,
+          projectId: projectWorkspaces.projectId,
+        })
         .from(projectWorkspaces)
         .where(and(
           eq(projectWorkspaces.companyId, input.companyId),
           eq(projectWorkspaces.id, input.nextProjectWorkspaceId),
         ))
-        .then((rows) => rows[0]?.cwd ?? null)
+        .then((rows) => rows[0] ?? null)
     : null;
+
+  let nextProjectWorkspaceCwd = nextProjectWorkspaceRow?.cwd ?? null;
+  if (!nextProjectWorkspaceCwd && nextProjectWorkspaceRow?.projectId) {
+    // SPA-12426 audit finding (B): a `managed_checkout` project workspace
+    // stores `cwd = NULL` — there is no path to compare until the checkout
+    // is materialized. Resolve it the same way
+    // `reopenClosedIsolatedExecutionWorkspaceForIssue` resolves a rebuild's
+    // base cwd, so a managed_checkout target no longer silently falls
+    // through to "unresolved" and reproduces the original SPA-12426
+    // collision on every managed_checkout project.
+    try {
+      const { ensureManagedProjectWorkspace } = await import("./heartbeat.js");
+      const managedWorkspace = await ensureManagedProjectWorkspace({
+        companyId: input.companyId,
+        projectId: nextProjectWorkspaceRow.projectId,
+        repoUrl: nextProjectWorkspaceRow.repoUrl,
+        resolveGitAuth: createGitRemoteAuthProvider(db, input.companyId),
+      });
+      nextProjectWorkspaceCwd = managedWorkspace.cwd;
+    } catch {
+      nextProjectWorkspaceCwd = null;
+    }
+  }
 
   let newRepoRoot: string | null = null;
   if (nextProjectWorkspaceCwd) {
@@ -4462,6 +4535,14 @@ async function relocateRetiredWorktreeIfCrossRepo(
       return { worktreeMoved: false, worktreeMoveSkipped: "path_in_use_by_live_workspace" };
     }
 
+    // Defense in depth for audit finding (A): the Part 0 check above should
+    // already have returned before reaching here, but never let a future
+    // refactor compute a move target inside a `runs/` directory, where
+    // `reapOrphanedRunWorktrees` would read it as an orphaned run id.
+    if (isEphemeralRunWorktreeLeafPath(input.leafPath)) {
+      return { worktreeMoved: false, worktreeMoveSkipped: "ephemeral_run_worktree" };
+    }
+
     const movedToPath = `${input.leafPath}.rebind-retired-${input.executionWorkspaceId.slice(0, 8)}`;
     if (existsSync(movedToPath)) {
       return {
@@ -4470,9 +4551,33 @@ async function relocateRetiredWorktreeIfCrossRepo(
       };
     }
 
+    // SPA-12426 audit finding (C), verified empirically: unlike
+    // `git worktree remove`, a non-forced `git worktree move` does NOT
+    // refuse a dirty tree — only a LOCKED one. Re-run the same dirty check
+    // retire used earlier, immediately before the move and inside this same
+    // locked transaction, so a worktree that went dirty in the window since
+    // the earlier check is never silently relocated out from under in-flight
+    // work.
+    let dirtyAtMoveStatus: string;
     try {
-      // Non-forced: git itself refuses if the worktree is locked or became
-      // dirty between the earlier clean check and here. Never --force.
+      dirtyAtMoveStatus = (await runExpensiveGitStatus({
+        args: ["status", "--porcelain", "--untracked-files=all"],
+        cwd: input.leafPath,
+        operation: "execution_workspaces.rebind_retire_dirty_at_move",
+        fairnessKeys: [`workspace:${input.executionWorkspaceId}`],
+      })).stdout;
+    } catch (err) {
+      return {
+        worktreeMoved: false,
+        worktreeMoveError: `Could not verify the worktree at "${input.leafPath}" was still clean immediately before moving it: ${err instanceof Error ? err.message : String(err)}`,
+      };
+    }
+    if (dirtyAtMoveStatus.trim().length > 0) {
+      return { worktreeMoved: false, worktreeMoveSkipped: "dirty_at_move" };
+    }
+
+    try {
+      // Non-forced: git refuses if the worktree is locked. Never --force.
       await runGit(["worktree", "move", input.leafPath, movedToPath], ownerRepoRoot);
     } catch (err) {
       return { worktreeMoved: false, worktreeMoveError: err instanceof Error ? err.message : String(err) };
