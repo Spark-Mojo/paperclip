@@ -910,6 +910,16 @@ export const stalledReviewDecisionSchema = z
 
 export type StalledReviewDecision = z.infer<typeof stalledReviewDecisionSchema>;
 
+export const stageDecisionSchema = z
+  .object({
+    action: z.enum(["approve", "request_changes"]),
+    body: z.string().min(1),
+    stageId: z.string().min(1),
+  })
+  .strict();
+
+export type StageDecisionInput = z.infer<typeof stageDecisionSchema>;
+
 export const checkoutIssueSchema = z.object({
   agentId: z.string().guid(),
   expectedStatuses: z.array(z.enum(ISSUE_STATUSES)).nonempty(),
