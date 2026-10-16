@@ -93,6 +93,7 @@ import {
   restoreIssueDocumentRevisionSchema,
   respondIssueThreadInteractionSchema,
   stalledReviewDecisionSchema,
+  stageDecisionSchema,
   submitIssueThreadInteractionVerdictsSchema,
   updateIssueWorkProductSchema,
   updateDocumentAnnotationThreadSchema,
@@ -278,6 +279,7 @@ import {
 } from "../services/issues.js";
 import { authorizationDeniedDetails } from "../services/authorization.js";
 import { stalledReviewDecisionService } from "../services/stalled-review-decisions.js";
+import { stageDecisionService } from "../services/issue-stage-decisions.js";
 import { environmentService } from "../services/environments.js";
 import { environmentRuntimeService } from "../services/environment-runtime.js";
 import { redactSensitiveText } from "../redaction.js";
@@ -13059,6 +13061,50 @@ export function issueRoutes(
         action: req.body.action,
         comment: result.comment,
         wakeQueued,
+      });
+    },
+  );
+
+  router.post(
+    "/issues/:id/stage-decision",
+    validate(stageDecisionSchema),
+    async (req, res) => {
+      const id = req.params.id as string;
+      const existing = await getAccessibleResource(
+        req,
+        res,
+        svc.getById(id),
+        "Issue not found",
+      );
+      if (!existing) return;
+      const issueMutationAccess = await assertAgentIssueMutationAllowed(
+        req,
+        res,
+        existing,
+        {
+          allowVisibleIssueWrite: true,
+          requestedStatusTransition: null,
+        },
+      );
+      if (!issueMutationAccess) return;
+
+      const actor = getActorInfo(req);
+      const result = await stageDecisionService(db).decide({
+        issueId: existing.id,
+        companyId: existing.companyId,
+        action: req.body.action,
+        body: req.body.body,
+        actor: {
+          agentId: actor.actorType === "agent" ? actor.agentId : null,
+          userId: actor.actorType === "user" ? actor.actorId : null,
+          runId: actor.runId ?? null,
+        },
+      });
+
+      res.json({
+        issue: result.issue,
+        decision: result.decision,
+        duplicate: result.duplicate,
       });
     },
   );
