@@ -105,18 +105,29 @@ export interface IssueRewakeCandidateInput {
   hasExplicitResume: boolean;
 }
 
+const NO_EXTRA_ISSUE_REWAKE_REASONS: ReadonlySet<string> = new Set();
+
 /**
  * Whether a wake is even a candidate for throttling. Wakes that carry new
  * information or an explicit operator escalation always pass.
+ *
+ * `extraReasons` lets a caller widen candidacy for a specific downstream
+ * decision without changing the shared cooldown throttle's own reason set —
+ * the circuit breaker uses this to also gate `finish_successful_run_handoff`
+ * (audit finding, PR #211) while every other caller keeps the original
+ * THROTTLED_ISSUE_REWAKE_REASONS-only behavior unchanged.
  */
-export function isThrottleCandidateIssueRewake(input: IssueRewakeCandidateInput): boolean {
+export function isThrottleCandidateIssueRewake(
+  input: IssueRewakeCandidateInput,
+  extraReasons: ReadonlySet<string> = NO_EXTRA_ISSUE_REWAKE_REASONS,
+): boolean {
   if (input.forceFreshSession) return false;
   // Explicit resume is an operator privilege, not an actor-class escape hatch.
   // Agent-authored resume comments remain subject to the normal rewake throttle.
   if (input.hasExplicitResume && input.requestedByActorType !== "agent") return false;
   if (input.wakeCommentId) return input.requestedByActorType === "agent";
   if (input.reason === null) return true;
-  return THROTTLED_ISSUE_REWAKE_REASONS.has(input.reason);
+  return THROTTLED_ISSUE_REWAKE_REASONS.has(input.reason) || extraReasons.has(input.reason);
 }
 
 export interface RecentIssueRunSample {
@@ -151,6 +162,174 @@ export function computeIssueRewakeCooldownMs(noProgressStreak: number): number {
   const factor = 2 ** Math.min(doublings, 16);
   return Math.min(ISSUE_REWAKE_BASE_COOLDOWN_MS * factor, ISSUE_REWAKE_MAX_COOLDOWN_MS);
 }
+
+/**
+ * PAP-13775 follow-up: the escalating cooldown above slows a no-progress loop
+ * but never stops it — it caps at ISSUE_REWAKE_MAX_COOLDOWN_MS and keeps
+ * re-admitting forever (measured 10-16: SPA-12493 ran ~120 times). This is
+ * the permanent circuit breaker on top of the same streak computation: once
+ * a card's last N consecutive terminal runs for the same agent all landed
+ * with no issue-visible progress, the engine stops scheduling further
+ * continuation/handoff wakes for it entirely rather than just slowing them
+ * down. The caller is responsible for actually moving the card to `backlog`
+ * and posting the one-time notice; this module only decides whether that
+ * should happen.
+ */
+export const ISSUE_REWAKE_CIRCUIT_BREAKER_THRESHOLD_ENV_VAR =
+  "PAPERCLIP_ISSUE_REWAKE_CIRCUIT_BREAKER_THRESHOLD";
+
+/** Matches the default asked for: 3 consecutive no-progress runs trips it. */
+export const ISSUE_REWAKE_CIRCUIT_BREAKER_DEFAULT_THRESHOLD = 3;
+
+// A 1-run breaker would trip on ordinary variance (a single slow or
+// ambiguous run is not a loop); a cap keeps a misconfigured env var from
+// disabling the breaker in all practical terms.
+const ISSUE_REWAKE_CIRCUIT_BREAKER_MIN_THRESHOLD = 2;
+// Capped at the run sample size: the streak can never exceed the number of
+// runs heartbeat samples, so a higher threshold would silently never trip.
+const ISSUE_REWAKE_CIRCUIT_BREAKER_MAX_THRESHOLD = ISSUE_REWAKE_RUN_SAMPLE_LIMIT;
+
+export function normalizeIssueRewakeCircuitBreakerThreshold(value: unknown): number {
+  const parsed =
+    typeof value === "number"
+      ? value
+      : typeof value === "string" && value.trim() !== ""
+        ? Number(value.trim())
+        : NaN;
+  if (!Number.isFinite(parsed)) return ISSUE_REWAKE_CIRCUIT_BREAKER_DEFAULT_THRESHOLD;
+  return Math.max(
+    ISSUE_REWAKE_CIRCUIT_BREAKER_MIN_THRESHOLD,
+    Math.min(ISSUE_REWAKE_CIRCUIT_BREAKER_MAX_THRESHOLD, Math.floor(parsed)),
+  );
+}
+
+export const ISSUE_REWAKE_CIRCUIT_BREAKER_TRIPPED_REASON =
+  "issue_rewake_circuit_breaker_tripped";
+
+/**
+ * activity_log action the breaker logs against the issue on every trip
+ * (actorType "system", no run id). The delegation veto's caller MUST
+ * exclude this exact action from its own evidence query: a second trip
+ * evaluation (a duplicate of the same streak, or a genuinely later streak
+ * whose window still reaches back far enough) would otherwise see the
+ * breaker's own prior bookkeeping entry — actorType "system", runId null —
+ * and self-match it as "a human/system action with no run id", vetoing a
+ * trip the breaker should make. This is the same self-match class as the
+ * original audit finding (issue.successful_run_handoff_required logged
+ * under the stuck run's own id), just against the breaker's own record
+ * instead of another subsystem's.
+ */
+export const ISSUE_REWAKE_CIRCUIT_BREAKER_TRIPPED_ACTIVITY_ACTION =
+  "issue.no_progress_circuit_breaker_tripped";
+
+/** Fixed prefix of the one-time card comment; used to dedupe the notice. */
+export const ISSUE_REWAKE_CIRCUIT_BREAKER_NOTICE_PREFIX =
+  "Paperclip stopped automatic re-wakes for this card";
+
+/**
+ * Pure trip decision. Deliberately conservative: a card owned by a human —
+ * assigned directly (`assigneeUserId`) or holding the conversation seat
+ * (`conversationUserId`, audit finding #3, PR #211) — never trips. A false
+ * trip strands real work, a miss only costs tokens. The streak itself
+ * already excludes failed/cancelled runs (evaluateIssueRewakeThrottle breaks
+ * the streak there) and resets on new issue input, so this only needs the
+ * human-ownership guard; the delegation veto below is a second, independent
+ * guard the caller applies before actually tripping.
+ */
+export function shouldTripIssueRewakeCircuitBreaker(input: {
+  noProgressStreak: number;
+  threshold: number;
+  isHumanOwned: boolean;
+}): boolean {
+  if (input.isHumanOwned) return false;
+  return input.noProgressStreak >= input.threshold;
+}
+
+export interface BreakerSampledRun {
+  id: string;
+  startedAt: Date | null;
+  finishedAt: Date | null;
+}
+
+/**
+ * Audit finding #2 (PR #211): the primary progress check only looks at
+ * activity logged directly against THIS issue under one of this agent's own
+ * sampled run ids, so a delegated child issue (a fan-out worker doing real
+ * work) or a subagent's comment/activity on this same issue under its own
+ * run id is invisible to it — a parent that is genuinely delegating looks
+ * identical to one that is stuck.
+ *
+ * This resolves the time window the caller should search across both of
+ * those evidence shapes in: the union of the counted no-progress runs' own
+ * windows, from the earliest counted run's start through now. Veto-only
+ * logic lives in the caller (it needs a DB read); this function only
+ * decides the window, so a wider window can only make the breaker MORE
+ * reluctant to trip, never the opposite.
+ */
+export function resolveBreakerExtraProgressWindowStart(input: {
+  recentTerminalRuns: BreakerSampledRun[];
+  noProgressStreak: number;
+}): Date | null {
+  const counted = input.recentTerminalRuns.slice(0, input.noProgressStreak);
+  const starts = counted
+    .map((run) => run.startedAt ?? run.finishedAt)
+    .filter((value): value is Date => value instanceof Date);
+  if (starts.length === 0) return null;
+  return new Date(Math.min(...starts.map((date) => date.getTime())));
+}
+
+/**
+ * Per-trip marker embedded as the first line of the notice. Keying dedup on
+ * this (instead of the bare, forever-global prefix — audit finding #4, PR
+ * #211) means a concurrent duplicate evaluation of the SAME streak (same
+ * newest counted run) still posts exactly one comment, while a genuinely
+ * later trip (a different streak, so a different newest run id) posts a
+ * fresh one instead of silently no-op'ing forever after the first trip ever
+ * recorded on this card.
+ */
+export function issueRewakeCircuitBreakerNoticeMarker(newestRunId: string): string {
+  return `${ISSUE_REWAKE_CIRCUIT_BREAKER_NOTICE_PREFIX} (run ${newestRunId})`;
+}
+
+export function buildIssueRewakeCircuitBreakerNotice(input: {
+  streak: number;
+  /** Run ids counted toward the streak, newest first. */
+  runIds: string[];
+}): string {
+  const newestRunId = input.runIds[0] ?? "unknown";
+  const runList = input.runIds.map((id) => `\`${id}\``).join(", ") || "(none)";
+  return [
+    issueRewakeCircuitBreakerNoticeMarker(newestRunId),
+    `The last ${input.streak} consecutive runs ended with no issue-visible progress (issue status unchanged, no new comment, no new work product, no delegated child-issue activity).`,
+    `Runs counted toward this streak, newest first: ${runList}.`,
+    "This card was moved to `backlog` so it stops consuming runs for no new information.",
+    "To resume automatic work: move the card back to `todo` (or reassign it). Either change counts as new progress and resets this breaker.",
+  ].join("\n\n");
+}
+
+/**
+ * REJECTED: a second "comment-only" streak tier (counting a run toward the
+ * breaker when the assignee's own repeated comment was its only
+ * progress-list activity, e.g. an agent re-reporting the same guard denial
+ * every run — measured on SPA-12493: 136 issue.comment_added rows against
+ * 58 issue.successful_run_handoff_required rows over 2 days, run_id set).
+ * Built and then reverted on re-audit (PR #211) once production data ruled
+ * it out: classifying runs by their own run-linked issue activity over 3
+ * days, 40 cards had 6+ consecutive comment-only runs, and 13 of those
+ * later finished `done` — SPA-12320 (98 consecutive comment-only runs),
+ * SPA-12339 (36), SPA-11895 (31), and others. Those were cards legitimately
+ * waiting on CI or review, commenting status each cycle; a comment-only
+ * tier at any threshold would have stranded all of them in `backlog`. No
+ * threshold separates "stuck, spinning" from "waiting, reporting status" in
+ * this signal — the loop that motivated this breaker needs a different,
+ * more specific detector, not a second generic streak.
+ *
+ * The strict tier below (evaluateIssueRewakeThrottle's no-progress streak,
+ * which the assignee's own comment DOES reset) stays the only tier: the
+ * same 3-day production sample had ZERO cards with 3+ consecutive silent
+ * (no activity at all) runs, so it is a safe backstop with no observed
+ * false-positive cost.
+ */
 
 export function evaluateIssueRewakeThrottle(input: IssueRewakeThrottleInput): IssueRewakeThrottleDecision {
   const runs = input.recentTerminalRuns;
