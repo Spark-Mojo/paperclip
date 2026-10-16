@@ -4030,6 +4030,25 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
      *
      * Idempotent on rows whose status is already `archived` / `cleanup_failed`
      * / has a `closedAt` — those are skipped, not errored.
+     *
+     * SPA-12426: archiving the row alone is not enough. The project's
+     * `branchTemplate` renders a path from `worktreeParentDir` + branch name
+     * only — it has no repo segment — so once the row is archived, the OLD
+     * worktree directory is left sitting at the EXACT path the NEW repo will
+     * try to realize into on the next run, and that run fails
+     * `workspace_validation_failed` (the SPA-11953 fence: "already exists and
+     * is owned by a different git repository") until a human moves it by
+     * hand. So once (and only once) the archive above actually transitions
+     * the row, this also removes the OLD worktree directory with a
+     * NON-forced `git worktree remove` — never `--force`, never a branch
+     * delete — run from the worktree's OWNING repo root (resolved fresh from
+     * the leaf path itself, because after a rebind that owner differs from
+     * the project's current workspace cwd). Removal is best-effort: it never
+     * un-archives the row and never throws out of this function. Guarded
+     * against SPA-9375 / SPA-12428: a rebind between two project workspaces
+     * of the SAME repo can reuse this exact path for a second, still-live
+     * execution workspace row — removal is skipped whenever another live row
+     * in the company still points at this path.
      */
     retireExecutionWorkspaceAfterProjectWorkspaceRebind: async (input: {
       companyId: string;
@@ -4037,7 +4056,15 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
       sourceIssueId: string;
       reason: string;
     }): Promise<
-      | { outcome: "retired"; executionWorkspaceId: string; worktreePath: string | null }
+      | {
+          outcome: "retired";
+          executionWorkspaceId: string;
+          worktreePath: string | null;
+          worktreeRemoved: boolean;
+          worktreeRemovalError?: string;
+          worktreeRemovalSkipped?: string;
+          detachedIssue?: true;
+        }
       | { outcome: "skipped_already_closed"; executionWorkspaceId: string }
       | { outcome: "refused_dirty"; executionWorkspaceId: string; worktreePath: string | null; dirtyReason: string }
       | { outcome: "refused_unpushed"; executionWorkspaceId: string; worktreePath: string | null; unpushedReason: string }
@@ -4100,10 +4127,56 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
         }
       }
       const retired = await archiveWorkspaceForRebind(db, input, row);
+      let worktreeRemoved = false;
+      let worktreeRemovalError: string | undefined;
+      let worktreeRemovalSkipped: string | undefined;
+      if (retired.archived && row.providerType === "git_worktree" && leafPath && !leafMissing) {
+        try {
+          // SPA-9375 / SPA-12428: a rebind between two project workspaces of
+          // the SAME repo can reuse this exact path for a second, still-live
+          // execution workspace row. Never remove a path another live row
+          // still depends on. Compared after path.resolve so a differently
+          // formatted (e.g. trailing-slash) stored value still collides.
+          const resolvedLeafPath = path.resolve(leafPath);
+          const livePathCollision = await db
+            .select({ id: executionWorkspaces.id })
+            .from(executionWorkspaces)
+            .where(and(
+              eq(executionWorkspaces.companyId, row.companyId),
+              ne(executionWorkspaces.id, row.id),
+              isNull(executionWorkspaces.closedAt),
+              sql<boolean>`${executionWorkspaces.status} NOT IN ('archived', 'cleanup_failed')`,
+              or(
+                eq(executionWorkspaces.cwd, leafPath),
+                eq(executionWorkspaces.providerRef, leafPath),
+                eq(executionWorkspaces.cwd, resolvedLeafPath),
+                eq(executionWorkspaces.providerRef, resolvedLeafPath),
+              ),
+            ))
+            .limit(1)
+            .then((rows) => rows[0] ?? null);
+          if (livePathCollision) {
+            worktreeRemovalSkipped = "path_in_use_by_live_workspace";
+          } else {
+            const { resolveGitOwnerRepoRoot } = await import("./workspace-runtime.js");
+            const ownerRepoRoot = await resolveGitOwnerRepoRoot(leafPath);
+            // Non-forced: git itself refuses if the worktree became dirty
+            // between the clean check above and here. Never --force, never
+            // delete the branch ref.
+            await runGit(["worktree", "remove", leafPath], ownerRepoRoot);
+            worktreeRemoved = true;
+          }
+        } catch (err) {
+          worktreeRemovalError = err instanceof Error ? err.message : String(err);
+        }
+      }
       return {
         outcome: "retired",
         executionWorkspaceId: row.id,
         worktreePath: leafPath ?? null,
+        worktreeRemoved,
+        ...(worktreeRemovalError ? { worktreeRemovalError } : {}),
+        ...(worktreeRemovalSkipped ? { worktreeRemovalSkipped } : {}),
         ...(retired.detachedIssue ? { detachedIssue: true as const } : {}),
       };
     },
@@ -4162,6 +4235,11 @@ async function assertBranchRefReachableForRetire(input: {
  * workspace. The transaction's row predicate mirrors the reaper's archive
  * statement: only the snapshot generation may move to `archived`, only
  * when the row is in the live set, and only while `closedAt` is null.
+ *
+ * Returns `archived: true` only when this call actually transitioned the
+ * row — never when a concurrent writer already moved it (the caller uses
+ * this to decide whether it is the one that should remove the OLD worktree,
+ * SPA-12426).
  */
 async function archiveWorkspaceForRebind(
   db: Db,
@@ -4172,7 +4250,7 @@ async function archiveWorkspaceForRebind(
     reason: string;
   },
   row: ExecutionWorkspaceRow,
-): Promise<{ detachedIssue: boolean }> {
+): Promise<{ detachedIssue: boolean; archived: boolean }> {
   const snapshotGeneration = readExecutionWorkspaceLifecycleGeneration(
     row.metadata as Record<string, unknown> | null,
   );
@@ -4200,7 +4278,7 @@ async function archiveWorkspaceForRebind(
       ))
       .returning()
       .then((rows: Array<ExecutionWorkspaceRow>) => rows[0] ?? null);
-    if (!archived) return { detachedIssue: false };
+    if (!archived) return { detachedIssue: false, archived: false };
     // Clear the issue's binding so the next run's allocator refuses the
     // reuse request (status=archived, SPA-7090) and provisions a fresh
     // workspace bound to the new project workspace.
@@ -4218,7 +4296,7 @@ async function archiveWorkspaceForRebind(
         .then((rows: Array<{ id: string }>) => rows[0] ?? null);
       detachedIssue = Boolean(updated);
     }
-    return { detachedIssue };
+    return { detachedIssue, archived: true };
   });
 }
 
