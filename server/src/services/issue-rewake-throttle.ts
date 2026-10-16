@@ -105,18 +105,29 @@ export interface IssueRewakeCandidateInput {
   hasExplicitResume: boolean;
 }
 
+const NO_EXTRA_ISSUE_REWAKE_REASONS: ReadonlySet<string> = new Set();
+
 /**
  * Whether a wake is even a candidate for throttling. Wakes that carry new
  * information or an explicit operator escalation always pass.
+ *
+ * `extraReasons` lets a caller widen candidacy for a specific downstream
+ * decision without changing the shared cooldown throttle's own reason set —
+ * the circuit breaker uses this to also gate `finish_successful_run_handoff`
+ * (audit finding, PR #211) while every other caller keeps the original
+ * THROTTLED_ISSUE_REWAKE_REASONS-only behavior unchanged.
  */
-export function isThrottleCandidateIssueRewake(input: IssueRewakeCandidateInput): boolean {
+export function isThrottleCandidateIssueRewake(
+  input: IssueRewakeCandidateInput,
+  extraReasons: ReadonlySet<string> = NO_EXTRA_ISSUE_REWAKE_REASONS,
+): boolean {
   if (input.forceFreshSession) return false;
   // Explicit resume is an operator privilege, not an actor-class escape hatch.
   // Agent-authored resume comments remain subject to the normal rewake throttle.
   if (input.hasExplicitResume && input.requestedByActorType !== "agent") return false;
   if (input.wakeCommentId) return input.requestedByActorType === "agent";
   if (input.reason === null) return true;
-  return THROTTLED_ISSUE_REWAKE_REASONS.has(input.reason);
+  return THROTTLED_ISSUE_REWAKE_REASONS.has(input.reason) || extraReasons.has(input.reason);
 }
 
 export interface RecentIssueRunSample {
@@ -198,19 +209,68 @@ export const ISSUE_REWAKE_CIRCUIT_BREAKER_NOTICE_PREFIX =
   "Paperclip stopped automatic re-wakes for this card";
 
 /**
- * Pure trip decision. Deliberately conservative: a card assigned to a human
- * (not an agent) never trips — a false trip strands real work, a miss only
- * costs tokens. The streak itself already excludes failed/cancelled runs
- * (evaluateIssueRewakeThrottle breaks the streak there) and resets on new
- * issue input, so this only needs the one additional human-ownership guard.
+ * Pure trip decision. Deliberately conservative: a card owned by a human —
+ * assigned directly (`assigneeUserId`) or holding the conversation seat
+ * (`conversationUserId`, audit finding #3, PR #211) — never trips. A false
+ * trip strands real work, a miss only costs tokens. The streak itself
+ * already excludes failed/cancelled runs (evaluateIssueRewakeThrottle breaks
+ * the streak there) and resets on new issue input, so this only needs the
+ * human-ownership guard; the delegation veto below is a second, independent
+ * guard the caller applies before actually tripping.
  */
 export function shouldTripIssueRewakeCircuitBreaker(input: {
   noProgressStreak: number;
   threshold: number;
-  isHumanAssigned: boolean;
+  isHumanOwned: boolean;
 }): boolean {
-  if (input.isHumanAssigned) return false;
+  if (input.isHumanOwned) return false;
   return input.noProgressStreak >= input.threshold;
+}
+
+export interface BreakerSampledRun {
+  id: string;
+  startedAt: Date | null;
+  finishedAt: Date | null;
+}
+
+/**
+ * Audit finding #2 (PR #211): the primary progress check only looks at
+ * activity logged directly against THIS issue under one of this agent's own
+ * sampled run ids, so a delegated child issue (a fan-out worker doing real
+ * work) or a subagent's comment/activity on this same issue under its own
+ * run id is invisible to it — a parent that is genuinely delegating looks
+ * identical to one that is stuck.
+ *
+ * This resolves the time window the caller should search across both of
+ * those evidence shapes in: the union of the counted no-progress runs' own
+ * windows, from the earliest counted run's start through now. Veto-only
+ * logic lives in the caller (it needs a DB read); this function only
+ * decides the window, so a wider window can only make the breaker MORE
+ * reluctant to trip, never the opposite.
+ */
+export function resolveBreakerExtraProgressWindowStart(input: {
+  recentTerminalRuns: BreakerSampledRun[];
+  noProgressStreak: number;
+}): Date | null {
+  const counted = input.recentTerminalRuns.slice(0, input.noProgressStreak);
+  const starts = counted
+    .map((run) => run.startedAt ?? run.finishedAt)
+    .filter((value): value is Date => value instanceof Date);
+  if (starts.length === 0) return null;
+  return new Date(Math.min(...starts.map((date) => date.getTime())));
+}
+
+/**
+ * Per-trip marker embedded as the first line of the notice. Keying dedup on
+ * this (instead of the bare, forever-global prefix — audit finding #4, PR
+ * #211) means a concurrent duplicate evaluation of the SAME streak (same
+ * newest counted run) still posts exactly one comment, while a genuinely
+ * later trip (a different streak, so a different newest run id) posts a
+ * fresh one instead of silently no-op'ing forever after the first trip ever
+ * recorded on this card.
+ */
+export function issueRewakeCircuitBreakerNoticeMarker(newestRunId: string): string {
+  return `${ISSUE_REWAKE_CIRCUIT_BREAKER_NOTICE_PREFIX} (run ${newestRunId})`;
 }
 
 export function buildIssueRewakeCircuitBreakerNotice(input: {
@@ -218,9 +278,11 @@ export function buildIssueRewakeCircuitBreakerNotice(input: {
   /** Run ids counted toward the streak, newest first. */
   runIds: string[];
 }): string {
+  const newestRunId = input.runIds[0] ?? "unknown";
   const runList = input.runIds.map((id) => `\`${id}\``).join(", ") || "(none)";
   return [
-    `${ISSUE_REWAKE_CIRCUIT_BREAKER_NOTICE_PREFIX}: the last ${input.noProgressStreak} consecutive runs ended with no issue-visible progress (issue status unchanged, no new comment, no new work product).`,
+    issueRewakeCircuitBreakerNoticeMarker(newestRunId),
+    `The last ${input.noProgressStreak} consecutive runs ended with no issue-visible progress (issue status unchanged, no new comment, no new work product, no delegated child-issue activity).`,
     `Runs counted toward this streak, newest first: ${runList}.`,
     "This card was moved to `backlog` so it stops consuming runs for no new information.",
     "To resume automatic work: move the card back to `todo` (or reassign it). Either change counts as new progress and resets this breaker.",

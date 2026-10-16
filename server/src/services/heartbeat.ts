@@ -366,11 +366,12 @@ import {
   ISSUE_REWAKE_RUN_SAMPLE_LIMIT,
   ISSUE_REWAKE_CIRCUIT_BREAKER_THRESHOLD_ENV_VAR,
   ISSUE_REWAKE_CIRCUIT_BREAKER_TRIPPED_REASON,
-  ISSUE_REWAKE_CIRCUIT_BREAKER_NOTICE_PREFIX,
   buildIssueRewakeCircuitBreakerNotice,
   evaluateIssueRewakeThrottle,
   isThrottleCandidateIssueRewake,
+  issueRewakeCircuitBreakerNoticeMarker,
   normalizeIssueRewakeCircuitBreakerThreshold,
+  resolveBreakerExtraProgressWindowStart,
   shouldTripIssueRewakeCircuitBreaker,
 } from "./issue-rewake-throttle.js";
 import {
@@ -10086,6 +10087,15 @@ export function resolveIdleTodoPullCanary(raw: string | undefined): {
   // setting a falsy switch, disables the feature outright either way.
   return { enabled: true, allowAll: allowlist.size === 0 || explicitAll, allowlist };
 }
+
+// Audit finding #1 (PR #211): finish_successful_run_handoff is not in
+// THROTTLED_ISSUE_REWAKE_REASONS, so a loop driven entirely by that reason
+// bypassed the circuit breaker. Widen only the breaker's own candidacy check
+// with this set — the cooldown throttle keeps its original reason set and
+// its original timing for this reason unchanged.
+const BREAKER_EXTRA_GATED_REASONS: ReadonlySet<string> = new Set([
+  FINISH_SUCCESSFUL_RUN_HANDOFF_REASON,
+]);
 
 export function heartbeatService(
   db: Db,
@@ -29593,21 +29603,38 @@ export function heartbeatService(
           // so external pollers/reconcilers can't storm full-price sessions.
           // Server-side recovery retries insert runs directly and never reach
           // this gate.
-          if (
-            isThrottleCandidateIssueRewake({
-              reason,
-              wakeCommentId: wakeCommentId ?? null,
-              requestedByActorType: opts.requestedByActorType ?? null,
-              forceFreshSession:
-                enrichedContextSnapshot.forceFreshSession === true,
-              hasExplicitResume: Boolean(explicitResumeSession),
-            })
-          ) {
+          //
+          // Audit finding #1 (PR #211): finish_successful_run_handoff drives
+          // the same no-progress loops (SPA-12493/12587/12506 alternate
+          // between it and issue_continuation_needed in production) but is
+          // not in THROTTLED_ISSUE_REWAKE_REASONS, so it bypassed this whole
+          // block entirely. isBreakerRewakeCandidate widens entry into the
+          // block (and the shared streak computation) to also cover it;
+          // isOrdinaryThrottleCandidate keeps gating the escalating cooldown
+          // exactly as before, so handoff wake timing is unaffected — only
+          // the breaker below additionally watches it.
+          const issueRewakeCandidateInput = {
+            reason,
+            wakeCommentId: wakeCommentId ?? null,
+            requestedByActorType: opts.requestedByActorType ?? null,
+            forceFreshSession:
+              enrichedContextSnapshot.forceFreshSession === true,
+            hasExplicitResume: Boolean(explicitResumeSession),
+          };
+          const isOrdinaryThrottleCandidate = isThrottleCandidateIssueRewake(
+            issueRewakeCandidateInput,
+          );
+          const isBreakerRewakeCandidate = isThrottleCandidateIssueRewake(
+            issueRewakeCandidateInput,
+            BREAKER_EXTRA_GATED_REASONS,
+          );
+          if (isBreakerRewakeCandidate) {
             const throttleNow = new Date();
             const recentTerminalRuns = await tx
               .select({
                 id: heartbeatRuns.id,
                 status: heartbeatRuns.status,
+                startedAt: heartbeatRuns.startedAt,
                 finishedAt: heartbeatRuns.finishedAt,
               })
               .from(heartbeatRuns)
@@ -29630,6 +29657,8 @@ export function heartbeatService(
               const sampleRunIds = recentTerminalRuns.map(
                 (sampleRun) => sampleRun.id,
               );
+              // The cooldown throttle's own progress definition is untouched
+              // (same query, same inputs, same decision function below).
               const progressRows = await tx
                 .select({ runId: activityLog.runId })
                 .from(activityLog)
@@ -29690,23 +29719,96 @@ export function heartbeatService(
               // throttle already computes reaches the breaker threshold,
               // stop scheduling continuation/handoff wakes for this card for
               // good instead of just backing off further. Never trips for a
-              // human-assigned card; the streak itself already excludes
-              // failed/cancelled runs and resets on new issue input via
-              // evaluateIssueRewakeThrottle above.
+              // human-owned card — direct assignee (assigneeUserId) or
+              // conversation seat (conversationUserId, audit finding #3) —
+              // and the streak itself already excludes failed/cancelled runs
+              // and resets on new issue input via evaluateIssueRewakeThrottle
+              // above.
               const circuitBreakerThreshold =
                 normalizeIssueRewakeCircuitBreakerThreshold(
                   runtimeEnv[ISSUE_REWAKE_CIRCUIT_BREAKER_THRESHOLD_ENV_VAR],
                 );
-              if (
-                shouldTripIssueRewakeCircuitBreaker({
-                  noProgressStreak: throttleDecision.noProgressStreak,
-                  threshold: circuitBreakerThreshold,
-                  isHumanAssigned: Boolean(issue.assigneeUserId),
-                })
-              ) {
+              const isBreakerTrippable = shouldTripIssueRewakeCircuitBreaker({
+                noProgressStreak: throttleDecision.noProgressStreak,
+                threshold: circuitBreakerThreshold,
+                isHumanOwned: Boolean(
+                  issue.assigneeUserId || issue.conversationUserId,
+                ),
+              });
+
+              // Audit finding #2 (PR #211): the progress check above is
+              // scoped to activity logged directly against THIS issue under
+              // one of this agent's OWN sampled run ids, so delegation is
+              // invisible to it — a child issue doing the real fan-out work,
+              // or a subagent commenting/acting on this same issue under its
+              // own run id. This can only VETO a trip the breaker would
+              // otherwise make; it never causes one, so it is only evaluated
+              // once the breaker would otherwise fire.
+              let hasBreakerExtraProgressVeto = false;
+              if (isBreakerTrippable) {
+                const extraProgressWindowStart =
+                  resolveBreakerExtraProgressWindowStart({
+                    recentTerminalRuns,
+                    noProgressStreak: throttleDecision.noProgressStreak,
+                  });
+                if (extraProgressWindowStart) {
+                  const childIssueIds = await tx
+                    .select({ id: issues.id })
+                    .from(issues)
+                    .where(
+                      and(
+                        eq(issues.companyId, issue.companyId),
+                        eq(issues.parentId, issue.id),
+                      ),
+                    )
+                    .then((rows) => rows.map((row) => row.id));
+                  const extraProgressRows = await tx
+                    .select({ id: activityLog.id })
+                    .from(activityLog)
+                    .where(
+                      and(
+                        eq(activityLog.companyId, issue.companyId),
+                        eq(activityLog.entityType, "issue"),
+                        gte(activityLog.createdAt, extraProgressWindowStart),
+                        or(
+                          // (a) any activity on a child issue of this card —
+                          // e.g. issue.child_created or a child's status
+                          // change — within the sampled run windows.
+                          childIssueIds.length > 0
+                            ? inArray(activityLog.entityId, childIssueIds)
+                            : sql`false`,
+                          // (b) a comment on THIS issue by any agent
+                          // (including a subagent), or any run-linked
+                          // activity on this issue, not limited to this
+                          // agent's own sampled run ids.
+                          and(
+                            eq(activityLog.entityId, issue.id),
+                            or(
+                              eq(activityLog.action, "issue.comment_added"),
+                              isNotNull(activityLog.runId),
+                            ),
+                          ),
+                        ),
+                      ),
+                    )
+                    .limit(1);
+                  hasBreakerExtraProgressVeto = extraProgressRows.length > 0;
+                }
+              }
+
+              if (isBreakerTrippable && !hasBreakerExtraProgressVeto) {
                 const trippedRunIds = recentTerminalRuns
                   .slice(0, throttleDecision.noProgressStreak)
                   .map((sampleRun) => sampleRun.id);
+                // Audit finding #4 (PR #211): dedup is keyed on THIS trip's
+                // marker (the newest counted run), not the bare prefix — a
+                // concurrent duplicate evaluation of the same streak still
+                // posts exactly one comment, while a later, genuinely new
+                // streak (a different newest run id) posts its own fresh
+                // notice instead of silently no-op'ing forever.
+                const noticeMarker = issueRewakeCircuitBreakerNoticeMarker(
+                  trippedRunIds[0] ?? "unknown",
+                );
 
                 if (issue.status === "in_progress") {
                   const backlogged = await tx
@@ -29752,7 +29854,7 @@ export function heartbeatService(
                     and(
                       eq(issueComments.companyId, issue.companyId),
                       eq(issueComments.issueId, issue.id),
-                      sql`${issueComments.body} like ${`${ISSUE_REWAKE_CIRCUIT_BREAKER_NOTICE_PREFIX}%`}`,
+                      sql`${issueComments.body} like ${`${noticeMarker}%`}`,
                     ),
                   )
                   .limit(1)
@@ -29797,7 +29899,12 @@ export function heartbeatService(
                 return { kind: "skipped" as const };
               }
 
-              if (throttleDecision.blocked) {
+              // The escalating cooldown's gate is unchanged: only an
+              // ordinary throttle candidate reaches this branch, so a
+              // breaker-only reason (finish_successful_run_handoff) below
+              // the trip threshold is never cooled down — its timing is
+              // exactly what it was before this change.
+              if (isOrdinaryThrottleCandidate && throttleDecision.blocked) {
                 await tx.insert(agentWakeupRequests).values({
                   ...durableReceiptFields,
                   companyId: agent.companyId,
