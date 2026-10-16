@@ -4334,35 +4334,101 @@ function deriveManagedCheckoutRepoNameForComparison(repoUrl: string | null): str
   }
 }
 
-// SPA-12426 re-audit finding (i): normalize a git remote URL to a bare
-// `host/owner/name`-shaped identity for cross-repo comparison WITHOUT ever
-// resolving a filesystem path (the cold-managed-checkout case has no path to
-// resolve without cloning). Lowercase, strips any scheme, strips
-// `user:pass@`/`user@` credentials (so a token embedded in an HTTPS remote,
-// e.g. `https://x-access-token:<token>@github.com/...`, is discarded before
-// anything downstream could log or return it), strips a trailing `.git` and
-// trailing slashes, and folds scp-like `git@host:owner/name` syntax to
-// `host/owner/name` so it compares equal to the HTTPS form of the same repo.
-function normalizeRepoIdentityForComparison(rawUrl: string | null | undefined): string | null {
+// SPA-12426 audit re-re-audit: `new URL()` on a scheme form can itself
+// compute the WRONG host when credentials contain a raw, unescaped '/' —
+// verified empirically:
+//   new URL("https://user:80/ss@host.com/org/repo.git").host === "user:80"
+// (port "80" is valid, so the parser never throws; it silently treats
+// "user:80" as the whole authority and "/ss@host.com/org/repo.git" as the
+// path). A password containing '@' but NOT '/' is fine (the parser
+// correctly uses the LAST '@' as the userinfo/host separator), so the
+// defect is specifically a raw '/' inside the credential, not '@'.
+// `parseSchemeRepoAuthority` below guards exactly that: before trusting
+// `new URL()`'s own host, it re-derives "the raw string's authority
+// section" by taking the text between `//` and the FIRST literal '/' in
+// the RAW string (the same boundary a naive/vulnerable parser would use).
+// If that candidate authority contains no '@' but an '@' shows up later
+// (meaning the real credential/host separator got shoved past the first
+// '/'), or if the candidate authority contains more than one '@' (which
+// '@' is the real separator is a judgment call we decline to make, even
+// though WHATWG's "last '@' wins" rule is itself unambiguous), the parse
+// is rejected as ambiguous. Every rejection here returns null, never a
+// best-guess identity: see the module fix rule — a wrongful SKIP (treating
+// an unresolvable repo as "cannot prove cross-repo") reproduces the old,
+// already-tolerated symptom, but a wrongful MOVE does not.
+function parseSchemeRepoAuthority(value: string): { host: string; owner: string; name: string } | null {
+  const schemeMatch = /^[a-z][a-z0-9+.-]*:\/\//i.exec(value);
+  if (!schemeMatch) return null;
+  const rest = value.slice(schemeMatch[0].length);
+  const rawFirstSlashIndex = rest.indexOf("/");
+  if (rawFirstSlashIndex === -1) return null; // no path at all — can't contain owner/name
+  const rawAuthorityCandidate = rest.slice(0, rawFirstSlashIndex);
+  const atCountInCandidate = rawAuthorityCandidate.split("@").length - 1;
+  if (atCountInCandidate > 1) return null; // ambiguous which '@' separates userinfo from host
+  if (atCountInCandidate === 0) {
+    const restAfterCandidate = rest.slice(rawFirstSlashIndex).split(/[?#]/)[0];
+    if (restAfterCandidate.includes("@")) return null; // raw '/' swallowed the real host boundary
+  }
+  let parsed: URL;
+  try {
+    parsed = new URL(value);
+  } catch {
+    return null;
+  }
+  const host = parsed.hostname.toLowerCase(); // hostname only — port is deliberately ignored
+  if (!host) return null;
+  const pathSegments = parsed.pathname.split("/").filter(Boolean);
+  if (pathSegments.length !== 2) return null; // not exactly owner/name
+  const owner = pathSegments[0].toLowerCase();
+  const name = pathSegments[1].replace(/\.git$/i, "").toLowerCase();
+  if (!owner || !name) return null;
+  return { host, owner, name };
+}
+
+// SPA-12426: scp-like `user@host:owner/name(.git)?` syntax (no scheme, no
+// `://`). All three character classes exclude '@', ':', and '/' so that a
+// stray extra '@' (e.g. `a@b@host:owner/name`, ambiguous about which '@'
+// is the real separator) or a credential containing '/' or ':' fails the
+// match outright rather than silently matching something else.
+const SCP_REPO_AUTHORITY_RE = /^[^@:/]+@([^@:/]+):(.+)$/;
+
+function parseScpRepoAuthority(value: string): { host: string; owner: string; name: string } | null {
+  const match = SCP_REPO_AUTHORITY_RE.exec(value);
+  if (!match) return null;
+  const [, host, rawPath] = match;
+  if (rawPath.includes("@")) return null; // ambiguous extra '@' in the path portion
+  const cleanedPath = rawPath.replace(/\/+$/, "");
+  const pathSegments = cleanedPath.split("/").filter(Boolean);
+  if (pathSegments.length !== 2) return null; // not exactly owner/name
+  const owner = pathSegments[0].toLowerCase();
+  const name = pathSegments[1].replace(/\.git$/i, "").toLowerCase();
+  if (!host || !owner || !name) return null;
+  return { host: host.toLowerCase(), owner, name };
+}
+
+// SPA-12426 re-audit finding (i), re-re-audited: normalize a git remote URL
+// to a `host/owner/name`-shaped identity for cross-repo comparison WITHOUT
+// ever resolving a filesystem path (the cold-managed-checkout case has no
+// path to resolve without cloning) and WITHOUT ever trusting a parse this
+// function cannot prove is unambiguous (see `parseSchemeRepoAuthority` /
+// `parseScpRepoAuthority` above — the dangerous direction this closes is
+// the SAME repo normalizing UNEQUAL being safe, and a wrongful EQUAL/
+// resolved verdict on two different repos being the one that is not).
+// Port is ignored (same host on a different port/scheme is the same repo);
+// owner/name are case-folded for comparison, which can only ever cause a
+// wrongful SKIP on a case-sensitive host (two paths differing only by case
+// are actually different repos there), never a wrongful move — the safe
+// direction, per the module fix rule. Neither the raw nor the normalized
+// value is ever logged or returned by this function's callers; only the
+// boolean comparison result is.
+export function normalizeRepoIdentityForComparison(rawUrl: string | null | undefined): string | null {
   const trimmed = rawUrl?.trim();
   if (!trimmed) return null;
-  let value = trimmed;
-  if (!value.includes("://")) {
-    const scpMatch = /^[^/@:]+@([^/:]+):(.+)$/.exec(value);
-    if (scpMatch) {
-      value = `${scpMatch[1]}/${scpMatch[2]}`;
-    }
-  } else {
-    value = value.replace(/^[a-z][a-z0-9+.-]*:\/\//i, "");
-    // Strip everything up to and including the LAST '@' before the first
-    // '/' — the credential portion of `user:pass@host/...`. A greedy
-    // `[^/]*@` backtracks to the rightmost '@' short of the first '/', so
-    // a password containing '@' is still handled correctly.
-    value = value.replace(/^[^/]*@/, "");
-  }
-  value = value.replace(/\.git$/i, "").replace(/\/+$/, "");
-  value = value.toLowerCase();
-  return value || null;
+  const identity = trimmed.includes("://")
+    ? parseSchemeRepoAuthority(trimmed)
+    : parseScpRepoAuthority(trimmed);
+  if (!identity) return null;
+  return `${identity.host}/${identity.owner}/${identity.name}`;
 }
 
 // SPA-12426 audit finding (A): the per-run ephemeral worktree shape

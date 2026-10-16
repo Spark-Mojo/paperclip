@@ -13058,6 +13058,120 @@ describeEmbeddedPostgres(
       }
     }, 30_000);
 
+    it("skips relocation with new_repo_root_unresolved for a cold managed_checkout whose repoUrl is ambiguous, and leaves the old worktree in place (SPA-12426 audit re-re-audit)", async () => {
+      // The dangerous direction this guards: a wrongful MOVE. A repoUrl
+      // whose credential contains a raw, unescaped '/' can make `new URL()`
+      // itself compute the WRONG host (verified empirically in the pure
+      // normalizer unit tests), so `normalizeRepoIdentityForComparison`
+      // must refuse to resolve it rather than guess — and this function
+      // must then skip ("new_repo_root_unresolved"), never move, when
+      // either side is unresolvable.
+      const support = await startEmbeddedPostgresTestDatabase(
+        "paperclip-spa12426-managed-cold-ambiguous-",
+      );
+      const previousPaperclipHome = process.env.PAPERCLIP_HOME;
+      const paperclipHome = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-spa12426-managed-cold-ambiguous-home-"));
+      process.env.PAPERCLIP_HOME = paperclipHome;
+      try {
+        const db = createDb(support.connectionString);
+        const companyId = randomUUID();
+        const projectId = randomUUID();
+        const oldProjectWorkspaceId = randomUUID();
+        const newProjectWorkspaceId = randomUUID();
+        const sourceIssueId = randomUUID();
+        const executionWorkspaceId = randomUUID();
+        const branchName = "PAP-12426-managed-cold-ambiguous";
+        const { oldRepo, oldWorktreePath } = await createOldRepoWorktree(branchName);
+        // The old worktree's origin resolves cleanly...
+        await runGit(oldRepo, ["remote", "add", "origin", "https://github.com/acme/old-repo.git"]);
+        await db.insert(companies).values({ id: companyId, name: "spa12426-managed-cold-ambiguous-co" });
+        await db.insert(projects).values({ id: projectId, companyId, name: "spa12426-managed-cold-ambiguous-project" });
+        await db.insert(projectWorkspaces).values([
+          {
+            id: oldProjectWorkspaceId,
+            companyId,
+            projectId,
+            name: "old-workspace",
+            cwd: oldRepo,
+            repoUrl: null,
+            repoRef: "refs/heads/main",
+          },
+          {
+            id: newProjectWorkspaceId,
+            companyId,
+            projectId,
+            name: "new-managed-workspace",
+            sourceType: "managed_checkout",
+            // cwd stays NULL (cold managed_checkout): no clone must ever
+            // happen to resolve this test.
+            cwd: null,
+            // ...but the NEXT workspace's repoUrl is ambiguous: a
+            // credential containing a raw '/', the exact shape that can
+            // make `new URL()` compute the wrong host on its own.
+            repoUrl: "https://user:80/ss@github.com/acme/new-repo.git",
+            repoRef: "refs/heads/main",
+          },
+        ]);
+        await db.insert(executionWorkspaces).values({
+          id: executionWorkspaceId,
+          companyId,
+          projectId,
+          projectWorkspaceId: oldProjectWorkspaceId,
+          mode: "isolated_workspace",
+          strategyType: "git_worktree",
+          name: "spa12426-managed-cold-ambiguous",
+          status: "active",
+          cwd: oldWorktreePath,
+          repoUrl: null,
+          baseRef: "refs/heads/main",
+          branchName,
+          providerType: "git_worktree",
+          providerRef: oldWorktreePath,
+          metadata: RUNTIME_OWNED_GIT_BRANCH_METADATA,
+        });
+        await db.insert(issues).values({
+          id: sourceIssueId,
+          companyId,
+          projectId,
+          projectWorkspaceId: oldProjectWorkspaceId,
+          executionWorkspaceId,
+          title: "SPA-12426 cold managed_checkout ambiguous repoUrl skips",
+          status: "todo",
+        } as Partial<typeof issues.$inferInsert>);
+        await db
+          .update(executionWorkspaces)
+          .set({ sourceIssueId })
+          .where(eq(executionWorkspaces.id, executionWorkspaceId));
+        const outcome = await executionWorkspaceService(
+          db,
+        ).retireExecutionWorkspaceAfterProjectWorkspaceRebind({
+          companyId,
+          executionWorkspaceId,
+          sourceIssueId,
+          reason: `project workspace rebind ${oldProjectWorkspaceId} -> ${newProjectWorkspaceId}`,
+          nextProjectWorkspaceId: newProjectWorkspaceId,
+        });
+        expect(outcome.outcome).toBe("retired");
+        if (outcome.outcome !== "retired") throw new Error("unreachable");
+        expect(outcome.worktreeMoved).toBe(false);
+        expect(outcome.worktreeMoveSkipped).toBe("new_repo_root_unresolved");
+        expect(outcome.worktreeMoveError).toBeUndefined();
+        await expect(fs.stat(oldWorktreePath)).resolves.toBeDefined();
+        const [archivedRow] = await db
+          .select()
+          .from(executionWorkspaces)
+          .where(eq(executionWorkspaces.id, executionWorkspaceId));
+        expect(archivedRow.cwd).toBe(oldWorktreePath);
+        // No clone ever happened: nothing was ever written under the
+        // sandboxed PAPERCLIP_HOME root at all.
+        await expect(fs.readdir(paperclipHome)).resolves.toEqual([]);
+      } finally {
+        if (previousPaperclipHome === undefined) delete process.env.PAPERCLIP_HOME;
+        else process.env.PAPERCLIP_HOME = previousPaperclipHome;
+        await support.cleanup();
+      }
+    }, 30_000);
+
     it("skips relocation with dirty_at_move when the worktree goes dirty immediately before the move (SPA-12426 finding (C))", async () => {
       // LIMIT OF THIS TEST (stated honestly): retire's OWN earlier dirty
       // check (before archiving) would already refuse a worktree that is
