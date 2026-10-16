@@ -31,7 +31,7 @@ async function makeConfigHome(initialConfig?: Record<string, unknown>) {
 }
 
 describe("prepareOpenCodeRuntimeConfig", () => {
-  it("injects an external_directory allow rule by default", async () => {
+  it("emits an external_directory deny rule by default (fail-closed when workspaceCwd is absent)", async () => {
     const configHome = await makeConfigHome({
       permission: {
         read: "allow",
@@ -56,7 +56,7 @@ describe("prepareOpenCodeRuntimeConfig", () => {
       theme: "system",
       permission: {
         read: "allow",
-        external_directory: "allow",
+        external_directory: "deny",
       },
     });
 
@@ -92,7 +92,7 @@ describe("prepareOpenCodeRuntimeConfig", () => {
       await fs.readFile(path.join(prepared.env.XDG_CONFIG_HOME, "opencode", "opencode.json"), "utf8"),
     ) as Record<string, unknown>;
     expect(runtimeConfig).toMatchObject({
-      permission: { read: "allow", external_directory: "allow" },
+      permission: { read: "allow", external_directory: "deny" },
       provider: providers,
     });
     expect(prepared.notes.some((n) => n.includes("bifrost"))).toBe(true);
@@ -361,6 +361,192 @@ describe("prepareOpenCodeRuntimeConfig", () => {
     cleanupPaths.add(prepared.env.XDG_CONFIG_HOME);
 
     expect(prepared.env.GH_CONFIG_DIR).toBeUndefined();
+    await prepared.cleanup();
+  });
+
+  // SPA-12520: per-dispatch external_directory scoping.
+  // Assumption: deny-first ordered-map relies on opencode's last-match-wins
+  // evaluation of the permission.external_directory map in insertion order;
+  // opencode's own iteration order is outside this repo (see gates ledger).
+  // Symlink traversal (a symlink inside the worktree pointing out) is out of
+  // scope per the mechanism-A decision — no kernel/fs boundary on this card.
+  const SPA12520_WORKTREE = "/srv/bulk/worktrees/engine-fork/SPA-99999";
+
+  function normalizeSpa12520(cwd: string): string {
+    const posix = cwd.replace(/\\/g, "/");
+    const collapsed = posix.length > 1 && posix.includes("//") ? posix.replace(/\/+/g, "/") : posix;
+    if (collapsed.length > 1 && collapsed.endsWith("/")) return collapsed.slice(0, -1);
+    return collapsed;
+  }
+
+  function expectedSpa12520Map(worktreeCwd: string): Record<string, string> {
+    const normalized = normalizeSpa12520(worktreeCwd);
+    return {
+      "*": "deny",
+      [normalized]: "allow",
+      [`${normalized}/**`]: "allow",
+    };
+  }
+
+  async function readExternalDirectory(
+    input: Parameters<typeof prepareOpenCodeRuntimeConfig>[0],
+  ): Promise<{ value: unknown; prepared: Awaited<ReturnType<typeof prepareOpenCodeRuntimeConfig>> }> {
+    const prepared = await prepareOpenCodeRuntimeConfig(input);
+    cleanupPaths.add(prepared.env.XDG_CONFIG_HOME);
+    const runtimeConfig = JSON.parse(
+      await fs.readFile(path.join(prepared.env.XDG_CONFIG_HOME, "opencode", "opencode.json"), "utf8"),
+    ) as { permission?: { external_directory?: unknown } };
+    return { value: runtimeConfig.permission?.external_directory, prepared };
+  }
+
+  // Matcher mirrors opencode's last-match-wins ordered-map evaluation:
+  // iterate Object.entries in order, convert each glob key to a RegExp where
+  // `*` → [^/]* and `**` → .*, last matching entry wins.
+  function evaluateExternalDirectoryMap(
+    map: Record<string, string>,
+    targetPath: string,
+  ): string | undefined {
+    let verdict: string | undefined;
+    for (const [glob, decision] of Object.entries(map)) {
+      // A bare "*" is the deny floor: it matches every path. Any other key
+      // is a glob where `*` matches within a segment and `**` spans segments.
+      const pattern =
+        glob === "*"
+          ? ".*"
+          : glob
+              .replace(/[.+^${}()|[\]\\]/g, "\\$&")
+              .replace(/\*\*/g, "\u0000")
+              .replace(/\*/g, "[^/]*")
+              .replace(/\u0000/g, ".*");
+      if (new RegExp(`^${pattern}$`).test(targetPath)) verdict = decision;
+    }
+    return verdict;
+  }
+
+  it("emits a scoped deny-first external_directory map for an absolute workspaceCwd (SPA-12520)", async () => {
+    const configHome = await makeConfigHome({ permission: { read: "allow" } });
+    const { value, prepared } = await readExternalDirectory({
+      env: { XDG_CONFIG_HOME: configHome },
+      config: {},
+      workspaceCwd: SPA12520_WORKTREE,
+    });
+    expect(value).toEqual(expectedSpa12520Map(SPA12520_WORKTREE));
+    expect(Object.keys(value as Record<string, string>)).toEqual([
+      "*",
+      SPA12520_WORKTREE,
+      `${SPA12520_WORKTREE}/**`,
+    ]);
+    await prepared.cleanup();
+  });
+
+  it("fail-closed: empty workspaceCwd emits deny (SPA-12520)", async () => {
+    const configHome = await makeConfigHome({ permission: { read: "allow" } });
+    const { value, prepared } = await readExternalDirectory({
+      env: { XDG_CONFIG_HOME: configHome },
+      config: {},
+      workspaceCwd: "",
+    });
+    expect(value).toBe("deny");
+    await prepared.cleanup();
+  });
+
+  it("fail-closed: relative workspaceCwd emits deny (SPA-12520)", async () => {
+    const configHome = await makeConfigHome({ permission: { read: "allow" } });
+    const { value, prepared } = await readExternalDirectory({
+      env: { XDG_CONFIG_HOME: configHome },
+      config: {},
+      workspaceCwd: "some/relative",
+    });
+    expect(value).toBe("deny");
+    await prepared.cleanup();
+  });
+
+  it("guard: scoped map carries no pool-wide glob allow (SPA-12520)", async () => {
+    const configHome = await makeConfigHome({ permission: { read: "allow" } });
+    const { value, prepared } = await readExternalDirectory({
+      env: { XDG_CONFIG_HOME: configHome },
+      config: {},
+      workspaceCwd: SPA12520_WORKTREE,
+    });
+    const map = value as Record<string, string>;
+    expect(Object.keys(map)).toHaveLength(3);
+    expect(Object.entries(map).filter(([k, v]) => k === "*" && v === "deny")).toHaveLength(1);
+    for (const [key, decision] of Object.entries(map)) {
+      if (decision === "allow") expect(key.startsWith(SPA12520_WORKTREE)).toBe(true);
+    }
+    await prepared.cleanup();
+  });
+
+  it("fixture-backed oracle: own tree allows, sibling tree denies (SPA-12520)", async () => {
+    const pool = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-spa12520-pool-"));
+    cleanupPaths.add(pool);
+    const ownTree = path.join(pool, "own-tree");
+    const siblingTree = path.join(pool, "sibling-tree");
+    await fs.mkdir(ownTree, { recursive: true });
+    await fs.mkdir(siblingTree, { recursive: true });
+    const ownFile = path.join(ownTree, "task.txt");
+    const siblingFile = path.join(siblingTree, "task.txt");
+    await fs.writeFile(ownFile, "own\n", "utf8");
+    await fs.writeFile(siblingFile, "sibling\n", "utf8");
+
+    const configHome = await makeConfigHome({ permission: { read: "allow" } });
+    const { value, prepared } = await readExternalDirectory({
+      env: { XDG_CONFIG_HOME: configHome },
+      config: {},
+      workspaceCwd: ownTree,
+    });
+    expect(evaluateExternalDirectoryMap(value as Record<string, string>, ownFile)).toBe("allow");
+    expect(evaluateExternalDirectoryMap(value as Record<string, string>, siblingFile)).toBe("deny");
+    await prepared.cleanup();
+  });
+
+  it("normalizes a trailing-slash workspaceCwd to the same map (SPA-12520)", async () => {
+    const configHome = await makeConfigHome({ permission: { read: "allow" } });
+    const slashed = await readExternalDirectory({
+      env: { XDG_CONFIG_HOME: configHome },
+      config: {},
+      workspaceCwd: `${SPA12520_WORKTREE}/`,
+    });
+    expect(slashed.value).toEqual(expectedSpa12520Map(SPA12520_WORKTREE));
+    await slashed.prepared.cleanup();
+  });
+
+  it("fail-closed: filesystem root workspaceCwd emits deny (SPA-12520)", async () => {
+    const configHome = await makeConfigHome({ permission: { read: "allow" } });
+    const { value, prepared } = await readExternalDirectory({
+      env: { XDG_CONFIG_HOME: configHome },
+      config: {},
+      workspaceCwd: "/",
+    });
+    expect(value).toBe("deny");
+    await prepared.cleanup();
+  });
+
+  it("collapses interior dot-segments and double slashes lexically (SPA-12520)", async () => {
+    const configHome = await makeConfigHome({ permission: { read: "allow" } });
+    const { value, prepared } = await readExternalDirectory({
+      env: { XDG_CONFIG_HOME: configHome },
+      config: {},
+      workspaceCwd: "/srv/bulk//worktrees/engine-fork/./SPA-99999/",
+    });
+    expect(value).toEqual(expectedSpa12520Map(SPA12520_WORKTREE));
+    await prepared.cleanup();
+  });
+
+  it("remote target ignores workspaceCwd and emits deny (SPA-12520)", async () => {
+    // Remote early-return creates no runtime config dir; the remote box never
+    // sees a local-path allow map. Assert the fail-closed contract instead:
+    // a note naming the skip, and no temp config home minted.
+    const configHome = await makeConfigHome({ permission: { read: "allow" } });
+    const prepared = await prepareOpenCodeRuntimeConfig({
+      env: { XDG_CONFIG_HOME: configHome },
+      config: {},
+      targetIsRemote: true,
+      workspaceCwd: SPA12520_WORKTREE,
+    });
+    cleanupPaths.add(prepared.env.XDG_CONFIG_HOME);
+    expect(prepared.env.XDG_CONFIG_HOME).toBe(configHome);
+    expect(prepared.notes.some((n) => n.includes("Remote target"))).toBe(true);
     await prepared.cleanup();
   });
 });

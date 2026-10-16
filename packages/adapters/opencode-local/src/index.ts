@@ -80,7 +80,7 @@ Core fields:
 - instructionsFilePath (string, optional): absolute path to a markdown instructions file prepended to the run prompt
 - model (string, required): OpenCode model id in provider/model format (for example anthropic/claude-sonnet-4-5)
 - variant (string, optional): provider-specific reasoning/profile variant passed as --variant (for example minimal|low|medium|high|xhigh|max)
-- dangerouslySkipPermissions (boolean, optional): inject a runtime OpenCode config that allows \`external_directory\` access without interactive prompts; defaults to true for unattended Paperclip runs
+- dangerouslySkipPermissions (boolean, optional): inject a runtime OpenCode config with a scoped-per-dispatch \`external_directory\` allow for the dispatch workspace (deny-first map; fail-closed \`deny\` when no absolute workspace root is available) without interactive prompts; defaults to true for unattended Paperclip runs
 - promptTemplate (string, optional): run prompt template
 - command (string, optional): defaults to "opencode"
 - extraArgs (string[], optional): additional CLI args
@@ -100,6 +100,8 @@ Notes:
   writing an opencode.json config file into the project working directory. Model \
   selection is passed via the --model CLI flag instead.
 - When \`dangerouslySkipPermissions\` is enabled, Paperclip injects a temporary \
-  runtime config with \`permission.external_directory=allow\` so headless runs do \
-  not stall on approval prompts.
+  runtime config with a scoped-per-dispatch \`permission.external_directory\` \
+  allow for the dispatch workspace (deny-first map) so headless runs do \
+  not stall on approval prompts; when no absolute workspace root is \
+  available the config instead carries \`external_directory=deny\` (fail-closed).
 `;
