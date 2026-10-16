@@ -6,6 +6,13 @@ import { asBoolean } from "@paperclipai/adapter-utils/server-utils";
 type PreparedOpenCodeRuntimeConfig = {
   env: Record<string, string>;
   notes: string[];
+  // SPA-12581 (F1): explicit marker for the generated runtime config dir the
+  // caller may stage to a remote box. Local path: the temp runtimeConfigHome.
+  // Remote path: a fresh temp dir holding a generated deny-only opencode.json
+  // (never the host config dir). Null when no config was generated
+  // (dangerouslySkipPermissions off). Callers must select staging from this
+  // field — never from notes, which are a logging concern, not a gate.
+  generatedConfigHome: string | null;
   cleanup: () => Promise<void>;
 };
 
@@ -134,6 +141,7 @@ export async function prepareOpenCodeRuntimeConfig(input: {
     return {
       env: input.env,
       notes: [],
+      generatedConfigHome: null,
       cleanup: async () => {},
     };
   }
@@ -144,14 +152,28 @@ export async function prepareOpenCodeRuntimeConfig(input: {
   // box do that via prepareAdapterExecutionTargetRuntime in execute.ts; this
   // host-fs helper is local-only.
   if (input.targetIsRemote) {
-    // SPA-12520: remote targets ship this config to the remote box, where a
-    // local worktree path is meaningless — emit fail-closed deny rather than
-    // a wrong-scope map. (Early return: no temp config dir is created, so the
-    // caller must not expect a runtime opencode.json on this path.)
+    // SPA-12581 (F1+F2): generate and ship an explicit deny opencode.json for
+    // remote runs. The host config dir is NEVER staged: a fresh temp dir holds
+    // a generated deny-only config ({permission:{external_directory:"deny"}}),
+    // so a remote target with a pre-existing permissive config still runs
+    // deny-by-default, and host-side config never leaves the host. The
+    // informational note below is logging only — execute.ts selects staging
+    // from generatedConfigHome, never from notes.
+    const remoteConfigHome = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-opencode-remote-config-"));
+    const remoteConfigDir = path.join(remoteConfigHome, "opencode");
+    await fs.mkdir(remoteConfigDir, { recursive: true });
+    await fs.writeFile(
+      path.join(remoteConfigDir, "opencode.json"),
+      `${JSON.stringify({ permission: { external_directory: "deny" } }, null, 2)}\n`,
+      "utf8",
+    );
     return {
-      env: input.env,
-      notes: ["Remote target: skipped local workspace scoping; external_directory left deny-by-default."],
-      cleanup: async () => {},
+      env: { ...input.env, XDG_CONFIG_HOME: remoteConfigHome },
+      notes: ["Remote target: generated deny-only opencode.json for the remote box; host config dir not staged."],
+      generatedConfigHome: remoteConfigHome,
+      cleanup: async () => {
+        await fs.rm(remoteConfigHome, { recursive: true, force: true });
+      },
     };
   }
 
@@ -306,6 +328,7 @@ export async function prepareOpenCodeRuntimeConfig(input: {
   return {
     env: nextEnv,
     notes,
+    generatedConfigHome: runtimeConfigHome,
     cleanup: async () => {
       await fs.rm(runtimeConfigHome, { recursive: true, force: true });
     },
