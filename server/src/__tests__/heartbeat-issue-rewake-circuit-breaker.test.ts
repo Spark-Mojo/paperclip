@@ -169,6 +169,34 @@ describeEmbeddedPostgres("heartbeat issue rewake circuit breaker", () => {
     return runId;
   }
 
+  /**
+   * Seeds a terminal run that produced ONLY an assignee-agent comment on
+   * the issue — the shape measured on SPA-12493 (the agent reports the same
+   * denial/status every run). Returns the run id so a test can attach
+   * additional rows (e.g. a status change, or evidence under this run's own
+   * id) to the exact same run afterward.
+   */
+  async function seedCommentOnlyRun(input: {
+    companyId: string;
+    agentId: string;
+    issueId: string;
+    finishedSecondsAgo: number;
+  }) {
+    const runId = await seedTerminalRun(input);
+    await db.insert(activityLog).values({
+      companyId: input.companyId,
+      actorType: "agent",
+      actorId: input.agentId,
+      agentId: input.agentId,
+      runId,
+      action: "issue.comment_added",
+      entityType: "issue",
+      entityId: input.issueId,
+      createdAt: new Date(Date.now() - input.finishedSecondsAgo * 1000),
+    });
+    return runId;
+  }
+
   function continuationWake(
     hb: ReturnType<typeof heartbeatService>,
     agentId: string,
@@ -659,5 +687,246 @@ describeEmbeddedPostgres("heartbeat issue rewake circuit breaker", () => {
     expect(notices).toHaveLength(2);
     // The two notices are distinct per-trip markers, not the same comment.
     expect(new Set(notices.map((notice) => notice.body)).size).toBe(2);
+  });
+
+  // --- Re-audit of 5ed094d4 (PR #211 second pass).
+  //
+  // A: veto clause (b) self-matched — issue.successful_run_handoff_required
+  // and file-resource reads are both logged under the STUCK run's own id,
+  // so isNotNull(runId) always matched and the veto fired on the loop's own
+  // bookkeeping. Restricted to (b1) a different run's activity by a
+  // non-assignee actor, or (b2) a comment by a non-assignee actor.
+  //
+  // B: a second, "comment-only" streak tier. Measured on SPA-12493 (2 days,
+  // rows with run_id set): 136 issue.comment_added vs 58
+  // issue.successful_run_handoff_required — the stuck agent commented
+  // almost every run, and ISSUE_PROGRESS_ACTIVITY_ACTIONS counts any actor's
+  // comment as progress, so the ordinary streak reset every time and the
+  // breaker would never have tripped on the case that motivated it.
+
+  it("trips a comment-only loop at 6 consecutive assignee-only-comment runs", async () => {
+    const { companyId, agentId, issueId } = await seedCompanyAgentIssue();
+
+    const runIds: string[] = [];
+    for (const finishedSecondsAgo of [600, 500, 400, 300, 200, 100]) {
+      runIds.push(
+        await seedCommentOnlyRun({ companyId, agentId, issueId, finishedSecondsAgo }),
+      );
+    }
+
+    const wake = await continuationWake(heartbeat, agentId, issueId);
+    expect(wake).toBeNull();
+
+    const skipped = await latestWakeRequest(agentId);
+    expect(skipped?.reason).toBe("issue_rewake_circuit_breaker_tripped");
+    const heartbeatSkip = (skipped?.payload as Record<string, unknown> | null)?.heartbeatSkip as
+      | Record<string, unknown>
+      | undefined;
+    expect(heartbeatSkip?.streakKind).toBe("comment_only");
+    expect(heartbeatSkip?.commentOnlyStreak).toBe(6);
+    expect(heartbeatSkip?.runIds).toEqual([...runIds].reverse());
+
+    const issueRow = await loadIssue(issueId);
+    expect(issueRow?.status).toBe("backlog");
+    const notices = await issueComment_count(issueId, ISSUE_REWAKE_CIRCUIT_BREAKER_NOTICE_PREFIX);
+    expect(notices).toHaveLength(1);
+    expect(notices[0]?.body).toContain("comment-only");
+    expect(notices[0]?.body).toContain("6 consecutive");
+  });
+
+  it("does not trip a comment-only loop at 5 consecutive assignee-only-comment runs", async () => {
+    const { companyId, agentId, issueId } = await seedCompanyAgentIssue();
+
+    for (const finishedSecondsAgo of [500, 400, 300, 200, 100]) {
+      await seedCommentOnlyRun({ companyId, agentId, issueId, finishedSecondsAgo });
+    }
+
+    await continuationWake(heartbeat, agentId, issueId);
+
+    const issueRow = await loadIssue(issueId);
+    expect(issueRow?.status).toBe("in_progress");
+    const notices = await issueComment_count(issueId, ISSUE_REWAKE_CIRCUIT_BREAKER_NOTICE_PREFIX);
+    expect(notices).toHaveLength(0);
+    const skipped = await latestWakeRequest(agentId);
+    expect(skipped?.reason).not.toBe("issue_rewake_circuit_breaker_tripped");
+  });
+
+  it("resets the comment-only streak when one run also changed the issue's status", async () => {
+    const { companyId, agentId, issueId } = await seedCompanyAgentIssue();
+
+    for (const finishedSecondsAgo of [600, 500, 400]) {
+      await seedCommentOnlyRun({ companyId, agentId, issueId, finishedSecondsAgo });
+    }
+    // A real status change on this one run — still accompanied by the
+    // agent's own comment, but no longer "only" a comment.
+    const statusChangeRunId = await seedCommentOnlyRun({
+      companyId,
+      agentId,
+      issueId,
+      finishedSecondsAgo: 300,
+    });
+    await db.insert(activityLog).values({
+      companyId,
+      actorType: "agent",
+      actorId: agentId,
+      agentId,
+      runId: statusChangeRunId,
+      action: "issue.updated",
+      entityType: "issue",
+      entityId: issueId,
+      details: { status: "in_progress", previousStatus: "blocked" },
+      createdAt: new Date(Date.now() - 300_000 + 500),
+    });
+    for (const finishedSecondsAgo of [200, 100]) {
+      await seedCommentOnlyRun({ companyId, agentId, issueId, finishedSecondsAgo });
+    }
+
+    // 6 runs total, but the walk stops at the status-change run (4th from
+    // newest), so only the 2 newest runs count — well under either
+    // threshold.
+    await continuationWake(heartbeat, agentId, issueId);
+
+    const issueRow = await loadIssue(issueId);
+    expect(issueRow?.status).toBe("in_progress");
+    const notices = await issueComment_count(issueId, ISSUE_REWAKE_CIRCUIT_BREAKER_NOTICE_PREFIX);
+    expect(notices).toHaveLength(0);
+  });
+
+  it("vetoes a comment-only trip when another agent also commented on this issue", async () => {
+    const { companyId, agentId, issueId } = await seedCompanyAgentIssue();
+    const otherAgentId = randomUUID();
+    await db.insert(agents).values({
+      id: otherAgentId,
+      companyId,
+      name: "AnotherAgent",
+      role: "engineer",
+      status: "active",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+
+    const runIds: string[] = [];
+    for (const finishedSecondsAgo of [600, 500, 400, 300, 200, 100]) {
+      runIds.push(
+        await seedCommentOnlyRun({ companyId, agentId, issueId, finishedSecondsAgo }),
+      );
+    }
+    // A different agent's own comment, well before the newest run finished
+    // (so it is not "new input since the last run" either) — clause (b2):
+    // a comment authored by anyone other than the assignee agent.
+    await db.insert(activityLog).values({
+      companyId,
+      actorType: "agent",
+      actorId: otherAgentId,
+      agentId: otherAgentId,
+      runId: null,
+      action: "issue.comment_added",
+      entityType: "issue",
+      entityId: issueId,
+      createdAt: new Date(Date.now() - 350_000),
+    });
+
+    await continuationWake(heartbeat, agentId, issueId);
+
+    const issueRow = await loadIssue(issueId);
+    expect(issueRow?.status).toBe("in_progress");
+    const notices = await issueComment_count(issueId, ISSUE_REWAKE_CIRCUIT_BREAKER_NOTICE_PREFIX);
+    expect(notices).toHaveLength(0);
+    const skipped = await latestWakeRequest(agentId);
+    expect(skipped?.reason).not.toBe("issue_rewake_circuit_breaker_tripped");
+  });
+
+  it("resets a comment-only trip when a human comments since the last run", async () => {
+    const { companyId, agentId, issueId } = await seedCompanyAgentIssue();
+
+    for (const finishedSecondsAgo of [600, 500, 400, 300, 200, 100]) {
+      await seedCommentOnlyRun({ companyId, agentId, issueId, finishedSecondsAgo });
+    }
+    // New human input after the newest run finished.
+    await db.insert(activityLog).values({
+      companyId,
+      actorType: "user",
+      actorId: "board-user",
+      action: "issue.comment_added",
+      entityType: "issue",
+      entityId: issueId,
+    });
+
+    await continuationWake(heartbeat, agentId, issueId);
+
+    const issueRow = await loadIssue(issueId);
+    expect(issueRow?.status).toBe("in_progress");
+    const notices = await issueComment_count(issueId, ISSUE_REWAKE_CIRCUIT_BREAKER_NOTICE_PREFIX);
+    expect(notices).toHaveLength(0);
+  });
+
+  it("does not veto a no-progress trip on file_resource_list or successful_run_handoff_required rows logged under a counted run's own id", async () => {
+    const { companyId, agentId, issueId } = await seedCompanyAgentIssue();
+
+    const runIds = [
+      await seedTerminalRun({ companyId, agentId, issueId, finishedSecondsAgo: 300 }),
+      await seedTerminalRun({ companyId, agentId, issueId, finishedSecondsAgo: 200 }),
+      await seedTerminalRun({ companyId, agentId, issueId, finishedSecondsAgo: 100 }),
+    ];
+    // The orchestrator's own file-resource read, logged under its OWN run
+    // id (the real shape: actorType is the calling agent, i.e. the
+    // assignee itself).
+    await db.insert(activityLog).values({
+      companyId,
+      actorType: "agent",
+      actorId: agentId,
+      agentId,
+      runId: runIds[0],
+      action: "issue.file_resource_list",
+      entityType: "issue",
+      entityId: issueId,
+      createdAt: new Date(Date.now() - 299_000),
+    });
+    // The heartbeat's own handoff-required notice, logged under the SAME
+    // stuck run's own id (the real shape: actorType "system", actorId
+    // "heartbeat" — this is the exact self-match the audit found).
+    await db.insert(activityLog).values({
+      companyId,
+      actorType: "system",
+      actorId: "heartbeat",
+      agentId,
+      runId: runIds[1],
+      action: "issue.successful_run_handoff_required",
+      entityType: "issue",
+      entityId: issueId,
+      createdAt: new Date(Date.now() - 199_000),
+    });
+
+    const wake = await continuationWake(heartbeat, agentId, issueId);
+    expect(wake).toBeNull();
+
+    const skipped = await latestWakeRequest(agentId);
+    expect(skipped?.reason).toBe("issue_rewake_circuit_breaker_tripped");
+
+    const issueRow = await loadIssue(issueId);
+    expect(issueRow?.status).toBe("backlog");
+    const notices = await issueComment_count(issueId, ISSUE_REWAKE_CIRCUIT_BREAKER_NOTICE_PREFIX);
+    expect(notices).toHaveLength(1);
+  });
+
+  it("still trips a loop driven only by finish_successful_run_handoff wakes after the re-audit fixes", async () => {
+    const { companyId, agentId, issueId } = await seedCompanyAgentIssue();
+
+    await seedTerminalRun({ companyId, agentId, issueId, finishedSecondsAgo: 300 });
+    await seedTerminalRun({ companyId, agentId, issueId, finishedSecondsAgo: 200 });
+    await seedTerminalRun({ companyId, agentId, issueId, finishedSecondsAgo: 100 });
+
+    const wake = await handoffWake(heartbeat, agentId, issueId);
+    expect(wake).toBeNull();
+
+    const skipped = await latestWakeRequest(agentId);
+    expect(skipped?.reason).toBe("issue_rewake_circuit_breaker_tripped");
+
+    const issueRow = await loadIssue(issueId);
+    expect(issueRow?.status).toBe("backlog");
+    const notices = await issueComment_count(issueId, ISSUE_REWAKE_CIRCUIT_BREAKER_NOTICE_PREFIX);
+    expect(notices).toHaveLength(1);
   });
 });
