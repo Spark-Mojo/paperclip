@@ -7,7 +7,7 @@ import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { ensureManagedProjectWorkspace, prepareProjectRepositoryWorkspaces } from "../services/heartbeat.ts";
 import { buildGitAuthInvocation, GIT_CREDENTIAL_TOKEN_ENV_KEY } from "../services/git-credentials.ts";
 import { sanitizeRuntimeServiceBaseEnv } from "../services/workspace-runtime.ts";
-import { resolveManagedProjectWorkspaceDir } from "../home-paths.ts";
+import { resolveManagedProjectWorkspaceDir, resolvePaperclipInstanceRoot } from "../home-paths.ts";
 
 const execFile = promisify(execFileCallback);
 
@@ -276,6 +276,54 @@ describe("ensureManagedProjectWorkspace clone credentials", () => {
       await expect(fs.readFile(path.join(cwd, "keep.txt"), "utf8")).resolves.toBe("operator data\n");
     } finally {
       await fs.rm(sourceRepo, { recursive: true, force: true });
+    }
+  });
+
+  it("retains a de-scoped repository outside the worktree with a clean git status", async () => {
+    const first = await createLocalSourceRepo();
+    const second = await createLocalSourceRepo();
+    try {
+      const anchor = await ensureManagedProjectWorkspace({ companyId: "repo-rescope", projectId: "two", repoUrl: first });
+      const attached = await prepareProjectRepositoryWorkspaces({
+        cwd: anchor.cwd, anchorRepoUrl: first,
+        workspaces: [{ id: "second", repoUrl: second, repoRef: null }],
+      });
+      expect(attached).toHaveLength(1);
+      const staleCwd = attached[0]!.cwd;
+      const staleEntry = path.basename(staleCwd);
+      // De-scope: empty workspaces with an existing root proceeds to the retention loop.
+      expect(await prepareProjectRepositoryWorkspaces({
+        cwd: anchor.cwd, anchorRepoUrl: first, workspaces: [],
+      })).toEqual([]);
+      // (a) The stale checkout is gone from under the worktree.
+      expect(await fs.readdir(path.dirname(staleCwd))).not.toContain(staleEntry);
+      await expect(fs.lstat(staleCwd)).rejects.toMatchObject({ code: "ENOENT" });
+      // (b) THE oracle: no untracked retention dir pollutes `git status`.
+      expect((await execFile("git", ["status", "--porcelain"], { cwd: anchor.cwd })).stdout).toBe("");
+      // (c) Retained under the instance root with a receipt naming the source path.
+      const retentionRoot = path.join(resolvePaperclipInstanceRoot(), "detached-repositories");
+      const names = await fs.readdir(retentionRoot);
+      let receiptName: string | null = null;
+      let receipt: { retainedFrom: string } | null = null;
+      for (const name of names.filter((entry) => entry.endsWith(".json"))) {
+        const parsed = JSON.parse(await fs.readFile(path.join(retentionRoot, name), "utf8"));
+        if (parsed.retainedFrom === staleCwd) {
+          receiptName = name;
+          receipt = parsed;
+        }
+      }
+      expect(receiptName).not.toBeNull();
+      expect(receipt!.retainedFrom).toBe(staleCwd);
+      const retentionId = receiptName!.slice(0, -".json".length);
+      const retainedDir = path.join(retentionRoot, retentionId);
+      expect((await fs.stat(retainedDir)).isDirectory()).toBe(true);
+      expect(await fs.readFile(path.join(retainedDir, "README.md"), "utf8")).toBe("hello\n");
+      // (d) No in-worktree retention surface.
+      const topLevel = await fs.readdir(anchor.cwd);
+      expect(topLevel).not.toContain("detached-repositories");
+      expect(topLevel).not.toContain(".paperclip-runtime");
+    } finally {
+      await Promise.all([first, second].map((cwd) => fs.rm(cwd, { recursive: true, force: true })));
     }
   });
 
