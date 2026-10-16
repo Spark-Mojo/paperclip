@@ -140,6 +140,7 @@ import {
   issueWriteDenialResponse,
   type IssueWriteDenialCode,
   type IssueWriteDenialContext,
+  type IssueCommentAuthorType,
 } from "@paperclipai/shared";
 import { trackAgentTaskCompleted } from "@paperclipai/shared/telemetry";
 import { getTelemetryClient } from "../telemetry.js";
@@ -841,9 +842,12 @@ function resolveIssueCommentActorForAuthorType(
   params: {
     req: Request;
     actor: ReturnType<typeof getActorInfo>;
-    requestedAuthorType: unknown;
+    requestedAuthorType: IssueCommentAuthorType | undefined;
   },
-): { actor: { agentId?: string; userId?: string; runId?: string | null; onBehalfOfUserId?: string | null }; authorType: unknown } {
+): {
+  actor: { agentId?: string; userId?: string; runId?: string | null; onBehalfOfUserId?: string | null };
+  authorType: IssueCommentAuthorType | undefined;
+} {
   const { actor, requestedAuthorType } = params;
   if (
     requestedAuthorType === "system" &&
@@ -14954,7 +14958,7 @@ export function issueRoutes(
           {
             authorizationReason: issueMutationAuthorizationReason,
             // SPA-11706 D1: same opt-in key for agents and users alike.
-            authorType: commentAuthor.authorType as any,
+            authorType: commentAuthor.authorType,
             clientRequestId: commentClientRequestId,
             sourceTrust: await sourceTrustForActorWrite(issue, actor),
           },
