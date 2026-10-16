@@ -661,13 +661,24 @@ describeEmbeddedPostgres("heartbeat issue rewake circuit breaker", () => {
     expect(new Set(notices.map((notice) => notice.body)).size).toBe(2);
   });
 
-  // --- Re-audit of 5ed094d4 (PR #211 second pass).
+  // --- Re-audit of 5ed094d4 (PR #211 second pass, then a third pass).
   //
-  // Fix A: veto clause (b) self-matched — issue.successful_run_handoff_required
-  // and file-resource reads are both logged under the STUCK run's own id,
-  // so isNotNull(runId) always matched and the veto fired on the loop's own
-  // bookkeeping. Restricted to (b1) a different run's activity by a
-  // non-assignee actor, or (b2) a comment by a non-assignee actor.
+  // Fix A (second pass): a run-id-based denylist self-matched —
+  // issue.successful_run_handoff_required and file-resource reads are both
+  // logged under the STUCK run's own id, so isNotNull(runId) always matched
+  // and the veto fired on the loop's own bookkeeping; then, separately, the
+  // breaker's own prior trip log entry (actorType "system", no run id) hit
+  // the same shape on a later evaluation.
+  //
+  // Fix A (third pass): denying each newly-found engine-bookkeeping shape
+  // one at a time does not converge — the scheduler sweep logs
+  // issue.monitor_exhausted, monitor_escalated_to_board,
+  // monitor_recovery_wake_queued, and monitor_recovery_issue_created the
+  // same way (actorType "system", runId null), and plausibly more exist.
+  // Replaced with an ALLOWLIST of what counts as external evidence: (a)
+  // child-issue activity, (b) a comment by a non-assignee agent or a human,
+  // (c) any activity at all by a human. A `system` actor is never evidence,
+  // by construction, so no exclusion list to maintain or outrun.
   //
   // A second "comment-only" streak tier was built here and then reverted:
   // see the REJECTED note on evaluateIssueRewakeThrottle in
@@ -710,6 +721,38 @@ describeEmbeddedPostgres("heartbeat issue rewake circuit breaker", () => {
       entityType: "issue",
       entityId: issueId,
       createdAt: new Date(Date.now() - 199_000),
+    });
+
+    const wake = await continuationWake(heartbeat, agentId, issueId);
+    expect(wake).toBeNull();
+
+    const skipped = await latestWakeRequest(agentId);
+    expect(skipped?.reason).toBe("issue_rewake_circuit_breaker_tripped");
+
+    const issueRow = await loadIssue(issueId);
+    expect(issueRow?.status).toBe("backlog");
+    const notices = await issueComment_count(issueId, ISSUE_REWAKE_CIRCUIT_BREAKER_NOTICE_PREFIX);
+    expect(notices).toHaveLength(1);
+  });
+
+  it("does not veto a no-progress trip on a scheduler-sweep issue.monitor_exhausted row (system actor, no run id)", async () => {
+    const { companyId, agentId, issueId } = await seedCompanyAgentIssue();
+
+    await seedTerminalRun({ companyId, agentId, issueId, finishedSecondsAgo: 300 });
+    await seedTerminalRun({ companyId, agentId, issueId, finishedSecondsAgo: 200 });
+    await seedTerminalRun({ companyId, agentId, issueId, finishedSecondsAgo: 100 });
+    // The scheduler sweep's own bookkeeping: actorType "system", no run
+    // id — the same shape the breaker's own trip log entry has, and the
+    // shape a run-id denylist could never fully enumerate.
+    await db.insert(activityLog).values({
+      companyId,
+      actorType: "system",
+      actorId: "scheduler",
+      runId: null,
+      action: "issue.monitor_exhausted",
+      entityType: "issue",
+      entityId: issueId,
+      createdAt: new Date(Date.now() - 150_000),
     });
 
     const wake = await continuationWake(heartbeat, agentId, issueId);

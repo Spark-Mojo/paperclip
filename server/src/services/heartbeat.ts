@@ -29786,18 +29786,25 @@ export function heartbeatService(
                       ),
                     )
                     .then((rows) => rows.map((row) => row.id));
-                  // Re-audit finding (PR #211): the original clause (b)
-                  // self-matched — issue.successful_run_handoff_required and
-                  // file-resource reads are both logged under the STUCK
-                  // run's own id, with isNotNull(runId) trivially true, so
-                  // the veto fired on the loop's own bookkeeping instead of
-                  // on real delegation evidence. (b) is now restricted to:
-                  // (b1) activity under a run id that is NOT one of the
-                  // counted streak runs, by an actor who is not the
-                  // assignee agent — genuine other-run evidence (a
-                  // subagent's own run, a human/system action) — or
-                  // (b2) a comment authored by anyone other than the
-                  // assignee agent, regardless of its run id.
+                  // Re-audit finding (PR #211, second pass): a run-id-based
+                  // denylist ("not one of the counted runs, not the
+                  // assignee") kept self-matching the engine's OWN
+                  // bookkeeping, which is logged with actorType "system"
+                  // and no run id just like genuine external evidence would
+                  // be if it had no run id — first issue.
+                  // successful_run_handoff_required and file-resource
+                  // reads under the stuck run's own id, then the breaker's
+                  // own prior trip log entry. More such rows exist (the
+                  // scheduler sweep's issue.monitor_exhausted,
+                  // monitor_escalated_to_board,
+                  // monitor_recovery_wake_queued,
+                  // monitor_recovery_issue_created — all actorType
+                  // "system", runId null) and plausibly more do too, so
+                  // denying known-bad shapes one at a time does not
+                  // converge. Replaced with an ALLOWLIST of what counts as
+                  // external evidence instead: a `system` actor is never
+                  // evidence, full stop, by construction — no exclusion
+                  // list to maintain or outrun.
                   const assigneeAgentId = issue.assigneeAgentId ?? null;
                   const isAssigneeAgentActor =
                     (assigneeAgentId
@@ -29814,19 +29821,6 @@ export function heartbeatService(
                         eq(activityLog.companyId, issue.companyId),
                         eq(activityLog.entityType, "issue"),
                         gte(activityLog.createdAt, extraProgressWindowStart),
-                        // Self-match guard: exclude the breaker's own prior
-                        // trip bookkeeping (actorType "system", no run id)
-                        // from counting as delegation/human evidence — a
-                        // second evaluation whose window still reaches back
-                        // to an earlier trip on this same card must not veto
-                        // itself on its own audit trail. Found via this
-                        // exact test: the second-trip assertion failed under
-                        // heavy load because the first trip's own log entry
-                        // (runId null, actorType system) satisfied (b1).
-                        ne(
-                          activityLog.action,
-                          ISSUE_REWAKE_CIRCUIT_BREAKER_TRIPPED_ACTIVITY_ACTION,
-                        ),
                         or(
                           // (a) any activity on a child issue of this card —
                           // e.g. issue.child_created or a child's status
@@ -29837,25 +29831,22 @@ export function heartbeatService(
                           and(
                             eq(activityLog.entityId, issue.id),
                             or(
-                              // (b1)
-                              and(
-                                or(
-                                  isNull(activityLog.runId),
-                                  notInArray(
-                                    activityLog.runId,
-                                    trippedRunIds,
-                                  ),
-                                ),
-                                not(isAssigneeAgentActor),
-                              ),
-                              // (b2)
+                              // (b) a comment on this issue by someone other
+                              // than the assignee agent — a subagent or a
+                              // human, never `system`.
                               and(
                                 eq(
                                   activityLog.action,
                                   "issue.comment_added",
                                 ),
+                                inArray(activityLog.actorType, [
+                                  "agent",
+                                  "user",
+                                ]),
                                 not(isAssigneeAgentActor),
                               ),
+                              // (c) any activity on this issue by a human.
+                              eq(activityLog.actorType, "user"),
                             ),
                           ),
                         ),
