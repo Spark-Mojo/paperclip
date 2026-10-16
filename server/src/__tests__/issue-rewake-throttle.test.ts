@@ -3,9 +3,11 @@ import {
   ISSUE_REWAKE_BASE_COOLDOWN_MS,
   ISSUE_REWAKE_MAX_COOLDOWN_MS,
   ISSUE_REWAKE_NO_PROGRESS_THRESHOLD,
+  ISSUE_REWAKE_RUN_SAMPLE_LIMIT,
   computeIssueRewakeCooldownMs,
   evaluateIssueRewakeThrottle,
   isThrottleCandidateIssueRewake,
+  normalizeIssueRewakeCircuitBreakerThreshold,
 } from "../services/issue-rewake-throttle.ts";
 
 const NOW = new Date("2026-07-12T18:14:00.000Z");
@@ -205,5 +207,18 @@ describe("evaluateIssueRewakeThrottle", () => {
       hasNewIssueInputSinceLastRun: true,
     });
     expect(decision).toEqual({ blocked: false, noProgressStreak: 0 });
+  });
+});
+
+describe("normalizeIssueRewakeCircuitBreakerThreshold", () => {
+  it("defaults to 3 and clamps to [2, run sample limit] so a threshold can always trip", () => {
+    expect(normalizeIssueRewakeCircuitBreakerThreshold(undefined)).toBe(3);
+    expect(normalizeIssueRewakeCircuitBreakerThreshold("nope")).toBe(3);
+    expect(normalizeIssueRewakeCircuitBreakerThreshold("1")).toBe(2);
+    expect(normalizeIssueRewakeCircuitBreakerThreshold("5")).toBe(5);
+    expect(normalizeIssueRewakeCircuitBreakerThreshold("20")).toBe(ISSUE_REWAKE_RUN_SAMPLE_LIMIT);
+    expect(normalizeIssueRewakeCircuitBreakerThreshold(ISSUE_REWAKE_RUN_SAMPLE_LIMIT + 1)).toBe(
+      ISSUE_REWAKE_RUN_SAMPLE_LIMIT,
+    );
   });
 });
