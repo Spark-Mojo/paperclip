@@ -127,8 +127,9 @@ export async function testEnvironment(
   // Prevent OpenCode from writing an opencode.json into the working directory.
   env.OPENCODE_DISABLE_PROJECT_CONFIG = "true";
   const preparedRuntimeConfig = await prepareOpenCodeRuntimeConfig({ env, config });
-  const localRuntimeConfigHome =
-    preparedRuntimeConfig.notes.length > 0 ? preparedRuntimeConfig.env.XDG_CONFIG_HOME : "";
+  // SPA-12581 (F1): see execute.ts — staging selects from generatedConfigHome,
+  // never from a notes gate.
+  const localRuntimeConfigHome = preparedRuntimeConfig.generatedConfigHome ?? "";
   if (asBoolean(config.dangerouslySkipPermissions, true)) {
     checks.push({
       code: "opencode_headless_permissions_enabled",

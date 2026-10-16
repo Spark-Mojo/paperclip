@@ -533,10 +533,45 @@ describe("prepareOpenCodeRuntimeConfig", () => {
     await prepared.cleanup();
   });
 
-  it("remote target ignores workspaceCwd and emits deny (SPA-12520)", async () => {
-    // Remote early-return creates no runtime config dir; the remote box never
-    // sees a local-path allow map. Assert the fail-closed contract instead:
-    // a note naming the skip, and no temp config home minted.
+  it("remote target stages no host config and ships a generated deny-only config (SPA-12581 F1+F2)", async () => {
+    // F1: the remote branch must never stage the host XDG config dir. The
+    // returned XDG_CONFIG_HOME is a fresh generated temp dir, not the host
+    // dir; the host dir's sentinel file is absent from the generated dir.
+    // F2: the generated dir carries an explicit deny opencode.json, so a
+    // remote target with a pre-existing permissive config still runs deny.
+    const configHome = await makeConfigHome({ permission: { read: "allow" } });
+    const sentinel = path.join(configHome, "opencode", "host-sentinel.txt");
+    await fs.writeFile(sentinel, "host-only\n", "utf8");
+    const prepared = await prepareOpenCodeRuntimeConfig({
+      env: { XDG_CONFIG_HOME: configHome },
+      config: {},
+      targetIsRemote: true,
+      workspaceCwd: SPA12520_WORKTREE,
+    });
+    cleanupPaths.add(prepared.env.XDG_CONFIG_HOME);
+    try {
+      expect(prepared.env.XDG_CONFIG_HOME).not.toBe(configHome);
+      expect(prepared.generatedConfigHome).toBe(prepared.env.XDG_CONFIG_HOME);
+      await expect(fs.access(path.join(prepared.env.XDG_CONFIG_HOME, "opencode", "host-sentinel.txt"))).rejects.toThrow();
+      const shipped = JSON.parse(
+        await fs.readFile(path.join(prepared.env.XDG_CONFIG_HOME, "opencode", "opencode.json"), "utf8"),
+      ) as { permission?: { external_directory?: unknown } };
+      expect(shipped).toEqual({ permission: { external_directory: "deny" } });
+      // Staging selector (mirrors execute.ts): generatedConfigHome, never notes.
+      const stageDir = prepared.generatedConfigHome ?? "";
+      expect(stageDir).not.toBe("");
+      expect(stageDir).not.toBe(configHome);
+    } finally {
+      await prepared.cleanup();
+    }
+    cleanupPaths.delete(prepared.env.XDG_CONFIG_HOME);
+    await expect(fs.access(prepared.env.XDG_CONFIG_HOME)).rejects.toThrow();
+  });
+
+  it("remote staging selector never resolves to the host dir even with notes present (SPA-12581 F1)", async () => {
+    // Regression guard for the notes.length staging gate Sable caught: notes
+    // are logging-only. Assert the selector contract directly — a non-empty
+    // notes array must not change which dir stages.
     const configHome = await makeConfigHome({ permission: { read: "allow" } });
     const prepared = await prepareOpenCodeRuntimeConfig({
       env: { XDG_CONFIG_HOME: configHome },
@@ -545,8 +580,13 @@ describe("prepareOpenCodeRuntimeConfig", () => {
       workspaceCwd: SPA12520_WORKTREE,
     });
     cleanupPaths.add(prepared.env.XDG_CONFIG_HOME);
-    expect(prepared.env.XDG_CONFIG_HOME).toBe(configHome);
-    expect(prepared.notes.some((n) => n.includes("Remote target"))).toBe(true);
-    await prepared.cleanup();
+    try {
+      expect(prepared.notes.length).toBeGreaterThan(0);
+      expect(prepared.generatedConfigHome).not.toBeNull();
+      expect(prepared.generatedConfigHome).not.toBe(configHome);
+    } finally {
+      await prepared.cleanup();
+    }
+    cleanupPaths.delete(prepared.env.XDG_CONFIG_HOME);
   });
 });

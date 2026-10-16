@@ -360,8 +360,12 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     targetIsRemote: executionTargetIsRemote,
     workspaceCwd: executionTargetIsRemote ? null : (effectiveWorkspaceCwd || cwd),
   });
-  const localRuntimeConfigHome =
-    preparedRuntimeConfig.notes.length > 0 ? preparedRuntimeConfig.env.XDG_CONFIG_HOME : "";
+  // SPA-12581 (F1): stage the GENERATED config dir only — never the host
+  // config dir, and never via a notes gate (notes are logging, not a
+  // staging signal). generatedConfigHome is the temp runtimeConfigHome on the
+  // local path, a fresh deny-only temp dir on the remote path, and null when
+  // no config was generated (skipPermissions off → stage nothing).
+  const localRuntimeConfigHome = preparedRuntimeConfig.generatedConfigHome ?? "";
   try {
     const runtimeEnv = Object.fromEntries(
       Object.entries(ensurePathInEnv({ ...process.env, ...preparedRuntimeConfig.env })).filter(
