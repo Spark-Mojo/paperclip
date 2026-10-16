@@ -128,6 +128,35 @@ export function stageDecisionService(db: Db) {
             currentStageId: existingState.currentStageId,
           });
         }
+        // Cross-stage idempotency (before gates): after an approve advances
+        // currentStageId, a stage-scoped lookup no longer sees the prior
+        // row, and the replaying prior-stage actor is no longer the active
+        // participant — so the issue-wide latest-decision check must run
+        // before the escalated-hold/participant gates, else the replay throws
+        // instead of returning duplicate:true.
+        const latestIssueDecision = await tx
+          .select()
+          .from(issueExecutionDecisions)
+          .where(and(
+            eq(issueExecutionDecisions.companyId, lockedIssue.companyId),
+            eq(issueExecutionDecisions.issueId, lockedIssue.id),
+          ))
+          .orderBy(desc(issueExecutionDecisions.createdAt))
+          .limit(1)
+          .then((rows) => rows[0] ?? null);
+        if (latestIssueDecision && latestIssueDecision.outcome === outcome &&
+          latestIssueDecision.body === body &&
+          principalsMatchDecision(latestIssueDecision, input.actor) &&
+          existingState.lastDecisionId === latestIssueDecision.id) {
+          const crossReflected = input.action === "approve"
+            ? existingState.completedStageIds.includes(latestIssueDecision.stageId) &&
+              latestIssueDecision.stageId !== activeStage.id
+            : existingState.status === "changes_requested" &&
+              existingState.currentStageId === latestIssueDecision.stageId;
+          if (crossReflected) {
+            return { issue: lockedIssue, decision: latestIssueDecision, duplicate: true as const };
+          }
+        }
         // Escalated-human hold: mirrors the sticky hold in
         // applyIssueExecutionPolicyTransition. An escalated review is held by
         // a human outside the stage's configured participants; only that
