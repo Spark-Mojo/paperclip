@@ -8,7 +8,13 @@ export function shouldWakeAssigneeForIssueComment(input: {
   };
   reopened: boolean;
   currentStatus: string | null | undefined;
+  commentAuthorType?: string | null | undefined;
 }) {
+  // SPA-12751: system-authored notes are lifecycle chatter, not human signal.
+  // They never wake the assignee; explicit reopen/resume still goes through.
+  if (input.commentAuthorType === "system" && !input.reopened && !input.resumeRequested) {
+    return false;
+  }
   const sourceRunId = input.commentCreatedByRunId;
   const commentIsFromCurrentIssueRun = Boolean(
     sourceRunId &&
