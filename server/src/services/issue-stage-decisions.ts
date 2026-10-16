@@ -47,7 +47,7 @@ export interface StageDecisionInput {
   action: StageDecisionAction;
   body: string;
   actor: StageDecisionActor;
-  stageId?: string | null;
+  stageId: string;
 }
 
 const OUTCOME_BY_ACTION: Record<StageDecisionAction, IssueExecutionDecisionOutcome> = {
@@ -129,13 +129,17 @@ export function stageDecisionService(db: Db) {
             currentStageId: existingState.currentStageId,
           });
         }
-        // Explicit target-stage contract: when the caller names a stageId
-        // that is not the active stage, it is either an explicit retry of
-        // the completed stage (idempotent duplicate) or a stale write that
+        // Explicit target-stage contract: stageId is REQUIRED. A missing,
+        // empty, or non-active stageId is either an explicit retry of the
+        // completed stage (idempotent duplicate) or a stale write that
         // must fail closed. A same-actor/same-body approval on the NEW
         // stage after approve-advance is a fresh decision, never a
         // duplicate — only a stageId naming the completed stage replays.
-        if (input.stageId != null && input.stageId !== activeStage.id) {
+        // Fail-closed on omission: a missing/empty stageId can never pass
+        // the participant gate below as a fresh approval — it routes here
+        // as a mismatch (expected: activeStage.id) and 409s unless it
+        // replays the completed stage.
+        if (!input.stageId || input.stageId !== activeStage.id) {
           const latestIssueDecision = await tx
             .select()
             .from(issueExecutionDecisions)
@@ -157,7 +161,7 @@ export function stageDecisionService(db: Db) {
           throw conflict("Stage decision targets a stage that is not active", {
             issueId: lockedIssue.id,
             expected: activeStage.id,
-            received: input.stageId,
+            received: input.stageId ?? null,
           });
         }
         // Escalated-human hold: mirrors the sticky hold in
