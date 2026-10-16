@@ -187,7 +187,7 @@ export function costService(db: Db, budgetHooks: BudgetServiceHooks = {}) {
         ${issues.id} IN (
           WITH RECURSIVE issue_tree(id) AS (
             ${cteSeed}
-            UNION ALL
+            UNION
             SELECT ${childIssues.id}
             FROM ${issues} ${childIssues}
             JOIN issue_tree ON ${childIssues.parentId} = issue_tree.id
@@ -202,7 +202,7 @@ export function costService(db: Db, budgetHooks: BudgetServiceHooks = {}) {
       const runSummarySql = sql`
         WITH RECURSIVE issue_tree(id) AS (
           ${cteSeedText}
-          UNION ALL
+          UNION
           SELECT (${childIssues.id})::text
           FROM ${issues} ${childIssues}
           JOIN issue_tree ON (${childIssues.parentId})::text = issue_tree.id
