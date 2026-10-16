@@ -12739,18 +12739,10 @@ describeEmbeddedPostgres(
       }
     }, 30_000);
 
-    it("moves a managed_checkout next project workspace's worktree cross-repo when its cwd is NULL (SPA-12426 finding (B))", async () => {
+    it("does not treat a runs/<branch> branch-template leaf as ephemeral when the leaf segment is not a run-id shape (SPA-12426 re-audit finding (ii))", async () => {
       const support = await startEmbeddedPostgresTestDatabase(
-        "paperclip-spa12426-managed-checkout-",
+        "paperclip-spa12426-runs-branch-template-",
       );
-      // SPA-12426 finding (B): a managed_checkout project workspace stores
-      // cwd = NULL; its live checkout path is resolved on demand via
-      // ensureManagedProjectWorkspace, which derives its path from
-      // PAPERCLIP_HOME. Sandbox that resolution the same way the rest of
-      // this file's managed-checkout-adjacent tests sandbox it.
-      const previousPaperclipHome = process.env.PAPERCLIP_HOME;
-      const paperclipHome = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-spa12426-managed-home-"));
-      process.env.PAPERCLIP_HOME = paperclipHome;
       try {
         const db = createDb(support.connectionString);
         const companyId = randomUUID();
@@ -12759,15 +12751,17 @@ describeEmbeddedPostgres(
         const newProjectWorkspaceId = randomUUID();
         const sourceIssueId = randomUUID();
         const executionWorkspaceId = randomUUID();
-        const branchName = "PAP-12426-managed-checkout";
+        // A branchTemplate like `runs/{{issue.identifier}}` sanitizes to
+        // exactly this shape — sanitizeBranchName keeps `/`. The leaf's
+        // parent dir is named `runs`, same as the SPA-9275 ephemeral shape,
+        // but the leaf's OWN basename ("SPA-1-x") is not a run-id (a UUID,
+        // or `run-<uuid>`) — this is an ORDINARY per-branch worktree, not an
+        // ephemeral one, and must not be skipped as if it were.
+        const branchName = "runs/SPA-1-x";
         const { oldRepo, oldWorktreePath } = await createOldRepoWorktree(branchName);
-        // A real local repo that `ensureManagedProjectWorkspace` clones FROM
-        // (a plain local filesystem path is a valid `git clone` source — no
-        // credentials needed, confirmed by reading createGitRemoteAuthProvider:
-        // it returns null for any non-GitHub remote url before touching the DB).
-        const managedSourceRepo = await createNewRepo();
-        await db.insert(companies).values({ id: companyId, name: "spa12426-managed-co" });
-        await db.insert(projects).values({ id: projectId, companyId, name: "spa12426-managed-project" });
+        const newRepo = await createNewRepo();
+        await db.insert(companies).values({ id: companyId, name: "spa12426-runs-branch-co" });
+        await db.insert(projects).values({ id: projectId, companyId, name: "spa12426-runs-branch-project" });
         await db.insert(projectWorkspaces).values([
           {
             id: oldProjectWorkspaceId,
@@ -12782,10 +12776,9 @@ describeEmbeddedPostgres(
             id: newProjectWorkspaceId,
             companyId,
             projectId,
-            name: "new-managed-workspace",
-            sourceType: "managed_checkout",
-            cwd: null,
-            repoUrl: managedSourceRepo,
+            name: "new-workspace",
+            cwd: newRepo,
+            repoUrl: null,
             repoRef: "refs/heads/main",
           },
         ]);
@@ -12796,7 +12789,7 @@ describeEmbeddedPostgres(
           projectWorkspaceId: oldProjectWorkspaceId,
           mode: "isolated_workspace",
           strategyType: "git_worktree",
-          name: "spa12426-managed-checkout",
+          name: "spa12426-runs-branch-template",
           status: "active",
           cwd: oldWorktreePath,
           repoUrl: null,
@@ -12812,7 +12805,7 @@ describeEmbeddedPostgres(
           projectId,
           projectWorkspaceId: oldProjectWorkspaceId,
           executionWorkspaceId,
-          title: "SPA-12426 managed_checkout rebind still moves",
+          title: "SPA-12426 runs/ branch template is not ephemeral",
           status: "todo",
         } as Partial<typeof issues.$inferInsert>);
         await db
@@ -12830,11 +12823,117 @@ describeEmbeddedPostgres(
         });
         expect(outcome.outcome).toBe("retired");
         if (outcome.outcome !== "retired") throw new Error("unreachable");
-        // If managed_checkout resolution were still falling through to
-        // "unresolved" (the finding (B) bug), this would be
-        // worktreeMoveSkipped: "new_repo_root_unresolved" and
-        // worktreeMoved: false — asserting worktreeMoved true here is the
-        // regression check.
+        // If the bare basename(dirname(leaf)) === "runs" check alone were
+        // still in effect, this would incorrectly skip with
+        // worktreeMoveSkipped: "ephemeral_run_worktree". Moving
+        // successfully is the finding (ii) regression check.
+        expect(outcome.worktreeMoveSkipped).toBeUndefined();
+        expect(outcome.worktreeMoved).toBe(true);
+        const movedToPath = outcome.worktreeMovedTo;
+        expect(movedToPath).toBe(`${oldWorktreePath}.rebind-retired-${executionWorkspaceId.slice(0, 8)}`);
+        await expect(fs.stat(oldWorktreePath)).rejects.toThrow();
+        await expect(fs.stat(movedToPath!)).resolves.toBeDefined();
+      } finally {
+        await support.cleanup();
+      }
+    }, 30_000);
+
+    it("moves a cold managed_checkout next project workspace's worktree cross-repo via repo identity, never cloning (SPA-12426 re-audit finding (i))", async () => {
+      const support = await startEmbeddedPostgresTestDatabase(
+        "paperclip-spa12426-managed-cold-",
+      );
+      // Sandboxed PAPERCLIP_HOME purely so the "predicted managed path"
+      // this function computes (but never materializes) resolves under a
+      // throwaway root — the established pattern elsewhere in this file.
+      const previousPaperclipHome = process.env.PAPERCLIP_HOME;
+      const paperclipHome = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-spa12426-managed-cold-home-"));
+      process.env.PAPERCLIP_HOME = paperclipHome;
+      try {
+        const db = createDb(support.connectionString);
+        const companyId = randomUUID();
+        const projectId = randomUUID();
+        const oldProjectWorkspaceId = randomUUID();
+        const newProjectWorkspaceId = randomUUID();
+        const sourceIssueId = randomUUID();
+        const executionWorkspaceId = randomUUID();
+        const branchName = "PAP-12426-managed-cold";
+        const { oldRepo, oldWorktreePath } = await createOldRepoWorktree(branchName);
+        // SPA-12426 re-audit finding (i): the old worktree's owner repo gets
+        // a REAL `origin` remote this time (a credential-bearing HTTPS
+        // URL — never cloned, never logged; read only via
+        // `git config --get remote.origin.url` for the identity compare).
+        await runGit(oldRepo, ["remote", "add", "origin", "https://x-access-token:FAKE@github.com/acme/old-repo.git"]);
+        await db.insert(companies).values({ id: companyId, name: "spa12426-managed-cold-co" });
+        await db.insert(projects).values({ id: projectId, companyId, name: "spa12426-managed-cold-project" });
+        await db.insert(projectWorkspaces).values([
+          {
+            id: oldProjectWorkspaceId,
+            companyId,
+            projectId,
+            name: "old-workspace",
+            cwd: oldRepo,
+            repoUrl: null,
+            repoRef: "refs/heads/main",
+          },
+          {
+            id: newProjectWorkspaceId,
+            companyId,
+            projectId,
+            name: "new-managed-workspace",
+            sourceType: "managed_checkout",
+            // cwd stays NULL: a managed_checkout that has never been
+            // materialized on this host (cold). No clone must ever happen
+            // to resolve this test.
+            cwd: null,
+            // A DIFFERENT repo identity from the old worktree's origin
+            // above, deliberately WITHOUT credentials — proving the
+            // comparison does not depend on both sides carrying the same
+            // credential shape.
+            repoUrl: "https://github.com/acme/new-repo.git",
+            repoRef: "refs/heads/main",
+          },
+        ]);
+        await db.insert(executionWorkspaces).values({
+          id: executionWorkspaceId,
+          companyId,
+          projectId,
+          projectWorkspaceId: oldProjectWorkspaceId,
+          mode: "isolated_workspace",
+          strategyType: "git_worktree",
+          name: "spa12426-managed-cold",
+          status: "active",
+          cwd: oldWorktreePath,
+          repoUrl: null,
+          baseRef: "refs/heads/main",
+          branchName,
+          providerType: "git_worktree",
+          providerRef: oldWorktreePath,
+          metadata: RUNTIME_OWNED_GIT_BRANCH_METADATA,
+        });
+        await db.insert(issues).values({
+          id: sourceIssueId,
+          companyId,
+          projectId,
+          projectWorkspaceId: oldProjectWorkspaceId,
+          executionWorkspaceId,
+          title: "SPA-12426 cold managed_checkout rebind moves via repo identity",
+          status: "todo",
+        } as Partial<typeof issues.$inferInsert>);
+        await db
+          .update(executionWorkspaces)
+          .set({ sourceIssueId })
+          .where(eq(executionWorkspaces.id, executionWorkspaceId));
+        const outcome = await executionWorkspaceService(
+          db,
+        ).retireExecutionWorkspaceAfterProjectWorkspaceRebind({
+          companyId,
+          executionWorkspaceId,
+          sourceIssueId,
+          reason: `project workspace rebind ${oldProjectWorkspaceId} -> ${newProjectWorkspaceId}`,
+          nextProjectWorkspaceId: newProjectWorkspaceId,
+        });
+        expect(outcome.outcome).toBe("retired");
+        if (outcome.outcome !== "retired") throw new Error("unreachable");
         expect(outcome.worktreeMoveSkipped).toBeUndefined();
         expect(outcome.worktreeMoveError).toBeUndefined();
         expect(outcome.worktreeMoved).toBe(true);
@@ -12847,6 +12946,111 @@ describeEmbeddedPostgres(
           .from(executionWorkspaces)
           .where(eq(executionWorkspaces.id, executionWorkspaceId));
         expect(archivedRow.cwd).toBe(movedToPath);
+        // The credential must never leak into any returned field.
+        expect(JSON.stringify(outcome)).not.toContain("FAKE");
+        // And no clone ever happened: nothing was ever written under the
+        // sandboxed PAPERCLIP_HOME root at all.
+        await expect(fs.readdir(paperclipHome)).resolves.toEqual([]);
+      } finally {
+        if (previousPaperclipHome === undefined) delete process.env.PAPERCLIP_HOME;
+        else process.env.PAPERCLIP_HOME = previousPaperclipHome;
+        await support.cleanup();
+      }
+    }, 30_000);
+
+    it("skips relocation with same_repo_rebind for a cold managed_checkout whose repoUrl normalizes to the same repo identity as the old worktree's origin (SPA-12426 re-audit finding (i))", async () => {
+      const support = await startEmbeddedPostgresTestDatabase(
+        "paperclip-spa12426-managed-cold-same-repo-",
+      );
+      const previousPaperclipHome = process.env.PAPERCLIP_HOME;
+      const paperclipHome = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-spa12426-managed-cold-same-home-"));
+      process.env.PAPERCLIP_HOME = paperclipHome;
+      try {
+        const db = createDb(support.connectionString);
+        const companyId = randomUUID();
+        const projectId = randomUUID();
+        const oldProjectWorkspaceId = randomUUID();
+        const newProjectWorkspaceId = randomUUID();
+        const sourceIssueId = randomUUID();
+        const executionWorkspaceId = randomUUID();
+        const branchName = "PAP-12426-managed-cold-same-repo";
+        const { oldRepo, oldWorktreePath } = await createOldRepoWorktree(branchName);
+        // scp-like syntax on the old side, HTTPS (no .git, no creds) on the
+        // next workspace's side — different literal strings, same
+        // normalized identity (host/owner/name).
+        await runGit(oldRepo, ["remote", "add", "origin", "git@github.com:acme/same-repo.git"]);
+        await db.insert(companies).values({ id: companyId, name: "spa12426-managed-cold-same-co" });
+        await db.insert(projects).values({ id: projectId, companyId, name: "spa12426-managed-cold-same-project" });
+        await db.insert(projectWorkspaces).values([
+          {
+            id: oldProjectWorkspaceId,
+            companyId,
+            projectId,
+            name: "old-workspace",
+            cwd: oldRepo,
+            repoUrl: null,
+            repoRef: "refs/heads/main",
+          },
+          {
+            id: newProjectWorkspaceId,
+            companyId,
+            projectId,
+            name: "new-managed-workspace",
+            sourceType: "managed_checkout",
+            cwd: null,
+            repoUrl: "https://github.com/acme/same-repo",
+            repoRef: "refs/heads/main",
+          },
+        ]);
+        await db.insert(executionWorkspaces).values({
+          id: executionWorkspaceId,
+          companyId,
+          projectId,
+          projectWorkspaceId: oldProjectWorkspaceId,
+          mode: "isolated_workspace",
+          strategyType: "git_worktree",
+          name: "spa12426-managed-cold-same-repo",
+          status: "active",
+          cwd: oldWorktreePath,
+          repoUrl: null,
+          baseRef: "refs/heads/main",
+          branchName,
+          providerType: "git_worktree",
+          providerRef: oldWorktreePath,
+          metadata: RUNTIME_OWNED_GIT_BRANCH_METADATA,
+        });
+        await db.insert(issues).values({
+          id: sourceIssueId,
+          companyId,
+          projectId,
+          projectWorkspaceId: oldProjectWorkspaceId,
+          executionWorkspaceId,
+          title: "SPA-12426 cold managed_checkout same-repo identity skips",
+          status: "todo",
+        } as Partial<typeof issues.$inferInsert>);
+        await db
+          .update(executionWorkspaces)
+          .set({ sourceIssueId })
+          .where(eq(executionWorkspaces.id, executionWorkspaceId));
+        const outcome = await executionWorkspaceService(
+          db,
+        ).retireExecutionWorkspaceAfterProjectWorkspaceRebind({
+          companyId,
+          executionWorkspaceId,
+          sourceIssueId,
+          reason: `project workspace rebind ${oldProjectWorkspaceId} -> ${newProjectWorkspaceId}`,
+          nextProjectWorkspaceId: newProjectWorkspaceId,
+        });
+        expect(outcome.outcome).toBe("retired");
+        if (outcome.outcome !== "retired") throw new Error("unreachable");
+        expect(outcome.worktreeMoved).toBe(false);
+        expect(outcome.worktreeMoveSkipped).toBe("same_repo_rebind");
+        await expect(fs.stat(oldWorktreePath)).resolves.toBeDefined();
+        const [archivedRow] = await db
+          .select()
+          .from(executionWorkspaces)
+          .where(eq(executionWorkspaces.id, executionWorkspaceId));
+        expect(archivedRow.cwd).toBe(oldWorktreePath);
       } finally {
         if (previousPaperclipHome === undefined) delete process.env.PAPERCLIP_HOME;
         else process.env.PAPERCLIP_HOME = previousPaperclipHome;
