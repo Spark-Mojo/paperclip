@@ -970,9 +970,57 @@ describe("issue update comment wakeups", () => {
         .send({ body: "guard note", authorType: "system" });
 
       expect(res.status).toBe(201);
+      // resolveIssueCommentActorForAuthorType (routes/issues.ts:838) maps the
+      // local-board sentinel + explicit authorType "system" to an id-less
+      // actor with undefined authorType, so the service derives "system".
+      // Assert the mapping INPUTS here: the mocked authorType "system" on the
+      // return value above is not load-bearing (the mock bypasses the
+      // service), so the args are what prove the route took the system path.
+      expect(mockIssueService.addComment).toHaveBeenCalledWith(
+        existing.id,
+        "guard note",
+        expect.not.objectContaining({ userId: expect.anything() }),
+        expect.objectContaining({ authorType: undefined }),
+        expect.anything(),
+      );
       await vi.waitFor(() => expect(mockIssueService.findMentionedAgents).toHaveBeenCalled());
       // Quiescence window: let any fire-and-forget wake dispatch settle
       // before asserting suppression, so a late wake cannot false-green.
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
+    });
+
+    it("maps a PATCH-with-comment system note to an id-less actor and suppresses the wake", async () => {
+      const existing = makeIssue({
+        assigneeAgentId: ASSIGNEE_AGENT_ID,
+        assigneeUserId: null,
+        status: "in_progress",
+      });
+      mockIssueService.getById.mockResolvedValue(existing);
+      mockIssueService.update.mockResolvedValue({ ...existing });
+      mockIssueService.addComment.mockResolvedValue({
+        id: "comment-system-patch",
+        issueId: existing.id,
+        companyId: existing.companyId,
+        body: "patch guard note",
+        authorType: "system",
+        createdByRunId: null,
+      });
+
+      // PATCH-with-comment takes the same resolveIssueCommentActorForAuthorType
+      // mapping (routes/issues.ts:14894) before svc.addComment.
+      const res = await request(await createApp())
+        .patch(`/api/issues/${existing.id}`)
+        .send({ comment: "patch guard note", authorType: "system" });
+
+      expect(res.status).toBe(200);
+      expect(mockIssueService.addComment).toHaveBeenCalledWith(
+        existing.id,
+        "patch guard note",
+        expect.not.objectContaining({ userId: expect.anything() }),
+        expect.objectContaining({ authorType: undefined }),
+      );
+      await vi.waitFor(() => expect(mockIssueService.findMentionedAgents).toHaveBeenCalled());
       await new Promise((resolve) => setTimeout(resolve, 50));
       expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
     });
@@ -994,11 +1042,23 @@ describe("issue update comment wakeups", () => {
         createdByRunId: null,
       });
 
-      const res = await request(await createApp())
+      // Genuine non-sentinel user actor: the test middleware builds
+      // req.actor as { type: "board", userId: "local-board", ... }, and
+      // getActorInfo (routes/authz.ts) maps any non-agent req.actor to
+      // actorType "user" with actorId = req.actor.userId. Overriding
+      // `userId` (not `actorId`) is what produces actorId "some-human".
+      const res = await request(await createApp({ userId: "some-human" }))
         .post(`/api/issues/${existing.id}/comments`)
         .send({ body: "please take another look" });
 
       expect(res.status).toBe(201);
+      expect(mockIssueService.addComment).toHaveBeenCalledWith(
+        existing.id,
+        "please take another look",
+        expect.objectContaining({ userId: "some-human" }),
+        expect.objectContaining({ authorType: "user" }),
+        expect.anything(),
+      );
       await vi.waitFor(() => expect(mockHeartbeatService.wakeup).toHaveBeenCalledTimes(1));
       expect(mockHeartbeatService.wakeup).toHaveBeenCalledWith(
         ASSIGNEE_AGENT_ID,
@@ -1028,6 +1088,15 @@ describe("issue update comment wakeups", () => {
         .send({ body: "sentinel follow-up" });
 
       expect(res.status).toBe(201);
+      // Sentinel without an explicit authorType takes the pass-through
+      // branch (authorType forwarded, service derives "user" from userId).
+      expect(mockIssueService.addComment).toHaveBeenCalledWith(
+        existing.id,
+        "sentinel follow-up",
+        expect.objectContaining({ userId: "local-board" }),
+        expect.objectContaining({ authorType: "user" }),
+        expect.anything(),
+      );
       await vi.waitFor(() => expect(mockHeartbeatService.wakeup).toHaveBeenCalledTimes(1));
       expect(mockHeartbeatService.wakeup).toHaveBeenCalledWith(
         ASSIGNEE_AGENT_ID,
