@@ -185,7 +185,9 @@ export const ISSUE_REWAKE_CIRCUIT_BREAKER_DEFAULT_THRESHOLD = 3;
 // ambiguous run is not a loop); a cap keeps a misconfigured env var from
 // disabling the breaker in all practical terms.
 const ISSUE_REWAKE_CIRCUIT_BREAKER_MIN_THRESHOLD = 2;
-const ISSUE_REWAKE_CIRCUIT_BREAKER_MAX_THRESHOLD = 20;
+// Capped at the run sample size: the streak can never exceed the number of
+// runs heartbeat samples, so a higher threshold would silently never trip.
+const ISSUE_REWAKE_CIRCUIT_BREAKER_MAX_THRESHOLD = ISSUE_REWAKE_RUN_SAMPLE_LIMIT;
 
 export function normalizeIssueRewakeCircuitBreakerThreshold(value: unknown): number {
   const parsed =

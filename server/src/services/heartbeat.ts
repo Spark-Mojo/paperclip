@@ -29857,7 +29857,14 @@ export function heartbeatService(
                 }
               }
 
-              if (isBreakerTrippable && !hasBreakerExtraProgressVeto) {
+              // Only an active card trips. A stale continuation for a card that
+              // is already backlogged/done/blocked falls through to the ordinary
+              // path, so no new notice or tripped-wake record is created for it.
+              if (
+                isBreakerTrippable &&
+                !hasBreakerExtraProgressVeto &&
+                issue.status === "in_progress"
+              ) {
                 // Audit finding #4 (PR #211): dedup is keyed on THIS trip's
                 // marker (the newest counted run), not the bare prefix — a
                 // concurrent duplicate evaluation of the same streak still
