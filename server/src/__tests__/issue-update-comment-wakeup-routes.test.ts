@@ -201,7 +201,7 @@ function registerModuleMocks() {
   }));
 }
 
-async function createApp() {
+async function createApp(actorOverrides: Record<string, unknown> = {}) {
   const [{ errorHandler }, { issueRoutes }] = await Promise.all([
     vi.importActual<typeof import("../middleware/index.js")>("../middleware/index.js"),
     vi.importActual<typeof import("../routes/issues.js")>("../routes/issues.js"),
@@ -216,6 +216,7 @@ async function createApp() {
       source: "local_implicit",
       runId: req.header("x-paperclip-run-id") ?? null,
       isInstanceAdmin: false,
+      ...actorOverrides,
     };
     next();
   });
@@ -275,7 +276,7 @@ describe("issue update comment wakeups", () => {
     const app = await createApp();
     const res = method === "post"
       ? await request(app).post(`/api/issues/${existing.id}/comments`).send({ body: "go", reopen: true, interrupt: true })
-      : await request(app).patch(`/api/issues/${existing.id}`).send({ comment: "go", assigneeAgentId: ASSIGNEE_AGENT_ID, status: "todo" });
+      : await request(app).patch(`/api/issues/${existing.id}`).send({ comment: "go", assigneeAgentId: ASSIGNEE_AGENT_ID, expectedAssigneeAgentId: null, status: "todo" });
     expect(res.status).toBe(409);
     expect(res.body.error).toBe("Task is paused. Resume it before sending a message.");
     expect(res.body.details.rootIssueId).toBe("parent-1");
@@ -283,7 +284,8 @@ describe("issue update comment wakeups", () => {
     expect(mockIssueService.addComment).not.toHaveBeenCalled();
     expect(mockIssueService.update).not.toHaveBeenCalled();
     expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
-  });
+    // First test pays the cold transform of routes/issues.ts (~18k lines, ~19s > 15s default); later cases reuse the cache.
+  }, 60_000);
 
   it("includes the new comment in assignment wakes from issue updates", async () => {
     const existing = makeIssue();
@@ -305,6 +307,8 @@ describe("issue update comment wakeups", () => {
       .send({
         assigneeAgentId: ASSIGNEE_AGENT_ID,
         assigneeUserId: null,
+        expectedAssigneeAgentId: null,
+        expectedAssigneeUserId: "local-board",
         comment: "write the whole thing",
         commentClientRequestId: "55555555-5555-4555-8555-555555555555",
       });
@@ -377,6 +381,7 @@ describe("issue update comment wakeups", () => {
       .send({
         assigneeAgentId: ASSIGNEE_AGENT_ID,
         assigneeUserId: null,
+        expectedAssigneeAgentId: PREVIOUS_AGENT_ID,
         comment: "stop and hand this to CodexCoder",
         interrupt: true,
       });
@@ -463,6 +468,8 @@ describe("issue update comment wakeups", () => {
       .send({
         assigneeAgentId: null,
         assigneeUserId: "local-board",
+        expectedAssigneeAgentId: PREVIOUS_AGENT_ID,
+        expectedAssigneeUserId: null,
         comment: "stop here, I will take it",
         interrupt: true,
       });
@@ -488,10 +495,12 @@ describe("issue update comment wakeups", () => {
     expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
   });
 
+  // Exercises assign-unchanged + deferWakeForGoal: unassigned→assigned as
+  // board actor is unexpressible (allowlist vs CAS conflict, pre-existing since d260f73f8).
   it("defers the assignment wake when a structured goal owns the next run", async () => {
-    const existing = makeIssue({ assigneeAgentId: null, assigneeUserId: null, status: "todo" });
+    const existing = makeIssue({ assigneeAgentId: ASSIGNEE_AGENT_ID, assigneeUserId: null, status: "todo" });
     mockIssueService.getById.mockResolvedValue(existing);
-    mockIssueService.update.mockResolvedValue(makeIssue({ assigneeAgentId: ASSIGNEE_AGENT_ID, status: "todo" }));
+    mockIssueService.update.mockResolvedValue(makeIssue({ assigneeAgentId: ASSIGNEE_AGENT_ID, assigneeUserId: null, status: "todo" }));
     const res = await request(await createApp()).patch(`/api/issues/${existing.id}`).send({
       assigneeAgentId: ASSIGNEE_AGENT_ID, assigneeUserId: null, deferWakeForGoal: true,
     });
@@ -937,5 +946,93 @@ describe("issue update comment wakeups", () => {
         }),
       }),
     );
+  });
+
+  describe("system-note wake suppression (SPA-12751)", () => {
+    it("does not wake the assignee for a system note on an in_progress card", async () => {
+      const existing = makeIssue({
+        assigneeAgentId: ASSIGNEE_AGENT_ID,
+        assigneeUserId: null,
+        status: "in_progress",
+      });
+      mockIssueService.getById.mockResolvedValue(existing);
+      mockIssueService.addComment.mockResolvedValue({
+        id: "comment-system-guard",
+        issueId: existing.id,
+        companyId: existing.companyId,
+        body: "guard note",
+        authorType: "system",
+        createdByRunId: null,
+      });
+
+      const res = await request(await createApp())
+        .post(`/api/issues/${existing.id}/comments`)
+        .send({ body: "guard note", authorType: "system" });
+
+      expect(res.status).toBe(201);
+      await vi.waitFor(() => expect(mockIssueService.findMentionedAgents).toHaveBeenCalled());
+      // Quiescence window: let any fire-and-forget wake dispatch settle
+      // before asserting suppression, so a late wake cannot false-green.
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
+    });
+
+    it("still wakes the assignee for a human user comment (control)", async () => {
+      const existing = makeIssue({
+        assigneeAgentId: ASSIGNEE_AGENT_ID,
+        assigneeUserId: null,
+        status: "in_progress",
+      });
+      mockIssueService.getById.mockResolvedValue(existing);
+      mockIssueService.addComment.mockResolvedValue({
+        id: "comment-human-control",
+        issueId: existing.id,
+        companyId: existing.companyId,
+        body: "please take another look",
+        authorType: "user",
+        authorUserId: "some-human",
+        createdByRunId: null,
+      });
+
+      const res = await request(await createApp())
+        .post(`/api/issues/${existing.id}/comments`)
+        .send({ body: "please take another look" });
+
+      expect(res.status).toBe(201);
+      await vi.waitFor(() => expect(mockHeartbeatService.wakeup).toHaveBeenCalledTimes(1));
+      expect(mockHeartbeatService.wakeup).toHaveBeenCalledWith(
+        ASSIGNEE_AGENT_ID,
+        expect.objectContaining({ reason: "issue_commented" }),
+      );
+    });
+
+    it("still wakes the assignee for a sentinel-posted comment without system authorType", async () => {
+      const existing = makeIssue({
+        assigneeAgentId: ASSIGNEE_AGENT_ID,
+        assigneeUserId: null,
+        status: "in_progress",
+      });
+      mockIssueService.getById.mockResolvedValue(existing);
+      mockIssueService.addComment.mockResolvedValue({
+        id: "comment-sentinel-user",
+        issueId: existing.id,
+        companyId: existing.companyId,
+        body: "sentinel follow-up",
+        authorType: "user",
+        authorUserId: "local-board",
+        createdByRunId: null,
+      });
+
+      const res = await request(await createApp())
+        .post(`/api/issues/${existing.id}/comments`)
+        .send({ body: "sentinel follow-up" });
+
+      expect(res.status).toBe(201);
+      await vi.waitFor(() => expect(mockHeartbeatService.wakeup).toHaveBeenCalledTimes(1));
+      expect(mockHeartbeatService.wakeup).toHaveBeenCalledWith(
+        ASSIGNEE_AGENT_ID,
+        expect.objectContaining({ reason: "issue_commented" }),
+      );
+    });
   });
 });
