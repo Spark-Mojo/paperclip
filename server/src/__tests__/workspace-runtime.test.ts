@@ -12123,6 +12123,13 @@ describeEmbeddedPostgres(
           reason: `project workspace rebind ${oldProjectWorkspaceId} -> ${newProjectWorkspaceId}`,
         });
         expect(outcome.outcome).toBe("retired");
+        if (outcome.outcome !== "retired") throw new Error("unreachable");
+        // SPA-12426: the archived row alone leaves the OLD worktree sitting
+        // at the exact path the NEW repo's branchTemplate would render into,
+        // colliding with every future run. Retire must also remove it
+        // (non-forced) while leaving the branch ref intact for recovery.
+        expect(outcome.worktreeRemoved).toBe(true);
+        expect(outcome.worktreeRemovalError).toBeUndefined();
         const [archivedRow] = await db
           .select()
           .from(executionWorkspaces)
@@ -12134,6 +12141,230 @@ describeEmbeddedPostgres(
           .from(issues)
           .where(eq(issues.id, sourceIssueId));
         expect(updatedIssue.executionWorkspaceId).toBeNull();
+        await expect(fs.stat(oldWorktreePath)).rejects.toThrow();
+        await expect(readGit(oldRepo, ["rev-parse", "--verify", `refs/heads/${branchName}`])).resolves.not.toBe("");
+      } finally {
+        await support.cleanup();
+      }
+    }, 30_000);
+
+    it("archives but does not remove the worktree when another live execution workspace row still points at the same path (SPA-9375 / SPA-12428)", async () => {
+      const support = await startEmbeddedPostgresTestDatabase(
+        "paperclip-spa12428-path-collision-",
+      );
+      try {
+        const db = createDb(support.connectionString);
+        const companyId = randomUUID();
+        const projectId = randomUUID();
+        const oldProjectWorkspaceId = randomUUID();
+        const newProjectWorkspaceId = randomUUID();
+        const sourceIssueId = randomUUID();
+        const executionWorkspaceId = randomUUID();
+        const otherLiveExecutionWorkspaceId = randomUUID();
+        const branchName = "PAP-12428-path-collision";
+        const { oldRepo, oldWorktreePath } = await createOldRepoWorktree(branchName);
+        await db.insert(companies).values({
+          id: companyId,
+          name: "spa12428-co",
+        });
+        await db.insert(projects).values({
+          id: projectId,
+          companyId,
+          name: "spa12428-project",
+        });
+        await db.insert(projectWorkspaces).values([
+          {
+            id: oldProjectWorkspaceId,
+            companyId,
+            projectId,
+            name: "old-workspace",
+            cwd: oldRepo,
+            repoUrl: null,
+            repoRef: "refs/heads/main",
+          },
+          {
+            id: newProjectWorkspaceId,
+            companyId,
+            projectId,
+            name: "new-workspace",
+            cwd: oldRepo,
+            repoUrl: null,
+            repoRef: "refs/heads/main",
+          },
+        ]);
+        await db.insert(executionWorkspaces).values([
+          {
+            id: executionWorkspaceId,
+            companyId,
+            projectId,
+            projectWorkspaceId: oldProjectWorkspaceId,
+            mode: "isolated_workspace",
+            strategyType: "git_worktree",
+            name: "spa12428-retiring",
+            status: "active",
+            cwd: oldWorktreePath,
+            repoUrl: null,
+            baseRef: "refs/heads/main",
+            branchName,
+            providerType: "git_worktree",
+            providerRef: oldWorktreePath,
+            metadata: RUNTIME_OWNED_GIT_BRANCH_METADATA,
+          },
+          // SPA-9375 / SPA-12428: a rebind between two project workspaces of
+          // the SAME repo can reuse this exact path for a second, still-live
+          // row. Removal must never touch a path another live row depends on.
+          {
+            id: otherLiveExecutionWorkspaceId,
+            companyId,
+            projectId,
+            projectWorkspaceId: newProjectWorkspaceId,
+            mode: "isolated_workspace",
+            strategyType: "git_worktree",
+            name: "spa12428-live-sibling",
+            status: "active",
+            cwd: oldWorktreePath,
+            repoUrl: null,
+            baseRef: "refs/heads/main",
+            branchName,
+            providerType: "git_worktree",
+            providerRef: oldWorktreePath,
+            metadata: RUNTIME_OWNED_GIT_BRANCH_METADATA,
+          },
+        ]);
+        await db.insert(issues).values({
+          id: sourceIssueId,
+          companyId,
+          projectId,
+          projectWorkspaceId: oldProjectWorkspaceId,
+          executionWorkspaceId,
+          title: "SPA-12428 path collision skips removal",
+          status: "todo",
+        } as Partial<typeof issues.$inferInsert>);
+        await db
+          .update(executionWorkspaces)
+          .set({ sourceIssueId })
+          .where(eq(executionWorkspaces.id, executionWorkspaceId));
+        const outcome = await executionWorkspaceService(
+          db,
+        ).retireExecutionWorkspaceAfterProjectWorkspaceRebind({
+          companyId,
+          executionWorkspaceId,
+          sourceIssueId,
+          reason: `project workspace rebind ${oldProjectWorkspaceId} -> ${newProjectWorkspaceId}`,
+        });
+        expect(outcome.outcome).toBe("retired");
+        if (outcome.outcome !== "retired") throw new Error("unreachable");
+        expect(outcome.worktreeRemoved).toBe(false);
+        expect(outcome.worktreeRemovalSkipped).toBe("path_in_use_by_live_workspace");
+        const [archivedRow] = await db
+          .select()
+          .from(executionWorkspaces)
+          .where(eq(executionWorkspaces.id, executionWorkspaceId));
+        expect(archivedRow.status).toBe("archived");
+        expect(archivedRow.closedAt).not.toBeNull();
+        // The path survives on disk for the still-live sibling row.
+        await expect(fs.stat(oldWorktreePath)).resolves.toBeDefined();
+      } finally {
+        await support.cleanup();
+      }
+    }, 30_000);
+
+    it("archives but reports the old worktree removal failure when it is locked", async () => {
+      const support = await startEmbeddedPostgresTestDatabase(
+        "paperclip-spa12426-locked-rebind-",
+      );
+      try {
+        const db = createDb(support.connectionString);
+        const companyId = randomUUID();
+        const projectId = randomUUID();
+        const oldProjectWorkspaceId = randomUUID();
+        const newProjectWorkspaceId = randomUUID();
+        const sourceIssueId = randomUUID();
+        const executionWorkspaceId = randomUUID();
+        const branchName = "PAP-12426-locked-rebind";
+        const { oldRepo, oldWorktreePath } = await createOldRepoWorktree(branchName);
+        // Lock the worktree so a non-forced `git worktree remove` refuses —
+        // this is the git-level backstop the fix relies on: removal is
+        // best-effort and must never throw out of retire or un-archive the row.
+        await runGit(oldRepo, ["worktree", "lock", oldWorktreePath]);
+        await db.insert(companies).values({
+          id: companyId,
+          name: "spa12426-co",
+        });
+        await db.insert(projects).values({
+          id: projectId,
+          companyId,
+          name: "spa12426-project",
+        });
+        await db.insert(projectWorkspaces).values([
+          {
+            id: oldProjectWorkspaceId,
+            companyId,
+            projectId,
+            name: "old-workspace",
+            cwd: oldRepo,
+            repoUrl: null,
+            repoRef: "refs/heads/main",
+          },
+          {
+            id: newProjectWorkspaceId,
+            companyId,
+            projectId,
+            name: "new-workspace",
+            cwd: oldRepo,
+            repoUrl: null,
+            repoRef: "refs/heads/main",
+          },
+        ]);
+        await db.insert(executionWorkspaces).values({
+          id: executionWorkspaceId,
+          companyId,
+          projectId,
+          projectWorkspaceId: oldProjectWorkspaceId,
+          mode: "isolated_workspace",
+          strategyType: "git_worktree",
+          name: "spa12426-locked",
+          status: "active",
+          cwd: oldWorktreePath,
+          repoUrl: null,
+          baseRef: "refs/heads/main",
+          branchName,
+          providerType: "git_worktree",
+          providerRef: oldWorktreePath,
+          metadata: RUNTIME_OWNED_GIT_BRANCH_METADATA,
+        });
+        await db.insert(issues).values({
+          id: sourceIssueId,
+          companyId,
+          projectId,
+          projectWorkspaceId: oldProjectWorkspaceId,
+          executionWorkspaceId,
+          title: "SPA-12426 locked rebind archives but keeps the worktree",
+          status: "todo",
+        } as Partial<typeof issues.$inferInsert>);
+        await db
+          .update(executionWorkspaces)
+          .set({ sourceIssueId })
+          .where(eq(executionWorkspaces.id, executionWorkspaceId));
+        const outcome = await executionWorkspaceService(
+          db,
+        ).retireExecutionWorkspaceAfterProjectWorkspaceRebind({
+          companyId,
+          executionWorkspaceId,
+          sourceIssueId,
+          reason: `project workspace rebind ${oldProjectWorkspaceId} -> ${newProjectWorkspaceId}`,
+        });
+        expect(outcome.outcome).toBe("retired");
+        if (outcome.outcome !== "retired") throw new Error("unreachable");
+        expect(outcome.worktreeRemoved).toBe(false);
+        expect(outcome.worktreeRemovalError).toBeTruthy();
+        const [archivedRow] = await db
+          .select()
+          .from(executionWorkspaces)
+          .where(eq(executionWorkspaces.id, executionWorkspaceId));
+        expect(archivedRow.status).toBe("archived");
+        expect(archivedRow.closedAt).not.toBeNull();
+        await expect(fs.stat(oldWorktreePath)).resolves.toBeDefined();
       } finally {
         await support.cleanup();
       }

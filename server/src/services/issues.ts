@@ -353,6 +353,35 @@ export async function executeIssuePostCommitActions(
             },
             "execution workspace not retired after project workspace rebind: row already closed",
           );
+        } else if (outcome.outcome === "retired") {
+          // SPA-12426: the row archives either way; worktreeRemoved tracks
+          // the best-effort removal of the OLD worktree directory so the
+          // NEW repo's next realize does not collide with it on disk.
+          if (outcome.worktreeRemoved) {
+            logger.info(
+              {
+                companyId: action.companyId,
+                issueId: action.issueId,
+                executionWorkspaceId: outcome.executionWorkspaceId,
+                worktreePath: outcome.worktreePath,
+                worktreeRemoved: outcome.worktreeRemoved,
+              },
+              "execution workspace retired after project workspace rebind",
+            );
+          } else {
+            logger.warn(
+              {
+                companyId: action.companyId,
+                issueId: action.issueId,
+                executionWorkspaceId: outcome.executionWorkspaceId,
+                worktreePath: outcome.worktreePath,
+                worktreeRemoved: outcome.worktreeRemoved,
+                worktreeRemovalError: outcome.worktreeRemovalError,
+                worktreeRemovalSkipped: outcome.worktreeRemovalSkipped,
+              },
+              "execution workspace retired after project workspace rebind, but the old worktree directory was not removed",
+            );
+          }
         }
       } catch (err) {
         // The bound row remains untouched on failure; the next run will see
