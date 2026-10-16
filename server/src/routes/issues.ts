@@ -13094,7 +13094,7 @@ export function issueRoutes(
         companyId: existing.companyId,
         action: req.body.action,
         body: req.body.body,
-        stageId: req.body.stageId ?? null,
+        stageId: req.body.stageId,
         actor: {
           agentId: actor.actorType === "agent" ? actor.agentId : null,
           userId: actor.actorType === "user" ? actor.actorId : null,

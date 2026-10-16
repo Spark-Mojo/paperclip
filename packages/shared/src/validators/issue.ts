@@ -914,7 +914,7 @@ export const stageDecisionSchema = z
   .object({
     action: z.enum(["approve", "request_changes"]),
     body: z.string().min(1),
-    stageId: z.string().min(1).optional(),
+    stageId: z.string().min(1),
   })
   .strict();
 
