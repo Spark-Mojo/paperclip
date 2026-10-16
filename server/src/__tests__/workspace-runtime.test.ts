@@ -59,7 +59,10 @@ import {
   WORKSPACE_RUNTIME_PORT_ALLOCATION_ATTEMPTS,
   type RealizedExecutionWorkspace,
 } from "../services/workspace-runtime.ts";
-import { executionWorkspaceService } from "../services/execution-workspaces.ts";
+import {
+  executionWorkspaceService,
+  __testOnlyRelocateRetiredWorktreeIfCrossRepo,
+} from "../services/execution-workspaces.ts";
 import {
   findAdoptableLocalService,
   isLocalServiceRegistryCwdCompatible,
@@ -11355,6 +11358,37 @@ async function createNewRepo() {
   return await createTempRepo();
 }
 
+// SPA-12426: a variant of createOldRepoWorktree whose branch carries a
+// COMMITTED .gitignore naming `ignoredRelPath`, committed on the repo's
+// default branch (and therefore on `origin/main`) BEFORE the worktree's
+// branch is cut from it — so the branch stays exactly at `origin/main`'s
+// tip (reachable, same as the plain helper) and adding the actual ignored
+// file afterward never shows up as dirty/untracked (`git status` omits
+// ignored paths by default).
+async function createOldRepoWorktreeWithGitignore(branchName: string, ignoredRelPath: string) {
+  const oldRepo = await createTempRepo();
+  await fs.writeFile(path.join(oldRepo, ".gitignore"), `${ignoredRelPath}\n`, "utf8");
+  await runGit(oldRepo, ["add", ".gitignore"]);
+  await runGit(oldRepo, ["-c", "user.name=Fixture", "-c", "user.email=fixture@example.test", "commit", "-m", "add gitignore"]);
+  const oldWorktreePath = path.join(oldRepo, ".paperclip", "worktrees", branchName);
+  await fs.mkdir(path.dirname(oldWorktreePath), { recursive: true });
+  await runGit(oldRepo, ["worktree", "add", "-b", branchName, oldWorktreePath, "HEAD"]);
+  await runGit(oldRepo, ["update-ref", "refs/remotes/origin/main", "HEAD"]);
+  return { oldRepo, oldWorktreePath };
+}
+
+// SPA-12426 audit finding (A): a worktree in the SPA-9275 ephemeral
+// per-run shape, `${worktreeParentDir}/runs/<runId>/`, instead of the
+// per-branch shape the other helpers use.
+async function createOldRepoEphemeralRunWorktree(runId: string, branchName: string) {
+  const oldRepo = await createTempRepo();
+  const oldWorktreePath = path.join(oldRepo, ".paperclip", "runs", runId);
+  await fs.mkdir(path.dirname(oldWorktreePath), { recursive: true });
+  await runGit(oldRepo, ["worktree", "add", "-b", branchName, oldWorktreePath, "HEAD"]);
+  await runGit(oldRepo, ["update-ref", "refs/remotes/origin/main", "HEAD"]);
+  return { oldRepo, oldWorktreePath };
+}
+
 describe("ensurePersistedExecutionWorkspaceAvailable SPA-9437 project workspace rebind", () => {
   it("tears down a clean persisted git worktree bound to a different repo and signals unprovisionable (SPA-9437)", async () => {
     const branchName = "PAP-9437-clean-rebind";
@@ -12041,7 +12075,7 @@ describe("realizeExecutionWorkspace SPA-11953 shared configured worktree path", 
 describeEmbeddedPostgres(
   "executionWorkspaceService.retireExecutionWorkspaceAfterProjectWorkspaceRebind SPA-9437",
   () => {
-    it("archives a clean runtime-owned execution workspace on rebind (SPA-9437)", async () => {
+    it("archives a clean runtime-owned execution workspace on a cross-repo rebind and moves the old worktree (SPA-9437 / SPA-12426)", async () => {
       const support = await startEmbeddedPostgresTestDatabase(
         "paperclip-spa9437-clean-rebind-",
       );
@@ -12054,7 +12088,16 @@ describeEmbeddedPostgres(
         const sourceIssueId = randomUUID();
         const executionWorkspaceId = randomUUID();
         const branchName = "PAP-9437-issue-update-clean";
-        const { oldRepo, oldWorktreePath } = await createOldRepoWorktree(branchName);
+        const ignoredRelPath = "ignored-scratch.txt";
+        const { oldRepo, oldWorktreePath } = await createOldRepoWorktreeWithGitignore(branchName, ignoredRelPath);
+        // Gitignored content: `git status` omits it, so it never trips the
+        // dirty check, but a non-forced `git worktree remove` would have
+        // deleted it with no signal (SPA-12426 finding (3)). A move must
+        // preserve it.
+        await fs.writeFile(path.join(oldWorktreePath, ignoredRelPath), "scratch\n", "utf8");
+        // A genuinely different repo for the NEW project workspace — the
+        // cross-repo precondition (part A) that gates the move at all.
+        const newRepo = await createNewRepo();
         await db.insert(companies).values({
           id: companyId,
           name: "spa9437-co",
@@ -12064,6 +12107,231 @@ describeEmbeddedPostgres(
           companyId,
           name: "spa9437-project",
         });
+        await db.insert(projectWorkspaces).values([
+          {
+            id: oldProjectWorkspaceId,
+            companyId,
+            projectId,
+            name: "old-workspace",
+            cwd: oldRepo,
+            repoUrl: null,
+            repoRef: "refs/heads/main",
+          },
+          {
+            id: newProjectWorkspaceId,
+            companyId,
+            projectId,
+            name: "new-workspace",
+            cwd: newRepo,
+            repoUrl: null,
+            repoRef: "refs/heads/main",
+          },
+        ]);
+        await db.insert(executionWorkspaces).values({
+          id: executionWorkspaceId,
+          companyId,
+          projectId,
+          projectWorkspaceId: oldProjectWorkspaceId,
+          mode: "isolated_workspace",
+          strategyType: "git_worktree",
+          name: "spa9437-clean",
+          status: "active",
+          cwd: oldWorktreePath,
+          repoUrl: null,
+          baseRef: "refs/heads/main",
+          branchName,
+          providerType: "git_worktree",
+          providerRef: oldWorktreePath,
+          metadata: RUNTIME_OWNED_GIT_BRANCH_METADATA,
+        });
+        await db.insert(issues).values({
+          id: sourceIssueId,
+          // PR #210 final audit: relocation requires the branch to name this card.
+          identifier: (branchName.match(/[A-Za-z]+-\d+/) ?? [null])[0],
+          companyId,
+          projectId,
+          projectWorkspaceId: oldProjectWorkspaceId,
+          executionWorkspaceId,
+          title: "SPA-9437 clean rebind archives",
+          status: "todo",
+        } as Partial<typeof issues.$inferInsert>);
+        await db
+          .update(executionWorkspaces)
+          .set({ sourceIssueId })
+          .where(eq(executionWorkspaces.id, executionWorkspaceId));
+        const outcome = await executionWorkspaceService(
+          db,
+        ).retireExecutionWorkspaceAfterProjectWorkspaceRebind({
+          companyId,
+          executionWorkspaceId,
+          sourceIssueId,
+          reason: `project workspace rebind ${oldProjectWorkspaceId} -> ${newProjectWorkspaceId}`,
+          nextProjectWorkspaceId: newProjectWorkspaceId,
+        });
+        expect(outcome.outcome).toBe("retired");
+        if (outcome.outcome !== "retired") throw new Error("unreachable");
+        // SPA-12426: the archived row alone leaves the OLD worktree sitting
+        // at the exact path the NEW repo's branchTemplate would render into,
+        // colliding with every future run. Retire must relocate it (never
+        // remove it) while leaving the branch ref intact for recovery.
+        expect(outcome.worktreeMoved).toBe(true);
+        expect(outcome.worktreeMoveError).toBeUndefined();
+        expect(outcome.worktreeMoveSkipped).toBeUndefined();
+        const movedToPath = outcome.worktreeMovedTo;
+        expect(movedToPath).toBe(`${oldWorktreePath}.rebind-retired-${executionWorkspaceId.slice(0, 8)}`);
+        const [archivedRow] = await db
+          .select()
+          .from(executionWorkspaces)
+          .where(eq(executionWorkspaces.id, executionWorkspaceId));
+        expect(archivedRow.status).toBe("archived");
+        expect(archivedRow.closedAt).not.toBeNull();
+        expect(archivedRow.cwd).toBe(movedToPath);
+        expect(archivedRow.providerRef).toBe(movedToPath);
+        const [updatedIssue] = await db
+          .select()
+          .from(issues)
+          .where(eq(issues.id, sourceIssueId));
+        expect(updatedIssue.executionWorkspaceId).toBeNull();
+        await expect(fs.stat(oldWorktreePath)).rejects.toThrow();
+        await expect(fs.stat(movedToPath!)).resolves.toBeDefined();
+        // The gitignored file survives at the moved path — a move, not a
+        // remove, preserves content a non-forced `git worktree remove`
+        // would have silently deleted.
+        expect(await fs.readFile(path.join(movedToPath!, ignoredRelPath), "utf8")).toBe("scratch\n");
+        await expect(readGit(oldRepo, ["rev-parse", "--verify", `refs/heads/${branchName}`])).resolves.not.toBe("");
+      } finally {
+        await support.cleanup();
+      }
+    }, 30_000);
+
+    it("skips relocation when the branch does not name this card (shared branch, PR #210 final audit)", async () => {
+      const support = await startEmbeddedPostgresTestDatabase(
+        "paperclip-spa9437-clean-rebind-",
+      );
+      try {
+        const db = createDb(support.connectionString);
+        const companyId = randomUUID();
+        const projectId = randomUUID();
+        const oldProjectWorkspaceId = randomUUID();
+        const newProjectWorkspaceId = randomUUID();
+        const sourceIssueId = randomUUID();
+        const executionWorkspaceId = randomUUID();
+        const branchName = "shared-integration";
+        const ignoredRelPath = "ignored-scratch.txt";
+        const { oldRepo, oldWorktreePath } = await createOldRepoWorktreeWithGitignore(branchName, ignoredRelPath);
+        // Gitignored content: `git status` omits it, so it never trips the
+        // dirty check, but a non-forced `git worktree remove` would have
+        // deleted it with no signal (SPA-12426 finding (3)). A move must
+        // preserve it.
+        await fs.writeFile(path.join(oldWorktreePath, ignoredRelPath), "scratch\n", "utf8");
+        // A genuinely different repo for the NEW project workspace — the
+        // cross-repo precondition (part A) that gates the move at all.
+        const newRepo = await createNewRepo();
+        await db.insert(companies).values({
+          id: companyId,
+          name: "spa9437-co",
+        });
+        await db.insert(projects).values({
+          id: projectId,
+          companyId,
+          name: "spa9437-project",
+        });
+        await db.insert(projectWorkspaces).values([
+          {
+            id: oldProjectWorkspaceId,
+            companyId,
+            projectId,
+            name: "old-workspace",
+            cwd: oldRepo,
+            repoUrl: null,
+            repoRef: "refs/heads/main",
+          },
+          {
+            id: newProjectWorkspaceId,
+            companyId,
+            projectId,
+            name: "new-workspace",
+            cwd: newRepo,
+            repoUrl: null,
+            repoRef: "refs/heads/main",
+          },
+        ]);
+        await db.insert(executionWorkspaces).values({
+          id: executionWorkspaceId,
+          companyId,
+          projectId,
+          projectWorkspaceId: oldProjectWorkspaceId,
+          mode: "isolated_workspace",
+          strategyType: "git_worktree",
+          name: "spa9437-clean",
+          status: "active",
+          cwd: oldWorktreePath,
+          repoUrl: null,
+          baseRef: "refs/heads/main",
+          branchName,
+          providerType: "git_worktree",
+          providerRef: oldWorktreePath,
+          metadata: RUNTIME_OWNED_GIT_BRANCH_METADATA,
+        });
+        await db.insert(issues).values({
+          id: sourceIssueId,
+          // PR #210 final audit: relocation requires the branch to name this card.
+          identifier: "PAP-1",
+          companyId,
+          projectId,
+          projectWorkspaceId: oldProjectWorkspaceId,
+          executionWorkspaceId,
+          title: "SPA-9437 clean rebind archives",
+          status: "todo",
+        } as Partial<typeof issues.$inferInsert>);
+        await db
+          .update(executionWorkspaces)
+          .set({ sourceIssueId })
+          .where(eq(executionWorkspaces.id, executionWorkspaceId));
+        const outcome = await executionWorkspaceService(
+          db,
+        ).retireExecutionWorkspaceAfterProjectWorkspaceRebind({
+          companyId,
+          executionWorkspaceId,
+          sourceIssueId,
+          reason: `project workspace rebind ${oldProjectWorkspaceId} -> ${newProjectWorkspaceId}`,
+          nextProjectWorkspaceId: newProjectWorkspaceId,
+        });
+        expect(outcome.outcome).toBe("retired");
+        if (outcome.outcome !== "retired") throw new Error("unreachable");
+        expect(outcome.worktreeMoved).toBe(false);
+        expect(outcome.worktreeMoveSkipped).toBe("branch_not_card_specific");
+        await expect(fs.stat(oldWorktreePath)).resolves.toBeTruthy();
+      } finally {
+        await support.cleanup();
+      }
+    }, 30_000);
+
+    it("skips relocation with same_repo_rebind when the new project workspace is the SAME repo (SPA-12426 finding (2))", async () => {
+      const support = await startEmbeddedPostgresTestDatabase(
+        "paperclip-spa12426-same-repo-",
+      );
+      try {
+        const db = createDb(support.connectionString);
+        const companyId = randomUUID();
+        const projectId = randomUUID();
+        const oldProjectWorkspaceId = randomUUID();
+        const newProjectWorkspaceId = randomUUID();
+        const sourceIssueId = randomUUID();
+        const executionWorkspaceId = randomUUID();
+        const branchName = "PAP-12426-same-repo";
+        const { oldRepo, oldWorktreePath } = await createOldRepoWorktree(branchName);
+        await db.insert(companies).values({
+          id: companyId,
+          name: "spa12426-same-repo-co",
+        });
+        await db.insert(projects).values({
+          id: projectId,
+          companyId,
+          name: "spa12426-same-repo-project",
+        });
+        // Both project workspaces resolve to the SAME repo: realize reuses
+        // this exact path, so there is nothing to clear.
         await db.insert(projectWorkspaces).values([
           {
             id: oldProjectWorkspaceId,
@@ -12091,7 +12359,7 @@ describeEmbeddedPostgres(
           projectWorkspaceId: oldProjectWorkspaceId,
           mode: "isolated_workspace",
           strategyType: "git_worktree",
-          name: "spa9437-clean",
+          name: "spa12426-same-repo",
           status: "active",
           cwd: oldWorktreePath,
           repoUrl: null,
@@ -12103,11 +12371,13 @@ describeEmbeddedPostgres(
         });
         await db.insert(issues).values({
           id: sourceIssueId,
+          // PR #210 final audit: relocation requires the branch to name this card.
+          identifier: (branchName.match(/[A-Za-z]+-\d+/) ?? [null])[0],
           companyId,
           projectId,
           projectWorkspaceId: oldProjectWorkspaceId,
           executionWorkspaceId,
-          title: "SPA-9437 clean rebind archives",
+          title: "SPA-12426 same-repo rebind skips relocation",
           status: "todo",
         } as Partial<typeof issues.$inferInsert>);
         await db
@@ -12121,19 +12391,1137 @@ describeEmbeddedPostgres(
           executionWorkspaceId,
           sourceIssueId,
           reason: `project workspace rebind ${oldProjectWorkspaceId} -> ${newProjectWorkspaceId}`,
+          nextProjectWorkspaceId: newProjectWorkspaceId,
         });
         expect(outcome.outcome).toBe("retired");
+        if (outcome.outcome !== "retired") throw new Error("unreachable");
+        expect(outcome.worktreeMoved).toBe(false);
+        expect(outcome.worktreeMoveSkipped).toBe("same_repo_rebind");
         const [archivedRow] = await db
           .select()
           .from(executionWorkspaces)
           .where(eq(executionWorkspaces.id, executionWorkspaceId));
         expect(archivedRow.status).toBe("archived");
         expect(archivedRow.closedAt).not.toBeNull();
-        const [updatedIssue] = await db
+        // cwd/providerRef are untouched — realize reuses path P next.
+        expect(archivedRow.cwd).toBe(oldWorktreePath);
+        expect(archivedRow.providerRef).toBe(oldWorktreePath);
+        await expect(fs.stat(oldWorktreePath)).resolves.toBeDefined();
+      } finally {
+        await support.cleanup();
+      }
+    }, 30_000);
+
+    it("archives but does not relocate the worktree when another live execution workspace row still points at the same path (SPA-9375 / SPA-12428)", async () => {
+      const support = await startEmbeddedPostgresTestDatabase(
+        "paperclip-spa12428-path-collision-",
+      );
+      try {
+        const db = createDb(support.connectionString);
+        const companyId = randomUUID();
+        const projectId = randomUUID();
+        const oldProjectWorkspaceId = randomUUID();
+        const newProjectWorkspaceId = randomUUID();
+        const sourceIssueId = randomUUID();
+        const executionWorkspaceId = randomUUID();
+        const otherLiveExecutionWorkspaceId = randomUUID();
+        const branchName = "PAP-12428-path-collision";
+        const { oldRepo, oldWorktreePath } = await createOldRepoWorktree(branchName);
+        const newRepo = await createNewRepo();
+        await db.insert(companies).values({
+          id: companyId,
+          name: "spa12428-co",
+        });
+        await db.insert(projects).values({
+          id: projectId,
+          companyId,
+          name: "spa12428-project",
+        });
+        await db.insert(projectWorkspaces).values([
+          {
+            id: oldProjectWorkspaceId,
+            companyId,
+            projectId,
+            name: "old-workspace",
+            cwd: oldRepo,
+            repoUrl: null,
+            repoRef: "refs/heads/main",
+          },
+          {
+            id: newProjectWorkspaceId,
+            companyId,
+            projectId,
+            name: "new-workspace",
+            cwd: newRepo,
+            repoUrl: null,
+            repoRef: "refs/heads/main",
+          },
+        ]);
+        await db.insert(executionWorkspaces).values([
+          {
+            id: executionWorkspaceId,
+            companyId,
+            projectId,
+            projectWorkspaceId: oldProjectWorkspaceId,
+            mode: "isolated_workspace",
+            strategyType: "git_worktree",
+            name: "spa12428-retiring",
+            status: "active",
+            cwd: oldWorktreePath,
+            repoUrl: null,
+            baseRef: "refs/heads/main",
+            branchName,
+            providerType: "git_worktree",
+            providerRef: oldWorktreePath,
+            metadata: RUNTIME_OWNED_GIT_BRANCH_METADATA,
+          },
+          // SPA-9375 / SPA-12428: a rebind between two project workspaces of
+          // the SAME repo can leave a second, still-live row pointing at
+          // this exact path. Relocation must never touch a path another
+          // live row depends on.
+          {
+            id: otherLiveExecutionWorkspaceId,
+            companyId,
+            projectId,
+            projectWorkspaceId: oldProjectWorkspaceId,
+            mode: "isolated_workspace",
+            strategyType: "git_worktree",
+            name: "spa12428-live-sibling",
+            status: "active",
+            cwd: oldWorktreePath,
+            repoUrl: null,
+            baseRef: "refs/heads/main",
+            branchName,
+            providerType: "git_worktree",
+            providerRef: oldWorktreePath,
+            metadata: RUNTIME_OWNED_GIT_BRANCH_METADATA,
+          },
+        ]);
+        await db.insert(issues).values({
+          id: sourceIssueId,
+          // PR #210 final audit: relocation requires the branch to name this card.
+          identifier: (branchName.match(/[A-Za-z]+-\d+/) ?? [null])[0],
+          companyId,
+          projectId,
+          projectWorkspaceId: oldProjectWorkspaceId,
+          executionWorkspaceId,
+          title: "SPA-12428 path collision skips relocation",
+          status: "todo",
+        } as Partial<typeof issues.$inferInsert>);
+        await db
+          .update(executionWorkspaces)
+          .set({ sourceIssueId })
+          .where(eq(executionWorkspaces.id, executionWorkspaceId));
+        const outcome = await executionWorkspaceService(
+          db,
+        ).retireExecutionWorkspaceAfterProjectWorkspaceRebind({
+          companyId,
+          executionWorkspaceId,
+          sourceIssueId,
+          reason: `project workspace rebind ${oldProjectWorkspaceId} -> ${newProjectWorkspaceId}`,
+          nextProjectWorkspaceId: newProjectWorkspaceId,
+        });
+        expect(outcome.outcome).toBe("retired");
+        if (outcome.outcome !== "retired") throw new Error("unreachable");
+        expect(outcome.worktreeMoved).toBe(false);
+        expect(outcome.worktreeMoveSkipped).toBe("path_in_use_by_live_workspace");
+        const [archivedRow] = await db
           .select()
-          .from(issues)
-          .where(eq(issues.id, sourceIssueId));
-        expect(updatedIssue.executionWorkspaceId).toBeNull();
+          .from(executionWorkspaces)
+          .where(eq(executionWorkspaces.id, executionWorkspaceId));
+        expect(archivedRow.status).toBe("archived");
+        expect(archivedRow.closedAt).not.toBeNull();
+        expect(archivedRow.cwd).toBe(oldWorktreePath);
+        // The path survives on disk for the still-live sibling row.
+        await expect(fs.stat(oldWorktreePath)).resolves.toBeDefined();
+      } finally {
+        await support.cleanup();
+      }
+    }, 30_000);
+
+    it("does not relocate when a live row of ANOTHER company points at the same path (Mira PR #210: host-global check)", async () => {
+      const support = await startEmbeddedPostgresTestDatabase(
+        "paperclip-pr210-cross-company-",
+      );
+      try {
+        const db = createDb(support.connectionString);
+        const companyId = randomUUID();
+        const projectId = randomUUID();
+        const oldProjectWorkspaceId = randomUUID();
+        const newProjectWorkspaceId = randomUUID();
+        const sourceIssueId = randomUUID();
+        const executionWorkspaceId = randomUUID();
+        const otherLiveExecutionWorkspaceId = randomUUID();
+        const otherCompanyId = randomUUID();
+        const otherProjectId = randomUUID();
+        const branchName = "PAP-12428-path-collision";
+        const { oldRepo, oldWorktreePath } = await createOldRepoWorktree(branchName);
+        const newRepo = await createNewRepo();
+        await db.insert(companies).values({
+          id: companyId,
+          name: "spa12428-co",
+        });
+        await db.insert(projects).values({
+          id: projectId,
+          companyId,
+          name: "spa12428-project",
+        });
+        await db.insert(companies).values({ id: otherCompanyId, name: "pr210-other-co", issuePrefix: "OTH" });
+        await db.insert(projects).values({ id: otherProjectId, companyId: otherCompanyId, name: "pr210-other-project" });
+        await db.insert(projectWorkspaces).values([
+          {
+            id: oldProjectWorkspaceId,
+            companyId,
+            projectId,
+            name: "old-workspace",
+            cwd: oldRepo,
+            repoUrl: null,
+            repoRef: "refs/heads/main",
+          },
+          {
+            id: newProjectWorkspaceId,
+            companyId,
+            projectId,
+            name: "new-workspace",
+            cwd: newRepo,
+            repoUrl: null,
+            repoRef: "refs/heads/main",
+          },
+        ]);
+        await db.insert(executionWorkspaces).values([
+          {
+            id: executionWorkspaceId,
+            companyId,
+            projectId,
+            projectWorkspaceId: oldProjectWorkspaceId,
+            mode: "isolated_workspace",
+            strategyType: "git_worktree",
+            name: "spa12428-retiring",
+            status: "active",
+            cwd: oldWorktreePath,
+            repoUrl: null,
+            baseRef: "refs/heads/main",
+            branchName,
+            providerType: "git_worktree",
+            providerRef: oldWorktreePath,
+            metadata: RUNTIME_OWNED_GIT_BRANCH_METADATA,
+          },
+          // SPA-9375 / SPA-12428: a rebind between two project workspaces of
+          // the SAME repo can leave a second, still-live row pointing at
+          // this exact path. Relocation must never touch a path another
+          // live row depends on.
+          {
+            id: otherLiveExecutionWorkspaceId,
+            companyId: otherCompanyId,
+            projectId: otherProjectId,
+            projectWorkspaceId: null,
+            mode: "isolated_workspace",
+            strategyType: "git_worktree",
+            name: "spa12428-live-sibling",
+            status: "active",
+            cwd: oldWorktreePath,
+            repoUrl: null,
+            baseRef: "refs/heads/main",
+            branchName,
+            providerType: "git_worktree",
+            providerRef: oldWorktreePath,
+            metadata: RUNTIME_OWNED_GIT_BRANCH_METADATA,
+          },
+        ]);
+        await db.insert(issues).values({
+          id: sourceIssueId,
+          // PR #210 final audit: relocation requires the branch to name this card.
+          identifier: (branchName.match(/[A-Za-z]+-\d+/) ?? [null])[0],
+          companyId,
+          projectId,
+          projectWorkspaceId: oldProjectWorkspaceId,
+          executionWorkspaceId,
+          title: "SPA-12428 path collision skips relocation",
+          status: "todo",
+        } as Partial<typeof issues.$inferInsert>);
+        await db
+          .update(executionWorkspaces)
+          .set({ sourceIssueId })
+          .where(eq(executionWorkspaces.id, executionWorkspaceId));
+        const outcome = await executionWorkspaceService(
+          db,
+        ).retireExecutionWorkspaceAfterProjectWorkspaceRebind({
+          companyId,
+          executionWorkspaceId,
+          sourceIssueId,
+          reason: `project workspace rebind ${oldProjectWorkspaceId} -> ${newProjectWorkspaceId}`,
+          nextProjectWorkspaceId: newProjectWorkspaceId,
+        });
+        expect(outcome.outcome).toBe("retired");
+        if (outcome.outcome !== "retired") throw new Error("unreachable");
+        expect(outcome.worktreeMoved).toBe(false);
+        expect(outcome.worktreeMoveSkipped).toBe("path_in_use_by_live_workspace");
+        const [archivedRow] = await db
+          .select()
+          .from(executionWorkspaces)
+          .where(eq(executionWorkspaces.id, executionWorkspaceId));
+        expect(archivedRow.status).toBe("archived");
+        expect(archivedRow.closedAt).not.toBeNull();
+        expect(archivedRow.cwd).toBe(oldWorktreePath);
+        // The path survives on disk for the still-live sibling row.
+        await expect(fs.stat(oldWorktreePath)).resolves.toBeDefined();
+      } finally {
+        await support.cleanup();
+      }
+    }, 30_000);
+
+    it("archives but reports the old worktree relocation failure, leaving cwd unchanged, when the worktree is locked", async () => {
+      const support = await startEmbeddedPostgresTestDatabase(
+        "paperclip-spa12426-locked-rebind-",
+      );
+      try {
+        const db = createDb(support.connectionString);
+        const companyId = randomUUID();
+        const projectId = randomUUID();
+        const oldProjectWorkspaceId = randomUUID();
+        const newProjectWorkspaceId = randomUUID();
+        const sourceIssueId = randomUUID();
+        const executionWorkspaceId = randomUUID();
+        const branchName = "PAP-12426-locked-rebind";
+        const { oldRepo, oldWorktreePath } = await createOldRepoWorktree(branchName);
+        const newRepo = await createNewRepo();
+        // Lock the worktree so a non-forced `git worktree move` refuses —
+        // this is the git-level backstop the fix relies on: relocation is
+        // best-effort and must never throw out of retire or un-archive the
+        // row, and must never leave cwd pointing at a half-moved path.
+        await runGit(oldRepo, ["worktree", "lock", oldWorktreePath]);
+        await db.insert(companies).values({
+          id: companyId,
+          name: "spa12426-co",
+        });
+        await db.insert(projects).values({
+          id: projectId,
+          companyId,
+          name: "spa12426-project",
+        });
+        await db.insert(projectWorkspaces).values([
+          {
+            id: oldProjectWorkspaceId,
+            companyId,
+            projectId,
+            name: "old-workspace",
+            cwd: oldRepo,
+            repoUrl: null,
+            repoRef: "refs/heads/main",
+          },
+          {
+            id: newProjectWorkspaceId,
+            companyId,
+            projectId,
+            name: "new-workspace",
+            cwd: newRepo,
+            repoUrl: null,
+            repoRef: "refs/heads/main",
+          },
+        ]);
+        await db.insert(executionWorkspaces).values({
+          id: executionWorkspaceId,
+          companyId,
+          projectId,
+          projectWorkspaceId: oldProjectWorkspaceId,
+          mode: "isolated_workspace",
+          strategyType: "git_worktree",
+          name: "spa12426-locked",
+          status: "active",
+          cwd: oldWorktreePath,
+          repoUrl: null,
+          baseRef: "refs/heads/main",
+          branchName,
+          providerType: "git_worktree",
+          providerRef: oldWorktreePath,
+          metadata: RUNTIME_OWNED_GIT_BRANCH_METADATA,
+        });
+        await db.insert(issues).values({
+          id: sourceIssueId,
+          // PR #210 final audit: relocation requires the branch to name this card.
+          identifier: (branchName.match(/[A-Za-z]+-\d+/) ?? [null])[0],
+          companyId,
+          projectId,
+          projectWorkspaceId: oldProjectWorkspaceId,
+          executionWorkspaceId,
+          title: "SPA-12426 locked rebind archives but keeps the worktree",
+          status: "todo",
+        } as Partial<typeof issues.$inferInsert>);
+        await db
+          .update(executionWorkspaces)
+          .set({ sourceIssueId })
+          .where(eq(executionWorkspaces.id, executionWorkspaceId));
+        const outcome = await executionWorkspaceService(
+          db,
+        ).retireExecutionWorkspaceAfterProjectWorkspaceRebind({
+          companyId,
+          executionWorkspaceId,
+          sourceIssueId,
+          reason: `project workspace rebind ${oldProjectWorkspaceId} -> ${newProjectWorkspaceId}`,
+          nextProjectWorkspaceId: newProjectWorkspaceId,
+        });
+        expect(outcome.outcome).toBe("retired");
+        if (outcome.outcome !== "retired") throw new Error("unreachable");
+        expect(outcome.worktreeMoved).toBe(false);
+        expect(outcome.worktreeMoveError).toBeTruthy();
+        const [archivedRow] = await db
+          .select()
+          .from(executionWorkspaces)
+          .where(eq(executionWorkspaces.id, executionWorkspaceId));
+        expect(archivedRow.status).toBe("archived");
+        expect(archivedRow.closedAt).not.toBeNull();
+        expect(archivedRow.cwd).toBe(oldWorktreePath);
+        expect(archivedRow.providerRef).toBe(oldWorktreePath);
+        await expect(fs.stat(oldWorktreePath)).resolves.toBeDefined();
+      } finally {
+        await support.cleanup();
+      }
+    }, 30_000);
+
+    it("skips relocation with row_changed_before_move when a reopen won the race since the archive committed (SPA-12426 finding (1))", async () => {
+      // LIMITS OF THIS TEST (stated honestly, per the redesign instructions):
+      // a true concurrent race would need `archiveWorkspaceForRebind` and
+      // `reopenClosedIsolatedExecutionWorkspaceForIssue` actually running in
+      // parallel against the shared Postgres advisory lock — not practical
+      // in a single-process unit test. This instead calls the internal
+      // `relocateRetiredWorktreeIfCrossRepo` seam directly (exported ONLY for
+      // this test) against a row hand-constructed to look exactly like what
+      // a reopen leaves behind: `archiveWorkspaceForRebind` ran and wrote
+      // generation 1, then a reopen won the race and bumped it to generation
+      // 2 before this function ever acquired the lock. That is the exact
+      // condition the re-check inside the transaction tests for, so this
+      // exercises the real guard — it just doesn't exercise the scheduler
+      // interleaving that produces the condition in production.
+      const support = await startEmbeddedPostgresTestDatabase(
+        "paperclip-spa12426-row-changed-",
+      );
+      try {
+        const db = createDb(support.connectionString);
+        const companyId = randomUUID();
+        const projectId = randomUUID();
+        const newProjectWorkspaceId = randomUUID();
+        const executionWorkspaceId = randomUUID();
+        const branchName = "PAP-12426-row-changed";
+        const { oldWorktreePath } = await createOldRepoWorktree(branchName);
+        const newRepo = await createNewRepo();
+        await db.insert(companies).values({ id: companyId, name: "spa12426-row-changed-co" });
+        await db.insert(projects).values({ id: projectId, companyId, name: "spa12426-row-changed-project" });
+        await db.insert(projectWorkspaces).values({
+          id: newProjectWorkspaceId,
+          companyId,
+          projectId,
+          name: "new-workspace",
+          cwd: newRepo,
+          repoUrl: null,
+          repoRef: "refs/heads/main",
+        });
+        // Hand-construct the "already archived at generation 1" state —
+        // exactly what `archiveWorkspaceForRebind` would have just written.
+        // projectWorkspaceId is null here: this test calls the internal
+        // relocate seam directly with an explicit leafPath/nextProjectWorkspaceId,
+        // which never reads the row's own projectWorkspaceId column.
+        await db.insert(executionWorkspaces).values({
+          id: executionWorkspaceId,
+          companyId,
+          projectId,
+          projectWorkspaceId: null,
+          mode: "isolated_workspace",
+          strategyType: "git_worktree",
+          name: "spa12426-row-changed",
+          status: "archived",
+          closedAt: new Date(),
+          cwd: oldWorktreePath,
+          repoUrl: null,
+          baseRef: "refs/heads/main",
+          branchName,
+          providerType: "git_worktree",
+          providerRef: oldWorktreePath,
+          metadata: { ...RUNTIME_OWNED_GIT_BRANCH_METADATA, lifecycleGeneration: 1 },
+        });
+        // Simulate a reopen winning the race: it re-activates the row and
+        // bumps the lifecycle generation, exactly as
+        // `reopenClosedIsolatedExecutionWorkspaceForIssue` does on a real
+        // reopen.
+        await db
+          .update(executionWorkspaces)
+          .set({
+            status: "active",
+            closedAt: null,
+            metadata: { ...RUNTIME_OWNED_GIT_BRANCH_METADATA, lifecycleGeneration: 2 },
+          })
+          .where(eq(executionWorkspaces.id, executionWorkspaceId));
+
+        const seamIssueId = randomUUID();
+        await db.insert(issues).values({
+          id: seamIssueId,
+          identifier: (branchName.match(/[A-Za-z]+-\d+/) ?? [null])[0],
+          companyId,
+          projectId,
+          title: "SPA-12426 relocate seam",
+          status: "todo",
+        } as Partial<typeof issues.$inferInsert>);
+        const moveResult = await __testOnlyRelocateRetiredWorktreeIfCrossRepo(db, {
+          companyId,
+          executionWorkspaceId,
+          branchName,
+          sourceIssueId: seamIssueId,
+          leafPath: oldWorktreePath,
+          nextProjectWorkspaceId: newProjectWorkspaceId,
+          // The STALE generation archiveWorkspaceForRebind would have
+          // presented, captured before the reopen above bumped it to 2.
+          archivedGeneration: 1,
+          ephemeralLifecycle: false,
+        });
+        expect(moveResult.worktreeMoved).toBe(false);
+        expect(moveResult.worktreeMoveSkipped).toBe("row_changed_before_move");
+        // Nothing touched: the worktree the reopen rebuilt at this path is
+        // left exactly alone.
+        await expect(fs.stat(oldWorktreePath)).resolves.toBeDefined();
+        const [row] = await db
+          .select()
+          .from(executionWorkspaces)
+          .where(eq(executionWorkspaces.id, executionWorkspaceId));
+        expect(row.cwd).toBe(oldWorktreePath);
+        expect(row.status).toBe("active");
+      } finally {
+        await support.cleanup();
+      }
+    }, 30_000);
+
+    it("skips relocation with ephemeral_run_worktree when the leaf is an SPA-9275 per-run worktree (SPA-12426 finding (A))", async () => {
+      const support = await startEmbeddedPostgresTestDatabase(
+        "paperclip-spa12426-ephemeral-run-",
+      );
+      try {
+        const db = createDb(support.connectionString);
+        const companyId = randomUUID();
+        const projectId = randomUUID();
+        const oldProjectWorkspaceId = randomUUID();
+        const newProjectWorkspaceId = randomUUID();
+        const sourceIssueId = randomUUID();
+        const executionWorkspaceId = randomUUID();
+        const branchName = "PAP-12426-ephemeral-run";
+        const runId = `run-${randomUUID()}`;
+        // `.paperclip/runs/<runId>/` — the SPA-9275 ephemeral per-run shape.
+        // `reapOrphanedRunWorktrees` (boot, DB-blind) treats every directory
+        // directly under a `runs/` dir as an orphaned run id; relocating
+        // this would hand it a brand-new child dir to misread that way.
+        const { oldRepo, oldWorktreePath } = await createOldRepoEphemeralRunWorktree(runId, branchName);
+        const newRepo = await createNewRepo();
+        await db.insert(companies).values({ id: companyId, name: "spa12426-ephemeral-co" });
+        await db.insert(projects).values({ id: projectId, companyId, name: "spa12426-ephemeral-project" });
+        await db.insert(projectWorkspaces).values([
+          {
+            id: oldProjectWorkspaceId,
+            companyId,
+            projectId,
+            name: "old-workspace",
+            cwd: oldRepo,
+            repoUrl: null,
+            repoRef: "refs/heads/main",
+          },
+          {
+            id: newProjectWorkspaceId,
+            companyId,
+            projectId,
+            name: "new-workspace",
+            cwd: newRepo,
+            repoUrl: null,
+            repoRef: "refs/heads/main",
+          },
+        ]);
+        await db.insert(executionWorkspaces).values({
+          id: executionWorkspaceId,
+          companyId,
+          projectId,
+          projectWorkspaceId: oldProjectWorkspaceId,
+          mode: "isolated_workspace",
+          strategyType: "git_worktree",
+          name: "spa12426-ephemeral-run",
+          status: "active",
+          cwd: oldWorktreePath,
+          repoUrl: null,
+          baseRef: "refs/heads/main",
+          branchName,
+          providerType: "git_worktree",
+          providerRef: oldWorktreePath,
+          // Deliberately NOT setting metadata.ephemeralLifecycle here — this
+          // test exercises the PATH-shape fallback detection specifically,
+          // not the (also correct) metadata-flag fast path.
+          metadata: RUNTIME_OWNED_GIT_BRANCH_METADATA,
+        });
+        await db.insert(issues).values({
+          id: sourceIssueId,
+          // PR #210 final audit: relocation requires the branch to name this card.
+          identifier: (branchName.match(/[A-Za-z]+-\d+/) ?? [null])[0],
+          companyId,
+          projectId,
+          projectWorkspaceId: oldProjectWorkspaceId,
+          executionWorkspaceId,
+          title: "SPA-12426 ephemeral run worktree skips relocation",
+          status: "todo",
+        } as Partial<typeof issues.$inferInsert>);
+        await db
+          .update(executionWorkspaces)
+          .set({ sourceIssueId })
+          .where(eq(executionWorkspaces.id, executionWorkspaceId));
+        const outcome = await executionWorkspaceService(
+          db,
+        ).retireExecutionWorkspaceAfterProjectWorkspaceRebind({
+          companyId,
+          executionWorkspaceId,
+          sourceIssueId,
+          reason: `project workspace rebind ${oldProjectWorkspaceId} -> ${newProjectWorkspaceId}`,
+          nextProjectWorkspaceId: newProjectWorkspaceId,
+        });
+        expect(outcome.outcome).toBe("retired");
+        if (outcome.outcome !== "retired") throw new Error("unreachable");
+        expect(outcome.worktreeMoved).toBe(false);
+        expect(outcome.worktreeMoveSkipped).toBe("ephemeral_run_worktree");
+        const [archivedRow] = await db
+          .select()
+          .from(executionWorkspaces)
+          .where(eq(executionWorkspaces.id, executionWorkspaceId));
+        expect(archivedRow.status).toBe("archived");
+        expect(archivedRow.cwd).toBe(oldWorktreePath);
+        // Nothing was ever constructed inside runs/ — the dir's only child
+        // is still exactly the original run worktree.
+        await expect(fs.stat(oldWorktreePath)).resolves.toBeDefined();
+        const runsDirEntries = await fs.readdir(path.join(oldRepo, ".paperclip", "runs"));
+        expect(runsDirEntries).toEqual([runId]);
+      } finally {
+        await support.cleanup();
+      }
+    }, 30_000);
+
+    it("does not treat a runs/<branch> branch-template leaf as ephemeral when the leaf segment is not a run-id shape (SPA-12426 re-audit finding (ii))", async () => {
+      const support = await startEmbeddedPostgresTestDatabase(
+        "paperclip-spa12426-runs-branch-template-",
+      );
+      try {
+        const db = createDb(support.connectionString);
+        const companyId = randomUUID();
+        const projectId = randomUUID();
+        const oldProjectWorkspaceId = randomUUID();
+        const newProjectWorkspaceId = randomUUID();
+        const sourceIssueId = randomUUID();
+        const executionWorkspaceId = randomUUID();
+        // A branchTemplate like `runs/{{issue.identifier}}` sanitizes to
+        // exactly this shape — sanitizeBranchName keeps `/`. The leaf's
+        // parent dir is named `runs`, same as the SPA-9275 ephemeral shape,
+        // but the leaf's OWN basename ("SPA-1-x") is not a run-id (a UUID,
+        // or `run-<uuid>`) — this is an ORDINARY per-branch worktree, not an
+        // ephemeral one, and must not be skipped as if it were.
+        const branchName = "runs/SPA-1-x";
+        const { oldRepo, oldWorktreePath } = await createOldRepoWorktree(branchName);
+        const newRepo = await createNewRepo();
+        await db.insert(companies).values({ id: companyId, name: "spa12426-runs-branch-co" });
+        await db.insert(projects).values({ id: projectId, companyId, name: "spa12426-runs-branch-project" });
+        await db.insert(projectWorkspaces).values([
+          {
+            id: oldProjectWorkspaceId,
+            companyId,
+            projectId,
+            name: "old-workspace",
+            cwd: oldRepo,
+            repoUrl: null,
+            repoRef: "refs/heads/main",
+          },
+          {
+            id: newProjectWorkspaceId,
+            companyId,
+            projectId,
+            name: "new-workspace",
+            cwd: newRepo,
+            repoUrl: null,
+            repoRef: "refs/heads/main",
+          },
+        ]);
+        await db.insert(executionWorkspaces).values({
+          id: executionWorkspaceId,
+          companyId,
+          projectId,
+          projectWorkspaceId: oldProjectWorkspaceId,
+          mode: "isolated_workspace",
+          strategyType: "git_worktree",
+          name: "spa12426-runs-branch-template",
+          status: "active",
+          cwd: oldWorktreePath,
+          repoUrl: null,
+          baseRef: "refs/heads/main",
+          branchName,
+          providerType: "git_worktree",
+          providerRef: oldWorktreePath,
+          metadata: RUNTIME_OWNED_GIT_BRANCH_METADATA,
+        });
+        await db.insert(issues).values({
+          id: sourceIssueId,
+          // PR #210 final audit: relocation requires the branch to name this card.
+          identifier: (branchName.match(/[A-Za-z]+-\d+/) ?? [null])[0],
+          companyId,
+          projectId,
+          projectWorkspaceId: oldProjectWorkspaceId,
+          executionWorkspaceId,
+          title: "SPA-12426 runs/ branch template is not ephemeral",
+          status: "todo",
+        } as Partial<typeof issues.$inferInsert>);
+        await db
+          .update(executionWorkspaces)
+          .set({ sourceIssueId })
+          .where(eq(executionWorkspaces.id, executionWorkspaceId));
+        const outcome = await executionWorkspaceService(
+          db,
+        ).retireExecutionWorkspaceAfterProjectWorkspaceRebind({
+          companyId,
+          executionWorkspaceId,
+          sourceIssueId,
+          reason: `project workspace rebind ${oldProjectWorkspaceId} -> ${newProjectWorkspaceId}`,
+          nextProjectWorkspaceId: newProjectWorkspaceId,
+        });
+        expect(outcome.outcome).toBe("retired");
+        if (outcome.outcome !== "retired") throw new Error("unreachable");
+        // If the bare basename(dirname(leaf)) === "runs" check alone were
+        // still in effect, this would incorrectly skip with
+        // worktreeMoveSkipped: "ephemeral_run_worktree". Moving
+        // successfully is the finding (ii) regression check.
+        expect(outcome.worktreeMoveSkipped).toBeUndefined();
+        expect(outcome.worktreeMoved).toBe(true);
+        const movedToPath = outcome.worktreeMovedTo;
+        expect(movedToPath).toBe(`${oldWorktreePath}.rebind-retired-${executionWorkspaceId.slice(0, 8)}`);
+        await expect(fs.stat(oldWorktreePath)).rejects.toThrow();
+        await expect(fs.stat(movedToPath!)).resolves.toBeDefined();
+      } finally {
+        await support.cleanup();
+      }
+    }, 30_000);
+
+    it("moves a cold managed_checkout next project workspace's worktree cross-repo via repo identity, never cloning (SPA-12426 re-audit finding (i))", async () => {
+      const support = await startEmbeddedPostgresTestDatabase(
+        "paperclip-spa12426-managed-cold-",
+      );
+      // Sandboxed PAPERCLIP_HOME purely so the "predicted managed path"
+      // this function computes (but never materializes) resolves under a
+      // throwaway root — the established pattern elsewhere in this file.
+      const previousPaperclipHome = process.env.PAPERCLIP_HOME;
+      const paperclipHome = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-spa12426-managed-cold-home-"));
+      process.env.PAPERCLIP_HOME = paperclipHome;
+      try {
+        const db = createDb(support.connectionString);
+        const companyId = randomUUID();
+        const projectId = randomUUID();
+        const oldProjectWorkspaceId = randomUUID();
+        const newProjectWorkspaceId = randomUUID();
+        const sourceIssueId = randomUUID();
+        const executionWorkspaceId = randomUUID();
+        const branchName = "PAP-12426-managed-cold";
+        const { oldRepo, oldWorktreePath } = await createOldRepoWorktree(branchName);
+        // SPA-12426 re-audit finding (i): the old worktree's owner repo gets
+        // a REAL `origin` remote this time (a credential-bearing HTTPS
+        // URL — never cloned, never logged; read only via
+        // `git config --get remote.origin.url` for the identity compare).
+        await runGit(oldRepo, ["remote", "add", "origin", "https://x-access-token:FAKE@github.com/acme/old-repo.git"]);
+        await db.insert(companies).values({ id: companyId, name: "spa12426-managed-cold-co" });
+        await db.insert(projects).values({ id: projectId, companyId, name: "spa12426-managed-cold-project" });
+        await db.insert(projectWorkspaces).values([
+          {
+            id: oldProjectWorkspaceId,
+            companyId,
+            projectId,
+            name: "old-workspace",
+            cwd: oldRepo,
+            repoUrl: null,
+            repoRef: "refs/heads/main",
+          },
+          {
+            id: newProjectWorkspaceId,
+            companyId,
+            projectId,
+            name: "new-managed-workspace",
+            sourceType: "managed_checkout",
+            // cwd stays NULL: a managed_checkout that has never been
+            // materialized on this host (cold). No clone must ever happen
+            // to resolve this test.
+            cwd: null,
+            // A DIFFERENT repo identity from the old worktree's origin
+            // above, deliberately WITHOUT credentials — proving the
+            // comparison does not depend on both sides carrying the same
+            // credential shape.
+            repoUrl: "https://github.com/acme/new-repo.git",
+            repoRef: "refs/heads/main",
+          },
+        ]);
+        await db.insert(executionWorkspaces).values({
+          id: executionWorkspaceId,
+          companyId,
+          projectId,
+          projectWorkspaceId: oldProjectWorkspaceId,
+          mode: "isolated_workspace",
+          strategyType: "git_worktree",
+          name: "spa12426-managed-cold",
+          status: "active",
+          cwd: oldWorktreePath,
+          repoUrl: null,
+          baseRef: "refs/heads/main",
+          branchName,
+          providerType: "git_worktree",
+          providerRef: oldWorktreePath,
+          metadata: RUNTIME_OWNED_GIT_BRANCH_METADATA,
+        });
+        await db.insert(issues).values({
+          id: sourceIssueId,
+          // PR #210 final audit: relocation requires the branch to name this card.
+          identifier: (branchName.match(/[A-Za-z]+-\d+/) ?? [null])[0],
+          companyId,
+          projectId,
+          projectWorkspaceId: oldProjectWorkspaceId,
+          executionWorkspaceId,
+          title: "SPA-12426 cold managed_checkout rebind moves via repo identity",
+          status: "todo",
+        } as Partial<typeof issues.$inferInsert>);
+        await db
+          .update(executionWorkspaces)
+          .set({ sourceIssueId })
+          .where(eq(executionWorkspaces.id, executionWorkspaceId));
+        const outcome = await executionWorkspaceService(
+          db,
+        ).retireExecutionWorkspaceAfterProjectWorkspaceRebind({
+          companyId,
+          executionWorkspaceId,
+          sourceIssueId,
+          reason: `project workspace rebind ${oldProjectWorkspaceId} -> ${newProjectWorkspaceId}`,
+          nextProjectWorkspaceId: newProjectWorkspaceId,
+        });
+        expect(outcome.outcome).toBe("retired");
+        if (outcome.outcome !== "retired") throw new Error("unreachable");
+        expect(outcome.worktreeMoveSkipped).toBeUndefined();
+        expect(outcome.worktreeMoveError).toBeUndefined();
+        expect(outcome.worktreeMoved).toBe(true);
+        const movedToPath = outcome.worktreeMovedTo;
+        expect(movedToPath).toBe(`${oldWorktreePath}.rebind-retired-${executionWorkspaceId.slice(0, 8)}`);
+        await expect(fs.stat(oldWorktreePath)).rejects.toThrow();
+        await expect(fs.stat(movedToPath!)).resolves.toBeDefined();
+        const [archivedRow] = await db
+          .select()
+          .from(executionWorkspaces)
+          .where(eq(executionWorkspaces.id, executionWorkspaceId));
+        expect(archivedRow.cwd).toBe(movedToPath);
+        // The credential must never leak into any returned field.
+        expect(JSON.stringify(outcome)).not.toContain("FAKE");
+        // And no clone ever happened: nothing was ever written under the
+        // sandboxed PAPERCLIP_HOME root at all.
+        await expect(fs.readdir(paperclipHome)).resolves.toEqual([]);
+      } finally {
+        if (previousPaperclipHome === undefined) delete process.env.PAPERCLIP_HOME;
+        else process.env.PAPERCLIP_HOME = previousPaperclipHome;
+        await support.cleanup();
+      }
+    }, 30_000);
+
+    it("skips relocation with same_repo_rebind for a cold managed_checkout whose repoUrl normalizes to the same repo identity as the old worktree's origin (SPA-12426 re-audit finding (i))", async () => {
+      const support = await startEmbeddedPostgresTestDatabase(
+        "paperclip-spa12426-managed-cold-same-repo-",
+      );
+      const previousPaperclipHome = process.env.PAPERCLIP_HOME;
+      const paperclipHome = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-spa12426-managed-cold-same-home-"));
+      process.env.PAPERCLIP_HOME = paperclipHome;
+      try {
+        const db = createDb(support.connectionString);
+        const companyId = randomUUID();
+        const projectId = randomUUID();
+        const oldProjectWorkspaceId = randomUUID();
+        const newProjectWorkspaceId = randomUUID();
+        const sourceIssueId = randomUUID();
+        const executionWorkspaceId = randomUUID();
+        const branchName = "PAP-12426-managed-cold-same-repo";
+        const { oldRepo, oldWorktreePath } = await createOldRepoWorktree(branchName);
+        // scp-like syntax on the old side, HTTPS (no .git, no creds) on the
+        // next workspace's side — different literal strings, same
+        // normalized identity (host/owner/name).
+        await runGit(oldRepo, ["remote", "add", "origin", "git@github.com:acme/same-repo.git"]);
+        await db.insert(companies).values({ id: companyId, name: "spa12426-managed-cold-same-co" });
+        await db.insert(projects).values({ id: projectId, companyId, name: "spa12426-managed-cold-same-project" });
+        await db.insert(projectWorkspaces).values([
+          {
+            id: oldProjectWorkspaceId,
+            companyId,
+            projectId,
+            name: "old-workspace",
+            cwd: oldRepo,
+            repoUrl: null,
+            repoRef: "refs/heads/main",
+          },
+          {
+            id: newProjectWorkspaceId,
+            companyId,
+            projectId,
+            name: "new-managed-workspace",
+            sourceType: "managed_checkout",
+            cwd: null,
+            repoUrl: "https://github.com/acme/same-repo",
+            repoRef: "refs/heads/main",
+          },
+        ]);
+        await db.insert(executionWorkspaces).values({
+          id: executionWorkspaceId,
+          companyId,
+          projectId,
+          projectWorkspaceId: oldProjectWorkspaceId,
+          mode: "isolated_workspace",
+          strategyType: "git_worktree",
+          name: "spa12426-managed-cold-same-repo",
+          status: "active",
+          cwd: oldWorktreePath,
+          repoUrl: null,
+          baseRef: "refs/heads/main",
+          branchName,
+          providerType: "git_worktree",
+          providerRef: oldWorktreePath,
+          metadata: RUNTIME_OWNED_GIT_BRANCH_METADATA,
+        });
+        await db.insert(issues).values({
+          id: sourceIssueId,
+          // PR #210 final audit: relocation requires the branch to name this card.
+          identifier: (branchName.match(/[A-Za-z]+-\d+/) ?? [null])[0],
+          companyId,
+          projectId,
+          projectWorkspaceId: oldProjectWorkspaceId,
+          executionWorkspaceId,
+          title: "SPA-12426 cold managed_checkout same-repo identity skips",
+          status: "todo",
+        } as Partial<typeof issues.$inferInsert>);
+        await db
+          .update(executionWorkspaces)
+          .set({ sourceIssueId })
+          .where(eq(executionWorkspaces.id, executionWorkspaceId));
+        const outcome = await executionWorkspaceService(
+          db,
+        ).retireExecutionWorkspaceAfterProjectWorkspaceRebind({
+          companyId,
+          executionWorkspaceId,
+          sourceIssueId,
+          reason: `project workspace rebind ${oldProjectWorkspaceId} -> ${newProjectWorkspaceId}`,
+          nextProjectWorkspaceId: newProjectWorkspaceId,
+        });
+        expect(outcome.outcome).toBe("retired");
+        if (outcome.outcome !== "retired") throw new Error("unreachable");
+        expect(outcome.worktreeMoved).toBe(false);
+        expect(outcome.worktreeMoveSkipped).toBe("same_repo_rebind");
+        await expect(fs.stat(oldWorktreePath)).resolves.toBeDefined();
+        const [archivedRow] = await db
+          .select()
+          .from(executionWorkspaces)
+          .where(eq(executionWorkspaces.id, executionWorkspaceId));
+        expect(archivedRow.cwd).toBe(oldWorktreePath);
+      } finally {
+        if (previousPaperclipHome === undefined) delete process.env.PAPERCLIP_HOME;
+        else process.env.PAPERCLIP_HOME = previousPaperclipHome;
+        await support.cleanup();
+      }
+    }, 30_000);
+
+    it("skips relocation with new_repo_root_unresolved for a cold managed_checkout whose repoUrl is ambiguous, and leaves the old worktree in place (SPA-12426 audit re-re-audit)", async () => {
+      // The dangerous direction this guards: a wrongful MOVE. A repoUrl
+      // whose credential contains a raw, unescaped '/' can make `new URL()`
+      // itself compute the WRONG host (verified empirically in the pure
+      // normalizer unit tests), so `normalizeRepoIdentityForComparison`
+      // must refuse to resolve it rather than guess — and this function
+      // must then skip ("new_repo_root_unresolved"), never move, when
+      // either side is unresolvable.
+      const support = await startEmbeddedPostgresTestDatabase(
+        "paperclip-spa12426-managed-cold-ambiguous-",
+      );
+      const previousPaperclipHome = process.env.PAPERCLIP_HOME;
+      const paperclipHome = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-spa12426-managed-cold-ambiguous-home-"));
+      process.env.PAPERCLIP_HOME = paperclipHome;
+      try {
+        const db = createDb(support.connectionString);
+        const companyId = randomUUID();
+        const projectId = randomUUID();
+        const oldProjectWorkspaceId = randomUUID();
+        const newProjectWorkspaceId = randomUUID();
+        const sourceIssueId = randomUUID();
+        const executionWorkspaceId = randomUUID();
+        const branchName = "PAP-12426-managed-cold-ambiguous";
+        const { oldRepo, oldWorktreePath } = await createOldRepoWorktree(branchName);
+        // The old worktree's origin resolves cleanly...
+        await runGit(oldRepo, ["remote", "add", "origin", "https://github.com/acme/old-repo.git"]);
+        await db.insert(companies).values({ id: companyId, name: "spa12426-managed-cold-ambiguous-co" });
+        await db.insert(projects).values({ id: projectId, companyId, name: "spa12426-managed-cold-ambiguous-project" });
+        await db.insert(projectWorkspaces).values([
+          {
+            id: oldProjectWorkspaceId,
+            companyId,
+            projectId,
+            name: "old-workspace",
+            cwd: oldRepo,
+            repoUrl: null,
+            repoRef: "refs/heads/main",
+          },
+          {
+            id: newProjectWorkspaceId,
+            companyId,
+            projectId,
+            name: "new-managed-workspace",
+            sourceType: "managed_checkout",
+            // cwd stays NULL (cold managed_checkout): no clone must ever
+            // happen to resolve this test.
+            cwd: null,
+            // ...but the NEXT workspace's repoUrl is ambiguous: a
+            // credential containing a raw '/', the exact shape that can
+            // make `new URL()` compute the wrong host on its own.
+            repoUrl: "https://user:80/ss@github.com/acme/new-repo.git",
+            repoRef: "refs/heads/main",
+          },
+        ]);
+        await db.insert(executionWorkspaces).values({
+          id: executionWorkspaceId,
+          companyId,
+          projectId,
+          projectWorkspaceId: oldProjectWorkspaceId,
+          mode: "isolated_workspace",
+          strategyType: "git_worktree",
+          name: "spa12426-managed-cold-ambiguous",
+          status: "active",
+          cwd: oldWorktreePath,
+          repoUrl: null,
+          baseRef: "refs/heads/main",
+          branchName,
+          providerType: "git_worktree",
+          providerRef: oldWorktreePath,
+          metadata: RUNTIME_OWNED_GIT_BRANCH_METADATA,
+        });
+        await db.insert(issues).values({
+          id: sourceIssueId,
+          // PR #210 final audit: relocation requires the branch to name this card.
+          identifier: (branchName.match(/[A-Za-z]+-\d+/) ?? [null])[0],
+          companyId,
+          projectId,
+          projectWorkspaceId: oldProjectWorkspaceId,
+          executionWorkspaceId,
+          title: "SPA-12426 cold managed_checkout ambiguous repoUrl skips",
+          status: "todo",
+        } as Partial<typeof issues.$inferInsert>);
+        await db
+          .update(executionWorkspaces)
+          .set({ sourceIssueId })
+          .where(eq(executionWorkspaces.id, executionWorkspaceId));
+        const outcome = await executionWorkspaceService(
+          db,
+        ).retireExecutionWorkspaceAfterProjectWorkspaceRebind({
+          companyId,
+          executionWorkspaceId,
+          sourceIssueId,
+          reason: `project workspace rebind ${oldProjectWorkspaceId} -> ${newProjectWorkspaceId}`,
+          nextProjectWorkspaceId: newProjectWorkspaceId,
+        });
+        expect(outcome.outcome).toBe("retired");
+        if (outcome.outcome !== "retired") throw new Error("unreachable");
+        expect(outcome.worktreeMoved).toBe(false);
+        expect(outcome.worktreeMoveSkipped).toBe("new_repo_root_unresolved");
+        expect(outcome.worktreeMoveError).toBeUndefined();
+        await expect(fs.stat(oldWorktreePath)).resolves.toBeDefined();
+        const [archivedRow] = await db
+          .select()
+          .from(executionWorkspaces)
+          .where(eq(executionWorkspaces.id, executionWorkspaceId));
+        expect(archivedRow.cwd).toBe(oldWorktreePath);
+        // No clone ever happened: nothing was ever written under the
+        // sandboxed PAPERCLIP_HOME root at all.
+        await expect(fs.readdir(paperclipHome)).resolves.toEqual([]);
+      } finally {
+        if (previousPaperclipHome === undefined) delete process.env.PAPERCLIP_HOME;
+        else process.env.PAPERCLIP_HOME = previousPaperclipHome;
+        await support.cleanup();
+      }
+    }, 30_000);
+
+    it("skips relocation with dirty_at_move when the worktree goes dirty immediately before the move (SPA-12426 finding (C))", async () => {
+      // LIMIT OF THIS TEST (stated honestly): retire's OWN earlier dirty
+      // check (before archiving) would already refuse a worktree that is
+      // dirty at THAT point, so reproducing "went dirty in the window
+      // between the earlier check and the move" through the public
+      // retire() entry point would need a real race between this call and a
+      // concurrent file write — not practical in a single-process test.
+      // This instead calls the internal relocate seam directly (same
+      // test-only export used by the row_changed_before_move test) against
+      // a worktree that is ALREADY dirty, which exercises the exact guard
+      // finding (C) added (the fresh `git status` immediately before the
+      // move) rather than the timing that produces the condition in
+      // production.
+      const support = await startEmbeddedPostgresTestDatabase(
+        "paperclip-spa12426-dirty-at-move-",
+      );
+      try {
+        const db = createDb(support.connectionString);
+        const companyId = randomUUID();
+        const projectId = randomUUID();
+        const newProjectWorkspaceId = randomUUID();
+        const executionWorkspaceId = randomUUID();
+        const branchName = "PAP-12426-dirty-at-move";
+        const { oldWorktreePath } = await createOldRepoWorktree(branchName);
+        const newRepo = await createNewRepo();
+        await db.insert(companies).values({ id: companyId, name: "spa12426-dirty-at-move-co" });
+        await db.insert(projects).values({ id: projectId, companyId, name: "spa12426-dirty-at-move-project" });
+        await db.insert(projectWorkspaces).values({
+          id: newProjectWorkspaceId,
+          companyId,
+          projectId,
+          name: "new-workspace",
+          cwd: newRepo,
+          repoUrl: null,
+          repoRef: "refs/heads/main",
+        });
+        await db.insert(executionWorkspaces).values({
+          id: executionWorkspaceId,
+          companyId,
+          projectId,
+          projectWorkspaceId: null,
+          mode: "isolated_workspace",
+          strategyType: "git_worktree",
+          name: "spa12426-dirty-at-move",
+          status: "archived",
+          closedAt: new Date(),
+          cwd: oldWorktreePath,
+          repoUrl: null,
+          baseRef: "refs/heads/main",
+          branchName,
+          providerType: "git_worktree",
+          providerRef: oldWorktreePath,
+          metadata: { ...RUNTIME_OWNED_GIT_BRANCH_METADATA, lifecycleGeneration: 1 },
+        });
+        // Make the worktree dirty NOW, after the row is already "archived"
+        // — simulating the window finding (C) closes.
+        await fs.writeFile(path.join(oldWorktreePath, "late-scratch.txt"), "late\n", "utf8");
+
+        const seamIssueId = randomUUID();
+        await db.insert(issues).values({
+          id: seamIssueId,
+          identifier: (branchName.match(/[A-Za-z]+-\d+/) ?? [null])[0],
+          companyId,
+          projectId,
+          title: "SPA-12426 relocate seam",
+          status: "todo",
+        } as Partial<typeof issues.$inferInsert>);
+        const moveResult = await __testOnlyRelocateRetiredWorktreeIfCrossRepo(db, {
+          companyId,
+          executionWorkspaceId,
+          branchName,
+          sourceIssueId: seamIssueId,
+          leafPath: oldWorktreePath,
+          nextProjectWorkspaceId: newProjectWorkspaceId,
+          archivedGeneration: 1,
+          ephemeralLifecycle: false,
+        });
+        expect(moveResult.worktreeMoved).toBe(false);
+        expect(moveResult.worktreeMoveSkipped).toBe("dirty_at_move");
+        // Nothing moved: the dirty worktree is left exactly where it was.
+        await expect(fs.stat(oldWorktreePath)).resolves.toBeDefined();
+        expect(await fs.readFile(path.join(oldWorktreePath, "late-scratch.txt"), "utf8")).toBe("late\n");
+        const [row] = await db
+          .select()
+          .from(executionWorkspaces)
+          .where(eq(executionWorkspaces.id, executionWorkspaceId));
+        expect(row.cwd).toBe(oldWorktreePath);
       } finally {
         await support.cleanup();
       }
@@ -12159,7 +13547,7 @@ describeEmbeddedPostgres(
         await db.insert(executionWorkspaces).values({ id: executionWorkspaceId, companyId, projectId, projectWorkspaceId, mode: "isolated_workspace", strategyType: "git_worktree", name: "ahead-workspace", status: "active", cwd: oldWorktreePath, branchName, providerType: "git_worktree", providerRef: oldWorktreePath, metadata: RUNTIME_OWNED_GIT_BRANCH_METADATA });
         await db.insert(issues).values({ id: sourceIssueId, companyId, projectId, projectWorkspaceId, executionWorkspaceId, title: "ahead rebind", status: "todo" } as Partial<typeof issues.$inferInsert>);
         await db.update(executionWorkspaces).set({ sourceIssueId }).where(eq(executionWorkspaces.id, executionWorkspaceId));
-        const outcome = await executionWorkspaceService(db).retireExecutionWorkspaceAfterProjectWorkspaceRebind({ companyId, executionWorkspaceId, sourceIssueId, reason: "rebind" });
+        const outcome = await executionWorkspaceService(db).retireExecutionWorkspaceAfterProjectWorkspaceRebind({ companyId, executionWorkspaceId, sourceIssueId, reason: "rebind", nextProjectWorkspaceId: null });
         expect(outcome.outcome).toBe("refused_unpushed");
         expect((await db.select().from(executionWorkspaces).where(eq(executionWorkspaces.id, executionWorkspaceId)))[0].status).toBe("active");
         expect((await db.select().from(issues).where(eq(issues.id, sourceIssueId)))[0].executionWorkspaceId).toBe(executionWorkspaceId);
@@ -12233,6 +13621,8 @@ describeEmbeddedPostgres(
         });
         await db.insert(issues).values({
           id: sourceIssueId,
+          // PR #210 final audit: relocation requires the branch to name this card.
+          identifier: (branchName.match(/[A-Za-z]+-\d+/) ?? [null])[0],
           companyId,
           projectId,
           projectWorkspaceId: oldProjectWorkspaceId,
@@ -12251,6 +13641,7 @@ describeEmbeddedPostgres(
           executionWorkspaceId,
           sourceIssueId,
           reason: `project workspace rebind ${oldProjectWorkspaceId} -> ${newProjectWorkspaceId}`,
+          nextProjectWorkspaceId: newProjectWorkspaceId,
         });
         expect(outcome.outcome).toBe("refused_dirty");
         if (outcome.outcome !== "refused_dirty") throw new Error("unreachable");

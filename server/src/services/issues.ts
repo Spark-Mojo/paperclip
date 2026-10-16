@@ -312,6 +312,9 @@ export async function executeIssuePostCommitActions(
             `project workspace rebind ` +
             `${action.previousProjectWorkspaceId ?? "<none>"} -> ` +
             `${action.nextProjectWorkspaceId ?? "<none>"}`,
+          // SPA-12426: retire needs this to decide cross-repo vs. same-repo
+          // before it ever considers moving the OLD worktree.
+          nextProjectWorkspaceId: action.nextProjectWorkspaceId,
         });
         if (outcome.outcome === "refused_dirty") {
           logger.warn(
@@ -353,6 +356,75 @@ export async function executeIssuePostCommitActions(
             },
             "execution workspace not retired after project workspace rebind: row already closed",
           );
+        } else if (outcome.outcome === "retired") {
+          // SPA-12426: the row archives either way; worktreeMoved tracks the
+          // best-effort relocation of the OLD worktree directory (never a
+          // removal — see the service docstring) so a CROSS-repo rebind's
+          // next realize does not collide with it on disk. A same-repo
+          // rebind, or a reopen that raced this retire, legitimately leaves
+          // worktreeMoved false with a `worktreeMoveSkipped` reason, not an
+          // error — only log at warn when there is an actual error.
+          if (outcome.worktreeMoved) {
+            logger.info(
+              {
+                companyId: action.companyId,
+                issueId: action.issueId,
+                executionWorkspaceId: outcome.executionWorkspaceId,
+                worktreePath: outcome.worktreePath,
+                worktreeMoved: outcome.worktreeMoved,
+                worktreeMovedTo: outcome.worktreeMovedTo,
+              },
+              "execution workspace retired after project workspace rebind",
+            );
+          } else if (outcome.worktreeMoveError) {
+            logger.warn(
+              {
+                companyId: action.companyId,
+                issueId: action.issueId,
+                executionWorkspaceId: outcome.executionWorkspaceId,
+                worktreePath: outcome.worktreePath,
+                worktreeMoved: outcome.worktreeMoved,
+                worktreeMoveError: outcome.worktreeMoveError,
+              },
+              "execution workspace retired after project workspace rebind, but relocating the old worktree directory failed",
+            );
+          } else if (
+            outcome.worktreeMoveSkipped === "same_repo_rebind"
+            || outcome.worktreeMoveSkipped === "path_in_use_by_live_workspace"
+            || outcome.worktreeMoveSkipped === "ephemeral_run_worktree"
+          ) {
+            // Expected, benign skips: realize reuses the path (same-repo),
+            // another live row still owns it, or the path is an SPA-9275
+            // per-run worktree that can never collide with a branch-template
+            // realize by construction — nothing for an operator to do.
+            logger.info(
+              {
+                companyId: action.companyId,
+                issueId: action.issueId,
+                executionWorkspaceId: outcome.executionWorkspaceId,
+                worktreePath: outcome.worktreePath,
+                worktreeMoved: outcome.worktreeMoved,
+                worktreeMoveSkipped: outcome.worktreeMoveSkipped,
+              },
+              "execution workspace retired after project workspace rebind; old worktree directory left in place",
+            );
+          } else {
+            // Any other skip (new_repo_root_unresolved, row_changed_before_move,
+            // dirty_at_move, ...) means the OLD worktree is still sitting at
+            // the collision path SPA-12426 exists to clear, or something
+            // unexpected happened — worth an operator's attention.
+            logger.warn(
+              {
+                companyId: action.companyId,
+                issueId: action.issueId,
+                executionWorkspaceId: outcome.executionWorkspaceId,
+                worktreePath: outcome.worktreePath,
+                worktreeMoved: outcome.worktreeMoved,
+                worktreeMoveSkipped: outcome.worktreeMoveSkipped,
+              },
+              "execution workspace retired after project workspace rebind; old worktree directory left in place and may still collide on the next realize",
+            );
+          }
         }
       } catch (err) {
         // The bound row remains untouched on failure; the next run will see
