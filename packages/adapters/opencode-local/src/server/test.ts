@@ -126,7 +126,13 @@ export async function testEnvironment(
 
   // Prevent OpenCode from writing an opencode.json into the working directory.
   env.OPENCODE_DISABLE_PROJECT_CONFIG = "true";
-  const preparedRuntimeConfig = await prepareOpenCodeRuntimeConfig({ env, config });
+  // SPA-12520 F3: thread the remote mode through — a remote env-check must
+  // take the remote branch (fresh deny-only temp dir, never host config).
+  // Without targetIsRemote the call takes the LOCAL branch, copies host
+  // ~/.config/opencode + bakes gateway secrets into the temp dir, and stages
+  // it as the xdgConfig asset below. workspaceCwd is null: remote ships
+  // deny-only, never a wrong-scope local-path map.
+  const preparedRuntimeConfig = await prepareOpenCodeRuntimeConfig({ env, config, targetIsRemote, workspaceCwd: null });
   // SPA-12581 (F1): see execute.ts — staging selects from generatedConfigHome,
   // never from a notes gate.
   const localRuntimeConfigHome = preparedRuntimeConfig.generatedConfigHome ?? "";
