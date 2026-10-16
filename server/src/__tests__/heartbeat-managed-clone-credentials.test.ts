@@ -322,6 +322,22 @@ describe("ensureManagedProjectWorkspace clone credentials", () => {
       const topLevel = await fs.readdir(anchor.cwd);
       expect(topLevel).not.toContain("detached-repositories");
       expect(topLevel).not.toContain(".paperclip-runtime");
+      // (e) Migration: legacy in-worktree residue is swept out on the same pass.
+      const legacyDir = path.join(anchor.cwd, ".paperclip-runtime", "detached-repositories", "legacy-uuid");
+      await fs.mkdir(legacyDir, { recursive: true });
+      await fs.writeFile(path.join(legacyDir, "legacy.txt"), "legacy work\n");
+      expect(await prepareProjectRepositoryWorkspaces({
+        cwd: anchor.cwd, anchorRepoUrl: first, workspaces: [],
+      })).toEqual([]);
+      await expect(fs.lstat(legacyDir)).rejects.toMatchObject({ code: "ENOENT" });
+      expect((await execFile("git", ["status", "--porcelain"], { cwd: anchor.cwd })).stdout).toBe("");
+      const namesAfter = await fs.readdir(retentionRoot);
+      let legacyReceipt = false;
+      for (const name of namesAfter.filter((entry) => entry.endsWith(".json"))) {
+        const parsed = JSON.parse(await fs.readFile(path.join(retentionRoot, name), "utf8"));
+        if (parsed.reason === "legacy-in-worktree-sweep") legacyReceipt = true;
+      }
+      expect(legacyReceipt).toBe(true);
     } finally {
       await Promise.all([first, second].map((cwd) => fs.rm(cwd, { recursive: true, force: true })));
     }
