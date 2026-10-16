@@ -12430,6 +12430,135 @@ describeEmbeddedPostgres(
       }
     }, 30_000);
 
+    it("does not relocate when a live row of ANOTHER company points at the same path (Mira PR #210: host-global check)", async () => {
+      const support = await startEmbeddedPostgresTestDatabase(
+        "paperclip-pr210-cross-company-",
+      );
+      try {
+        const db = createDb(support.connectionString);
+        const companyId = randomUUID();
+        const projectId = randomUUID();
+        const oldProjectWorkspaceId = randomUUID();
+        const newProjectWorkspaceId = randomUUID();
+        const sourceIssueId = randomUUID();
+        const executionWorkspaceId = randomUUID();
+        const otherLiveExecutionWorkspaceId = randomUUID();
+        const otherCompanyId = randomUUID();
+        const otherProjectId = randomUUID();
+        const branchName = "PAP-12428-path-collision";
+        const { oldRepo, oldWorktreePath } = await createOldRepoWorktree(branchName);
+        const newRepo = await createNewRepo();
+        await db.insert(companies).values({
+          id: companyId,
+          name: "spa12428-co",
+        });
+        await db.insert(projects).values({
+          id: projectId,
+          companyId,
+          name: "spa12428-project",
+        });
+        await db.insert(companies).values({ id: otherCompanyId, name: "pr210-other-co", issuePrefix: "OTH" });
+        await db.insert(projects).values({ id: otherProjectId, companyId: otherCompanyId, name: "pr210-other-project" });
+        await db.insert(projectWorkspaces).values([
+          {
+            id: oldProjectWorkspaceId,
+            companyId,
+            projectId,
+            name: "old-workspace",
+            cwd: oldRepo,
+            repoUrl: null,
+            repoRef: "refs/heads/main",
+          },
+          {
+            id: newProjectWorkspaceId,
+            companyId,
+            projectId,
+            name: "new-workspace",
+            cwd: newRepo,
+            repoUrl: null,
+            repoRef: "refs/heads/main",
+          },
+        ]);
+        await db.insert(executionWorkspaces).values([
+          {
+            id: executionWorkspaceId,
+            companyId,
+            projectId,
+            projectWorkspaceId: oldProjectWorkspaceId,
+            mode: "isolated_workspace",
+            strategyType: "git_worktree",
+            name: "spa12428-retiring",
+            status: "active",
+            cwd: oldWorktreePath,
+            repoUrl: null,
+            baseRef: "refs/heads/main",
+            branchName,
+            providerType: "git_worktree",
+            providerRef: oldWorktreePath,
+            metadata: RUNTIME_OWNED_GIT_BRANCH_METADATA,
+          },
+          // SPA-9375 / SPA-12428: a rebind between two project workspaces of
+          // the SAME repo can leave a second, still-live row pointing at
+          // this exact path. Relocation must never touch a path another
+          // live row depends on.
+          {
+            id: otherLiveExecutionWorkspaceId,
+            companyId: otherCompanyId,
+            projectId: otherProjectId,
+            projectWorkspaceId: null,
+            mode: "isolated_workspace",
+            strategyType: "git_worktree",
+            name: "spa12428-live-sibling",
+            status: "active",
+            cwd: oldWorktreePath,
+            repoUrl: null,
+            baseRef: "refs/heads/main",
+            branchName,
+            providerType: "git_worktree",
+            providerRef: oldWorktreePath,
+            metadata: RUNTIME_OWNED_GIT_BRANCH_METADATA,
+          },
+        ]);
+        await db.insert(issues).values({
+          id: sourceIssueId,
+          companyId,
+          projectId,
+          projectWorkspaceId: oldProjectWorkspaceId,
+          executionWorkspaceId,
+          title: "SPA-12428 path collision skips relocation",
+          status: "todo",
+        } as Partial<typeof issues.$inferInsert>);
+        await db
+          .update(executionWorkspaces)
+          .set({ sourceIssueId })
+          .where(eq(executionWorkspaces.id, executionWorkspaceId));
+        const outcome = await executionWorkspaceService(
+          db,
+        ).retireExecutionWorkspaceAfterProjectWorkspaceRebind({
+          companyId,
+          executionWorkspaceId,
+          sourceIssueId,
+          reason: `project workspace rebind ${oldProjectWorkspaceId} -> ${newProjectWorkspaceId}`,
+          nextProjectWorkspaceId: newProjectWorkspaceId,
+        });
+        expect(outcome.outcome).toBe("retired");
+        if (outcome.outcome !== "retired") throw new Error("unreachable");
+        expect(outcome.worktreeMoved).toBe(false);
+        expect(outcome.worktreeMoveSkipped).toBe("path_in_use_by_live_workspace");
+        const [archivedRow] = await db
+          .select()
+          .from(executionWorkspaces)
+          .where(eq(executionWorkspaces.id, executionWorkspaceId));
+        expect(archivedRow.status).toBe("archived");
+        expect(archivedRow.closedAt).not.toBeNull();
+        expect(archivedRow.cwd).toBe(oldWorktreePath);
+        // The path survives on disk for the still-live sibling row.
+        await expect(fs.stat(oldWorktreePath)).resolves.toBeDefined();
+      } finally {
+        await support.cleanup();
+      }
+    }, 30_000);
+
     it("archives but reports the old worktree relocation failure, leaving cwd unchanged, when the worktree is locked", async () => {
       const support = await startEmbeddedPostgresTestDatabase(
         "paperclip-spa12426-locked-rebind-",
