@@ -351,7 +351,15 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   if (authToken) {
     env.PAPERCLIP_API_KEY = authToken;
   }
-  const preparedRuntimeConfig = await prepareOpenCodeRuntimeConfig({ env, config });
+  const preparedRuntimeConfig = await prepareOpenCodeRuntimeConfig({
+    env,
+    config,
+    // SPA-12520: local-only scoping. Remote targets ship this config to the
+    // remote box (xdgConfig asset), where the local path is meaningless, so
+    // the adapter emits fail-closed deny there rather than a wrong-scope map.
+    targetIsRemote: executionTargetIsRemote,
+    workspaceCwd: executionTargetIsRemote ? null : (effectiveWorkspaceCwd || cwd),
+  });
   const localRuntimeConfigHome =
     preparedRuntimeConfig.notes.length > 0 ? preparedRuntimeConfig.env.XDG_CONFIG_HOME : "";
   try {
