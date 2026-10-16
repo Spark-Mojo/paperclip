@@ -47,6 +47,7 @@ export interface StageDecisionInput {
   action: StageDecisionAction;
   body: string;
   actor: StageDecisionActor;
+  stageId?: string | null;
 }
 
 const OUTCOME_BY_ACTION: Record<StageDecisionAction, IssueExecutionDecisionOutcome> = {
@@ -128,34 +129,36 @@ export function stageDecisionService(db: Db) {
             currentStageId: existingState.currentStageId,
           });
         }
-        // Cross-stage idempotency (before gates): after an approve advances
-        // currentStageId, a stage-scoped lookup no longer sees the prior
-        // row, and the replaying prior-stage actor is no longer the active
-        // participant — so the issue-wide latest-decision check must run
-        // before the escalated-hold/participant gates, else the replay throws
-        // instead of returning duplicate:true.
-        const latestIssueDecision = await tx
-          .select()
-          .from(issueExecutionDecisions)
-          .where(and(
-            eq(issueExecutionDecisions.companyId, lockedIssue.companyId),
-            eq(issueExecutionDecisions.issueId, lockedIssue.id),
-          ))
-          .orderBy(desc(issueExecutionDecisions.createdAt))
-          .limit(1)
-          .then((rows) => rows[0] ?? null);
-        if (latestIssueDecision && latestIssueDecision.outcome === outcome &&
-          latestIssueDecision.body === body &&
-          principalsMatchDecision(latestIssueDecision, input.actor) &&
-          existingState.lastDecisionId === latestIssueDecision.id) {
-          const crossReflected = input.action === "approve"
-            ? existingState.completedStageIds.includes(latestIssueDecision.stageId) &&
-              latestIssueDecision.stageId !== activeStage.id
-            : existingState.status === "changes_requested" &&
-              existingState.currentStageId === latestIssueDecision.stageId;
-          if (crossReflected) {
+        // Explicit target-stage contract: when the caller names a stageId
+        // that is not the active stage, it is either an explicit retry of
+        // the completed stage (idempotent duplicate) or a stale write that
+        // must fail closed. A same-actor/same-body approval on the NEW
+        // stage after approve-advance is a fresh decision, never a
+        // duplicate — only a stageId naming the completed stage replays.
+        if (input.stageId != null && input.stageId !== activeStage.id) {
+          const latestIssueDecision = await tx
+            .select()
+            .from(issueExecutionDecisions)
+            .where(and(
+              eq(issueExecutionDecisions.companyId, lockedIssue.companyId),
+              eq(issueExecutionDecisions.issueId, lockedIssue.id),
+            ))
+            .orderBy(desc(issueExecutionDecisions.createdAt))
+            .limit(1)
+            .then((rows) => rows[0] ?? null);
+          if (latestIssueDecision && latestIssueDecision.outcome === outcome &&
+            latestIssueDecision.body === body &&
+            principalsMatchDecision(latestIssueDecision, input.actor) &&
+            existingState.lastDecisionId === latestIssueDecision.id &&
+            existingState.completedStageIds.includes(latestIssueDecision.stageId) &&
+            latestIssueDecision.stageId === input.stageId) {
             return { issue: lockedIssue, decision: latestIssueDecision, duplicate: true as const };
           }
+          throw conflict("Stage decision targets a stage that is not active", {
+            issueId: lockedIssue.id,
+            expected: activeStage.id,
+            received: input.stageId,
+          });
         }
         // Escalated-human hold: mirrors the sticky hold in
         // applyIssueExecutionPolicyTransition. An escalated review is held by
