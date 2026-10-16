@@ -168,6 +168,19 @@ describe("execution workspace config helpers", () => {
 // cases exercise the normalizer directly, independent of the embedded-PG
 // suite below.
 describe("normalizeRepoIdentityForComparison SPA-12426", () => {
+  it("returns null for IPv6 or bracketed hosts in either syntax (round-5 audit: scp mis-split caused a wrongful move)", () => {
+    expect(normalizeRepoIdentityForComparison("git@[::1]:owner/repo.git")).toBeNull();
+    expect(normalizeRepoIdentityForComparison("ssh://git@[::1]/owner/repo.git")).toBeNull();
+    expect(normalizeRepoIdentityForComparison("https://[2001:db8::1]/owner/repo.git")).toBeNull();
+  });
+
+  it("still resolves plain DNS and IPv4 hosts", () => {
+    expect(normalizeRepoIdentityForComparison("git@10.0.0.5:owner/repo.git")).toBe(
+      normalizeRepoIdentityForComparison("https://10.0.0.5/owner/repo.git"),
+    );
+    expect(normalizeRepoIdentityForComparison("https://github.com/owner/repo.git")).not.toBeNull();
+  });
+
   it("treats an ssh URL with an explicit port and the plain https form of the same repo as equal", () => {
     const a = normalizeRepoIdentityForComparison("ssh://git@host:2222/org/repo.git");
     const b = normalizeRepoIdentityForComparison("https://host/org/repo.git");

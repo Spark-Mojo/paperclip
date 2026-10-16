@@ -4428,8 +4428,17 @@ export function normalizeRepoIdentityForComparison(rawUrl: string | null | undef
     ? parseSchemeRepoAuthority(trimmed)
     : parseScpRepoAuthority(trimmed);
   if (!identity) return null;
+  // SPA-12426 round-5 audit: the scp parser cannot represent an IPv6 literal
+  // (`git@[::1]:owner/repo` mis-split into host "[" with a garbage owner),
+  // which made the SAME repo normalize non-null and unequal to its scheme
+  // form, i.e. a wrongful move. Only a plain DNS name or IPv4 host is
+  // trusted; anything else (brackets, colons, empty) is ambiguous -> null,
+  // and null always means skip, never move.
+  if (!REPO_IDENTITY_HOST_RE.test(identity.host)) return null;
   return `${identity.host}/${identity.owner}/${identity.name}`;
 }
+
+const REPO_IDENTITY_HOST_RE = /^[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?$/i;
 
 // SPA-12426 audit finding (A): the per-run ephemeral worktree shape
 // (`${worktreeParentDir}/runs/<runId>/`, SPA-9275). `reapOrphanedRunWorktrees`
