@@ -6,6 +6,13 @@ import { asBoolean } from "@paperclipai/adapter-utils/server-utils";
 type PreparedOpenCodeRuntimeConfig = {
   env: Record<string, string>;
   notes: string[];
+  // SPA-12581 (F1): explicit marker for the generated runtime config dir the
+  // caller may stage to a remote box. Local path: the temp runtimeConfigHome.
+  // Remote path: a fresh temp dir holding a generated deny-only opencode.json
+  // (never the host config dir). Null when no config was generated
+  // (dangerouslySkipPermissions off). Callers must select staging from this
+  // field — never from notes, which are a logging concern, not a gate.
+  generatedConfigHome: string | null;
   cleanup: () => Promise<void>;
 };
 
@@ -92,6 +99,22 @@ function parseConfiguredModelRef(raw: unknown): { provider: string; model: strin
   return { provider: trimmed.slice(0, slash), model: trimmed.slice(slash + 1) };
 }
 
+// SPA-12520: normalize a workspace root for external_directory scoping —
+// POSIX separators, interior `..`/`//` collapsed lexically, trailing slashes
+// stripped except root. Returns null when the input is missing/empty/relative
+// or is the filesystem root `/` (fail-closed deny: `/` + `/**` would allow
+// everything). Symlink traversal is out of scope (mechanism A, not B — the
+// card explicitly excludes a kernel/fs boundary).
+function normalizeWorkspaceCwdForScoping(raw: string | null | undefined): string | null {
+  if (typeof raw !== "string") return null;
+  const trimmed = raw.trim();
+  if (trimmed.length === 0) return null;
+  const posix = path.posix.normalize(trimmed.replace(/\\/g, "/"));
+  if (!posix.startsWith("/") || posix === "/") return null;
+  if (posix.length > 1) return posix.replace(/\/+$/, "") || null;
+  return posix;
+}
+
 async function readJsonObject(filepath: string): Promise<Record<string, unknown>> {
   try {
     const raw = await fs.readFile(filepath, "utf8");
@@ -106,12 +129,19 @@ export async function prepareOpenCodeRuntimeConfig(input: {
   env: Record<string, string>;
   config: Record<string, unknown>;
   targetIsRemote?: boolean;
+  // SPA-12520: per-dispatch workspace root used to scope
+  // permission.external_directory. A non-empty absolute path emits a
+  // deny-first ordered map ({ "*": "deny", "<wt>": "allow",
+  // "<wt>/**": "allow" }); missing/empty/relative emits "deny"
+  // (fail-closed, no pool-wide fallback).
+  workspaceCwd?: string | null;
 }): Promise<PreparedOpenCodeRuntimeConfig> {
   const skipPermissions = asBoolean(input.config.dangerouslySkipPermissions, true);
   if (!skipPermissions) {
     return {
       env: input.env,
       notes: [],
+      generatedConfigHome: null,
       cleanup: async () => {},
     };
   }
@@ -122,10 +152,28 @@ export async function prepareOpenCodeRuntimeConfig(input: {
   // box do that via prepareAdapterExecutionTargetRuntime in execute.ts; this
   // host-fs helper is local-only.
   if (input.targetIsRemote) {
+    // SPA-12581 (F1+F2): generate and ship an explicit deny opencode.json for
+    // remote runs. The host config dir is NEVER staged: a fresh temp dir holds
+    // a generated deny-only config ({permission:{external_directory:"deny"}}),
+    // so a remote target with a pre-existing permissive config still runs
+    // deny-by-default, and host-side config never leaves the host. The
+    // informational note below is logging only — execute.ts selects staging
+    // from generatedConfigHome, never from notes.
+    const remoteConfigHome = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-opencode-remote-config-"));
+    const remoteConfigDir = path.join(remoteConfigHome, "opencode");
+    await fs.mkdir(remoteConfigDir, { recursive: true });
+    await fs.writeFile(
+      path.join(remoteConfigDir, "opencode.json"),
+      `${JSON.stringify({ permission: { external_directory: "deny" } }, null, 2)}\n`,
+      "utf8",
+    );
     return {
-      env: input.env,
-      notes: [],
-      cleanup: async () => {},
+      env: { ...input.env, XDG_CONFIG_HOME: remoteConfigHome },
+      notes: ["Remote target: generated deny-only opencode.json for the remote box; host config dir not staged."],
+      generatedConfigHome: remoteConfigHome,
+      cleanup: async () => {
+        await fs.rm(remoteConfigHome, { recursive: true, force: true });
+      },
     };
   }
 
@@ -162,8 +210,27 @@ export async function prepareOpenCodeRuntimeConfig(input: {
   const existingPermission = isPlainObject(existingConfig.permission)
     ? existingConfig.permission
     : {};
+  // SPA-12520: scope external_directory per dispatch. A non-empty absolute
+  // workspaceCwd emits a deny-first ordered map that relies on opencode's
+  // last-match-wins evaluation in insertion order ("*" first, then the
+  // worktree and its subtree); anything else emits "deny" (fail-closed, no
+  // pool-wide fallback). The adapter owns the runtime config, so a user's own
+  // external_directory map from their opencode.json is intentionally replaced
+  // below — partial-merge survival of unknown keys would be a worse failure
+  // mode for a scoped dispatch. Last-match-wins ordering follows the shipped
+  // runner-driver precedent (opencode-server-driver.ts:1898).
+  const scopedWorkspaceCwd = normalizeWorkspaceCwdForScoping(input.workspaceCwd);
+  const externalDirectory: unknown = scopedWorkspaceCwd
+    ? {
+        "*": "deny",
+        [scopedWorkspaceCwd]: "allow",
+        [`${scopedWorkspaceCwd}/**`]: "allow",
+      }
+    : "deny";
   const notes = [
-    "Injected runtime OpenCode config with permission.external_directory=allow to avoid headless approval prompts.",
+    scopedWorkspaceCwd
+      ? `Injected runtime OpenCode config with scoped permission.external_directory (deny-first, allowing ${scopedWorkspaceCwd}) to avoid headless approval prompts.`
+      : "Injected runtime OpenCode config with permission.external_directory=deny (fail-closed: no workspaceCwd) to avoid headless approval prompts.",
   ];
 
   // Merge gateway/custom provider definitions supplied via PAPERCLIP_OPENCODE_PROVIDERS
@@ -219,7 +286,7 @@ export async function prepareOpenCodeRuntimeConfig(input: {
     ...existingConfig,
     permission: {
       ...existingPermission,
-      external_directory: "allow",
+      external_directory: externalDirectory,
     },
   };
   if (Object.keys(nextProvider).length > 0) {
@@ -261,6 +328,7 @@ export async function prepareOpenCodeRuntimeConfig(input: {
   return {
     env: nextEnv,
     notes,
+    generatedConfigHome: runtimeConfigHome,
     cleanup: async () => {
       await fs.rm(runtimeConfigHome, { recursive: true, force: true });
     },

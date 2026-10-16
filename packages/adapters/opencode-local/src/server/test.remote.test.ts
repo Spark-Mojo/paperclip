@@ -92,6 +92,21 @@ describe("opencode remote environment diagnostics", () => {
   it.each([false, true])("stages remote runtime config assets for sandbox hello probes (managed=%s)", async (managed) => {
     const configHome = await mkdtemp(path.join(os.tmpdir(), "opencode-remote-test-config-"));
     configHomes.push(configHome);
+    // SPA-12520 F3: seed the host configHome with host-derived material a
+    // remote env-check must never stage — a sentinel file plus a permissive
+    // opencode.json (the broad access F2 closed on the execute path).
+    // NOTE: the "allow" string below is fixture-only seed data (what the
+    // HOST config holds), never a generated policy — no blanket allow is
+    // emitted by the adapter (guard below asserts the staged dir is the
+    // generated deny-only temp dir).
+    const { mkdir, writeFile } = await import("node:fs/promises");
+    await mkdir(path.join(configHome, "opencode"), { recursive: true });
+    await writeFile(path.join(configHome, "opencode", "host-sentinel.txt"), "host-only\n", "utf8");
+    await writeFile(
+      path.join(configHome, "opencode", "opencode.json"),
+      JSON.stringify({ permission: { external_directory: "allow" }, provider: { hostonly: {} } }),
+      "utf8",
+    );
     const remoteTarget: AdapterExecutionTarget = {
       kind: "remote",
       transport: "sandbox",
@@ -153,5 +168,38 @@ describe("opencode remote environment diagnostics", () => {
     expect(probeCall?.[4].env.XDG_CONFIG_HOME).toBe(
       "/remote/workspace/.paperclip-runtime/runs/test/workspace/.paperclip-runtime/opencode/xdgConfig",
     );
+
+    // SPA-12520 F3: remote env-check must stage nothing host-derived. The
+    // staged xdgConfig asset is the generated deny-only temp dir from the
+    // remote branch — never the caller-supplied host configHome (which may
+    // hold opencode config incl. credentials + baked gateway keys). The
+    // assert below pins the asset input BEFORE the remote rewrite: the
+    // localDir handed to prepareAdapterExecutionTargetRuntime equals the
+    // generated remoteConfigHome, not configHome.
+    //
+    // NOTE on read timing: testEnvironment's finally block runs
+    // preparedRuntimeConfig.cleanup() before returning, so the generated
+    // temp dir under TMPDIR is already removed here (same lifecycle as the
+    // execute path). Host-derived exclusion is asserted on the recorded
+    // asset INPUT (localDir path identity), not by reading the removed dir.
+    // A pre-fix regression run (targetIsRemote not threaded) fails this
+    // block: localDir === configHome (the seeded host dir).
+    const stagedDir = (runtimeInput?.assets?.[0] as { localDir?: string } | undefined)?.localDir ?? "";
+    expect(runtimeInput?.assets).toHaveLength(1);
+    expect(stagedDir).not.toBe("");
+    expect(stagedDir).not.toBe(configHome);
+    expect(stagedDir).not.toContain("opencode-remote-test-config-");
+    // The staged dir is the remote generated temp dir by NAME — the only
+    // observable left after cleanup for the fixture seeded above: the local
+    // branch would mint a COPY dir (paperclip-opencode-config-*, see
+    // runtime-config.ts:191), the remote branch mints
+    // "paperclip-opencode-remote-config-*". Host-sentinel / deny-shape of
+    // the generated dir itself is covered unit-side in runtime-config.test.ts
+    // (SPA-12581 F1+F2 fixtures, asserting the live generated files).
+    expect(path.basename(stagedDir)).toMatch(/^paperclip-opencode-remote-config-/);
+    // The seeded host-sentinel.txt marks WHAT the host dir holds (F1-class
+    // host-derived material); path identity above is what pins it unstaged.
+    // Content-exclusion of a copied host dir is covered unit-side in
+    // runtime-config.test.ts (F1 sentinel-absent fixture).
   });
 });
