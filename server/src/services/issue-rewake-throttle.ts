@@ -152,6 +152,81 @@ export function computeIssueRewakeCooldownMs(noProgressStreak: number): number {
   return Math.min(ISSUE_REWAKE_BASE_COOLDOWN_MS * factor, ISSUE_REWAKE_MAX_COOLDOWN_MS);
 }
 
+/**
+ * PAP-13775 follow-up: the escalating cooldown above slows a no-progress loop
+ * but never stops it — it caps at ISSUE_REWAKE_MAX_COOLDOWN_MS and keeps
+ * re-admitting forever (measured 10-16: SPA-12493 ran ~120 times). This is
+ * the permanent circuit breaker on top of the same streak computation: once
+ * a card's last N consecutive terminal runs for the same agent all landed
+ * with no issue-visible progress, the engine stops scheduling further
+ * continuation/handoff wakes for it entirely rather than just slowing them
+ * down. The caller is responsible for actually moving the card to `backlog`
+ * and posting the one-time notice; this module only decides whether that
+ * should happen.
+ */
+export const ISSUE_REWAKE_CIRCUIT_BREAKER_THRESHOLD_ENV_VAR =
+  "PAPERCLIP_ISSUE_REWAKE_CIRCUIT_BREAKER_THRESHOLD";
+
+/** Matches the default asked for: 3 consecutive no-progress runs trips it. */
+export const ISSUE_REWAKE_CIRCUIT_BREAKER_DEFAULT_THRESHOLD = 3;
+
+// A 1-run breaker would trip on ordinary variance (a single slow or
+// ambiguous run is not a loop); a cap keeps a misconfigured env var from
+// disabling the breaker in all practical terms.
+const ISSUE_REWAKE_CIRCUIT_BREAKER_MIN_THRESHOLD = 2;
+const ISSUE_REWAKE_CIRCUIT_BREAKER_MAX_THRESHOLD = 20;
+
+export function normalizeIssueRewakeCircuitBreakerThreshold(value: unknown): number {
+  const parsed =
+    typeof value === "number"
+      ? value
+      : typeof value === "string" && value.trim() !== ""
+        ? Number(value.trim())
+        : NaN;
+  if (!Number.isFinite(parsed)) return ISSUE_REWAKE_CIRCUIT_BREAKER_DEFAULT_THRESHOLD;
+  return Math.max(
+    ISSUE_REWAKE_CIRCUIT_BREAKER_MIN_THRESHOLD,
+    Math.min(ISSUE_REWAKE_CIRCUIT_BREAKER_MAX_THRESHOLD, Math.floor(parsed)),
+  );
+}
+
+export const ISSUE_REWAKE_CIRCUIT_BREAKER_TRIPPED_REASON =
+  "issue_rewake_circuit_breaker_tripped";
+
+/** Fixed prefix of the one-time card comment; used to dedupe the notice. */
+export const ISSUE_REWAKE_CIRCUIT_BREAKER_NOTICE_PREFIX =
+  "Paperclip stopped automatic re-wakes for this card";
+
+/**
+ * Pure trip decision. Deliberately conservative: a card assigned to a human
+ * (not an agent) never trips — a false trip strands real work, a miss only
+ * costs tokens. The streak itself already excludes failed/cancelled runs
+ * (evaluateIssueRewakeThrottle breaks the streak there) and resets on new
+ * issue input, so this only needs the one additional human-ownership guard.
+ */
+export function shouldTripIssueRewakeCircuitBreaker(input: {
+  noProgressStreak: number;
+  threshold: number;
+  isHumanAssigned: boolean;
+}): boolean {
+  if (input.isHumanAssigned) return false;
+  return input.noProgressStreak >= input.threshold;
+}
+
+export function buildIssueRewakeCircuitBreakerNotice(input: {
+  noProgressStreak: number;
+  /** Run ids counted toward the streak, newest first. */
+  runIds: string[];
+}): string {
+  const runList = input.runIds.map((id) => `\`${id}\``).join(", ") || "(none)";
+  return [
+    `${ISSUE_REWAKE_CIRCUIT_BREAKER_NOTICE_PREFIX}: the last ${input.noProgressStreak} consecutive runs ended with no issue-visible progress (issue status unchanged, no new comment, no new work product).`,
+    `Runs counted toward this streak, newest first: ${runList}.`,
+    "This card was moved to `backlog` so it stops consuming runs for no new information.",
+    "To resume automatic work: move the card back to `todo` (or reassign it). Either change counts as new progress and resets this breaker.",
+  ].join("\n\n");
+}
+
 export function evaluateIssueRewakeThrottle(input: IssueRewakeThrottleInput): IssueRewakeThrottleDecision {
   const runs = input.recentTerminalRuns;
   if (runs.length === 0) return { blocked: false, noProgressStreak: 0 };

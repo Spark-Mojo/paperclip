@@ -364,8 +364,14 @@ import {
   ISSUE_PROGRESS_ACTIVITY_ACTIONS,
   ISSUE_REWAKE_LOOKBACK_MS,
   ISSUE_REWAKE_RUN_SAMPLE_LIMIT,
+  ISSUE_REWAKE_CIRCUIT_BREAKER_THRESHOLD_ENV_VAR,
+  ISSUE_REWAKE_CIRCUIT_BREAKER_TRIPPED_REASON,
+  ISSUE_REWAKE_CIRCUIT_BREAKER_NOTICE_PREFIX,
+  buildIssueRewakeCircuitBreakerNotice,
   evaluateIssueRewakeThrottle,
   isThrottleCandidateIssueRewake,
+  normalizeIssueRewakeCircuitBreakerThreshold,
+  shouldTripIssueRewakeCircuitBreaker,
 } from "./issue-rewake-throttle.js";
 import {
   logActivity,
@@ -28704,6 +28710,7 @@ export function heartbeatService(
               executionWorkspacePreference: issues.executionWorkspacePreference,
               executionWorkspaceSettings: issues.executionWorkspaceSettings,
               assigneeAgentId: issues.assigneeAgentId,
+              assigneeUserId: issues.assigneeUserId,
               executionRunId: issues.executionRunId,
               executionAgentNameKey: issues.executionAgentNameKey,
               createdAt: issues.createdAt,
@@ -29676,6 +29683,119 @@ export function heartbeatService(
                 // wake privilege, nor can it mask an actual human response.
                 hasNewIssueInputSinceLastRun: newInputRows.length > 0,
               });
+
+              // Circuit breaker (PAP-13775 follow-up): the cooldown below
+              // only slows a no-progress loop, it never stops one (measured
+              // 10-16: SPA-12493 ran ~120 times). Once the same streak this
+              // throttle already computes reaches the breaker threshold,
+              // stop scheduling continuation/handoff wakes for this card for
+              // good instead of just backing off further. Never trips for a
+              // human-assigned card; the streak itself already excludes
+              // failed/cancelled runs and resets on new issue input via
+              // evaluateIssueRewakeThrottle above.
+              const circuitBreakerThreshold =
+                normalizeIssueRewakeCircuitBreakerThreshold(
+                  runtimeEnv[ISSUE_REWAKE_CIRCUIT_BREAKER_THRESHOLD_ENV_VAR],
+                );
+              if (
+                shouldTripIssueRewakeCircuitBreaker({
+                  noProgressStreak: throttleDecision.noProgressStreak,
+                  threshold: circuitBreakerThreshold,
+                  isHumanAssigned: Boolean(issue.assigneeUserId),
+                })
+              ) {
+                const trippedRunIds = recentTerminalRuns
+                  .slice(0, throttleDecision.noProgressStreak)
+                  .map((sampleRun) => sampleRun.id);
+
+                if (issue.status === "in_progress") {
+                  const backlogged = await tx
+                    .update(issues)
+                    .set({
+                      status: "backlog",
+                      checkoutRunId: null,
+                      executionRunId: null,
+                      executionAgentNameKey: null,
+                      executionLockedAt: null,
+                      updatedAt: throttleNow,
+                    })
+                    .where(
+                      and(
+                        eq(issues.id, issue.id),
+                        eq(issues.companyId, issue.companyId),
+                        eq(issues.status, "in_progress"),
+                      ),
+                    )
+                    .returning({ id: issues.id });
+                  if (backlogged.length > 0) {
+                    await logActivity(tx as unknown as Db, {
+                      companyId: issue.companyId,
+                      actorType: "system",
+                      actorId: "heartbeat",
+                      agentId,
+                      action: "issue.no_progress_circuit_breaker_tripped",
+                      entityType: "issue",
+                      entityId: issue.id,
+                      details: {
+                        noProgressStreak: throttleDecision.noProgressStreak,
+                        threshold: circuitBreakerThreshold,
+                        runIds: trippedRunIds,
+                      },
+                    });
+                  }
+                }
+
+                const existingNotice = await tx
+                  .select({ id: issueComments.id })
+                  .from(issueComments)
+                  .where(
+                    and(
+                      eq(issueComments.companyId, issue.companyId),
+                      eq(issueComments.issueId, issue.id),
+                      sql`${issueComments.body} like ${`${ISSUE_REWAKE_CIRCUIT_BREAKER_NOTICE_PREFIX}%`}`,
+                    ),
+                  )
+                  .limit(1)
+                  .then((rows) => rows[0] ?? null);
+                if (!existingNotice) {
+                  await issuesSvc.addComment(
+                    issue.id,
+                    buildIssueRewakeCircuitBreakerNotice({
+                      noProgressStreak: throttleDecision.noProgressStreak,
+                      runIds: trippedRunIds,
+                    }),
+                    {},
+                    { authorType: "system" },
+                    tx,
+                  );
+                }
+
+                await tx.insert(agentWakeupRequests).values({
+                  ...durableReceiptFields,
+                  companyId: agent.companyId,
+                  agentId,
+                  source,
+                  triggerDetail,
+                  reason: ISSUE_REWAKE_CIRCUIT_BREAKER_TRIPPED_REASON,
+                  payload: {
+                    ...(payload ?? {}),
+                    issueId,
+                    heartbeatSkip: {
+                      reason: ISSUE_REWAKE_CIRCUIT_BREAKER_TRIPPED_REASON,
+                      requestedReason: reason,
+                      noProgressStreak: throttleDecision.noProgressStreak,
+                      threshold: circuitBreakerThreshold,
+                      runIds: trippedRunIds,
+                    },
+                  },
+                  status: "skipped",
+                  requestedByActorType: opts.requestedByActorType ?? null,
+                  requestedByActorId: opts.requestedByActorId ?? null,
+                  idempotencyKey: opts.idempotencyKey ?? null,
+                  finishedAt: throttleNow,
+                });
+                return { kind: "skipped" as const };
+              }
 
               if (throttleDecision.blocked) {
                 await tx.insert(agentWakeupRequests).values({
