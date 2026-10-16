@@ -365,6 +365,7 @@ import {
   ISSUE_REWAKE_LOOKBACK_MS,
   ISSUE_REWAKE_RUN_SAMPLE_LIMIT,
   ISSUE_REWAKE_CIRCUIT_BREAKER_THRESHOLD_ENV_VAR,
+  ISSUE_REWAKE_CIRCUIT_BREAKER_TRIPPED_ACTIVITY_ACTION,
   ISSUE_REWAKE_CIRCUIT_BREAKER_TRIPPED_REASON,
   buildIssueRewakeCircuitBreakerNotice,
   evaluateIssueRewakeThrottle,
@@ -29813,6 +29814,19 @@ export function heartbeatService(
                         eq(activityLog.companyId, issue.companyId),
                         eq(activityLog.entityType, "issue"),
                         gte(activityLog.createdAt, extraProgressWindowStart),
+                        // Self-match guard: exclude the breaker's own prior
+                        // trip bookkeeping (actorType "system", no run id)
+                        // from counting as delegation/human evidence — a
+                        // second evaluation whose window still reaches back
+                        // to an earlier trip on this same card must not veto
+                        // itself on its own audit trail. Found via this
+                        // exact test: the second-trip assertion failed under
+                        // heavy load because the first trip's own log entry
+                        // (runId null, actorType system) satisfied (b1).
+                        ne(
+                          activityLog.action,
+                          ISSUE_REWAKE_CIRCUIT_BREAKER_TRIPPED_ACTIVITY_ACTION,
+                        ),
                         or(
                           // (a) any activity on a child issue of this card —
                           // e.g. issue.child_created or a child's status
@@ -29888,7 +29902,7 @@ export function heartbeatService(
                       actorType: "system",
                       actorId: "heartbeat",
                       agentId,
-                      action: "issue.no_progress_circuit_breaker_tripped",
+                      action: ISSUE_REWAKE_CIRCUIT_BREAKER_TRIPPED_ACTIVITY_ACTION,
                       entityType: "issue",
                       entityId: issue.id,
                       details: {

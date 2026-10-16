@@ -204,6 +204,22 @@ export function normalizeIssueRewakeCircuitBreakerThreshold(value: unknown): num
 export const ISSUE_REWAKE_CIRCUIT_BREAKER_TRIPPED_REASON =
   "issue_rewake_circuit_breaker_tripped";
 
+/**
+ * activity_log action the breaker logs against the issue on every trip
+ * (actorType "system", no run id). The delegation veto's caller MUST
+ * exclude this exact action from its own evidence query: a second trip
+ * evaluation (a duplicate of the same streak, or a genuinely later streak
+ * whose window still reaches back far enough) would otherwise see the
+ * breaker's own prior bookkeeping entry — actorType "system", runId null —
+ * and self-match it as "a human/system action with no run id", vetoing a
+ * trip the breaker should make. This is the same self-match class as the
+ * original audit finding (issue.successful_run_handoff_required logged
+ * under the stuck run's own id), just against the breaker's own record
+ * instead of another subsystem's.
+ */
+export const ISSUE_REWAKE_CIRCUIT_BREAKER_TRIPPED_ACTIVITY_ACTION =
+  "issue.no_progress_circuit_breaker_tripped";
+
 /** Fixed prefix of the one-time card comment; used to dedupe the notice. */
 export const ISSUE_REWAKE_CIRCUIT_BREAKER_NOTICE_PREFIX =
   "Paperclip stopped automatic re-wakes for this card";
