@@ -351,9 +351,21 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   if (authToken) {
     env.PAPERCLIP_API_KEY = authToken;
   }
-  const preparedRuntimeConfig = await prepareOpenCodeRuntimeConfig({ env, config });
-  const localRuntimeConfigHome =
-    preparedRuntimeConfig.notes.length > 0 ? preparedRuntimeConfig.env.XDG_CONFIG_HOME : "";
+  const preparedRuntimeConfig = await prepareOpenCodeRuntimeConfig({
+    env,
+    config,
+    // SPA-12520: local-only scoping. Remote targets ship this config to the
+    // remote box (xdgConfig asset), where the local path is meaningless, so
+    // the adapter emits fail-closed deny there rather than a wrong-scope map.
+    targetIsRemote: executionTargetIsRemote,
+    workspaceCwd: executionTargetIsRemote ? null : (effectiveWorkspaceCwd || cwd),
+  });
+  // SPA-12581 (F1): stage the GENERATED config dir only — never the host
+  // config dir, and never via a notes gate (notes are logging, not a
+  // staging signal). generatedConfigHome is the temp runtimeConfigHome on the
+  // local path, a fresh deny-only temp dir on the remote path, and null when
+  // no config was generated (skipPermissions off → stage nothing).
+  const localRuntimeConfigHome = preparedRuntimeConfig.generatedConfigHome ?? "";
   try {
     const runtimeEnv = Object.fromEntries(
       Object.entries(ensurePathInEnv({ ...process.env, ...preparedRuntimeConfig.env })).filter(
