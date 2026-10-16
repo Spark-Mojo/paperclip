@@ -217,7 +217,7 @@ describeEmbeddedPostgres("issue stage decision routes", () => {
 
     const res = await request(app(agentActor(seeded.companyId, seeded.reviewerAgentId, runId)))
       .post(`/api/issues/${issueId}/stage-decision`)
-      .send({ action: "approve", body: "Looks good, shipping it." });
+      .send({ action: "approve", body: "Looks good, shipping it.", stageId: stageId1 });
 
     expect(res.status, JSON.stringify(res.body)).toBe(200);
     expect(res.body.issue).toMatchObject({ id: issueId, status: "in_review" });
@@ -230,7 +230,7 @@ describeEmbeddedPostgres("issue stage decision routes", () => {
 
   it("forbids the builder and the current assignee from recording a decision", async () => {
     const seeded = await seedCompany("RVO");
-    const { issueId } = await seedStageIssue({
+    const { issueId, stageId1 } = await seedStageIssue({
       companyId: seeded.companyId,
       builderAgentId: seeded.assigneeAgentId,
       reviewerAgentId: seeded.reviewerAgentId,
@@ -242,13 +242,13 @@ describeEmbeddedPostgres("issue stage decision routes", () => {
     const builderRunId = await seedRun(seeded.companyId, seeded.assigneeAgentId, issueId);
     const builderDenied = await request(app(agentActor(seeded.companyId, seeded.assigneeAgentId, builderRunId)))
       .post(`/api/issues/${issueId}/stage-decision`)
-      .send({ action: "approve", body: "Self-approving my own work." });
+      .send({ action: "approve", body: "Self-approving my own work.", stageId: stageId1 });
     expect(builderDenied.status).toBe(403);
 
     const assigneeRunId = await seedRun(seeded.companyId, seeded.peerAgentId, issueId);
     const assigneeDenied = await request(app(agentActor(seeded.companyId, seeded.peerAgentId, assigneeRunId)))
       .post(`/api/issues/${issueId}/stage-decision`)
-      .send({ action: "approve", body: "Approving from the assignee seat." });
+      .send({ action: "approve", body: "Approving from the assignee seat.", stageId: stageId1 });
     expect(assigneeDenied.status).toBe(403);
     expect(await countDecisions(issueId, seeded.companyId)).toHaveLength(0);
   });
@@ -256,7 +256,7 @@ describeEmbeddedPostgres("issue stage decision routes", () => {
   it("replays an identical decision as a duplicate without inserting a second row", async () => {
     // Approve is terminal on a single-stage policy; request_changes keeps the stage open.
     const seeded = await seedCompany("IDM");
-    const { issueId } = await seedStageIssue({
+    const { issueId, stageId1 } = await seedStageIssue({
       companyId: seeded.companyId,
       builderAgentId: seeded.assigneeAgentId,
       reviewerAgentId: seeded.reviewerAgentId,
@@ -264,7 +264,7 @@ describeEmbeddedPostgres("issue stage decision routes", () => {
     });
     const runId = await seedRun(seeded.companyId, seeded.reviewerAgentId, issueId);
     const actor = agentActor(seeded.companyId, seeded.reviewerAgentId, runId);
-    const payload = { action: "request_changes", body: "Needs a null-check on line 42." };
+    const payload = { action: "request_changes", body: "Needs a null-check on line 42.", stageId: stageId1 };
 
     const first = await request(app(actor))
       .post(`/api/issues/${issueId}/stage-decision`)
@@ -286,7 +286,7 @@ describeEmbeddedPostgres("issue stage decision routes", () => {
 
   it("last writer wins: a different body is a new decision and state reflects the latest write", async () => {
     const seeded = await seedCompany("LWW");
-    const { issueId, stageId1 } = await seedStageIssue({
+    const { issueId, stageId1, stageId2 } = await seedStageIssue({
       companyId: seeded.companyId,
       builderAgentId: seeded.assigneeAgentId,
       reviewerAgentId: seeded.reviewerAgentId,
@@ -299,13 +299,13 @@ describeEmbeddedPostgres("issue stage decision routes", () => {
     const approveBody = "Stage one looks good.";
     const approved = await request(app(actor))
       .post(`/api/issues/${issueId}/stage-decision`)
-      .send({ action: "approve", body: approveBody });
+      .send({ action: "approve", body: approveBody, stageId: stageId1 });
     expect(approved.status, JSON.stringify(approved.body)).toBe(200);
 
     const changesBody = "Stage two needs rework on error handling.";
     const changes = await request(app(actor))
       .post(`/api/issues/${issueId}/stage-decision`)
-      .send({ action: "request_changes", body: changesBody });
+      .send({ action: "request_changes", body: changesBody, stageId: stageId2 });
     expect(changes.status, JSON.stringify(changes.body)).toBe(200);
     expect(changes.body.duplicate ?? false).toBe(false);
     let persisted = await readIssue(issueId);
@@ -315,7 +315,7 @@ describeEmbeddedPostgres("issue stage decision routes", () => {
     // Stale approve body on the now-open stage lands as a NEW decision.
     const staleApprove = await request(app(actor))
       .post(`/api/issues/${issueId}/stage-decision`)
-      .send({ action: "approve", body: approveBody });
+      .send({ action: "approve", body: approveBody, stageId: stageId2 });
     expect(staleApprove.status, JSON.stringify(staleApprove.body)).toBe(200);
     expect(staleApprove.body.duplicate ?? false).toBe(false);
     expect(await countDecisions(issueId, seeded.companyId)).toHaveLength(3);
@@ -335,7 +335,7 @@ describeEmbeddedPostgres("issue stage decision routes", () => {
     });
     const runId = await seedRun(seeded.companyId, seeded.reviewerAgentId, issueId);
     const actor = agentActor(seeded.companyId, seeded.reviewerAgentId, runId);
-    const payload = { action: "approve", body: "Stage one looks good, retry me." };
+    const payload = { action: "approve", body: "Stage one looks good, retry me.", stageId: stageId1 };
 
     const first = await request(app(actor))
       .post(`/api/issues/${issueId}/stage-decision`)
@@ -362,7 +362,7 @@ describeEmbeddedPostgres("issue stage decision routes", () => {
 
   it("same actor same body on the new active stage is a fresh approval", async () => {
     const seeded = await seedCompany("NXS");
-    const { issueId, stageId2 } = await seedStageIssue({
+    const { issueId, stageId1, stageId2 } = await seedStageIssue({
       companyId: seeded.companyId,
       builderAgentId: seeded.assigneeAgentId,
       reviewerAgentId: seeded.reviewerAgentId,
@@ -371,17 +371,16 @@ describeEmbeddedPostgres("issue stage decision routes", () => {
     });
     const runId = await seedRun(seeded.companyId, seeded.reviewerAgentId, issueId);
     const actor = agentActor(seeded.companyId, seeded.reviewerAgentId, runId);
-    const payload = { action: "approve", body: "Looks good at every stage." };
 
     const first = await request(app(actor))
       .post(`/api/issues/${issueId}/stage-decision`)
-      .send(payload);
+      .send({ action: "approve", body: "Looks good at every stage.", stageId: stageId1 });
     expect(first.status, JSON.stringify(first.body)).toBe(200);
     expect(first.body.duplicate ?? false).toBe(false);
 
     const second = await request(app(actor))
       .post(`/api/issues/${issueId}/stage-decision`)
-      .send(payload);
+      .send({ action: "approve", body: "Looks good at every stage.", stageId: stageId2 });
     expect(second.status, JSON.stringify(second.body)).toBe(200);
     expect(second.body.duplicate ?? false).toBe(false);
     expect(second.body.decision.id).not.toBe(first.body.decision.id);
@@ -404,7 +403,7 @@ describeEmbeddedPostgres("issue stage decision routes", () => {
 
     const first = await request(app(actor))
       .post(`/api/issues/${issueId}/stage-decision`)
-      .send({ action: "approve", body: "Stage one complete." });
+      .send({ action: "approve", body: "Stage one complete.", stageId: stageId1 });
     expect(first.status, JSON.stringify(first.body)).toBe(200);
 
     const stale = await request(app(actor))
@@ -416,7 +415,7 @@ describeEmbeddedPostgres("issue stage decision routes", () => {
 
   it("rejects a non-participant stranger with 422 and admits the designated participant", async () => {
     const seeded = await seedCompany("STR");
-    const { issueId } = await seedStageIssue({
+    const { issueId, stageId1 } = await seedStageIssue({
       companyId: seeded.companyId,
       builderAgentId: seeded.assigneeAgentId,
       reviewerAgentId: seeded.reviewerAgentId,
@@ -425,19 +424,52 @@ describeEmbeddedPostgres("issue stage decision routes", () => {
     const strangerRunId = await seedRun(seeded.companyId, seeded.peerAgentId, issueId);
     const stranger = await request(app(agentActor(seeded.companyId, seeded.peerAgentId, strangerRunId)))
       .post(`/api/issues/${issueId}/stage-decision`)
-      .send({ action: "approve", body: "I am not the reviewer." });
+      .send({ action: "approve", body: "I am not the reviewer.", stageId: stageId1 });
     expect(stranger.status).toBe(422);
 
     const reviewerRunId = await seedRun(seeded.companyId, seeded.reviewerAgentId, issueId);
     const reviewer = await request(app(agentActor(seeded.companyId, seeded.reviewerAgentId, reviewerRunId)))
       .post(`/api/issues/${issueId}/stage-decision`)
-      .send({ action: "approve", body: "I am the designated reviewer." });
+      .send({ action: "approve", body: "I am the designated reviewer.", stageId: stageId1 });
     expect(reviewer.status, JSON.stringify(reviewer.body)).toBe(200);
+  });
+
+  it("identical retry without stageId cannot approve the next stage", async () => {
+    const seeded = await seedCompany("NSI");
+    const { issueId, stageId1, stageId2 } = await seedStageIssue({
+      companyId: seeded.companyId,
+      builderAgentId: seeded.assigneeAgentId,
+      reviewerAgentId: seeded.reviewerAgentId,
+      identifier: "NSI-1",
+      stageCount: 2,
+    });
+    const runId = await seedRun(seeded.companyId, seeded.reviewerAgentId, issueId);
+    const actor = agentActor(seeded.companyId, seeded.reviewerAgentId, runId);
+
+    const first = await request(app(actor))
+      .post(`/api/issues/${issueId}/stage-decision`)
+      .send({ action: "approve", body: "Stage one approved.", stageId: stageId1 });
+    expect(first.status, JSON.stringify(first.body)).toBe(200);
+    let persisted = await readIssue(issueId);
+    expect(persisted.executionState.currentStageId).toBe(stageId2);
+    const lastDecisionId = persisted.executionState.lastDecisionId;
+
+    // Identical action+body with NO stageId must not approve stage 2.
+    // validate() rejects the missing stageId before the handler: 400.
+    const retry = await request(app(actor))
+      .post(`/api/issues/${issueId}/stage-decision`)
+      .send({ action: "approve", body: "Stage one approved." });
+    expect(retry.status).toBe(400);
+    expect(await countDecisions(issueId, seeded.companyId)).toHaveLength(1);
+    persisted = await readIssue(issueId);
+    expect(persisted.executionState.currentStageId).toBe(stageId2);
+    expect(persisted.executionState.completedStageIds).not.toContain(stageId2);
+    expect(persisted.executionState.lastDecisionId).toBe(lastDecisionId);
   });
 
   it("returns 409 for a card that is not in_review", async () => {
     const seeded = await seedCompany("NIR");
-    const { issueId } = await seedStageIssue({
+    const { issueId, stageId1 } = await seedStageIssue({
       companyId: seeded.companyId,
       builderAgentId: seeded.assigneeAgentId,
       reviewerAgentId: seeded.reviewerAgentId,
@@ -448,7 +480,7 @@ describeEmbeddedPostgres("issue stage decision routes", () => {
 
     const res = await request(app(agentActor(seeded.companyId, seeded.reviewerAgentId, runId)))
       .post(`/api/issues/${issueId}/stage-decision`)
-      .send({ action: "approve", body: "Too late." });
+      .send({ action: "approve", body: "Too late.", stageId: stageId1 });
     expect(res.status).toBe(409);
     expect(await countDecisions(issueId, seeded.companyId)).toHaveLength(0);
   });
