@@ -4158,6 +4158,8 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
             leafPath,
             nextProjectWorkspaceId: input.nextProjectWorkspaceId,
             archivedGeneration: retired.generation,
+            branchName: row.branchName ?? null,
+            sourceIssueId: input.sourceIssueId ?? null,
             // SPA-12426 audit finding (A): the row's own stored flag is the
             // authoritative signal for an ephemeral per-run worktree (see
             // SPA-9275); the function also re-derives it from the leaf
@@ -4562,6 +4564,11 @@ function isEphemeralRunWorktreeLeafPath(leafPath: string): boolean {
  * `worktreeMoved: false` and an error/skip reason. It never throws out of
  * this function and never un-archives the row.
  */
+function branchNamesCard(branchName: string, identifier: string): boolean {
+  const escaped = identifier.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  return new RegExp(`(^|[^A-Za-z0-9])${escaped}($|[^A-Za-z0-9])`, "i").test(branchName);
+}
+
 async function relocateRetiredWorktreeIfCrossRepo(
   db: Db,
   input: {
@@ -4571,6 +4578,8 @@ async function relocateRetiredWorktreeIfCrossRepo(
     nextProjectWorkspaceId: string | null;
     archivedGeneration: number;
     ephemeralLifecycle: boolean;
+    branchName: string | null;
+    sourceIssueId: string | null;
   },
 ): Promise<{
   worktreeMoved: boolean;
@@ -4585,6 +4594,25 @@ async function relocateRetiredWorktreeIfCrossRepo(
   // child directory under `runs/` that it reads as an orphaned run id.
   if (input.ephemeralLifecycle || isEphemeralRunWorktreeLeafPath(input.leafPath)) {
     return { worktreeMoved: false, worktreeMoveSkipped: "ephemeral_run_worktree" };
+  }
+
+  // Final audit of PR #210 (refuted path-race disposition): nothing serializes
+  // a DIFFERENT issue's same-repo realize, which reuses an existing worktree at
+  // its rendered path on filesystem/git checks alone, against this move. That
+  // is only possible when two issues render the same branch, e.g. a project-
+  // wide `workspaceStrategy.existingBranch` or a template without the issue id.
+  // So move only a worktree whose branch names THIS card's identifier as a
+  // whole token. No other card can render that path, and a shared-branch
+  // configuration keeps today's behavior (skip).
+  const cardIdentifier = input.sourceIssueId
+    ? await db
+        .select({ identifier: issues.identifier })
+        .from(issues)
+        .where(eq(issues.id, input.sourceIssueId))
+        .then((rows) => rows[0]?.identifier ?? null)
+    : null;
+  if (!cardIdentifier || !input.branchName || !branchNamesCard(input.branchName, cardIdentifier)) {
+    return { worktreeMoved: false, worktreeMoveSkipped: "branch_not_card_specific" };
   }
 
   const { resolveGitOwnerRepoRoot, resolvePathForWorktreeComparison } = await import("./workspace-runtime.js");
