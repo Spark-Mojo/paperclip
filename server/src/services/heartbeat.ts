@@ -365,14 +365,11 @@ import {
   ISSUE_REWAKE_LOOKBACK_MS,
   ISSUE_REWAKE_RUN_SAMPLE_LIMIT,
   ISSUE_REWAKE_CIRCUIT_BREAKER_THRESHOLD_ENV_VAR,
-  ISSUE_REWAKE_CIRCUIT_BREAKER_COMMENT_ONLY_THRESHOLD_ENV_VAR,
   ISSUE_REWAKE_CIRCUIT_BREAKER_TRIPPED_REASON,
   buildIssueRewakeCircuitBreakerNotice,
-  evaluateIssueRewakeCommentOnlyStreak,
   evaluateIssueRewakeThrottle,
   isThrottleCandidateIssueRewake,
   issueRewakeCircuitBreakerNoticeMarker,
-  normalizeIssueRewakeCircuitBreakerCommentOnlyThreshold,
   normalizeIssueRewakeCircuitBreakerThreshold,
   resolveBreakerExtraProgressWindowStart,
   shouldTripIssueRewakeCircuitBreaker,
@@ -29724,71 +29721,39 @@ export function heartbeatService(
                 hasNewIssueInputSinceLastRun,
               });
 
-              // Re-audit finding (PR #211, production SPA-12493 measurement):
-              // ISSUE_PROGRESS_ACTIVITY_ACTIONS counts ANY actor's comment as
-              // progress, including the stuck agent's own — 136
-              // issue.comment_added rows against 58
-              // issue.successful_run_handoff_required rows over 2 days. A
-              // loop where the agent comments every run (reporting the same
-              // denial/status) resets throttleDecision's streak every time,
-              // so the ordinary tier above would never trip on the exact
-              // case that motivated the breaker. This second, parallel tier
-              // does not let the assignee's own comment reset it; everything
-              // else about tripping (backlog move, marker notice, skip,
-              // human-owned exemption, delegation veto) is identical.
-              const commentOnlyStreak = evaluateIssueRewakeCommentOnlyStreak({
-                recentTerminalRuns,
-                activityRows: progressRows,
-                hasNewIssueInputSinceLastRun,
-                assigneeAgentId: issue.assigneeAgentId ?? null,
-              });
-
               // Circuit breaker (PAP-13775 follow-up): the cooldown below
               // only slows a no-progress loop, it never stops one (measured
-              // 10-16: SPA-12493 ran ~120 times). Once either tier's streak
-              // reaches its own threshold, stop scheduling continuation/
-              // handoff wakes for this card for good instead of just backing
-              // off further. Never trips for a human-owned card — direct
-              // assignee (assigneeUserId) or conversation seat
-              // (conversationUserId, audit finding #3) — and both streaks
-              // already exclude failed/cancelled runs and reset on new issue
-              // input.
+              // 10-16: SPA-12493 ran ~120 times). Once the streak this
+              // throttle already computes reaches the breaker threshold,
+              // stop scheduling continuation/handoff wakes for this card for
+              // good instead of just backing off further. Never trips for a
+              // human-owned card — direct assignee (assigneeUserId) or
+              // conversation seat (conversationUserId, audit finding #3) —
+              // and the streak itself already excludes failed/cancelled
+              // runs and resets on new issue input.
+              //
+              // A second "comment-only" tier (counting a run toward the
+              // breaker when the assignee's own repeated comment was its
+              // only progress-list activity) was built and then reverted on
+              // re-audit (PR #211): see the REJECTED note on
+              // evaluateIssueRewakeThrottle's module for the production
+              // numbers that ruled it out (cards legitimately waiting on CI
+              // or review comment every cycle too, and no threshold told
+              // them apart from a genuinely stuck loop). The strict,
+              // single-tier streak below had zero false positives in that
+              // same sample, so it stays the only tier.
               const circuitBreakerThreshold =
                 normalizeIssueRewakeCircuitBreakerThreshold(
                   runtimeEnv[ISSUE_REWAKE_CIRCUIT_BREAKER_THRESHOLD_ENV_VAR],
                 );
-              const commentOnlyBreakerThreshold =
-                normalizeIssueRewakeCircuitBreakerCommentOnlyThreshold(
-                  runtimeEnv[
-                    ISSUE_REWAKE_CIRCUIT_BREAKER_COMMENT_ONLY_THRESHOLD_ENV_VAR
-                  ],
-                );
               const isHumanOwnedCard = Boolean(
                 issue.assigneeUserId || issue.conversationUserId,
               );
-              const isNoProgressBreakerTrippable =
-                shouldTripIssueRewakeCircuitBreaker({
-                  noProgressStreak: throttleDecision.noProgressStreak,
-                  threshold: circuitBreakerThreshold,
-                  isHumanOwned: isHumanOwnedCard,
-                });
-              const isCommentOnlyBreakerTrippable =
-                shouldTripIssueRewakeCircuitBreaker({
-                  noProgressStreak: commentOnlyStreak,
-                  threshold: commentOnlyBreakerThreshold,
-                  isHumanOwned: isHumanOwnedCard,
-                });
-              const isBreakerTrippable =
-                isNoProgressBreakerTrippable || isCommentOnlyBreakerTrippable;
-              // Prefer the no-progress tier's own accounting when both
-              // trip at once — either is a legitimate trip reason, and
-              // trippedStreak only needs to be ONE consistent count for the
-              // notice/backlog/skip below.
-              const trippedStreakKind: "no_progress" | "comment_only" =
-                isNoProgressBreakerTrippable ? "no_progress" : "comment_only";
-              const trippedStreak = isNoProgressBreakerTrippable
-                ? throttleDecision.noProgressStreak
-                : commentOnlyStreak;
+              const isBreakerTrippable = shouldTripIssueRewakeCircuitBreaker({
+                noProgressStreak: throttleDecision.noProgressStreak,
+                threshold: circuitBreakerThreshold,
+                isHumanOwned: isHumanOwnedCard,
+              });
 
               // Audit finding #2 (PR #211): the progress check above is
               // scoped to activity logged directly against THIS issue under
@@ -29802,12 +29767,12 @@ export function heartbeatService(
               let trippedRunIds: string[] = [];
               if (isBreakerTrippable) {
                 trippedRunIds = recentTerminalRuns
-                  .slice(0, trippedStreak)
+                  .slice(0, throttleDecision.noProgressStreak)
                   .map((sampleRun) => sampleRun.id);
                 const extraProgressWindowStart =
                   resolveBreakerExtraProgressWindowStart({
                     recentTerminalRuns,
-                    noProgressStreak: trippedStreak,
+                    noProgressStreak: throttleDecision.noProgressStreak,
                   });
                 if (extraProgressWindowStart) {
                   const childIssueIds = await tx
@@ -29927,11 +29892,8 @@ export function heartbeatService(
                       entityType: "issue",
                       entityId: issue.id,
                       details: {
-                        streakKind: trippedStreakKind,
                         noProgressStreak: throttleDecision.noProgressStreak,
-                        commentOnlyStreak,
                         threshold: circuitBreakerThreshold,
-                        commentOnlyThreshold: commentOnlyBreakerThreshold,
                         runIds: trippedRunIds,
                       },
                     });
@@ -29954,9 +29916,8 @@ export function heartbeatService(
                   await issuesSvc.addComment(
                     issue.id,
                     buildIssueRewakeCircuitBreakerNotice({
-                      streak: trippedStreak,
+                      streak: throttleDecision.noProgressStreak,
                       runIds: trippedRunIds,
-                      kind: trippedStreakKind,
                     }),
                     {},
                     { authorType: "system" },
@@ -29977,11 +29938,8 @@ export function heartbeatService(
                     heartbeatSkip: {
                       reason: ISSUE_REWAKE_CIRCUIT_BREAKER_TRIPPED_REASON,
                       requestedReason: reason,
-                      streakKind: trippedStreakKind,
                       noProgressStreak: throttleDecision.noProgressStreak,
-                      commentOnlyStreak,
                       threshold: circuitBreakerThreshold,
-                      commentOnlyThreshold: commentOnlyBreakerThreshold,
                       runIds: trippedRunIds,
                     },
                   },
