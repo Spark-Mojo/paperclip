@@ -3016,7 +3016,7 @@ async function directoryExists(value: string) {
   return fs.stat(value).then((stats) => stats.isDirectory()).catch(() => false);
 }
 
-async function resolvePathForWorktreeComparison(value: string): Promise<string> {
+export async function resolvePathForWorktreeComparison(value: string): Promise<string> {
   const resolved = path.resolve(value);
   return fs.realpath(resolved).then((realPath) => path.resolve(realPath)).catch(() => resolved);
 }

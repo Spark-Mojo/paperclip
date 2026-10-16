@@ -4039,30 +4039,48 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
      * `workspace_validation_failed` (the SPA-11953 fence: "already exists and
      * is owned by a different git repository") until a human moves it by
      * hand. So once (and only once) the archive above actually transitions
-     * the row, this also removes the OLD worktree directory with a
-     * NON-forced `git worktree remove` — never `--force`, never a branch
-     * delete — run from the worktree's OWNING repo root (resolved fresh from
-     * the leaf path itself, because after a rebind that owner differs from
-     * the project's current workspace cwd). Removal is best-effort: it never
-     * un-archives the row and never throws out of this function. Guarded
-     * against SPA-9375 / SPA-12428: a rebind between two project workspaces
-     * of the SAME repo can reuse this exact path for a second, still-live
-     * execution workspace row — removal is skipped whenever another live row
-     * in the company still points at this path.
+     * the row, and only when the rebind is CROSS-repo (the leaf's owning repo
+     * root differs from the new project workspace's repo root — a same-repo
+     * rebind reuses this exact path on realize, so there is nothing to clear
+     * and moving it would only get in the way), this also relocates the OLD
+     * worktree directory with a non-forced `git worktree move` to a sibling
+     * `<path>.rebind-retired-<rowId>` path — never `git worktree remove`.
+     * Move, not remove, because a non-forced remove deletes gitignored
+     * content (`.unlazy/` ledgers, build scratch, anything the agent left
+     * that was never meant to be committed) with no signal that it happened;
+     * a move preserves it under a clearly-named sibling path instead. The row
+     * is then updated to point `cwd`/`providerRef` at the moved path, so a
+     * later reopen rebuilds there and never collides with path P again.
+     * Relocation is best-effort: it never un-archives the row and never
+     * throws out of this function. Guarded twice against concurrent writers:
+     * (1) SPA-9375 / SPA-12428 — a rebind between two project workspaces of
+     * the SAME repo can leave a second, still-live execution workspace row
+     * pointing at this exact path; relocation is skipped whenever another
+     * live row in the company still points at it. (2) a reopen racing this
+     * retire — the move only runs inside a transaction that re-acquires the
+     * per-workspace lifecycle lock and re-verifies the row is still exactly
+     * the row this call itself just archived (status, closedAt, and lifecycle
+     * generation unchanged); a reopen that won the race bumps the generation
+     * and this call backs off without touching the worktree it rebuilt.
      */
     retireExecutionWorkspaceAfterProjectWorkspaceRebind: async (input: {
       companyId: string;
       executionWorkspaceId: string;
       sourceIssueId: string;
       reason: string;
+      // SPA-12426: the repo the issue's projectWorkspaceId now points at.
+      // Used only to decide cross-repo vs. same-repo (part A below); never
+      // used to pick a realize target.
+      nextProjectWorkspaceId: string | null;
     }): Promise<
       | {
           outcome: "retired";
           executionWorkspaceId: string;
           worktreePath: string | null;
-          worktreeRemoved: boolean;
-          worktreeRemovalError?: string;
-          worktreeRemovalSkipped?: string;
+          worktreeMoved: boolean;
+          worktreeMovedTo?: string;
+          worktreeMoveError?: string;
+          worktreeMoveSkipped?: string;
           detachedIssue?: true;
         }
       | { outcome: "skipped_already_closed"; executionWorkspaceId: string }
@@ -4127,56 +4145,35 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
         }
       }
       const retired = await archiveWorkspaceForRebind(db, input, row);
-      let worktreeRemoved = false;
-      let worktreeRemovalError: string | undefined;
-      let worktreeRemovalSkipped: string | undefined;
+      let worktreeMoved = false;
+      let worktreeMovedTo: string | undefined;
+      let worktreeMoveError: string | undefined;
+      let worktreeMoveSkipped: string | undefined;
       if (retired.archived && row.providerType === "git_worktree" && leafPath && !leafMissing) {
         try {
-          // SPA-9375 / SPA-12428: a rebind between two project workspaces of
-          // the SAME repo can reuse this exact path for a second, still-live
-          // execution workspace row. Never remove a path another live row
-          // still depends on. Compared after path.resolve so a differently
-          // formatted (e.g. trailing-slash) stored value still collides.
-          const resolvedLeafPath = path.resolve(leafPath);
-          const livePathCollision = await db
-            .select({ id: executionWorkspaces.id })
-            .from(executionWorkspaces)
-            .where(and(
-              eq(executionWorkspaces.companyId, row.companyId),
-              ne(executionWorkspaces.id, row.id),
-              isNull(executionWorkspaces.closedAt),
-              sql<boolean>`${executionWorkspaces.status} NOT IN ('archived', 'cleanup_failed')`,
-              or(
-                eq(executionWorkspaces.cwd, leafPath),
-                eq(executionWorkspaces.providerRef, leafPath),
-                eq(executionWorkspaces.cwd, resolvedLeafPath),
-                eq(executionWorkspaces.providerRef, resolvedLeafPath),
-              ),
-            ))
-            .limit(1)
-            .then((rows) => rows[0] ?? null);
-          if (livePathCollision) {
-            worktreeRemovalSkipped = "path_in_use_by_live_workspace";
-          } else {
-            const { resolveGitOwnerRepoRoot } = await import("./workspace-runtime.js");
-            const ownerRepoRoot = await resolveGitOwnerRepoRoot(leafPath);
-            // Non-forced: git itself refuses if the worktree became dirty
-            // between the clean check above and here. Never --force, never
-            // delete the branch ref.
-            await runGit(["worktree", "remove", leafPath], ownerRepoRoot);
-            worktreeRemoved = true;
-          }
+          const moveResult = await relocateRetiredWorktreeIfCrossRepo(db, {
+            companyId: row.companyId,
+            executionWorkspaceId: row.id,
+            leafPath,
+            nextProjectWorkspaceId: input.nextProjectWorkspaceId,
+            archivedGeneration: retired.generation,
+          });
+          worktreeMoved = moveResult.worktreeMoved;
+          worktreeMovedTo = moveResult.worktreeMovedTo;
+          worktreeMoveError = moveResult.worktreeMoveError;
+          worktreeMoveSkipped = moveResult.worktreeMoveSkipped;
         } catch (err) {
-          worktreeRemovalError = err instanceof Error ? err.message : String(err);
+          worktreeMoveError = err instanceof Error ? err.message : String(err);
         }
       }
       return {
         outcome: "retired",
         executionWorkspaceId: row.id,
         worktreePath: leafPath ?? null,
-        worktreeRemoved,
-        ...(worktreeRemovalError ? { worktreeRemovalError } : {}),
-        ...(worktreeRemovalSkipped ? { worktreeRemovalSkipped } : {}),
+        worktreeMoved,
+        ...(worktreeMovedTo ? { worktreeMovedTo } : {}),
+        ...(worktreeMoveError ? { worktreeMoveError } : {}),
+        ...(worktreeMoveSkipped ? { worktreeMoveSkipped } : {}),
         ...(retired.detachedIssue ? { detachedIssue: true as const } : {}),
       };
     },
@@ -4238,8 +4235,12 @@ async function assertBranchRefReachableForRetire(input: {
  *
  * Returns `archived: true` only when this call actually transitioned the
  * row — never when a concurrent writer already moved it (the caller uses
- * this to decide whether it is the one that should remove the OLD worktree,
- * SPA-12426).
+ * this to decide whether it is the one that should relocate the OLD
+ * worktree, SPA-12426). `generation` is the lifecycle generation this call
+ * wrote when it archived (irrelevant when `archived` is false) — the caller
+ * presents this same number back to `relocateRetiredWorktreeIfCrossRepo`'s
+ * re-check, so a reopen that bumps the generation after this commits is
+ * detected before the worktree is touched.
  */
 async function archiveWorkspaceForRebind(
   db: Db,
@@ -4250,10 +4251,11 @@ async function archiveWorkspaceForRebind(
     reason: string;
   },
   row: ExecutionWorkspaceRow,
-): Promise<{ detachedIssue: boolean; archived: boolean }> {
+): Promise<{ detachedIssue: boolean; archived: boolean; generation: number }> {
   const snapshotGeneration = readExecutionWorkspaceLifecycleGeneration(
     row.metadata as Record<string, unknown> | null,
   );
+  const nextGeneration = snapshotGeneration + 1;
   const archivedMetadata = bumpExecutionWorkspaceLifecycleGeneration(
     row.metadata as Record<string, unknown> | null,
   );
@@ -4278,7 +4280,7 @@ async function archiveWorkspaceForRebind(
       ))
       .returning()
       .then((rows: Array<ExecutionWorkspaceRow>) => rows[0] ?? null);
-    if (!archived) return { detachedIssue: false, archived: false };
+    if (!archived) return { detachedIssue: false, archived: false, generation: snapshotGeneration };
     // Clear the issue's binding so the next run's allocator refuses the
     // reuse request (status=archived, SPA-7090) and provisions a fresh
     // workspace bound to the new project workspace.
@@ -4296,8 +4298,230 @@ async function archiveWorkspaceForRebind(
         .then((rows: Array<{ id: string }>) => rows[0] ?? null);
       detachedIssue = Boolean(updated);
     }
-    return { detachedIssue, archived: true };
+    return { detachedIssue, archived: true, generation: nextGeneration };
+  });
+}
+
+// SPA-12426: the metadata key recording the path a retired worktree was
+// relocated FROM. Written only when `relocateRetiredWorktreeIfCrossRepo`
+// actually moves a worktree, so a human (or a later audit) can tell a
+// `<path>.rebind-retired-<rowId>` directory apart from a normal worktree.
+const EXECUTION_WORKSPACE_REBIND_RETIRED_FROM_PATH_METADATA_KEY = "rebindRetiredFromPath";
+
+/**
+ * SPA-12426: once `archiveWorkspaceForRebind` has archived a row for a
+ * project-workspace rebind, this decides whether the OLD worktree directory
+ * needs to move out of the way, and if so, moves it — never removes it.
+ *
+ * Part A (cross-repo only, closes audit finding (2)): the OLD worktree only
+ * collides with a FUTURE realize when the new project workspace is a
+ * DIFFERENT repo — a same-repo rebind's realize reuses this exact path, so
+ * there is nothing to clear. Compares the leaf's canonical owning repo root
+ * (`resolveGitOwnerRepoRoot`, resolved fresh from the leaf path itself — NOT
+ * read off the earlier `inspectGitCloseReadiness` result, which for a
+ * worktree leaf is that leaf's OWN toplevel, not the shared main-repo root)
+ * against the canonical repo root of the project workspace
+ * `nextProjectWorkspaceId` now points at, both normalized through
+ * `resolvePathForWorktreeComparison` (the same realpath-based comparison the
+ * SPA-11953 fence uses). Equal roots skip with `"same_repo_rebind"`. Unable
+ * to resolve the new side at all (no id, no row, not a git checkout) skips
+ * with `"new_repo_root_unresolved"` — this function never moves a worktree
+ * it cannot prove is cross-repo.
+ *
+ * Part B (move, never remove, closes audit finding (3)): a non-forced `git
+ * worktree remove` silently deletes gitignored content — `.unlazy/` ledgers,
+ * build scratch, anything an agent left that was never meant to be
+ * committed — with no signal that it happened. `git worktree move` to a
+ * sibling `<path>.rebind-retired-<rowId-prefix>` path frees the original
+ * path for the new repo's realize while preserving everything on disk.
+ * Never forced: git itself refuses the move if the worktree is locked or
+ * went dirty since the earlier clean check, and that refusal surfaces as
+ * `worktreeMoveError` rather than losing anything.
+ *
+ * Part C (one lock, one transaction, closes audit finding (1) — the reopen
+ * race): `archiveWorkspaceForRebind` released the lifecycle advisory lock
+ * when ITS transaction committed, so a reopen could in principle acquire it
+ * and rebuild at `leafPath` before this function ever runs. The live-row
+ * collision check, the move, and the row update here all run inside ONE
+ * transaction that re-acquires that same lock and re-reads the row UNDER the
+ * lock, requiring status `archived`, `closedAt` set, and the lifecycle
+ * generation still equal to `archivedGeneration` (the generation
+ * `archiveWorkspaceForRebind` itself just wrote). A reopen that won the race
+ * has already bumped the generation by the time this acquires the lock, so
+ * this backs off with `"row_changed_before_move"` instead of moving a
+ * worktree the reopen already rebuilt. A reopen that loses the race blocks
+ * on the same lock until this transaction commits, then rebuilds at the
+ * MOVED path (this function's row update already pointed `cwd`/`providerRef`
+ * there), never at the freed original path.
+ *
+ * Best-effort throughout: a failure at any step returns a result with
+ * `worktreeMoved: false` and an error/skip reason. It never throws out of
+ * this function and never un-archives the row.
+ */
+async function relocateRetiredWorktreeIfCrossRepo(
+  db: Db,
+  input: {
+    companyId: string;
+    executionWorkspaceId: string;
+    leafPath: string;
+    nextProjectWorkspaceId: string | null;
+    archivedGeneration: number;
+  },
+): Promise<{
+  worktreeMoved: boolean;
+  worktreeMovedTo?: string;
+  worktreeMoveError?: string;
+  worktreeMoveSkipped?: string;
+}> {
+  const { resolveGitOwnerRepoRoot, resolvePathForWorktreeComparison } = await import("./workspace-runtime.js");
+
+  let ownerRepoRoot: string;
+  try {
+    ownerRepoRoot = await resolveGitOwnerRepoRoot(input.leafPath);
+  } catch (err) {
+    return {
+      worktreeMoved: false,
+      worktreeMoveError: `Could not resolve the old worktree's owning repo root: ${err instanceof Error ? err.message : String(err)}`,
+    };
+  }
+
+  const nextProjectWorkspaceCwd = input.nextProjectWorkspaceId
+    ? await db
+        .select({ cwd: projectWorkspaces.cwd })
+        .from(projectWorkspaces)
+        .where(and(
+          eq(projectWorkspaces.companyId, input.companyId),
+          eq(projectWorkspaces.id, input.nextProjectWorkspaceId),
+        ))
+        .then((rows) => rows[0]?.cwd ?? null)
+    : null;
+
+  let newRepoRoot: string | null = null;
+  if (nextProjectWorkspaceCwd) {
+    try {
+      newRepoRoot = await resolveGitOwnerRepoRoot(nextProjectWorkspaceCwd);
+    } catch {
+      newRepoRoot = null;
+    }
+  }
+  if (!newRepoRoot) {
+    return { worktreeMoved: false, worktreeMoveSkipped: "new_repo_root_unresolved" };
+  }
+
+  const [canonicalOwnerRepoRoot, canonicalNewRepoRoot] = await Promise.all([
+    resolvePathForWorktreeComparison(ownerRepoRoot),
+    resolvePathForWorktreeComparison(newRepoRoot),
+  ]);
+  if (canonicalOwnerRepoRoot === canonicalNewRepoRoot) {
+    return { worktreeMoved: false, worktreeMoveSkipped: "same_repo_rebind" };
+  }
+
+  return db.transaction(async (tx: Parameters<Parameters<Db["transaction"]>[0]>[0]) => {
+    await acquireExecutionWorkspaceLifecycleLock(tx, input.executionWorkspaceId);
+    const fresh = await tx
+      .select()
+      .from(executionWorkspaces)
+      .where(eq(executionWorkspaces.id, input.executionWorkspaceId))
+      .then((rows) => rows[0] ?? null);
+    const freshGeneration = fresh
+      ? readExecutionWorkspaceLifecycleGeneration(fresh.metadata as Record<string, unknown> | null)
+      : null;
+    if (
+      !fresh
+      || fresh.status !== "archived"
+      || !fresh.closedAt
+      || freshGeneration !== input.archivedGeneration
+    ) {
+      return { worktreeMoved: false, worktreeMoveSkipped: "row_changed_before_move" };
+    }
+
+    // SPA-9375 / SPA-12428, re-checked here (not just earlier) because this
+    // is the transaction that actually moves the path: a rebind between two
+    // DIFFERENT project workspaces of the SAME repo can leave a second,
+    // still-live row pointing at this exact path. Compared after
+    // path.resolve so a differently formatted stored value still collides.
+    const resolvedLeafPath = path.resolve(input.leafPath);
+    const livePathCollision = await tx
+      .select({ id: executionWorkspaces.id })
+      .from(executionWorkspaces)
+      .where(and(
+        eq(executionWorkspaces.companyId, input.companyId),
+        ne(executionWorkspaces.id, input.executionWorkspaceId),
+        isNull(executionWorkspaces.closedAt),
+        sql<boolean>`${executionWorkspaces.status} NOT IN ('archived', 'cleanup_failed')`,
+        or(
+          eq(executionWorkspaces.cwd, input.leafPath),
+          eq(executionWorkspaces.providerRef, input.leafPath),
+          eq(executionWorkspaces.cwd, resolvedLeafPath),
+          eq(executionWorkspaces.providerRef, resolvedLeafPath),
+        ),
+      ))
+      .limit(1)
+      .then((rows) => rows[0] ?? null);
+    if (livePathCollision) {
+      return { worktreeMoved: false, worktreeMoveSkipped: "path_in_use_by_live_workspace" };
+    }
+
+    const movedToPath = `${input.leafPath}.rebind-retired-${input.executionWorkspaceId.slice(0, 8)}`;
+    if (existsSync(movedToPath)) {
+      return {
+        worktreeMoved: false,
+        worktreeMoveError: `Refusing to move the retired worktree: target path "${movedToPath}" already exists.`,
+      };
+    }
+
+    try {
+      // Non-forced: git itself refuses if the worktree is locked or became
+      // dirty between the earlier clean check and here. Never --force.
+      await runGit(["worktree", "move", input.leafPath, movedToPath], ownerRepoRoot);
+    } catch (err) {
+      return { worktreeMoved: false, worktreeMoveError: err instanceof Error ? err.message : String(err) };
+    }
+
+    try {
+      await tx
+        .update(executionWorkspaces)
+        .set({
+          cwd: movedToPath,
+          providerRef: movedToPath,
+          metadata: sql`COALESCE(${executionWorkspaces.metadata}, '{}'::jsonb) || jsonb_build_object(${EXECUTION_WORKSPACE_REBIND_RETIRED_FROM_PATH_METADATA_KEY}::text, ${input.leafPath}::text)`,
+          updatedAt: new Date(),
+        })
+        .where(eq(executionWorkspaces.id, input.executionWorkspaceId));
+    } catch (err) {
+      // Best-effort revert so the row's cwd and the worktree's actual disk
+      // location never disagree with each other.
+      try {
+        await runGit(["worktree", "move", movedToPath, input.leafPath], ownerRepoRoot);
+      } catch (revertErr) {
+        return {
+          worktreeMoved: false,
+          worktreeMoveError:
+            `Row update failed after moving the worktree, and reverting the move also failed: ` +
+            `${err instanceof Error ? err.message : String(err)}; revert error: ` +
+            `${revertErr instanceof Error ? revertErr.message : String(revertErr)}`,
+        };
+      }
+      return {
+        worktreeMoved: false,
+        worktreeMoveError: `Row update failed after moving the worktree; the move was reverted: ${err instanceof Error ? err.message : String(err)}`,
+      };
+    }
+
+    return { worktreeMoved: true, worktreeMovedTo: movedToPath };
   });
 }
 
 export { toExecutionWorkspace };
+
+// SPA-12426: exported ONLY for the "row changed before move" test in
+// workspace-runtime.test.ts. That test needs to call this directly with a
+// deliberately stale `archivedGeneration` to simulate a reopen that won the
+// race between `archiveWorkspaceForRebind`'s transaction committing (which
+// releases the lifecycle advisory lock) and this function's transaction
+// acquiring it — a race the public
+// `retireExecutionWorkspaceAfterProjectWorkspaceRebind` entry point closes
+// before any caller could ever observe the gap, so there is no way to drive
+// this path through the public API alone. Not part of the service's public
+// surface; do not call this from application code.
+export { relocateRetiredWorktreeIfCrossRepo as __testOnlyRelocateRetiredWorktreeIfCrossRepo };
