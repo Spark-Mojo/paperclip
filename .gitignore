@@ -79,3 +79,6 @@ tests/storybook-visual/playwright-report/
 .vercel/
 .env.local
 test-results/
+
+# Per-card gates ledgers and guard sentinels (fleet orchestration guard); local scratch, never committed.
+.unlazy/
