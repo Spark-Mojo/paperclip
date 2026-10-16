@@ -437,13 +437,13 @@ function actorPrincipal(actor: ActorLike): IssueExecutionStagePrincipal | null {
   return null;
 }
 
-function principalsEqual(a: IssueExecutionStagePrincipal | null, b: IssueExecutionStagePrincipal | null): boolean {
+export function principalsEqual(a: IssueExecutionStagePrincipal | null, b: IssueExecutionStagePrincipal | null): boolean {
   if (!a || !b) return false;
   if (a.type !== b.type) return false;
   return a.type === "agent" ? a.agentId === b.agentId : a.userId === b.userId;
 }
 
-function resolveMaxReviewRounds(policy: IssueExecutionPolicy | null): number {
+export function resolveMaxReviewRounds(policy: IssueExecutionPolicy | null): number {
   const configured = policy?.maxReviewRounds;
   return typeof configured === "number" && configured > 0 ? configured : DEFAULT_MAX_REVIEW_ROUNDS;
 }
@@ -471,7 +471,7 @@ function nextPendingStage(policy: IssueExecutionPolicy, state: IssueExecutionSta
   return policy.stages.find((stage) => !completed.has(stage.id)) ?? null;
 }
 
-function nextPendingStageAfter(
+export function nextPendingStageAfter(
   policy: IssueExecutionPolicy,
   completedStage: IssueExecutionStage,
   state: IssueExecutionState | null,
@@ -481,7 +481,7 @@ function nextPendingStageAfter(
   return policy.stages.find((stage, index) => index > completedIndex && !completed.has(stage.id)) ?? null;
 }
 
-function selectStageParticipant(
+export function selectStageParticipant(
   stage: IssueExecutionStage,
   opts?: {
     preferred?: IssueExecutionStagePrincipal | null;
@@ -498,12 +498,12 @@ function selectStageParticipant(
   return first ? { type: first.type, agentId: first.agentId ?? null, userId: first.userId ?? null } : null;
 }
 
-function stageHasParticipant(stage: IssueExecutionStage, participant: IssueExecutionStagePrincipal | null): boolean {
+export function stageHasParticipant(stage: IssueExecutionStage, participant: IssueExecutionStagePrincipal | null): boolean {
   if (!participant) return false;
   return stage.participants.some((candidate) => principalsEqual(candidate, participant));
 }
 
-function patchForPrincipal(principal: IssueExecutionStagePrincipal | null) {
+export function patchForPrincipal(principal: IssueExecutionStagePrincipal | null) {
   if (!principal) {
     return { assigneeAgentId: null, assigneeUserId: null };
   }
@@ -512,7 +512,7 @@ function patchForPrincipal(principal: IssueExecutionStagePrincipal | null) {
     : { assigneeAgentId: null, assigneeUserId: principal.userId ?? null };
 }
 
-function buildCompletedState(previous: IssueExecutionState | null, currentStage: IssueExecutionStage): IssueExecutionState {
+export function buildCompletedState(previous: IssueExecutionState | null, currentStage: IssueExecutionStage): IssueExecutionState {
   const completedStageIds = Array.from(new Set([...(previous?.completedStageIds ?? []), currentStage.id]));
   return {
     status: COMPLETED_STATUS,
@@ -602,7 +602,7 @@ function buildPendingState(input: {
   };
 }
 
-function buildChangesRequestedState(
+export function buildChangesRequestedState(
   previous: IssueExecutionState,
   currentStage: IssueExecutionStage,
   changesRequestedCount: number,
@@ -618,7 +618,7 @@ function buildChangesRequestedState(
   };
 }
 
-function buildPendingStagePatch(input: {
+export function buildPendingStagePatch(input: {
   patch: Record<string, unknown>;
   previous: IssueExecutionState | null;
   policy: IssueExecutionPolicy;
