@@ -4595,7 +4595,7 @@ async function relocateRetiredWorktreeIfCrossRepo(
   } catch (err) {
     return {
       worktreeMoved: false,
-      worktreeMoveError: `Could not resolve the old worktree's owning repo root: ${err instanceof Error ? err.message : String(err)}`,
+      worktreeMoveError: `Could not resolve the old worktree's owning repo root`,
     };
   }
 
@@ -4713,7 +4713,9 @@ async function relocateRetiredWorktreeIfCrossRepo(
       .select({ id: executionWorkspaces.id })
       .from(executionWorkspaces)
       .where(and(
-        eq(executionWorkspaces.companyId, input.companyId),
+        // Host-global on purpose (Mira PR #210): the worktree path and the git
+        // move act on one shared filesystem, so a live row of ANY company at
+        // this path blocks the move.
         ne(executionWorkspaces.id, input.executionWorkspaceId),
         isNull(executionWorkspaces.closedAt),
         sql<boolean>`${executionWorkspaces.status} NOT IN ('archived', 'cleanup_failed')`,
@@ -4764,7 +4766,7 @@ async function relocateRetiredWorktreeIfCrossRepo(
     } catch (err) {
       return {
         worktreeMoved: false,
-        worktreeMoveError: `Could not verify the worktree at "${input.leafPath}" was still clean immediately before moving it: ${err instanceof Error ? err.message : String(err)}`,
+        worktreeMoveError: `Could not verify the worktree at "${input.leafPath}" was still clean immediately before moving it`,
       };
     }
     if (dirtyAtMoveStatus.trim().length > 0) {
@@ -4775,7 +4777,7 @@ async function relocateRetiredWorktreeIfCrossRepo(
       // Non-forced: git refuses if the worktree is locked. Never --force.
       await runGit(["worktree", "move", input.leafPath, movedToPath], ownerRepoRoot);
     } catch (err) {
-      return { worktreeMoved: false, worktreeMoveError: err instanceof Error ? err.message : String(err) };
+      return { worktreeMoved: false, worktreeMoveError: "Git refused to move the retired worktree." };
     }
 
     try {
@@ -4787,7 +4789,17 @@ async function relocateRetiredWorktreeIfCrossRepo(
           metadata: sql`COALESCE(${executionWorkspaces.metadata}, '{}'::jsonb) || jsonb_build_object(${EXECUTION_WORKSPACE_REBIND_RETIRED_FROM_PATH_METADATA_KEY}::text, ${input.leafPath}::text)`,
           updatedAt: new Date(),
         })
-        .where(eq(executionWorkspaces.id, input.executionWorkspaceId));
+        .where(and(
+          eq(executionWorkspaces.id, input.executionWorkspaceId),
+          eq(executionWorkspaces.status, "archived"),
+          sql`COALESCE((${executionWorkspaces.metadata} ->> ${EXECUTION_WORKSPACE_LIFECYCLE_GENERATION_METADATA_KEY}::text)::int, 0) = ${input.archivedGeneration}`,
+        ))
+        .returning({ id: executionWorkspaces.id })
+        .then((rows: Array<{ id: string }>) => {
+          // Mira PR #210: zero matched rows is a failure, not a success — the
+          // row must still point at the worktree's real location.
+          if (rows.length !== 1) throw new Error("row update matched no archived row at this generation");
+        });
     } catch (err) {
       // Best-effort revert so the row's cwd and the worktree's actual disk
       // location never disagree with each other.
@@ -4798,13 +4810,13 @@ async function relocateRetiredWorktreeIfCrossRepo(
           worktreeMoved: false,
           worktreeMoveError:
             `Row update failed after moving the worktree, and reverting the move also failed: ` +
-            `${err instanceof Error ? err.message : String(err)}; revert error: ` +
-            `${revertErr instanceof Error ? revertErr.message : String(revertErr)}`,
+            `(row update failed); revert error: ` +
+            `(revert failed)`,
         };
       }
       return {
         worktreeMoved: false,
-        worktreeMoveError: `Row update failed after moving the worktree; the move was reverted: ${err instanceof Error ? err.message : String(err)}`,
+        worktreeMoveError: `Row update failed after moving the worktree; the move was reverted`,
       };
     }
 
