@@ -4564,6 +4564,22 @@ function isEphemeralRunWorktreeLeafPath(leafPath: string): boolean {
  * `worktreeMoved: false` and an error/skip reason. It never throws out of
  * this function and never un-archives the row.
  */
+/**
+ * True when `branchName` carries `identifier` as a whole token. Used as the
+ * precondition for relocating a retired worktree: a branch rendered from the
+ * card's own identifier cannot be rendered by any other card's template, so
+ * no other live card can reuse this path between the collision check and
+ * the move. A shared branch (project-wide `existingBranch`, or a template
+ * without the identifier) fails this check and keeps today's behaviour.
+ *
+ * Accepted residual (SPA-12426, audited): a DIFFERENT card given a per-issue
+ * `workspaceStrategy.existingBranch` override equal to this card's own
+ * branch name can still reuse the path in that window. That needs a
+ * deliberate override pointing two cards at one card's branch, which is
+ * already a broken configuration (two cards in one worktree). The outcome
+ * is a move, never a delete: content survives at the moved path and the
+ * other card's next realize fails visibly rather than losing work.
+ */
 function branchNamesCard(branchName: string, identifier: string): boolean {
   const escaped = identifier.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
   return new RegExp(`(^|[^A-Za-z0-9])${escaped}($|[^A-Za-z0-9])`, "i").test(branchName);
