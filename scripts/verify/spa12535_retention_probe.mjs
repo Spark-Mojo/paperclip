@@ -6,7 +6,7 @@ import { execFileSync } from "node:child_process";
 
 const SRC = "server/src/services/heartbeat.ts";
 const src = fs.readFileSync(SRC, "utf8");
-if (src.includes('path.join(input.cwd, ".paperclip-runtime", "detached-repositories"')) {
+if (src.includes('".paperclip-runtime", "detached-repositories", randomUUID()')) {
   console.log("IN-WORKTREE-RETENTION");
   process.exit(1);
 }
