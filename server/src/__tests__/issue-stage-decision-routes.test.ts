@@ -349,7 +349,7 @@ describeEmbeddedPostgres("issue stage decision routes", () => {
 
     const second = await request(app(actor))
       .post(`/api/issues/${issueId}/stage-decision`)
-      .send(payload);
+      .send({ ...payload, stageId: stageId1 });
     expect(second.status, JSON.stringify(second.body)).toBe(200);
     expect(second.body.duplicate).toBe(true);
     expect(second.body.decision.id).toBe(first.body.decision.id);
@@ -358,6 +358,60 @@ describeEmbeddedPostgres("issue stage decision routes", () => {
     expect(persisted.executionState.currentStageId).toBe(stageId2);
     expect(persisted.executionState.completedStageIds).not.toContain(stageId2);
     expect(persisted.executionState.lastDecisionId).toBe(first.body.decision.id);
+  });
+
+  it("same actor same body on the new active stage is a fresh approval", async () => {
+    const seeded = await seedCompany("NXS");
+    const { issueId, stageId2 } = await seedStageIssue({
+      companyId: seeded.companyId,
+      builderAgentId: seeded.assigneeAgentId,
+      reviewerAgentId: seeded.reviewerAgentId,
+      identifier: "NXS-1",
+      stageCount: 2,
+    });
+    const runId = await seedRun(seeded.companyId, seeded.reviewerAgentId, issueId);
+    const actor = agentActor(seeded.companyId, seeded.reviewerAgentId, runId);
+    const payload = { action: "approve", body: "Looks good at every stage." };
+
+    const first = await request(app(actor))
+      .post(`/api/issues/${issueId}/stage-decision`)
+      .send(payload);
+    expect(first.status, JSON.stringify(first.body)).toBe(200);
+    expect(first.body.duplicate ?? false).toBe(false);
+
+    const second = await request(app(actor))
+      .post(`/api/issues/${issueId}/stage-decision`)
+      .send(payload);
+    expect(second.status, JSON.stringify(second.body)).toBe(200);
+    expect(second.body.duplicate ?? false).toBe(false);
+    expect(second.body.decision.id).not.toBe(first.body.decision.id);
+    expect(await countDecisions(issueId, seeded.companyId)).toHaveLength(2);
+    const persisted = await readIssue(issueId);
+    expect(persisted.executionState.completedStageIds).toContain(stageId2);
+  });
+
+  it("mismatched stageId with non-matching payload is a 409 conflict", async () => {
+    const seeded = await seedCompany("CF4");
+    const { issueId, stageId1 } = await seedStageIssue({
+      companyId: seeded.companyId,
+      builderAgentId: seeded.assigneeAgentId,
+      reviewerAgentId: seeded.reviewerAgentId,
+      identifier: "CF4-1",
+      stageCount: 2,
+    });
+    const runId = await seedRun(seeded.companyId, seeded.reviewerAgentId, issueId);
+    const actor = agentActor(seeded.companyId, seeded.reviewerAgentId, runId);
+
+    const first = await request(app(actor))
+      .post(`/api/issues/${issueId}/stage-decision`)
+      .send({ action: "approve", body: "Stage one complete." });
+    expect(first.status, JSON.stringify(first.body)).toBe(200);
+
+    const stale = await request(app(actor))
+      .post(`/api/issues/${issueId}/stage-decision`)
+      .send({ action: "request_changes", body: "Different payload, stale stage.", stageId: stageId1 });
+    expect(stale.status).toBe(409);
+    expect(await countDecisions(issueId, seeded.companyId)).toHaveLength(1);
   });
 
   it("rejects a non-participant stranger with 422 and admits the designated participant", async () => {
