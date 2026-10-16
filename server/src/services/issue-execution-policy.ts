@@ -443,7 +443,7 @@ export function principalsEqual(a: IssueExecutionStagePrincipal | null, b: Issue
   return a.type === "agent" ? a.agentId === b.agentId : a.userId === b.userId;
 }
 
-function resolveMaxReviewRounds(policy: IssueExecutionPolicy | null): number {
+export function resolveMaxReviewRounds(policy: IssueExecutionPolicy | null): number {
   const configured = policy?.maxReviewRounds;
   return typeof configured === "number" && configured > 0 ? configured : DEFAULT_MAX_REVIEW_ROUNDS;
 }

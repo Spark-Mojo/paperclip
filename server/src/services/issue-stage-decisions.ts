@@ -28,7 +28,9 @@ import {
   parseIssueExecutionState,
   patchForPrincipal,
   principalsEqual,
+  resolveMaxReviewRounds,
   selectStageParticipant,
+  stageHasParticipant,
 } from "./issue-execution-policy.js";
 
 export type StageDecisionAction = "approve" | "request_changes";
@@ -101,31 +103,22 @@ export function stageDecisionService(db: Db) {
           });
         }
 
-        // Reviewer-only rule: the builder and the current assignee can never
-        // record a stage decision — self-approval is impossible.
+        // Gate order matters: builder ban is absolute (self-approval is
+        // impossible even if misconfigured as participant); then resolve the
+        // active stage and check participant membership BEFORE the assignee
+        // ban, so the designated reviewer decides regardless of assignee seat
+        // (approve-advance reassigns the card to the next stage participant).
         if (
           (input.actor.agentId && lockedIssue.createdByAgentId === input.actor.agentId) ||
           (input.actor.userId && lockedIssue.createdByUserId === input.actor.userId)
         ) {
           throw forbidden("The card builder cannot record a stage decision");
         }
-        if (
-          (input.actor.agentId && lockedIssue.assigneeAgentId === input.actor.agentId) ||
-          (input.actor.userId && lockedIssue.assigneeUserId === input.actor.userId)
-        ) {
-          throw forbidden("The current assignee cannot record a stage decision");
-        }
 
         const policy = normalizeIssueExecutionPolicy(lockedIssue.executionPolicy ?? null);
         const existingState = parseIssueExecutionState(lockedIssue.executionState);
         if (!policy || policy.stages.length === 0 || !existingState?.currentStageId) {
           throw unprocessable("Card has no pending execution stage", { issueId: lockedIssue.id });
-        }
-        if (existingState.status !== "pending" && existingState.status !== "changes_requested") {
-          throw conflict("Execution stage is not awaiting a decision", {
-            issueId: lockedIssue.id,
-            executionStatus: existingState.status,
-          });
         }
         const activeStage: IssueExecutionStage | null =
           policy.stages.find((stage) => stage.id === existingState.currentStageId) ?? null;
@@ -135,9 +128,30 @@ export function stageDecisionService(db: Db) {
             currentStageId: existingState.currentStageId,
           });
         }
+        // Escalated-human hold: mirrors the sticky hold in
+        // applyIssueExecutionPolicyTransition. An escalated review is held by
+        // a human outside the stage's configured participants; only that
+        // human decides until they do — their own decisions fall through to
+        // the participant gate below, which they satisfy as currentParticipant.
+        const escalatedHold =
+          existingState.currentParticipant?.type === "user" &&
+          !stageHasParticipant(activeStage, existingState.currentParticipant) &&
+          (existingState.changesRequestedCount ?? 0) >= resolveMaxReviewRounds(policy);
+        if (escalatedHold && !principalsEqual(existingState.currentParticipant, actor)) {
+          throw unprocessable("Only the escalated reviewer can advance the current execution stage");
+        }
         // Execution-stage membership is the gate: only the designated
         // participant (or an escalated human holding the stage) decides.
-        if (!principalsEqual(existingState.currentParticipant, actor)) {
+        const isParticipant = principalsEqual(existingState.currentParticipant, actor);
+        // Assignee ban applies only to non-participants — the designated
+        // reviewer decides regardless of assignee seat.
+        if (!isParticipant) {
+          if (
+            (input.actor.agentId && lockedIssue.assigneeAgentId === input.actor.agentId) ||
+            (input.actor.userId && lockedIssue.assigneeUserId === input.actor.userId)
+          ) {
+            throw forbidden("The current assignee cannot record a stage decision");
+          }
           throw unprocessable("Only the active reviewer or approver can record the current execution stage decision");
         }
         if (!existingState.returnAssignee && input.action === "request_changes") {
@@ -170,6 +184,17 @@ export function stageDecisionService(db: Db) {
           if (reflected) {
             return { issue: lockedIssue, decision: latestDecision, duplicate: true as const };
           }
+        }
+
+        // Pending-only guard (non-duplicates only): an identical replay
+        // above already returned duplicate:true, so anything reaching here on
+        // a non-pending state is a fresh write that must fail closed instead
+        // of overwriting mid-park state.
+        if (existingState.status !== "pending" && existingState.status !== "changes_requested") {
+          throw conflict("Execution stage is not awaiting a decision", {
+            issueId: lockedIssue.id,
+            executionStatus: existingState.status,
+          });
         }
 
         const returnAssignee = existingState.returnAssignee ??
