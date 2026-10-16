@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { and, desc, eq, sql } from "drizzle-orm";
+import { and, desc, eq, inArray, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   activityLog,
@@ -24,7 +24,9 @@ import {
 import { heartbeatService } from "../services/heartbeat.ts";
 import { drainHeartbeatRunsToQuiescence } from "./helpers/drain-heartbeat-runs.js";
 import { runningProcesses } from "../adapters/index.ts";
+import { instanceSettingsService } from "../services/instance-settings.ts";
 import { ISSUE_REWAKE_CIRCUIT_BREAKER_NOTICE_PREFIX } from "../services/issue-rewake-throttle.ts";
+import { FINISH_SUCCESSFUL_RUN_HANDOFF_REASON } from "../services/recovery/successful-run-handoff.ts";
 
 const mockAdapterExecute = vi.hoisted(() =>
   vi.fn(async () => ({
@@ -180,6 +182,22 @@ describeEmbeddedPostgres("heartbeat issue rewake circuit breaker", () => {
       contextSnapshot: { issueId, wakeReason: "issue_continuation_needed" },
       requestedByActorType: "system",
       requestedByActorId: "test",
+    });
+  }
+
+  function handoffWake(
+    hb: ReturnType<typeof heartbeatService>,
+    agentId: string,
+    issueId: string,
+  ) {
+    return hb.wakeup(agentId, {
+      source: "automation",
+      triggerDetail: "system",
+      reason: FINISH_SUCCESSFUL_RUN_HANDOFF_REASON,
+      payload: { issueId },
+      contextSnapshot: { issueId, wakeReason: FINISH_SUCCESSFUL_RUN_HANDOFF_REASON },
+      requestedByActorType: "system",
+      requestedByActorId: "heartbeat",
     });
   }
 
@@ -380,5 +398,266 @@ describeEmbeddedPostgres("heartbeat issue rewake circuit breaker", () => {
     expect(issueRow?.status).toBe("backlog");
     const notices = await issueComment_count(issueId, ISSUE_REWAKE_CIRCUIT_BREAKER_NOTICE_PREFIX);
     expect(notices).toHaveLength(1);
+  });
+
+  // --- Audit finding #1 (PR #211): finish_successful_run_handoff must also
+  // be gated by the breaker, without changing the cooldown throttle's timing
+  // for that reason. Production (measured 10-16): SPA-12493 alternated
+  // 62 issue_continuation_needed / 58 finish_successful_run_handoff wakes.
+
+  it("trips a loop driven only by finish_successful_run_handoff wakes", async () => {
+    const { companyId, agentId, issueId } = await seedCompanyAgentIssue();
+
+    const runIds = [
+      await seedTerminalRun({ companyId, agentId, issueId, finishedSecondsAgo: 300 }),
+      await seedTerminalRun({ companyId, agentId, issueId, finishedSecondsAgo: 200 }),
+      await seedTerminalRun({ companyId, agentId, issueId, finishedSecondsAgo: 100 }),
+    ];
+
+    const wake = await handoffWake(heartbeat, agentId, issueId);
+    expect(wake).toBeNull();
+
+    const skipped = await latestWakeRequest(agentId);
+    expect(skipped?.reason).toBe("issue_rewake_circuit_breaker_tripped");
+    const heartbeatSkip = (skipped?.payload as Record<string, unknown> | null)?.heartbeatSkip as
+      | Record<string, unknown>
+      | undefined;
+    expect(heartbeatSkip?.noProgressStreak).toBe(3);
+    expect(heartbeatSkip?.runIds).toEqual([runIds[2], runIds[1], runIds[0]]);
+
+    const issueRow = await loadIssue(issueId);
+    expect(issueRow?.status).toBe("backlog");
+    const notices = await issueComment_count(issueId, ISSUE_REWAKE_CIRCUIT_BREAKER_NOTICE_PREFIX);
+    expect(notices).toHaveLength(1);
+  });
+
+  it("does not apply the cooldown throttle's timing to finish_successful_run_handoff wakes below the breaker threshold", async () => {
+    const { companyId, agentId, issueId } = await seedCompanyAgentIssue();
+
+    // 2 no-progress runs reach the ordinary throttle's own threshold
+    // (ISSUE_REWAKE_NO_PROGRESS_THRESHOLD = 2) — for an ordinary throttled
+    // reason this would be held back by the escalating cooldown. The
+    // breaker's threshold (default 3) is not reached yet either. A handoff
+    // wake is never an ordinary throttle candidate, so it must proceed
+    // immediately — its timing is unchanged by this fix.
+    await seedTerminalRun({ companyId, agentId, issueId, finishedSecondsAgo: 200 });
+    await seedTerminalRun({ companyId, agentId, issueId, finishedSecondsAgo: 100 });
+
+    const wake = await handoffWake(heartbeat, agentId, issueId);
+    expect(wake).not.toBeNull();
+
+    const latest = await latestWakeRequest(agentId);
+    expect(latest?.reason).not.toBe("issue_rewake_throttled");
+    expect(latest?.reason).not.toBe("issue_rewake_circuit_breaker_tripped");
+  });
+
+  // --- Audit finding #2 (PR #211): delegation (a child issue doing the real
+  // work, or a subagent commenting/acting on this issue under its own run
+  // id) must veto a trip the breaker would otherwise make.
+
+  it("never trips a parent that creates a child issue during each no-progress run", async () => {
+    const { companyId, agentId, issueId } = await seedCompanyAgentIssue();
+
+    for (const finishedSecondsAgo of [300, 200, 100]) {
+      const runId = await seedTerminalRun({ companyId, agentId, issueId, finishedSecondsAgo });
+      const childId = randomUUID();
+      const runStartedAt = new Date(Date.now() - finishedSecondsAgo * 1000 - 5_000);
+      await db.insert(issues).values({
+        id: childId,
+        companyId,
+        parentId: issueId,
+        title: `Delegated child for run ${runId}`,
+        status: "todo",
+        priority: "medium",
+        responsibleUserId: "responsible-user",
+      });
+      // The primary progress check only looks at activity against THIS
+      // issue's own id under the orchestrator's sampled run ids — a row
+      // scoped to the CHILD issue's id is exactly what it misses.
+      await db.insert(activityLog).values({
+        companyId,
+        actorType: "agent",
+        actorId: agentId,
+        agentId,
+        runId,
+        action: "issue.child_created",
+        entityType: "issue",
+        entityId: childId,
+        createdAt: new Date(runStartedAt.getTime() + 1_000),
+      });
+    }
+
+    // The breaker must not trip (and must not touch the card) once the
+    // child-delegation evidence is present. The ordinary cooldown throttle
+    // is a separate, non-destructive mechanism that may still hold this
+    // particular wake back on its own schedule — that is unrelated to this
+    // fix, so only the breaker's own effects are asserted here (same
+    // pattern as the human-assignee case above).
+    await continuationWake(heartbeat, agentId, issueId);
+
+    const issueRow = await loadIssue(issueId);
+    expect(issueRow?.status).toBe("in_progress");
+    const notices = await issueComment_count(issueId, ISSUE_REWAKE_CIRCUIT_BREAKER_NOTICE_PREFIX);
+    expect(notices).toHaveLength(0);
+    const skipped = await latestWakeRequest(agentId);
+    expect(skipped?.reason).not.toBe("issue_rewake_circuit_breaker_tripped");
+  });
+
+  it("never trips when a subagent comments on this issue under its own run id each cycle", async () => {
+    const { companyId, agentId, issueId } = await seedCompanyAgentIssue();
+    const subagentId = randomUUID();
+    await db.insert(agents).values({
+      id: subagentId,
+      companyId,
+      name: "SubagentHelper",
+      role: "engineer",
+      status: "active",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+
+    for (const finishedSecondsAgo of [300, 200, 100]) {
+      await seedTerminalRun({ companyId, agentId, issueId, finishedSecondsAgo });
+      const orchestratorStartedAt = new Date(Date.now() - finishedSecondsAgo * 1000 - 5_000);
+      const subagentRunId = randomUUID();
+      // During the orchestrator's own run in the same cycle (strictly
+      // before it finishes), so this never reads as "new input after the
+      // last run finished" for the ordinary throttle either — it is purely
+      // delegated work the primary, run-id-scoped progress check cannot see.
+      const subagentAt = new Date(orchestratorStartedAt.getTime() + 2_000);
+      await db.insert(heartbeatRuns).values({
+        id: subagentRunId,
+        companyId,
+        agentId: subagentId,
+        invocationSource: "assignment",
+        status: "succeeded",
+        responsibleUserId: "responsible-user",
+        createdAt: subagentAt,
+        startedAt: subagentAt,
+        finishedAt: subagentAt,
+        contextSnapshot: { issueId, wakeReason: "delegated_subtask" },
+      });
+      // Not under any of the orchestrator's own sampled run ids, so the
+      // primary (runId-scoped) progress check never sees it.
+      await db.insert(activityLog).values({
+        companyId,
+        actorType: "agent",
+        actorId: subagentId,
+        agentId: subagentId,
+        runId: subagentRunId,
+        action: "issue.comment_added",
+        entityType: "issue",
+        entityId: issueId,
+        createdAt: subagentAt,
+      });
+    }
+
+    await continuationWake(heartbeat, agentId, issueId);
+
+    const issueRow = await loadIssue(issueId);
+    expect(issueRow?.status).toBe("in_progress");
+    const notices = await issueComment_count(issueId, ISSUE_REWAKE_CIRCUIT_BREAKER_NOTICE_PREFIX);
+    expect(notices).toHaveLength(0);
+    const skipped = await latestWakeRequest(agentId);
+    expect(skipped?.reason).not.toBe("issue_rewake_circuit_breaker_tripped");
+  });
+
+  // --- Audit finding #3 (PR #211): a human holding the conversation seat
+  // (conversationUserId) is human-owned exactly like a direct assignee.
+
+  it("never trips for a card with a human in the conversation seat", async () => {
+    await instanceSettingsService(db).updateExperimental({ enableAgentChat: true });
+    try {
+      const { companyId, agentId, issueId } = await seedCompanyAgentIssue();
+      // issues_conversation_identity_check requires conversationAgentId and
+      // conversationUserId together, conversationAgentId === assigneeAgentId,
+      // assigneeUserId null, and an active/waiting conversationState.
+      await db
+        .update(issues)
+        .set({
+          conversationAgentId: agentId,
+          conversationUserId: "a-conversation-human",
+          conversationState: "active",
+        })
+        .where(eq(issues.id, issueId));
+
+      await seedTerminalRun({ companyId, agentId, issueId, finishedSecondsAgo: 300 });
+      await seedTerminalRun({ companyId, agentId, issueId, finishedSecondsAgo: 200 });
+      await seedTerminalRun({ companyId, agentId, issueId, finishedSecondsAgo: 100 });
+
+      await continuationWake(heartbeat, agentId, issueId);
+
+      const issueRow = await loadIssue(issueId);
+      expect(issueRow?.status).toBe("in_progress");
+      const notices = await issueComment_count(issueId, ISSUE_REWAKE_CIRCUIT_BREAKER_NOTICE_PREFIX);
+      expect(notices).toHaveLength(0);
+      const skipped = await latestWakeRequest(agentId);
+      expect(skipped?.reason).not.toBe("issue_rewake_circuit_breaker_tripped");
+    } finally {
+      await instanceSettingsService(db).updateExperimental({ enableAgentChat: false });
+    }
+  });
+
+  // --- Audit finding #4 (PR #211): notice dedup is keyed on this trip's
+  // marker (the newest counted run), not a bare global prefix, so a later
+  // genuine trip posts its own fresh notice.
+
+  it("posts a fresh notice for a second, later trip after a human resume breaks the first streak", async () => {
+    const { companyId, agentId, issueId } = await seedCompanyAgentIssue();
+
+    const firstStreakRunIds = [
+      await seedTerminalRun({ companyId, agentId, issueId, finishedSecondsAgo: 300 }),
+      await seedTerminalRun({ companyId, agentId, issueId, finishedSecondsAgo: 200 }),
+      await seedTerminalRun({ companyId, agentId, issueId, finishedSecondsAgo: 100 }),
+    ];
+
+    const firstWake = await continuationWake(heartbeat, agentId, issueId);
+    expect(firstWake).toBeNull();
+    let issueRow = await loadIssue(issueId);
+    expect(issueRow?.status).toBe("backlog");
+    let notices = await issueComment_count(issueId, ISSUE_REWAKE_CIRCUIT_BREAKER_NOTICE_PREFIX);
+    expect(notices).toHaveLength(1);
+
+    // A duplicate evaluation of the exact same streak (e.g. a retried stale
+    // trigger) must still dedupe to the one notice already posted.
+    const duplicateWake = await continuationWake(heartbeat, agentId, issueId);
+    expect(duplicateWake).toBeNull();
+    notices = await issueComment_count(issueId, ISSUE_REWAKE_CIRCUIT_BREAKER_NOTICE_PREFIX);
+    expect(notices).toHaveLength(1);
+
+    // Human resume: the card is moved back to in_progress. The first
+    // streak's runs are retired (their work is done; a human engaged and
+    // moved it forward) so the second evaluation measures a genuinely new
+    // streak rather than accumulating across the resume boundary.
+    await db.delete(heartbeatRuns).where(inArray(heartbeatRuns.id, firstStreakRunIds));
+    await db
+      .update(issues)
+      .set({ status: "in_progress", updatedAt: new Date() })
+      .where(eq(issues.id, issueId));
+    await db.insert(activityLog).values({
+      companyId,
+      actorType: "user",
+      actorId: "board-user",
+      action: "issue.comment_added",
+      entityType: "issue",
+      entityId: issueId,
+      createdAt: new Date(Date.now() - 50_000),
+    });
+
+    await seedTerminalRun({ companyId, agentId, issueId, finishedSecondsAgo: 40 });
+    await seedTerminalRun({ companyId, agentId, issueId, finishedSecondsAgo: 30 });
+    await seedTerminalRun({ companyId, agentId, issueId, finishedSecondsAgo: 20 });
+
+    const secondWake = await continuationWake(heartbeat, agentId, issueId);
+    expect(secondWake).toBeNull();
+
+    issueRow = await loadIssue(issueId);
+    expect(issueRow?.status).toBe("backlog");
+    notices = await issueComment_count(issueId, ISSUE_REWAKE_CIRCUIT_BREAKER_NOTICE_PREFIX);
+    expect(notices).toHaveLength(2);
+    // The two notices are distinct per-trip markers, not the same comment.
+    expect(new Set(notices.map((notice) => notice.body)).size).toBe(2);
   });
 });
