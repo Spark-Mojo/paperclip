@@ -3865,6 +3865,97 @@ const heartbeatRunSqlAsciiSafeColumns = {
   stderrExcerpt: sql<string | null>`NULL`.as("stderrExcerpt"),
 } as const;
 
+// Single-row getRun() projection (Option A): the 15 STORED generated columns
+// omitted from heartbeatRunPublicColumns (derived verbatim from
+// contextSnapshot/resultJson, already selected) cost nothing extra on a
+// PK fetch and carry no redaction value, but their absence broke ~49
+// internal call sites typed as typeof heartbeatRuns.$inferSelect.
+// These full variants restore every key while keeping the safe/ascii
+// redaction overrides above intact.
+const heartbeatRunContextGeneratedColumns = {
+  contextTaskKey: heartbeatRuns.contextTaskKey,
+  contextCommentId: heartbeatRuns.contextCommentId,
+  contextWakeCommentId: heartbeatRuns.contextWakeCommentId,
+  contextWakeCommentIds: heartbeatRuns.contextWakeCommentIds,
+  contextWakeReason: heartbeatRuns.contextWakeReason,
+  contextWakeSource: heartbeatRuns.contextWakeSource,
+  contextWakeTriggerDetail: heartbeatRuns.contextWakeTriggerDetail,
+} as const;
+
+// Raw result-derived STORED generated columns: full branch only. The safe
+// branch truncates the 4 free-text members (parity with
+// heartbeatRunListResultColumns and heartbeatRunSafeResultJsonColumn); the
+// ascii branch NULLs them (parity with heartbeatRunSqlAsciiSafeColumns
+// NULLing error/resultJson/excerpts for hasUnsafeTextProjectionDatabase).
+// resultLedgerSummary is a small-scalar jsonb object (billing/cost/timeout
+// keys, no free text — parity with the safe resultJson column preserving
+// cost keys verbatim), so it stays raw on the safe branch but is NULLed on
+// the ascii branch like resultJson. Text cost members are small scalars and
+// stay raw on every branch.
+const heartbeatRunResultGeneratedColumns = {
+  resultListSummary: heartbeatRuns.resultListSummary,
+  resultListResult: heartbeatRuns.resultListResult,
+  resultListMessage: heartbeatRuns.resultListMessage,
+  resultListError: heartbeatRuns.resultListError,
+  resultListTotalCostUsd: heartbeatRuns.resultListTotalCostUsd,
+  resultListCostUsd: heartbeatRuns.resultListCostUsd,
+  resultListCostUsdCamel: heartbeatRuns.resultListCostUsdCamel,
+  resultLedgerSummary: heartbeatRuns.resultLedgerSummary,
+} as const;
+
+const heartbeatRunResultGeneratedSafeColumns = {
+  resultListSummary: sql<string | null>`left(${heartbeatRuns.resultListSummary}, ${HEARTBEAT_RUN_RESULT_SUMMARY_MAX_CHARS})`.as(
+    "resultListSummary",
+  ),
+  resultListResult: sql<string | null>`left(${heartbeatRuns.resultListResult}, ${HEARTBEAT_RUN_RESULT_SUMMARY_MAX_CHARS})`.as(
+    "resultListResult",
+  ),
+  resultListMessage: sql<string | null>`left(${heartbeatRuns.resultListMessage}, ${HEARTBEAT_RUN_RESULT_SUMMARY_MAX_CHARS})`.as(
+    "resultListMessage",
+  ),
+  resultListError: sql<string | null>`left(${heartbeatRuns.resultListError}, ${HEARTBEAT_RUN_RESULT_SUMMARY_MAX_CHARS})`.as(
+    "resultListError",
+  ),
+  resultListTotalCostUsd: heartbeatRuns.resultListTotalCostUsd,
+  resultListCostUsd: heartbeatRuns.resultListCostUsd,
+  resultListCostUsdCamel: heartbeatRuns.resultListCostUsdCamel,
+  resultLedgerSummary: heartbeatRuns.resultLedgerSummary,
+} as const;
+
+const heartbeatRunResultGeneratedAsciiSafeColumns = {
+  resultListSummary: sql<string | null>`NULL`.as("resultListSummary"),
+  resultListResult: sql<string | null>`NULL`.as("resultListResult"),
+  resultListMessage: sql<string | null>`NULL`.as("resultListMessage"),
+  resultListError: sql<string | null>`NULL`.as("resultListError"),
+  resultListTotalCostUsd: heartbeatRuns.resultListTotalCostUsd,
+  resultListCostUsd: heartbeatRuns.resultListCostUsd,
+  resultListCostUsdCamel: heartbeatRuns.resultListCostUsdCamel,
+  resultLedgerSummary:
+    sql<Record<string, unknown> | null>`NULL`.as("resultLedgerSummary"),
+} as const;
+
+const heartbeatRunGeneratedColumns = {
+  ...heartbeatRunContextGeneratedColumns,
+  ...heartbeatRunResultGeneratedColumns,
+} as const;
+
+const heartbeatRunFullColumns = {
+  ...heartbeatRunPublicColumns,
+  ...heartbeatRunGeneratedColumns,
+} as const;
+
+const heartbeatRunFullSafeColumns = {
+  ...heartbeatRunSafeColumns,
+  ...heartbeatRunContextGeneratedColumns,
+  ...heartbeatRunResultGeneratedSafeColumns,
+} as const;
+
+const heartbeatRunFullAsciiSafeColumns = {
+  ...heartbeatRunSqlAsciiSafeColumns,
+  ...heartbeatRunContextGeneratedColumns,
+  ...heartbeatRunResultGeneratedAsciiSafeColumns,
+} as const;
+
 const heartbeatRunLogAccessColumns = {
   id: heartbeatRuns.id,
   companyId: heartbeatRuns.companyId,
@@ -11342,10 +11433,10 @@ export function heartbeatService(
     return db
       .select(
         opts?.unsafeFullResultJson
-          ? heartbeatRunPublicColumns
+          ? heartbeatRunFullColumns
           : safeForLegacyEncoding
-            ? heartbeatRunSqlAsciiSafeColumns
-            : heartbeatRunSafeColumns,
+            ? heartbeatRunFullAsciiSafeColumns
+            : heartbeatRunFullSafeColumns,
       )
       .from(heartbeatRuns)
       .where(eq(heartbeatRuns.id, runId))
