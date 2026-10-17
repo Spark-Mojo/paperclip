@@ -13831,9 +13831,39 @@ export function issueRoutes(
           !pendingApproval &&
           !descriptor
         ) {
+          const baseBlockedRefusal =
+            "Entering blocked requires unresolved blockers, a pending interaction/approval, or unblockDescriptor";
+          if (
+            requestedBlockerIds &&
+            requestedBlockerIds.length > 0 &&
+            !hasUnresolvedBlocker
+          ) {
+            const namedBlockers = await db
+              .select({ id: issueRows.id, status: issueRows.status })
+              .from(issueRows)
+              .where(
+                and(
+                  eq(issueRows.companyId, existing.companyId),
+                  inArray(issueRows.id, requestedBlockerIds),
+                ),
+              );
+            const terminalBlockers = namedBlockers.filter(
+              (row) => row.status === "done" || row.status === "cancelled",
+            );
+            if (terminalBlockers.length > 0) {
+              res.status(422).json({
+                error: `${baseBlockedRefusal}: ${terminalBlockers
+                  .map(
+                    (row) =>
+                      `blocker ${row.id} is ${row.status}; drop it from blockedByIssueIds and proceed — do not re-assert the wait`,
+                  )
+                  .join("; ")}`,
+              });
+              return;
+            }
+          }
           res.status(422).json({
-            error:
-              "Entering blocked requires unresolved blockers, a pending interaction/approval, or unblockDescriptor",
+            error: baseBlockedRefusal,
           });
           return;
         }
