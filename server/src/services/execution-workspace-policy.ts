@@ -22,6 +22,12 @@ export const AGENT_ROOT_ISSUE_REQUIRES_PROJECT_REMEDIATION =
 export const AGENT_ROOT_ISSUE_REQUIRES_PROJECT_MESSAGE =
   `An agent-created task must belong to a project, but this create resolved no project: it is a root task (no parent) and names neither projectId nor a project/execution workspace to infer one from. ${AGENT_ROOT_ISSUE_REQUIRES_PROJECT_REMEDIATION}`;
 
+export const AGENT_CODE_CARD_REQUIRES_WORKSPACE_CODE = "agent_code_card_requires_workspace";
+export const AGENT_CODE_CARD_REQUIRES_WORKSPACE_REMEDIATION =
+  "Pass an explicit projectWorkspaceId for the target project repository on the create, then retry.";
+export const AGENT_CODE_CARD_REQUIRES_WORKSPACE_MESSAGE =
+  `An agent-created code task must name its repository workspace explicitly: this create signals a code card but projectWorkspaceId is still null after inheritance and inference. ${AGENT_CODE_CARD_REQUIRES_WORKSPACE_REMEDIATION}`;
+
 /**
  * A repo-bound `agent_default` card is the miscategorised-code-card shape
  * (SPA-11739): `executionWorkspaceSettings.mode = "agent_default"` resolves no
