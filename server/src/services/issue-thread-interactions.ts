@@ -821,6 +821,7 @@ function shouldReturnAnsweredQuestionsToCreatorAgent(args: {
   current: IssueThreadInteractionRow;
   actor: InteractionActor;
 }) {
+  if (args.current.continuationPolicy !== "wake_assignee") return false;
   if (args.current.kind !== "ask_user_questions") return false;
   if (!args.current.createdByAgentId) return false;
   if (!args.actor.userId) return false;
@@ -848,6 +849,7 @@ async function returnAnsweredQuestionsToCreatorAgentInTransaction(
         eq(agents.companyId, issue.companyId),
       ),
     )
+    .for("update")
     .then((rows) => rows[0] ?? null);
   if (!creator) return false;
   // Defense in depth alongside the where clause: predicate-blind fakes return
@@ -865,6 +867,7 @@ async function returnAnsweredQuestionsToCreatorAgentInTransaction(
     })
     .from(issues)
     .where(eq(issues.id, issue.id))
+    .for("update")
     .then((rows) => rows[0] ?? null);
   if (!lockedIssue || lockedIssue.companyId !== issue.companyId) return false;
   if (
@@ -877,6 +880,12 @@ async function returnAnsweredQuestionsToCreatorAgentInTransaction(
     return false;
   }
 
+  // Conditional write: re-check user-held state at write time so a
+  // concurrent reassign wins (0 rows affected) instead of clobbering it.
+  // lockedIssue.assigneeUserId is truthy here per the predicate above; the
+  // explicit narrow keeps eq() off a null comparison.
+  const lockedUserId = lockedIssue.assigneeUserId;
+  if (!lockedUserId) return false;
   await tx
     .update(issues)
     .set({
@@ -884,8 +893,24 @@ async function returnAnsweredQuestionsToCreatorAgentInTransaction(
       assigneeUserId: null,
       updatedAt: new Date(),
     })
-    .where(eq(issues.id, issue.id));
-  return true;
+    .where(
+      and(
+        eq(issues.id, issue.id),
+        isNull(issues.assigneeAgentId),
+        eq(issues.assigneeUserId, lockedUserId),
+      ),
+    );
+  // Verify the write landed on this row: a concurrent reassignment leaves
+  // the conditional update affecting 0 rows, so the re-read mismatches and
+  // the caller falls back to touchIssue instead of claiming reassignment.
+  const verified = await tx
+    .select({
+      assigneeAgentId: issues.assigneeAgentId,
+    })
+    .from(issues)
+    .where(eq(issues.id, issue.id))
+    .then((rows) => rows[0] ?? null);
+  return verified?.assigneeAgentId === current.createdByAgentId;
 }
 
 function shouldSupersedeInteractionOnUserComment(interaction: UserCommentSupersedableInteraction) {
