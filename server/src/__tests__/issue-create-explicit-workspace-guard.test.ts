@@ -365,4 +365,62 @@ describeEmbeddedPostgres("agent-authored code card explicit workspace guard", ()
 
     expect(res.body.projectWorkspaceId).toBe(workspace.id);
   });
+
+  it("d1c: explicit code mode plus inheritance still 422s without an explicit workspace", async () => {
+    const companyId = await seedCompany();
+    const agent = await seedAgent(companyId);
+    const project = await seedProject(companyId);
+    const workspace = await seedProjectWorkspace(companyId, project.id);
+    const run = await seedRun(companyId, agent.id);
+    // Source issue: explicit project, null workspace pin, isolated execution
+    // pin bound to the same project's primary workspace.
+    const activeExecutionWorkspaceId = randomUUID();
+    await db.insert(executionWorkspaces).values({
+      id: activeExecutionWorkspaceId,
+      companyId,
+      projectId: project.id,
+      projectWorkspaceId: workspace.id,
+      mode: "isolated_workspace",
+      strategyType: "git_worktree",
+      name: "d1c execution workspace",
+      status: "active",
+      providerType: "local_fs",
+      cwd: "/tmp/paperclip-d1c-execution",
+    });
+    const [source] = await db
+      .insert(issues)
+      .values({
+        companyId,
+        title: "d1c inheritance source",
+        status: "todo",
+        projectId: project.id,
+        projectWorkspaceId: null,
+        executionWorkspaceId: activeExecutionWorkspaceId,
+        executionWorkspacePreference: "reuse_existing",
+        executionWorkspaceSettings: { mode: "isolated_workspace" },
+      })
+      .returning();
+    const app = createApp("agent", {
+      companyId,
+      agentId: agent.id,
+      runId: run.id,
+    });
+
+    // Explicit code mode on the child defeats the d1d inheritance exemption:
+    // PRRT_kwDOTwBwe86tja7T must still 422 naming projectWorkspaceId.
+    const res = await request(app)
+      .post(`/api/companies/${companyId}/issues`)
+      .send({
+        title: "d1c explicit code mode plus inheritance",
+        projectId: project.id,
+        inheritExecutionWorkspaceFromIssueId: source!.id,
+        executionWorkspaceSettings: { mode: "operator_branch" },
+      });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(422);
+    expect(res.body.error).toContain("projectWorkspaceId");
+    expect(res.body.details?.code).toBe(
+      AGENT_CODE_CARD_REQUIRES_WORKSPACE_CODE,
+    );
+  });
 });

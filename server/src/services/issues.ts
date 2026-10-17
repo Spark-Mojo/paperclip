@@ -10486,10 +10486,7 @@ export function issueService(db: Db) {
           const codePreference =
             executionWorkspacePreference === "isolated_workspace" ||
             executionWorkspacePreference === "operator_branch";
-          const codeMode = !inheritedExecutionWorkspacePin
-            ? parseIssueExecutionWorkspaceSettings(executionWorkspaceSettings)
-              ?.mode
-            : undefined;
+          const codeMode = (!inheritedExecutionWorkspacePin || hasExplicitExecutionWorkspaceOverride) ? parseIssueExecutionWorkspaceSettings(executionWorkspaceSettings)?.mode : undefined;
           if (
             codePreference ||
             codeMode === "isolated_workspace" ||
