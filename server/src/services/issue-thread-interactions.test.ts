@@ -31,21 +31,81 @@ function createSelectChain(rows: SelectRow[]) {
   };
 }
 
+function tableNameOf(table: unknown): string | undefined {
+  try {
+    return getTableName(table as never);
+  } catch {
+    if (
+      typeof table === "object" &&
+      table !== null &&
+      Symbol.for("drizzle:Name") in table
+    ) {
+      return (table as Record<symbol, string>)[Symbol.for("drizzle:Name")];
+    }
+    return undefined;
+  }
+}
+
+function makeSelectQuery(rows: SelectRow[]) {
+  const query: any = {
+    innerJoin() {
+      return query;
+    },
+    where() {
+      const clause: any = {
+        then: function (onFulfilled: (rows: SelectRow[]) => unknown, onRejected: unknown) {
+          // Awaited reads call then(resolve, reject) with two args; explicit
+          // mappings call then(cb) with one. Only the latter applies cb.
+          if (arguments.length >= 2) {
+            return Promise.resolve(rows).then(
+              onFulfilled as (value: SelectRow[]) => unknown,
+              onRejected as (reason: unknown) => unknown,
+            );
+          }
+          return Promise.resolve(onFulfilled(rows));
+        },
+        for() {
+          return Promise.resolve(rows);
+        },
+      };
+      return clause;
+    },
+  };
+  return query;
+}
+
 function createFakeDb(args: {
   interactionRow: Record<string, unknown>;
   parentRows?: SelectRow[];
+  issueRow?: Record<string, unknown> | null;
+  agentRow?: Record<string, unknown> | null;
 }) {
   let interactionRow = { ...args.interactionRow };
   const issueTouches: Array<Record<string, unknown>> = [];
   const interactionUpdates: Array<Record<string, unknown>> = [];
+  const issueUpdates: Array<Record<string, unknown>> = [];
   const toolActionRequestUpdates: Array<Record<string, unknown>> = [];
   const inserts: Array<{ table: string; values: Record<string, unknown> }> = [];
   let selectCallCount = 0;
 
+  const selectForTable = (tableName: string | undefined): SelectRow[] => {
+    if (tableName === "issues") {
+      return args.issueRow === undefined || args.issueRow === null ? [] : [args.issueRow];
+    }
+    if (tableName === "agents") {
+      return args.agentRow === undefined || args.agentRow === null ? [] : [args.agentRow];
+    }
+    selectCallCount += 1;
+    return selectCallCount === 1 ? [interactionRow] : (args.parentRows ?? []);
+  };
+
   const db: any = {
-    select: vi.fn(() => {
-      selectCallCount += 1;
-      return createSelectChain(selectCallCount === 1 ? [interactionRow] : (args.parentRows ?? []));
+    select: vi.fn((columns?: unknown) => {
+      void columns;
+      return {
+        from: (table: unknown) =>
+          makeSelectQuery(selectForTable(tableNameOf(table))),
+      };
     }),
     update: vi.fn((table: unknown) => ({
       set(values: Record<string, unknown>) {
@@ -53,6 +113,14 @@ function createFakeDb(args: {
           where() {
             if (getTableName(table as never) === "tool_action_requests") {
               toolActionRequestUpdates.push(values);
+              return Promise.resolve(undefined);
+            }
+            if (getTableName(table as never) === "issues") {
+              if ("assigneeAgentId" in values) {
+                issueUpdates.push(values);
+                return Promise.resolve(undefined);
+              }
+              issueTouches.push(values);
               return Promise.resolve(undefined);
             }
             if ("status" in values || "result" in values || "resolvedAt" in values) {
@@ -83,6 +151,7 @@ function createFakeDb(args: {
     db,
     getInteractionRow: () => interactionRow,
     issueTouches,
+    issueUpdates,
     interactionUpdates,
     toolActionRequestUpdates,
     inserts,
@@ -286,6 +355,304 @@ describe("issueThreadInteractionService", () => {
         }),
       }),
     ]);
+  });
+
+  it("answerQuestions reassigns a user-held issue to the creator agent", async () => {
+    const { issueThreadInteractionService } = await import("./issue-thread-interactions.js");
+
+    const interactionRow = {
+      id: "interaction-return",
+      companyId: "company-1",
+      issueId: "11111111-1111-4111-8111-111111111111",
+      kind: "ask_user_questions",
+      status: "pending",
+      continuationPolicy: "wake_assignee",
+      sourceCommentId: null,
+      sourceRunId: null,
+      title: null,
+      summary: null,
+      createdByAgentId: "agent-9",
+      createdByUserId: null,
+      resolvedByAgentId: null,
+      resolvedByUserId: null,
+      payload: {
+        version: 1,
+        questions: [
+          {
+            id: "q1",
+            prompt: "Pick one",
+            selectionMode: "single",
+            options: [{ id: "a", label: "A" }],
+          },
+        ],
+      },
+      result: null,
+      resolvedAt: null,
+      createdAt: new Date("2026-04-20T10:00:00.000Z"),
+      updatedAt: new Date("2026-04-20T10:00:00.000Z"),
+    };
+    const issueRow = {
+      id: "11111111-1111-4111-8111-111111111111",
+      companyId: "company-1",
+      status: "todo",
+      assigneeAgentId: null,
+      assigneeUserId: "user-1",
+    };
+    const agentRow = { id: "agent-9", companyId: "company-1", status: "idle" };
+    const state = createFakeDb({ interactionRow, issueRow, agentRow });
+    const svc = issueThreadInteractionService(state.db as never);
+
+    const result = await svc.answerQuestions({
+      id: "11111111-1111-4111-8111-111111111111",
+      companyId: "company-1",
+    }, "interaction-return", {
+      answers: [{ questionId: "q1", optionIds: ["a"] }],
+    }, {
+      userId: "local-board",
+    });
+
+    expect(result.status).toBe("answered");
+    expect(state.issueUpdates).toHaveLength(1);
+    expect(state.issueUpdates[0]).toMatchObject({
+      assigneeAgentId: "agent-9",
+      assigneeUserId: null,
+    });
+    expect(state.issueTouches).toHaveLength(0);
+  });
+
+  it("answerQuestions only touches the issue when it is already agent-assigned", async () => {
+    const { issueThreadInteractionService } = await import("./issue-thread-interactions.js");
+
+    const interactionRow = {
+      id: "interaction-noop",
+      companyId: "company-1",
+      issueId: "11111111-1111-4111-8111-111111111111",
+      kind: "ask_user_questions",
+      status: "pending",
+      continuationPolicy: "wake_assignee",
+      sourceCommentId: null,
+      sourceRunId: null,
+      title: null,
+      summary: null,
+      createdByAgentId: "agent-9",
+      createdByUserId: null,
+      resolvedByAgentId: null,
+      resolvedByUserId: null,
+      payload: {
+        version: 1,
+        questions: [
+          {
+            id: "q1",
+            prompt: "Pick one",
+            selectionMode: "single",
+            options: [{ id: "a", label: "A" }],
+          },
+        ],
+      },
+      result: null,
+      resolvedAt: null,
+      createdAt: new Date("2026-04-20T10:00:00.000Z"),
+      updatedAt: new Date("2026-04-20T10:00:00.000Z"),
+    };
+    const issueRow = {
+      id: "11111111-1111-4111-8111-111111111111",
+      companyId: "company-1",
+      status: "todo",
+      assigneeAgentId: "agent-9",
+      assigneeUserId: null,
+    };
+    const agentRow = { id: "agent-9", companyId: "company-1", status: "idle" };
+    const state = createFakeDb({ interactionRow, issueRow, agentRow });
+    const svc = issueThreadInteractionService(state.db as never);
+
+    const result = await svc.answerQuestions({
+      id: "11111111-1111-4111-8111-111111111111",
+      companyId: "company-1",
+    }, "interaction-noop", {
+      answers: [{ questionId: "q1", optionIds: ["a"] }],
+    }, {
+      userId: "local-board",
+    });
+
+    expect(result.status).toBe("answered");
+    expect(state.issueUpdates).toHaveLength(0);
+    expect(state.issueTouches).toHaveLength(1);
+  });
+
+  it("answerQuestions only touches the issue when the creator agent is disabled", async () => {
+    const { issueThreadInteractionService } = await import("./issue-thread-interactions.js");
+
+    const interactionRow = {
+      id: "interaction-disabled",
+      companyId: "company-1",
+      issueId: "11111111-1111-4111-8111-111111111111",
+      kind: "ask_user_questions",
+      status: "pending",
+      continuationPolicy: "wake_assignee",
+      sourceCommentId: null,
+      sourceRunId: null,
+      title: null,
+      summary: null,
+      createdByAgentId: "agent-9",
+      createdByUserId: null,
+      resolvedByAgentId: null,
+      resolvedByUserId: null,
+      payload: {
+        version: 1,
+        questions: [
+          {
+            id: "q1",
+            prompt: "Pick one",
+            selectionMode: "single",
+            options: [{ id: "a", label: "A" }],
+          },
+        ],
+      },
+      result: null,
+      resolvedAt: null,
+      createdAt: new Date("2026-04-20T10:00:00.000Z"),
+      updatedAt: new Date("2026-04-20T10:00:00.000Z"),
+    };
+    const issueRow = {
+      id: "11111111-1111-4111-8111-111111111111",
+      companyId: "company-1",
+      status: "todo",
+      assigneeAgentId: null,
+      assigneeUserId: "user-1",
+    };
+    const agentRow = { id: "agent-9", companyId: "company-1", status: "disabled" };
+    const state = createFakeDb({ interactionRow, issueRow, agentRow });
+    const svc = issueThreadInteractionService(state.db as never);
+
+    const result = await svc.answerQuestions({
+      id: "11111111-1111-4111-8111-111111111111",
+      companyId: "company-1",
+    }, "interaction-disabled", {
+      answers: [{ questionId: "q1", optionIds: ["a"] }],
+    }, {
+      userId: "local-board",
+    });
+
+    expect(result.status).toBe("answered");
+    expect(state.issueUpdates).toHaveLength(0);
+    expect(state.issueTouches).toHaveLength(1);
+  });
+
+  it("answerQuestions only touches the issue when the creator agent row is missing", async () => {
+    const { issueThreadInteractionService } = await import("./issue-thread-interactions.js");
+
+    const interactionRow = {
+      id: "interaction-nocreator",
+      companyId: "company-1",
+      issueId: "11111111-1111-4111-8111-111111111111",
+      kind: "ask_user_questions",
+      status: "pending",
+      continuationPolicy: "wake_assignee",
+      sourceCommentId: null,
+      sourceRunId: null,
+      title: null,
+      summary: null,
+      createdByAgentId: "agent-9",
+      createdByUserId: null,
+      resolvedByAgentId: null,
+      resolvedByUserId: null,
+      payload: {
+        version: 1,
+        questions: [
+          {
+            id: "q1",
+            prompt: "Pick one",
+            selectionMode: "single",
+            options: [{ id: "a", label: "A" }],
+          },
+        ],
+      },
+      result: null,
+      resolvedAt: null,
+      createdAt: new Date("2026-04-20T10:00:00.000Z"),
+      updatedAt: new Date("2026-04-20T10:00:00.000Z"),
+    };
+    const issueRow = {
+      id: "11111111-1111-4111-8111-111111111111",
+      companyId: "company-1",
+      status: "todo",
+      assigneeAgentId: null,
+      assigneeUserId: "user-1",
+    };
+    const state = createFakeDb({ interactionRow, issueRow, agentRow: null });
+    const svc = issueThreadInteractionService(state.db as never);
+
+    const result = await svc.answerQuestions({
+      id: "11111111-1111-4111-8111-111111111111",
+      companyId: "company-1",
+    }, "interaction-nocreator", {
+      answers: [{ questionId: "q1", optionIds: ["a"] }],
+    }, {
+      userId: "local-board",
+    });
+
+    expect(result.status).toBe("answered");
+    expect(state.issueUpdates).toHaveLength(0);
+    expect(state.issueTouches).toHaveLength(1);
+  });
+
+  it("answerQuestions only touches the issue when the creator agent is cross-company", async () => {
+    const { issueThreadInteractionService } = await import("./issue-thread-interactions.js");
+
+    const interactionRow = {
+      id: "interaction-crosscompany",
+      companyId: "company-1",
+      issueId: "11111111-1111-4111-8111-111111111111",
+      kind: "ask_user_questions",
+      status: "pending",
+      continuationPolicy: "wake_assignee",
+      sourceCommentId: null,
+      sourceRunId: null,
+      title: null,
+      summary: null,
+      createdByAgentId: "agent-9",
+      createdByUserId: null,
+      resolvedByAgentId: null,
+      resolvedByUserId: null,
+      payload: {
+        version: 1,
+        questions: [
+          {
+            id: "q1",
+            prompt: "Pick one",
+            selectionMode: "single",
+            options: [{ id: "a", label: "A" }],
+          },
+        ],
+      },
+      result: null,
+      resolvedAt: null,
+      createdAt: new Date("2026-04-20T10:00:00.000Z"),
+      updatedAt: new Date("2026-04-20T10:00:00.000Z"),
+    };
+    const issueRow = {
+      id: "11111111-1111-4111-8111-111111111111",
+      companyId: "company-1",
+      status: "todo",
+      assigneeAgentId: null,
+      assigneeUserId: "user-1",
+    };
+    const agentRow = { id: "agent-9", companyId: "company-OTHER", status: "idle" };
+    const state = createFakeDb({ interactionRow, issueRow, agentRow });
+    const svc = issueThreadInteractionService(state.db as never);
+
+    const result = await svc.answerQuestions({
+      id: "11111111-1111-4111-8111-111111111111",
+      companyId: "company-1",
+    }, "interaction-crosscompany", {
+      answers: [{ questionId: "q1", optionIds: ["a"] }],
+    }, {
+      userId: "local-board",
+    });
+
+    expect(result.status).toBe("answered");
+    expect(state.issueUpdates).toHaveLength(0);
+    expect(state.issueTouches).toHaveLength(1);
   });
 
   it("withdraws a pending interaction with attribution and rejects repeats", async () => {
