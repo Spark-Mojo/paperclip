@@ -105,11 +105,20 @@ function conversationOwnershipIssuePredicate(issueId: string) {
  * Other adapters keep their existing bootstrap and ownership protocols.
  */
 export async function getConversationOwnershipBlocker(db: Db, companyId: string, issueId: string) {
+  // SPA-12991 R4: a terminal owner run's released-or-expired lease is not
+  // held, even when cleanup_status is failed. Expiry counts even without a
+  // release, so the carve-out gates every arm: status released/expired alone
+  // counts as released-or-expired (an expiry sweep may set status without
+  // releasedAt), or an expiresAt already in the past is released, and its
+  // failed cleanup no longer proves execution authority.
+  const leaseReleasedOrExpired = sql`((${environmentLeases.status} in ('released', 'expired'))
+      or (${environmentLeases.expiresAt} is not null and ${environmentLeases.expiresAt} < now()))`;
   const activeLease = sql`exists (select 1 from ${environmentLeases}
     where ${environmentLeases.companyId} = "heartbeat_runs"."company_id"
       and ${environmentLeases.heartbeatRunId} = "heartbeat_runs"."id"
+      and not ${leaseReleasedOrExpired}
       and (${environmentLeases.releasedAt} is null
-        or ${environmentLeases.status} = 'pending_cleanup'
+        or ${environmentLeases.status} in ('pending_cleanup', 'active')
         or ${environmentLeases.cleanupStatus} = 'failed'))`;
   const candidates = await measureHeartbeatQuery(HEARTBEAT_QUERY_DIAGNOSTIC_TAGS[0], () =>
     db.select({ run: heartbeatRuns, activeLease }).from(heartbeatRuns)
