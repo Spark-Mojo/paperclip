@@ -81,6 +81,10 @@ function createFakeDb(args: {
   agentRow?: Record<string, unknown> | null;
 }) {
   let interactionRow = { ...args.interactionRow };
+  let issueRowState: Record<string, unknown> | null | undefined =
+    args.issueRow === undefined || args.issueRow === null
+      ? args.issueRow
+      : { ...args.issueRow };
   const issueTouches: Array<Record<string, unknown>> = [];
   const interactionUpdates: Array<Record<string, unknown>> = [];
   const issueUpdates: Array<Record<string, unknown>> = [];
@@ -90,7 +94,7 @@ function createFakeDb(args: {
 
   const selectForTable = (tableName: string | undefined): SelectRow[] => {
     if (tableName === "issues") {
-      return args.issueRow === undefined || args.issueRow === null ? [] : [args.issueRow];
+      return issueRowState === undefined || issueRowState === null ? [] : [issueRowState];
     }
     if (tableName === "agents") {
       return args.agentRow === undefined || args.agentRow === null ? [] : [args.agentRow];
@@ -118,6 +122,21 @@ function createFakeDb(args: {
             if (getTableName(table as never) === "issues") {
               if ("assigneeAgentId" in values) {
                 issueUpdates.push(values);
+                // Mirror the prod conditional write: mutate the canned row so
+                // the post-update read-back verification sees the new assignee.
+                if (
+                  issueRowState !== undefined &&
+                  issueRowState !== null &&
+                  values.assigneeAgentId !== null &&
+                  values.assigneeAgentId !== undefined
+                ) {
+                  issueRowState = {
+                    ...issueRowState,
+                    assigneeAgentId: values.assigneeAgentId,
+                    assigneeUserId:
+                      "assigneeUserId" in values ? values.assigneeUserId : issueRowState.assigneeUserId,
+                  };
+                }
                 return Promise.resolve(undefined);
               }
               issueTouches.push(values);
@@ -653,6 +672,182 @@ describe("issueThreadInteractionService", () => {
     expect(result.status).toBe("answered");
     expect(state.issueUpdates).toHaveLength(0);
     expect(state.issueTouches).toHaveLength(1);
+  });
+
+  it("answerQuestions does not reassign when continuationPolicy is none", async () => {
+    const { issueThreadInteractionService } = await import("./issue-thread-interactions.js");
+
+    const interactionRow = {
+      id: "interaction-none",
+      companyId: "company-1",
+      issueId: "11111111-1111-4111-8111-111111111111",
+      kind: "ask_user_questions",
+      status: "pending",
+      continuationPolicy: "none",
+      sourceCommentId: null,
+      sourceRunId: null,
+      title: null,
+      summary: null,
+      createdByAgentId: "agent-9",
+      createdByUserId: null,
+      resolvedByAgentId: null,
+      resolvedByUserId: null,
+      payload: {
+        version: 1,
+        questions: [
+          {
+            id: "q1",
+            prompt: "Pick one",
+            selectionMode: "single",
+            options: [{ id: "a", label: "A" }],
+          },
+        ],
+      },
+      result: null,
+      resolvedAt: null,
+      createdAt: new Date("2026-04-20T10:00:00.000Z"),
+      updatedAt: new Date("2026-04-20T10:00:00.000Z"),
+    };
+    const issueRow = {
+      id: "11111111-1111-4111-8111-111111111111",
+      companyId: "company-1",
+      status: "todo",
+      assigneeAgentId: null,
+      assigneeUserId: "user-1",
+    };
+    const agentRow = { id: "agent-9", companyId: "company-1", status: "idle" };
+    const state = createFakeDb({ interactionRow, issueRow, agentRow });
+    const svc = issueThreadInteractionService(state.db as never);
+
+    const result = await svc.answerQuestions({
+      id: "11111111-1111-4111-8111-111111111111",
+      companyId: "company-1",
+    }, "interaction-none", {
+      answers: [{ questionId: "q1", optionIds: ["a"] }],
+    }, {
+      userId: "local-board",
+    });
+
+    expect(result.status).toBe("answered");
+    expect(state.issueUpdates).toHaveLength(0);
+    expect(state.issueTouches).toHaveLength(1);
+  });
+
+  it("answerQuestions does not reassign when the creator agent is archived", async () => {
+    const { issueThreadInteractionService } = await import("./issue-thread-interactions.js");
+
+    const interactionRow = {
+      id: "interaction-archived",
+      companyId: "company-1",
+      issueId: "11111111-1111-4111-8111-111111111111",
+      kind: "ask_user_questions",
+      status: "pending",
+      continuationPolicy: "wake_assignee",
+      sourceCommentId: null,
+      sourceRunId: null,
+      title: null,
+      summary: null,
+      createdByAgentId: "agent-9",
+      createdByUserId: null,
+      resolvedByAgentId: null,
+      resolvedByUserId: null,
+      payload: {
+        version: 1,
+        questions: [
+          {
+            id: "q1",
+            prompt: "Pick one",
+            selectionMode: "single",
+            options: [{ id: "a", label: "A" }],
+          },
+        ],
+      },
+      result: null,
+      resolvedAt: null,
+      createdAt: new Date("2026-04-20T10:00:00.000Z"),
+      updatedAt: new Date("2026-04-20T10:00:00.000Z"),
+    };
+    const issueRow = {
+      id: "11111111-1111-4111-8111-111111111111",
+      companyId: "company-1",
+      status: "todo",
+      assigneeAgentId: null,
+      assigneeUserId: "user-1",
+    };
+    const agentRow = { id: "agent-9", companyId: "company-1", status: "archived" };
+    const state = createFakeDb({ interactionRow, issueRow, agentRow });
+    const svc = issueThreadInteractionService(state.db as never);
+
+    const result = await svc.answerQuestions({
+      id: "11111111-1111-4111-8111-111111111111",
+      companyId: "company-1",
+    }, "interaction-archived", {
+      answers: [{ questionId: "q1", optionIds: ["a"] }],
+    }, {
+      userId: "local-board",
+    });
+
+    expect(result.status).toBe("answered");
+    expect(state.issueUpdates).toHaveLength(0);
+    expect(state.issueTouches).toHaveLength(1);
+  });
+
+  it("answerQuestions rejects when the issue param is terminal", async () => {
+    const { issueThreadInteractionService } = await import("./issue-thread-interactions.js");
+
+    const interactionRow = {
+      id: "interaction-terminal",
+      companyId: "company-1",
+      issueId: "11111111-1111-4111-8111-111111111111",
+      kind: "ask_user_questions",
+      status: "pending",
+      continuationPolicy: "wake_assignee",
+      sourceCommentId: null,
+      sourceRunId: null,
+      title: null,
+      summary: null,
+      createdByAgentId: "agent-9",
+      createdByUserId: null,
+      resolvedByAgentId: null,
+      resolvedByUserId: null,
+      payload: {
+        version: 1,
+        questions: [
+          {
+            id: "q1",
+            prompt: "Pick one",
+            selectionMode: "single",
+            options: [{ id: "a", label: "A" }],
+          },
+        ],
+      },
+      result: null,
+      resolvedAt: null,
+      createdAt: new Date("2026-04-20T10:00:00.000Z"),
+      updatedAt: new Date("2026-04-20T10:00:00.000Z"),
+    };
+    const issueRow = {
+      id: "11111111-1111-4111-8111-111111111111",
+      companyId: "company-1",
+      status: "done",
+      assigneeAgentId: null,
+      assigneeUserId: "user-1",
+    };
+    const agentRow = { id: "agent-9", companyId: "company-1", status: "idle" };
+    const state = createFakeDb({ interactionRow, issueRow, agentRow });
+    const svc = issueThreadInteractionService(state.db as never);
+
+    await expect(svc.answerQuestions({
+      id: "11111111-1111-4111-8111-111111111111",
+      companyId: "company-1",
+      status: "done",
+    }, "interaction-terminal", {
+      answers: [{ questionId: "q1", optionIds: ["a"] }],
+    }, {
+      userId: "local-board",
+    })).rejects.toMatchObject({ status: 409 });
+    expect(state.issueUpdates).toHaveLength(0);
+    expect(state.issueTouches).toHaveLength(0);
   });
 
   it("withdraws a pending interaction with attribution and rejects repeats", async () => {
