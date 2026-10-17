@@ -104,20 +104,28 @@ export function stageDecisionService(db: Db) {
           });
         }
 
-        // Gate order matters: builder ban is absolute (self-approval is
-        // impossible even if misconfigured as participant); then resolve the
-        // active stage and check participant membership BEFORE the assignee
-        // ban, so the designated reviewer decides regardless of assignee seat
-        // (approve-advance reassigns the card to the next stage participant).
-        if (
+        // Gate order matters: resolve the active stage and check participant
+        // membership BEFORE the assignee ban, so the designated reviewer
+        // decides regardless of assignee seat (approve-advance reassigns the
+        // card to the next stage participant).
+        const policy = normalizeIssueExecutionPolicy(lockedIssue.executionPolicy ?? null);
+        const existingState = parseIssueExecutionState(lockedIssue.executionState);
+        // Builder ban is absolute (self-approval is impossible even if
+        // misconfigured as participant). It keys on the build executor — the
+        // parked build-stage returnAssignee — not the card creator (filing a
+        // card is not building it). It sits after state parse out of
+        // necessity (returnAssignee lives in execution state); legacy cards
+        // with a null returnAssignee fall back to the createdBy check.
+        if (existingState?.returnAssignee) {
+          if (principalsEqual(existingState.returnAssignee, actor)) {
+            throw forbidden("The card builder cannot record a stage decision");
+          }
+        } else if (
           (input.actor.agentId && lockedIssue.createdByAgentId === input.actor.agentId) ||
           (input.actor.userId && lockedIssue.createdByUserId === input.actor.userId)
         ) {
           throw forbidden("The card builder cannot record a stage decision");
         }
-
-        const policy = normalizeIssueExecutionPolicy(lockedIssue.executionPolicy ?? null);
-        const existingState = parseIssueExecutionState(lockedIssue.executionState);
         if (!policy || policy.stages.length === 0 || !existingState?.currentStageId) {
           throw unprocessable("Card has no pending execution stage", { issueId: lockedIssue.id });
         }

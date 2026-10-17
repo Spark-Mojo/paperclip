@@ -102,6 +102,7 @@ describeEmbeddedPostgres("issue stage decision routes", () => {
     status?: string;
     description?: string;
     stageCount?: 1 | 2;
+    creatorAgentId?: string;
   }) {
     const stageId1 = randomUUID();
     const stageId2 = randomUUID();
@@ -131,7 +132,7 @@ describeEmbeddedPostgres("issue stage decision routes", () => {
       status: input.status ?? "in_review",
       priority: "medium",
       assigneeAgentId: input.builderAgentId,
-      createdByAgentId: input.builderAgentId,
+      createdByAgentId: input.creatorAgentId ?? input.builderAgentId,
     });
     await db.update(issues).set({
       executionPolicy: { mode: "normal", commentRequired: true, stages },
@@ -250,6 +251,77 @@ describeEmbeddedPostgres("issue stage decision routes", () => {
       .post(`/api/issues/${issueId}/stage-decision`)
       .send({ action: "approve", body: "Approving from the assignee seat.", stageId: stageId1 });
     expect(assigneeDenied.status).toBe(403);
+    expect(await countDecisions(issueId, seeded.companyId)).toHaveLength(0);
+  });
+
+  it("R1: card creator who did not build may record a decision", async () => {
+    const seeded = await seedCompany("CRT");
+    const { issueId, stageId1 } = await seedStageIssue({
+      companyId: seeded.companyId,
+      builderAgentId: seeded.assigneeAgentId,
+      reviewerAgentId: seeded.reviewerAgentId,
+      creatorAgentId: seeded.reviewerAgentId,
+      identifier: "CRT-1",
+    });
+    const runId = await seedRun(seeded.companyId, seeded.reviewerAgentId, issueId);
+
+    const res = await request(app(agentActor(seeded.companyId, seeded.reviewerAgentId, runId)))
+      .post(`/api/issues/${issueId}/stage-decision`)
+      .send({ action: "approve", body: "Filing the card is not building it.", stageId: stageId1 });
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(res.body.decision).toMatchObject({ outcome: "approved", stageId: stageId1 });
+  });
+
+  it("R2: build executor as designated participant is still banned", async () => {
+    const seeded = await seedCompany("BLD");
+    const { issueId, stageId1 } = await seedStageIssue({
+      companyId: seeded.companyId,
+      builderAgentId: seeded.assigneeAgentId,
+      reviewerAgentId: seeded.reviewerAgentId,
+      creatorAgentId: seeded.reviewerAgentId,
+      identifier: "BLD-1",
+    });
+    // Misconfigure the builder as the current participant so the participant
+    // gate would admit them — the builder ban must fire first.
+    const persistedBld = await readIssue(issueId);
+    await db.update(issues).set({
+      executionState: {
+        ...persistedBld.executionState,
+        currentParticipant: { type: "agent", agentId: seeded.assigneeAgentId },
+      },
+    }).where(eq(issues.id, issueId));
+
+    const runId = await seedRun(seeded.companyId, seeded.assigneeAgentId, issueId);
+    const res = await request(app(agentActor(seeded.companyId, seeded.assigneeAgentId, runId)))
+      .post(`/api/issues/${issueId}/stage-decision`)
+      .send({ action: "approve", body: "Self-approving as participant.", stageId: stageId1 });
+    expect(res.status).toBe(403);
+    expect(await countDecisions(issueId, seeded.companyId)).toHaveLength(0);
+  });
+
+  it("fallback: null returnAssignee bans on createdBy", async () => {
+    const seeded = await seedCompany("FBK");
+    const { issueId, stageId1 } = await seedStageIssue({
+      companyId: seeded.companyId,
+      builderAgentId: seeded.assigneeAgentId,
+      reviewerAgentId: seeded.reviewerAgentId,
+      identifier: "FBK-1",
+    });
+    // Legacy card: no returnAssignee; creator (also builder here) decides.
+    const persistedFbk = await readIssue(issueId);
+    await db.update(issues).set({
+      executionState: {
+        ...persistedFbk.executionState,
+        currentParticipant: { type: "agent", agentId: seeded.assigneeAgentId },
+        returnAssignee: null,
+      },
+    }).where(eq(issues.id, issueId));
+
+    const runId = await seedRun(seeded.companyId, seeded.assigneeAgentId, issueId);
+    const res = await request(app(agentActor(seeded.companyId, seeded.assigneeAgentId, runId)))
+      .post(`/api/issues/${issueId}/stage-decision`)
+      .send({ action: "approve", body: "Legacy self-approval.", stageId: stageId1 });
+    expect(res.status).toBe(403);
     expect(await countDecisions(issueId, seeded.companyId)).toHaveLength(0);
   });
 
