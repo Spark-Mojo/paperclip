@@ -2974,6 +2974,45 @@ export function issueThreadInteractionService(
       );
     },
 
+    // Pending rows of the same kind on the same thread that the author of a new
+    // card has not seen yet. `listForIssue` already returns them, but only when
+    // the caller asked for the whole thread; this is the narrow read the create
+    // response needs. The new row is excluded so the response never lists the
+    // card it just created, and the issue scope is explicit so a pending card on
+    // another thread never leaks in. Read-only and best-effort: a failure here
+    // must not change the create outcome, so the route treats it as advisory.
+    listPendingSiblingInteractions: async (
+      issueId: string,
+      kind: string,
+      excludeInteractionId: string,
+    ) => {
+      const rows = await db
+        .select({
+          id: issueThreadInteractions.id,
+          kind: issueThreadInteractions.kind,
+          createdByAgentId: issueThreadInteractions.createdByAgentId,
+          createdAt: issueThreadInteractions.createdAt,
+        })
+        .from(issueThreadInteractions)
+        .where(and(
+          eq(issueThreadInteractions.issueId, issueId),
+          eq(issueThreadInteractions.kind, kind),
+          eq(issueThreadInteractions.status, "pending"),
+          ne(issueThreadInteractions.id, excludeInteractionId),
+        ))
+        .orderBy(
+          desc(issueThreadInteractions.createdAt),
+          desc(issueThreadInteractions.id),
+        );
+
+      return rows.map((row) => ({
+        id: row.id,
+        kind: row.kind,
+        createdByAgentId: row.createdByAgentId,
+        createdAt: row.createdAt,
+      }));
+    },
+
     getById: async (interactionId: string) => {
       const row = await db
         .select()

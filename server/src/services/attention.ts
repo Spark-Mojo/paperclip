@@ -757,16 +757,24 @@ export function interactionResolverAudience(
   };
 }
 
-function collapsePendingConfirmationsToNewest<T extends {
+// The board feed shows one item per issue and interaction kind, so a question
+// that a second agent re-asks on the same thread does not reach James twice.
+// The grouping is deliberately issue + kind: those two facts are what make two
+// rows the same ask. A row addressed to someone else, or with a different
+// resolver audience, still collapses here - see the siblingPendingInteractions
+// field on the create response, which tells the author who else is already
+// waiting on that thread. Nothing is deleted or resolved by this pass: every row
+// stays persisted and resolvable through GET /api/issues/{id}/interactions.
+function collapsePendingInteractionsToNewest<T extends {
   id: string;
   issueId: string;
   kind: string;
   createdAt: Date;
 }>(rows: T[]) {
+  const groupKeyOf = (row: T) => `${row.issueId}:${row.kind}`;
   const newestByGroup = new Map<string, T>();
   for (const row of rows) {
-    if (row.kind !== "request_confirmation") continue;
-    const groupKey = `${row.issueId}:${row.kind}`;
+    const groupKey = groupKeyOf(row);
     const newest = newestByGroup.get(groupKey);
     if (
       !newest
@@ -778,8 +786,7 @@ function collapsePendingConfirmationsToNewest<T extends {
   }
 
   return rows.filter((row) => (
-    row.kind !== "request_confirmation"
-    || newestByGroup.get(`${row.issueId}:${row.kind}`)?.id === row.id
+    newestByGroup.get(groupKeyOf(row))?.id === row.id
   ));
 }
 
@@ -1211,7 +1218,7 @@ export function attentionService(db: Db, serviceOptions: AttentionServiceOptions
           !evaluateAgentInvokability(companyAgentMap.get(row.addresseeAgentId), companyAgentRows).invokable)
         && (row.addresseeUserId === null || row.addresseeUserId === options.userId)
       );
-      const visibleInteractionRows = collapsePendingConfirmationsToNewest(boardInteractionRows);
+      const visibleInteractionRows = collapsePendingInteractionsToNewest(boardInteractionRows);
       const [interactionIssueMap, interactionImageMap, interactionPlanDocumentMap] = await Promise.all([
         issueSummaryMap(db, companyId, visibleInteractionRows.map((row) => row.issueId)),
         issueImageMap(db, companyId, visibleInteractionRows.map((row) => row.issueId)),

@@ -16646,7 +16646,39 @@ export function issueRoutes(
           );
       }
 
-      res.status(201).json(interaction);
+      // Additive: tell the author who else is already waiting on this thread,
+      // so a duplicate card is visible to the author instead of only to the
+      // feed. Advisory by construction - the card is already persisted, so a
+      // failed sibling read degrades to an empty list and never changes the
+      // 201 or the stored row.
+      let siblingPendingInteractions: Array<{
+        id: string;
+        kind: string;
+        createdByAgentId: string | null;
+        createdAt: Date;
+      }> = [];
+      try {
+        siblingPendingInteractions =
+          await issueThreadInteractionService(db).listPendingSiblingInteractions(
+            issue.id,
+            interaction.kind,
+            interaction.id,
+          );
+      } catch (err) {
+        logger.warn(
+          {
+            err,
+            issueId: issue.id,
+            interactionId: interaction.id,
+          },
+          "failed to read pending sibling interactions after create",
+        );
+      }
+
+      res.status(201).json({
+        ...interaction,
+        siblingPendingInteractions,
+      });
     },
   );
 

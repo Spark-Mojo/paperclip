@@ -1284,6 +1284,390 @@ describeEmbeddedPostgres("attention service", () => {
     expect(interactionIds).not.toContain(olderConfirmationId);
   });
 
+  // The board collapses a run of pending interactions on one issue thread to the
+  // newest row per kind, whatever the kind is. Today only request_confirmation
+  // collapses, so a re-asked question stacks up instead of superseding.
+  it("newest pending ask_user_questions per issue and kind", async () => {
+    const { companyId, workerId, reviewerId } = await seedCompany("ATY");
+    const questionIssueId = await insertIssue({
+      companyId,
+      identifier: "ATY-1",
+      title: "Repeated board questions",
+      status: "in_progress",
+      assigneeAgentId: workerId,
+    });
+    const tieIssueId = await insertIssue({
+      companyId,
+      identifier: "ATY-2",
+      title: "Simultaneous board questions",
+      status: "in_progress",
+      assigneeAgentId: workerId,
+    });
+    const loneIssueId = await insertIssue({
+      companyId,
+      identifier: "ATY-3",
+      title: "One lone sign-off",
+      status: "in_progress",
+      assigneeAgentId: workerId,
+    });
+    const olderQuestionId = randomUUID();
+    const newerQuestionId = randomUUID();
+    const firstTieId = randomUUID();
+    const secondTieId = randomUUID();
+    // Same comparison operator the collapse itself uses, so "tie broken by the
+    // greater id" is pinned rather than assumed.
+    const [tieLowerId, tieHigherId] = firstTieId > secondTieId
+      ? [secondTieId, firstTieId]
+      : [firstTieId, secondTieId];
+    const loneConfirmationId = randomUUID();
+    await db.insert(issueThreadInteractions).values([
+      {
+        id: olderQuestionId,
+        companyId,
+        issueId: questionIssueId,
+        kind: "ask_user_questions",
+        status: "pending",
+        continuationPolicy: "wake_assignee",
+        createdByAgentId: workerId,
+        title: "Which auth provider? (first ask)",
+        payload: {
+          version: 1,
+          questions: [
+            {
+              id: "q1",
+              prompt: "Which auth provider should we use?",
+              selectionMode: "single",
+              options: [{ id: "google", label: "Google" }],
+            },
+          ],
+        },
+        createdAt: new Date("2026-07-09T12:00:00.000Z"),
+        updatedAt: new Date("2026-07-09T12:00:00.000Z"),
+      },
+      {
+        id: newerQuestionId,
+        companyId,
+        issueId: questionIssueId,
+        kind: "ask_user_questions",
+        status: "pending",
+        continuationPolicy: "wake_assignee",
+        createdByAgentId: reviewerId,
+        title: "Which auth provider? (re-ask)",
+        payload: {
+          version: 1,
+          questions: [
+            {
+              id: "q1",
+              prompt: "Which auth provider should we use?",
+              selectionMode: "single",
+              options: [{ id: "microsoft", label: "Microsoft" }],
+            },
+          ],
+        },
+        createdAt: new Date("2026-07-09T12:05:00.000Z"),
+        updatedAt: new Date("2026-07-09T12:05:00.000Z"),
+      },
+      {
+        id: tieLowerId,
+        companyId,
+        issueId: tieIssueId,
+        kind: "ask_user_questions",
+        status: "pending",
+        continuationPolicy: "wake_assignee",
+        createdByAgentId: workerId,
+        title: "Simultaneous ask (lower id)",
+        payload: {
+          version: 1,
+          questions: [
+            {
+              id: "q1",
+              prompt: "Ship on Friday or Monday?",
+              selectionMode: "single",
+              options: [{ id: "friday", label: "Friday" }],
+            },
+          ],
+        },
+        createdAt: new Date("2026-07-09T12:06:00.000Z"),
+        updatedAt: new Date("2026-07-09T12:06:00.000Z"),
+      },
+      {
+        id: tieHigherId,
+        companyId,
+        issueId: tieIssueId,
+        kind: "ask_user_questions",
+        status: "pending",
+        continuationPolicy: "wake_assignee",
+        createdByAgentId: reviewerId,
+        title: "Simultaneous ask (higher id)",
+        payload: {
+          version: 1,
+          questions: [
+            {
+              id: "q1",
+              prompt: "Ship on Friday or Monday?",
+              selectionMode: "single",
+              options: [{ id: "monday", label: "Monday" }],
+            },
+          ],
+        },
+        createdAt: new Date("2026-07-09T12:06:00.000Z"),
+        updatedAt: new Date("2026-07-09T12:06:00.000Z"),
+      },
+      {
+        id: loneConfirmationId,
+        companyId,
+        issueId: loneIssueId,
+        kind: "request_confirmation",
+        status: "pending",
+        continuationPolicy: "wake_assignee",
+        createdByAgentId: workerId,
+        title: "Approve the lone sign-off",
+        payload: { version: 1, prompt: "Approve the lone sign-off?" },
+        createdAt: new Date("2026-07-09T12:07:00.000Z"),
+        updatedAt: new Date("2026-07-09T12:07:00.000Z"),
+      },
+    ]);
+
+    const feed = await attentionService(db).list(companyId, { userId: "board-user" });
+    const interactionIds = feed.items
+      .filter((item) => item.sourceKind === "issue_thread_interaction")
+      .map((item) => item.subject.id);
+
+    expect(interactionIds).toContain(newerQuestionId);
+    expect(interactionIds).not.toContain(olderQuestionId);
+    expect(interactionIds).toContain(tieHigherId);
+    expect(interactionIds).not.toContain(tieLowerId);
+    expect(interactionIds.filter((id) => id === loneConfirmationId)).toHaveLength(1);
+  });
+
+  // The collapse groups on `${issueId}:${kind}`. Widening it to every kind must
+  // not widen the group: distinct kinds on one thread and one kind on distinct
+  // threads are each separate work and both belong in the feed.
+  it("keeps pending interactions of different kinds and different issues distinct", async () => {
+    const { companyId, workerId, reviewerId } = await seedCompany("ATZ");
+    const firstIssueId = await insertIssue({
+      companyId,
+      identifier: "ATZ-1",
+      title: "Mixed pending interactions",
+      status: "in_progress",
+      assigneeAgentId: workerId,
+    });
+    const secondIssueId = await insertIssue({
+      companyId,
+      identifier: "ATZ-2",
+      title: "Same kind on another thread",
+      status: "in_progress",
+      assigneeAgentId: workerId,
+    });
+    const questionsId = randomUUID();
+    const confirmationId = randomUUID();
+    const checkboxId = randomUUID();
+    const otherIssueQuestionsId = randomUUID();
+    // Same issue, same kind, SECOND AUTHOR. This is the duplicate that reaches
+    // James's feed: two agents asked the same thread for the same kind of
+    // decision. It must collapse to one item.
+    const reAskedQuestionId = randomUUID();
+    await db.insert(issueThreadInteractions).values([
+      {
+        id: questionsId,
+        companyId,
+        issueId: firstIssueId,
+        kind: "ask_user_questions",
+        status: "pending",
+        continuationPolicy: "wake_assignee",
+        createdByAgentId: workerId,
+        title: "Questions on the first thread",
+        payload: {
+          version: 1,
+          questions: [
+            {
+              id: "q1",
+              prompt: "Which auth provider should we use?",
+              selectionMode: "single",
+              options: [{ id: "google", label: "Google" }],
+            },
+          ],
+        },
+        createdAt: new Date("2026-07-09T12:00:00.000Z"),
+        updatedAt: new Date("2026-07-09T12:00:00.000Z"),
+      },
+      {
+        id: confirmationId,
+        companyId,
+        issueId: firstIssueId,
+        kind: "request_confirmation",
+        status: "pending",
+        continuationPolicy: "wake_assignee",
+        createdByAgentId: workerId,
+        title: "Confirm on the first thread",
+        payload: { version: 1, prompt: "Approve the mixed interactions?" },
+        createdAt: new Date("2026-07-09T12:01:00.000Z"),
+        updatedAt: new Date("2026-07-09T12:01:00.000Z"),
+      },
+      {
+        id: checkboxId,
+        companyId,
+        issueId: firstIssueId,
+        kind: "request_checkbox_confirmation",
+        status: "pending",
+        continuationPolicy: "wake_assignee",
+        createdByAgentId: reviewerId,
+        title: "Checklist on the first thread",
+        payload: { version: 1, prompt: "Select rollout", options: [{ id: "one", label: "One" }] },
+        createdAt: new Date("2026-07-09T12:02:00.000Z"),
+        updatedAt: new Date("2026-07-09T12:02:00.000Z"),
+      },
+      {
+        id: otherIssueQuestionsId,
+        companyId,
+        issueId: secondIssueId,
+        kind: "ask_user_questions",
+        status: "pending",
+        continuationPolicy: "wake_assignee",
+        createdByAgentId: reviewerId,
+        title: "Questions on the second thread",
+        payload: {
+          version: 1,
+          questions: [
+            {
+              id: "q1",
+              prompt: "Which rollout region?",
+              selectionMode: "single",
+              options: [{ id: "us", label: "US" }],
+            },
+          ],
+        },
+        createdAt: new Date("2026-07-09T12:00:00.000Z"),
+        updatedAt: new Date("2026-07-09T12:00:00.000Z"),
+      },
+      {
+        id: reAskedQuestionId,
+        companyId,
+        issueId: firstIssueId,
+        kind: "ask_user_questions",
+        status: "pending",
+        continuationPolicy: "wake_assignee",
+        createdByAgentId: reviewerId,
+        title: "Re-asked questions on the first thread",
+        payload: {
+          version: 1,
+          questions: [
+            {
+              id: "q1",
+              prompt: "Which database should we pick?",
+              selectionMode: "single",
+              options: [{ id: "postgres", label: "Postgres" }],
+            },
+          ],
+        },
+        createdAt: new Date("2026-07-09T12:03:00.000Z"),
+        updatedAt: new Date("2026-07-09T12:03:00.000Z"),
+      },
+    ]);
+
+    const feed = await attentionService(db).list(companyId, { userId: "board-user" });
+    const interactionIds = feed.items
+      .filter((item) => item.sourceKind === "issue_thread_interaction")
+      .map((item) => item.subject.id);
+
+    // Distinct kinds on one thread, and one kind on distinct threads, both
+    // survive; each appears exactly once.
+    for (const id of [
+      confirmationId,
+      checkboxId,
+      otherIssueQuestionsId,
+      reAskedQuestionId,
+    ]) {
+      expect(interactionIds.filter((candidate) => candidate === id)).toHaveLength(1);
+    }
+    // The two ask_user_questions on the first thread collapse to the newest.
+    expect(interactionIds).toContain(reAskedQuestionId);
+    expect(interactionIds).not.toContain(questionsId);
+  });
+
+  // The collapse is a feed presentation concern only: it must never resolve,
+  // expire or hide a pending row from the issue thread that still owns it.
+  it("collapsing the feed hides no pending interaction from the issue interaction list", async () => {
+    const { companyId, workerId, reviewerId } = await seedCompany("AUA");
+    const issueId = await insertIssue({
+      companyId,
+      identifier: "AUA-1",
+      title: "Re-asked board questions",
+      status: "in_progress",
+      assigneeAgentId: workerId,
+    });
+    const supersededQuestionId = randomUUID();
+    const newestQuestionId = randomUUID();
+    await db.insert(issueThreadInteractions).values([
+      {
+        id: supersededQuestionId,
+        companyId,
+        issueId,
+        kind: "ask_user_questions",
+        status: "pending",
+        continuationPolicy: "wake_assignee",
+        createdByAgentId: workerId,
+        title: "Which auth provider? (first ask)",
+        payload: {
+          version: 1,
+          questions: [
+            {
+              id: "q1",
+              prompt: "Which auth provider should we use?",
+              selectionMode: "single",
+              options: [{ id: "google", label: "Google" }],
+            },
+          ],
+        },
+        createdAt: new Date("2026-07-09T12:00:00.000Z"),
+        updatedAt: new Date("2026-07-09T12:00:00.000Z"),
+      },
+      {
+        id: newestQuestionId,
+        companyId,
+        issueId,
+        kind: "ask_user_questions",
+        status: "pending",
+        continuationPolicy: "wake_assignee",
+        createdByAgentId: reviewerId,
+        title: "Which auth provider? (re-ask)",
+        payload: {
+          version: 1,
+          questions: [
+            {
+              id: "q1",
+              prompt: "Which auth provider should we use?",
+              selectionMode: "single",
+              options: [{ id: "microsoft", label: "Microsoft" }],
+            },
+          ],
+        },
+        createdAt: new Date("2026-07-09T12:05:00.000Z"),
+        updatedAt: new Date("2026-07-09T12:05:00.000Z"),
+      },
+    ]);
+
+    const feed = await attentionService(db).list(companyId, { userId: "board-user" });
+    const feedInteractionIds = feed.items
+      .filter((item) => item.sourceKind === "issue_thread_interaction")
+      .map((item) => item.subject.id);
+
+    expect(feedInteractionIds).toContain(newestQuestionId);
+    expect(feedInteractionIds).not.toContain(supersededQuestionId);
+
+    const storedRows = await db
+      .select({
+        id: issueThreadInteractions.id,
+        status: issueThreadInteractions.status,
+      })
+      .from(issueThreadInteractions)
+      .where(eq(issueThreadInteractions.issueId, issueId));
+
+    expect(storedRows.map((row) => `${row.id}:${row.status}`).sort()).toEqual(
+      [`${supersededQuestionId}:pending`, `${newestQuestionId}:pending`].sort(),
+    );
+  });
+
   it("uses inbox_dismissals with attention-prefixed dedup keys and resurfaces newer activity", async () => {
     const { companyId } = await seedCompany("ATD");
     const approvalId = randomUUID();
