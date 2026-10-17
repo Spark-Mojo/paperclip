@@ -113,6 +113,9 @@ import {
   parseIssueExecutionWorkspaceSettings,
   parseProjectExecutionWorkspacePolicy,
   resolvePinnedIssueWorkspaceStrategyType,
+  AGENT_CODE_CARD_REQUIRES_WORKSPACE_CODE,
+  AGENT_CODE_CARD_REQUIRES_WORKSPACE_MESSAGE,
+  AGENT_CODE_CARD_REQUIRES_WORKSPACE_REMEDIATION,
   AGENT_ROOT_ISSUE_REQUIRES_PROJECT_CODE,
   AGENT_ROOT_ISSUE_REQUIRES_PROJECT_MESSAGE,
   AGENT_ROOT_ISSUE_REQUIRES_PROJECT_REMEDIATION,
@@ -494,6 +497,14 @@ function agentRootIssueRequiresProjectDetails() {
   return {
     code: AGENT_ROOT_ISSUE_REQUIRES_PROJECT_CODE,
     remediation: AGENT_ROOT_ISSUE_REQUIRES_PROJECT_REMEDIATION,
+  };
+}
+
+function agentCodeCardRequiresWorkspaceDetails(candidateIds: string[]) {
+  return {
+    code: AGENT_CODE_CARD_REQUIRES_WORKSPACE_CODE,
+    remediation: AGENT_CODE_CARD_REQUIRES_WORKSPACE_REMEDIATION,
+    candidateProjectWorkspaceIds: candidateIds,
   };
 }
 
@@ -10465,6 +10476,46 @@ export function issueService(db: Db) {
         // loadProjectPolicyOnce is declared above (before the inheritance
         // block) so the inheritance-skip check shares the same cache as the
         // default-fill block below.
+
+        if (
+          !projectWorkspaceId &&
+          issueData.projectId &&
+          !issueData.createdByUserId &&
+          issueData.createdByAgentId
+        ) {
+          const codePreference =
+            executionWorkspacePreference === "isolated_workspace" ||
+            executionWorkspacePreference === "operator_branch";
+          const codeMode = parseIssueExecutionWorkspaceSettings(
+            executionWorkspaceSettings,
+          )?.mode;
+          if (
+            codePreference ||
+            codeMode === "isolated_workspace" ||
+            codeMode === "operator_branch"
+          ) {
+            const candidates = await tx
+              .select({ id: projectWorkspaces.id })
+              .from(projectWorkspaces)
+              .where(
+                and(
+                  eq(projectWorkspaces.projectId, issueData.projectId),
+                  eq(projectWorkspaces.companyId, companyId),
+                ),
+              )
+              .orderBy(
+                desc(projectWorkspaces.isPrimary),
+                asc(projectWorkspaces.createdAt),
+                asc(projectWorkspaces.id),
+              )
+              .limit(10);
+            const candidateIds = candidates.map((r) => r.id);
+            throw unprocessable(
+              `${AGENT_CODE_CARD_REQUIRES_WORKSPACE_MESSAGE} Candidates for this project: ${candidateIds.join(", ") || "none"}.`,
+              agentCodeCardRequiresWorkspaceDetails(candidateIds),
+            );
+          }
+        }
 
         if (
           executionWorkspaceSettings == null &&
