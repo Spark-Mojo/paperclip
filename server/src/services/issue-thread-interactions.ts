@@ -812,6 +812,107 @@ function shouldReturnAcceptedConfirmationToCreatorAgent(args: {
   return Boolean(args.issue.assigneeUserId);
 }
 
+function shouldReturnAnsweredQuestionsToCreatorAgent(args: {
+  issue: {
+    status: string;
+    assigneeAgentId: string | null;
+    assigneeUserId: string | null;
+  };
+  current: IssueThreadInteractionRow;
+  actor: InteractionActor;
+}) {
+  if (args.current.continuationPolicy !== "wake_assignee") return false;
+  if (args.current.kind !== "ask_user_questions") return false;
+  if (!args.current.createdByAgentId) return false;
+  if (!args.actor.userId) return false;
+  if (isTerminalIssueStatus(args.issue.status)) return false;
+  if (args.issue.assigneeAgentId) return false;
+  return Boolean(args.issue.assigneeUserId);
+}
+
+async function returnAnsweredQuestionsToCreatorAgentInTransaction(
+  tx: Pick<Db, "select" | "update">,
+  issue: { id: string; companyId: string },
+  current: IssueThreadInteractionRow,
+  actor: InteractionActor,
+): Promise<boolean> {
+  // Same-company scoping: the agents row must live under the issue's company.
+  // The agents table has no archived/disabled columns — validity is the
+  // status text not reading "archived"/"disabled" (status defaults to "idle").
+  if (!current.createdByAgentId) return false;
+  const creator = await tx
+    .select({ id: agents.id, companyId: agents.companyId, status: agents.status })
+    .from(agents)
+    .where(
+      and(
+        eq(agents.id, current.createdByAgentId),
+        eq(agents.companyId, issue.companyId),
+      ),
+    )
+    .for("update")
+    .then((rows) => rows[0] ?? null);
+  if (!creator) return false;
+  // Defense in depth alongside the where clause: predicate-blind fakes return
+  // canned rows regardless of predicates, so this makes cross-company visible.
+  if (creator.companyId !== issue.companyId) return false;
+  if (creator.status === "archived" || creator.status === "disabled") return false;
+
+  const lockedIssue = await tx
+    .select({
+      id: issues.id,
+      companyId: issues.companyId,
+      status: issues.status,
+      assigneeAgentId: issues.assigneeAgentId,
+      assigneeUserId: issues.assigneeUserId,
+    })
+    .from(issues)
+    .where(eq(issues.id, issue.id))
+    .for("update")
+    .then((rows) => rows[0] ?? null);
+  if (!lockedIssue || lockedIssue.companyId !== issue.companyId) return false;
+  if (
+    !shouldReturnAnsweredQuestionsToCreatorAgent({
+      issue: lockedIssue,
+      current,
+      actor,
+    })
+  ) {
+    return false;
+  }
+
+  // Conditional write: re-check user-held state at write time so a
+  // concurrent reassign wins (0 rows affected) instead of clobbering it.
+  // lockedIssue.assigneeUserId is truthy here per the predicate above; the
+  // explicit narrow keeps eq() off a null comparison.
+  const lockedUserId = lockedIssue.assigneeUserId;
+  if (!lockedUserId) return false;
+  await tx
+    .update(issues)
+    .set({
+      assigneeAgentId: current.createdByAgentId,
+      assigneeUserId: null,
+      updatedAt: new Date(),
+    })
+    .where(
+      and(
+        eq(issues.id, issue.id),
+        isNull(issues.assigneeAgentId),
+        eq(issues.assigneeUserId, lockedUserId),
+      ),
+    );
+  // Verify the write landed on this row: a concurrent reassignment leaves
+  // the conditional update affecting 0 rows, so the re-read mismatches and
+  // the caller falls back to touchIssue instead of claiming reassignment.
+  const verified = await tx
+    .select({
+      assigneeAgentId: issues.assigneeAgentId,
+    })
+    .from(issues)
+    .where(eq(issues.id, issue.id))
+    .then((rows) => rows[0] ?? null);
+  return verified?.assigneeAgentId === current.createdByAgentId;
+}
+
 function shouldSupersedeInteractionOnUserComment(interaction: UserCommentSupersedableInteraction) {
   if (interaction.kind === "connection_intent") return false;
   if (interaction.kind === "request_confirmation" && interaction.payload.toolAction) return false;
@@ -4757,7 +4858,7 @@ export function issueThreadInteractionService(
         answers: input.answers,
       });
 
-      const updated = await db.transaction(async (tx) => {
+      const { row: updatedRow, reassignedToCreatorAgent } = await db.transaction(async (tx) => {
         await mutationOptions.beforeResolveInTransaction?.(tx);
         const resolvedAt = new Date();
         const [row] = await tx
@@ -4794,15 +4895,29 @@ export function issueThreadInteractionService(
         // generic sibling-expiry pass would invalidate a Slack/Teams modal
         // submit token before it can be claimed in this same transaction.
         await mutationOptions.afterResolveInTransaction?.(tx, answered);
+        // Creator-return reassignment for answered questions (mirrors the
+        // accepted-confirmation return). The post-route wakeup is dispatched
+        // after this transaction commits, so the reassignment must land in
+        // the same transaction — otherwise the wake reads the stale (user)
+        // assignee and the creator never resumes.
+        const reassignedToCreatorAgent =
+          await returnAnsweredQuestionsToCreatorAgentInTransaction(
+            tx,
+            { id: issue.id, companyId: issue.companyId },
+            current,
+            actor,
+          );
         await enqueueTerminalIssueInteractionChatPublications(
           tx as unknown as Db,
           answered,
         );
-        return row;
+        return { row, reassignedToCreatorAgent };
       });
 
-      await touchIssue(db, issue.id);
-      const answered = hydrateInteraction(updated);
+      if (!reassignedToCreatorAgent) {
+        await touchIssue(db, issue.id);
+      }
+      const answered = hydrateInteraction(updatedRow);
       await emitInteractionResolvedTelemetry(db, answered);
       return answered;
     },
