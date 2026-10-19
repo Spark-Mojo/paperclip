@@ -342,4 +342,40 @@ describeEmbeddedPostgres("issue done gate — escalation close-guard (SPA-13737)
     const after = await db.select().from(issues).where(eq(issues.id, card.id)).then((rows) => rows[0]!);
     expect(after.status).toBe("in_progress");
   });
+
+  it("allows done for stale_active_run_evaluation with doneGateBypass and no receipt (SPA-13753 watchdog fold)", async () => {
+    const card = await createCard(db, companyId, {
+      assigneeAgentId: agentId,
+      originKind: "stale_active_run_evaluation",
+    });
+    const updated = await issueService(db).update(card.id, { status: "done", doneGateBypass: true });
+    expect(updated?.status).toBe("done");
+  });
+
+  it("allows done for issue_productivity_review with doneGateBypass and no receipt (SPA-13753 system-fold closure)", async () => {
+    const card = await createCard(db, companyId, {
+      assigneeAgentId: agentId,
+      originKind: "issue_productivity_review",
+    });
+    const updated = await issueService(db).update(card.id, { status: "done", doneGateBypass: true });
+    expect(updated?.status).toBe("done");
+  });
+
+  it("allows done for stale_active_run_evaluation without bypass and no receipt (SPA-13753)", async () => {
+    const card = await createCard(db, companyId, {
+      assigneeAgentId: agentId,
+      originKind: "stale_active_run_evaluation",
+    });
+    const updated = await issueService(db).update(card.id, { status: "done" });
+    expect(updated?.status).toBe("done");
+  });
+
+  it("allows done for issue_productivity_review without bypass and no receipt (SPA-13753)", async () => {
+    const card = await createCard(db, companyId, {
+      assigneeAgentId: agentId,
+      originKind: "issue_productivity_review",
+    });
+    const updated = await issueService(db).update(card.id, { status: "done" });
+    expect(updated?.status).toBe("done");
+  });
 });
