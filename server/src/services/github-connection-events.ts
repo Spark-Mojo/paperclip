@@ -19,6 +19,11 @@ import {
   type SealedConnectorEvents,
 } from "./paperclip-cloud-connector.js";
 import { issueThreadInteractionService } from "./issue-thread-interactions.js";
+import {
+  dedupeKey,
+  prQualifiesForSableSeat,
+  seatCardTitle,
+} from "./sable-seat-dispatch.js";
 import { logger } from "../middleware/logger.js";
 
 type LeasedEvent = SealedConnectorEvents["events"][number];
@@ -235,8 +240,29 @@ export function githubConnectionEventService(
     return bindingRows(rows);
   }
 
-  async function applyPullRequestEvent(companyId: string, event: LeasedEvent) {
-    const snapshot = githubSnapshotUpdate(event.payload);
+  type SableSeatSummonsOptions = {
+    createSeatSummons?: typeof issueThreadInteractionService;
+    resolveSeatCardIssue?: (
+      companyId: string,
+      snapshot: NonNullable<ReturnType<typeof githubSnapshotUpdate>>,
+    ) => Promise<{ id: string } | null>;
+    interactionService?: ReturnType<typeof issueThreadInteractionService>;
+    wakeup?: NonNullable<Parameters<typeof issueThreadInteractionService>[1]>["wakeup"];
+  };
+
+  async function applyPullRequestEvent(
+    companyId: string,
+    event: LeasedEvent,
+    seatOptions: SableSeatSummonsOptions = {},
+  ) {
+    const summonsOptions: SableSeatSummonsOptions = {
+      createSeatSummons: seatOptions.createSeatSummons,
+      resolveSeatCardIssue: seatOptions.resolveSeatCardIssue,
+      interactionService: seatOptions.interactionService,
+      wakeup: options.wakeup ?? seatOptions.wakeup,
+    };
+    const normalizedPayload = record(event.payload);
+    const snapshot = githubSnapshotUpdate(normalizedPayload);
     if (!snapshot) return;
     const appliedAt = now();
     await db.update(externalObjects).set({
@@ -259,7 +285,7 @@ export function githubConnectionEventService(
       sql`lower(${externalObjects.externalId}) = lower(${snapshot.externalId})`,
     ));
     if (snapshot.merged && event.action === "closed") {
-      await issueThreadInteractionService(db, { wakeup: options.wakeup })
+      await issueThreadInteractionService(db, { wakeup: summonsOptions.wakeup })
         .sweepMergedPullRequestConfirmations([{
           companyId,
           owner: snapshot.owner,
@@ -267,6 +293,122 @@ export function githubConnectionEventService(
           number: snapshot.number,
         }]);
     }
+    await maybeDispatchSableSeatSummons(
+      companyId,
+      normalizedPayload,
+      snapshot,
+      summonsOptions,
+    );
+  }
+
+  /**
+   * R1 automatic Sable seat dispatch (SPA-13735 d11).
+   *
+   * Hook point: after the existing snapshot update in applyPullRequestEvent.
+   * Runs only on opened/synchronize/reopened carrying a file list derivable
+   * WITHOUT new network calls. Dispatch reads the SAME normalized payload object passed to githubSnapshotUpdate (never raw event.payload, which would bypass the normalizeLeasedPayload allowlist). The allowlist
+   * carries no changedFiles, so the signal is whatever file-bearing field IS
+   * present — currently none — and the dispatch fail-closes (log + skip) when
+   * no file list is present. Never add a GitHub API fetch here.
+   *
+   * Author source: the leased payload's sender fields are the EVENT SENDER,
+   * NOT the PR author. There is no author identity on the leased payload, so
+   * the summons payload's prAuthorActor pair is recorded as unknown with a
+   * matching limitation note (d10 route fail-closes on a missing author pair;
+   * a later leaf enriching Cloud normalization is the path that unblocks a
+   * real author, not a guess here).
+   *
+   * Coordination: dedupeKey is the shared overlap guard with the SPA-13661
+   * arming path — both filers use the same key so one seat card per PR event
+   * (this dispatch passes it as the interaction idempotencyKey; the arming
+   * path checks the same key to avoid double-filing).
+   *
+   * Target resolution: the seat card needs an issue on this company to host
+   * the summons interaction. This seam has no such issue (the snapshot update
+   * writes externalObjects, not issues), so target resolution is ambiguous
+   * and the dispatch fails closed (log + skip, no card). Documented, not
+   * silent. This function stays closure-private: there is no test seam export; unit tests cover the exported contract below (pr-seat-dispatch.test.ts covers the qualify/dedupe/title contract; exporting this seam is deferred).
+   */
+  async function maybeDispatchSableSeatSummons(
+    companyId: string,
+    payload: Record<string, unknown>,
+    snapshot: NonNullable<ReturnType<typeof githubSnapshotUpdate>>,
+    options: SableSeatSummonsOptions = {},
+  ): Promise<{ dispatched: boolean; reason: string }> {
+    const action = typeof payload.action === "string" ? payload.action : null;
+    if (action !== "opened" && action !== "synchronize" && action !== "reopened") {
+      return { dispatched: false, reason: "action_not_dispatchable" };
+    }
+    // No new network calls: only a file list already on the payload counts.
+    // Defensive cap: the normalized allowlist carries no list field today,
+    // so this stays null; slice bounds a future allowlist entry.
+    const rawFiles = (payload as { changedFiles?: unknown }).changedFiles;
+    const changedFiles = Array.isArray(rawFiles)
+      ? rawFiles.filter((file): file is string => typeof file === "string").slice(0, 200)
+      : null;
+    if (!changedFiles) {
+      logger.info({
+        companyId,
+        repository: snapshot.repository,
+        number: snapshot.number,
+      }, "sable-seat dispatch skipped: no changed-file signal on leased payload");
+      return { dispatched: false, reason: "no_changed_files" };
+    }
+    const verdict = prQualifiesForSableSeat({ changedFiles });
+    if (!verdict.qualifies) {
+      return { dispatched: false, reason: "not_qualifying" };
+    }
+    const key = dedupeKey({ owner: snapshot.owner, repo: snapshot.repo, number: snapshot.number });
+    if (!key) {
+      logger.warn({ companyId }, "sable-seat dispatch skipped: invalid PR ref");
+      return { dispatched: false, reason: "invalid_pr_ref" };
+    }
+    const resolveSeatCardIssue = options.resolveSeatCardIssue ?? (async () => null);
+    const seatIssue = await resolveSeatCardIssue(companyId, snapshot);
+    if (!seatIssue) {
+      logger.info({
+        companyId,
+        repository: snapshot.repository,
+        number: snapshot.number,
+        dedupeKey: key,
+      }, "sable-seat dispatch skipped: no seat-card issue resolved for company");
+      return { dispatched: false, reason: "no_seat_card_issue" };
+    }
+    const serviceFactory = options.createSeatSummons ?? issueThreadInteractionService;
+    const service = options.interactionService ?? serviceFactory(db, { wakeup: options.wakeup });
+    await service.create(
+      { id: seatIssue.id, companyId },
+      {
+        kind: "request_confirmation",
+        idempotencyKey: key,
+        continuationPolicy: "none",
+        title: seatCardTitle({ owner: snapshot.owner, repo: snapshot.repo, number: snapshot.number }),
+        payload: {
+          version: 1,
+          prompt: `Sable review requested for ${snapshot.repository}#${snapshot.number}.`,
+          detailsMarkdown: `Matched surfaces: ${verdict.matchedPatterns.join(", ")}.`,
+          // SCHEMA-STRIP GAP (admitted): the request_confirmation zod schema
+          // strips unknown keys at create AND hydrate, so tags /
+          // prAuthorActorId / prAuthorActorType below do NOT survive — a
+          // dispatched summons is currently NOT detectable by
+          // isSeatSummonsInteraction. Detection waits on a schema extension
+          // in a later deliverable (shared validators file is out of scope
+          // here). Dispatch is kept; detection is pending. prAuthorActorId /
+          // prAuthorActorType are null here because the leased payload carries
+          // no PR-author identity.
+          ...({ tags: ["seat-summons", "sable-seat"], prAuthorActorId: null, prAuthorActorType: null } as {
+            tags: string[];
+            prAuthorActorId: null;
+            prAuthorActorType: null;
+          }),
+        } as unknown as Extract<
+          import("@paperclipai/shared").CreateIssueThreadInteraction,
+          { kind: "request_confirmation" }
+        >["payload"],
+      },
+      { systemId: "system:sable-seat-dispatch" },
+    );
+    return { dispatched: true, reason: "dispatched" };
   }
 
   async function applyInstallationEvent(database: Db, binding: GitHubBinding, event: LeasedEvent) {
@@ -370,7 +512,7 @@ export function githubConnectionEventService(
     const postCommitPublications: ActivityPublication[] = [];
     try {
       const applyAndFinalize = async (database: Db) => {
-        if (event.event === "pull_request") await applyPullRequestEvent(companyId, normalizedEvent);
+        if (event.event === "pull_request") await applyPullRequestEvent(companyId, normalizedEvent, { wakeup: options.wakeup });
         if (event.event === "installation" || event.event === "installation_repositories") {
           for (const binding of bindings) await applyInstallationEvent(database, binding, normalizedEvent);
         } else {
