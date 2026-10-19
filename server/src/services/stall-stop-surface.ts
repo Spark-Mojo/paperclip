@@ -4,7 +4,8 @@
  * When the same issue's runs fail terminally with error_code
  * `model_stream_stalled` N times in a row, the engine stops scheduling
  * further automatic runs for it, moves the card to `blocked`, and posts a
- * single board-visible note (deduped on STALL_STOP_SURFACE_MARKER). Only an
+ * single board-visible note (deduped per stall episode on
+ * stallStopNoticeMarker(newestRunId)). Only an
  * explicit human unblock resumes automatic work; bare board comments do not
  * re-arm. Server-side recovery retries bypass this module entirely — the
  * caller wires that, so this module never gates recovery.
@@ -20,14 +21,36 @@ export const STALL_STOP_ERROR_CODE = "model_stream_stalled";
 export const STALL_STOP_THRESHOLD = 3;
 
 /**
- * First line of the single board-visible note; also the dedup key the
- * caller uses to post it exactly once per stall episode.
+ * First-line prefix of the board-visible note; callers use the per-episode
+ * marker from stallStopNoticeMarker as the dedup key so a genuinely later
+ * streak (different newest run id) posts a fresh note while a concurrent
+ * duplicate of the same streak still dedups.
  */
 export const STALL_STOP_SURFACE_MARKER = "stop-and-surface:model_stream_stalled";
 
-/** Named unblock actions (actorType must be "user"). `status_changed` is NOT
- * listed here: it is direction-checked in isExplicitHumanUnblock (only a user
- * move FROM `blocked` TO a non-blocked status counts). */
+/**
+ * Per-stall-episode marker embedded as the first line of the notice. Keying
+ * dedup on this (instead of the bare, forever-global prefix) means a
+ * concurrent duplicate evaluation of the SAME streak (same newest counted
+ * run) still posts exactly one comment, while a genuinely later streak (a
+ * different newest run id) posts a fresh one. Mirrors
+ * issueRewakeCircuitBreakerNoticeMarker.
+ */
+export function stallStopNoticeMarker(newestRunId: string): string {
+  return `${STALL_STOP_SURFACE_MARKER} (run ${newestRunId})`;
+}
+
+/** agentWakeupRequests reason recorded when the stop first trips (R3). */
+export const STALL_STOP_SURFACE_TRIPPED_REASON = "stall_stop_surface_tripped";
+
+/** agentWakeupRequests reason recorded while a tripped stop holds (R4). */
+export const STALL_STOP_SURFACE_HELD_REASON = "stall_stop_surface_held";
+
+/** Named unblock actions (actorType must be "user"). `status_changed` and
+ * `issue.updated` are NOT listed here: they are direction-checked in
+ * isExplicitHumanUnblock (only a user move FROM `blocked` TO a non-blocked
+ * status counts). `issue.updated` is the real logged action for a status
+ * move (see routes/issues.ts); `status_changed` is kept as a harmless alias. */
 export const STALL_STOP_UNBLOCK_ACTIONS: ReadonlySet<string> = new Set([
   "issue.unblocked",
   "issue_unblocked",
@@ -67,14 +90,15 @@ export function shouldStopSurface(streak: number): boolean {
 /**
  * Board-visible note for one stall episode. Precondition: runIds holds the
  * counted streak (newest first); when empty the count falls back to
- * STALL_STOP_THRESHOLD and the run list renders as `(none)`. The marker is
- * always the first line.
+ * STALL_STOP_THRESHOLD and the run list renders as `(none)`. The
+ * per-episode marker stallStopNoticeMarker(newest) is always the first line.
  */
 export function buildStallStopNotice(runIds: string[]): string {
   const count = runIds.length > 0 ? runIds.length : STALL_STOP_THRESHOLD;
+  const newestRunId = runIds[0] ?? "unknown";
   const runList = runIds.map((id) => `\`${id}\``).join(", ") || "(none)";
   return [
-    STALL_STOP_SURFACE_MARKER,
+    stallStopNoticeMarker(newestRunId),
     `The last ${count} consecutive runs failed with error code \`${STALL_STOP_ERROR_CODE}\` and no automatic recovery succeeded.`,
     `Runs counted toward this streak, newest first: ${runList}.`,
     "This card was moved to `blocked` so it stops consuming runs on a stalled model stream.",
@@ -85,9 +109,11 @@ export function buildStallStopNotice(runIds: string[]): string {
 /**
  * True only for a human ("user") actor performing a status-change-off-blocked
  * or the named unblock action. Bare board comments (`comment_added` by any
- * actor) and all system/agent actions return false. A `status_changed` move
- * INTO `blocked`, `blocked`->`blocked`, or one with missing from/to returns
- * false — only a user move FROM `blocked` TO a non-blocked status re-arms.
+ * actor) and all system/agent actions return false. A status-change move
+ * (`issue.updated`, the real logged action for a status move, or the
+ * `status_changed` alias) INTO `blocked`, `blocked`->`blocked`, or one with
+ * missing from/to returns false — only a user move FROM `blocked` TO a
+ * non-blocked status re-arms.
  */
 export function isExplicitHumanUnblock(input: {
   actorType: string | null;
@@ -96,7 +122,7 @@ export function isExplicitHumanUnblock(input: {
   toStatus?: string | null;
 }): boolean {
   if (input.actorType !== "user") return false;
-  if (input.action === "status_changed") {
+  if (input.action === "status_changed" || input.action === "issue.updated") {
     if (input.fromStatus !== "blocked") return false;
     if (!input.toStatus || input.toStatus === "blocked") return false;
     return true;

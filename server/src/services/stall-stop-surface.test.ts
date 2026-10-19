@@ -7,6 +7,7 @@ import {
   evaluateStallWake,
   isExplicitHumanUnblock,
   shouldStopSurface,
+  stallStopNoticeMarker,
   type StallStopRunSample,
 } from "./stall-stop-surface.js";
 
@@ -89,16 +90,33 @@ describe("countStallStreak / shouldStopSurface", () => {
   });
 });
 
+describe("stallStopNoticeMarker", () => {
+  it("same newest run id => same marker", () => {
+    expect(stallStopNoticeMarker("r3")).toBe(stallStopNoticeMarker("r3"));
+  });
+
+  it("different newest run id => different marker", () => {
+    expect(stallStopNoticeMarker("r3")).not.toBe(stallStopNoticeMarker("r4"));
+  });
+
+  it("marker starts with the episode-independent prefix", () => {
+    expect(stallStopNoticeMarker("r3").startsWith(STALL_STOP_SURFACE_MARKER)).toBe(true);
+  });
+});
+
 describe("buildStallStopNotice", () => {
-  it("first line is exactly the marker", () => {
+  it("first line is the per-episode marker (run id embedded)", () => {
     const notice = buildStallStopNotice(["r3", "r2", "r1"]);
-    expect(notice.split("\n")[0]).toBe(STALL_STOP_SURFACE_MARKER);
-    expect(notice.split("\n")[0]).toBe("stop-and-surface:model_stream_stalled");
+    const firstLine = notice.split("\n")[0];
+    expect(firstLine).toBe(stallStopNoticeMarker("r3"));
+    expect(firstLine.startsWith(STALL_STOP_SURFACE_MARKER)).toBe(true);
+    expect(firstLine).toContain("r3");
   });
 
   it("empty runIds still emits marker first line with threshold count", () => {
     const notice = buildStallStopNotice([]);
-    expect(notice.split("\n")[0]).toBe(STALL_STOP_SURFACE_MARKER);
+    expect(notice.split("\n")[0]).toBe(stallStopNoticeMarker("unknown"));
+    expect(notice.split("\n")[0].startsWith(STALL_STOP_SURFACE_MARKER)).toBe(true);
     expect(notice).toContain("3");
     expect(notice).toContain("(none)");
   });
@@ -154,6 +172,54 @@ describe("isExplicitHumanUnblock", () => {
     ).toBe(false);
     expect(
       isExplicitHumanUnblock({ actorType: "user", action: "status_changed", toStatus: "todo" }),
+    ).toBe(false);
+  });
+
+  it("user issue.updated change blocked->todo is true", () => {
+    expect(
+      isExplicitHumanUnblock({
+        actorType: "user",
+        action: "issue.updated",
+        fromStatus: "blocked",
+        toStatus: "todo",
+      }),
+    ).toBe(true);
+  });
+
+  it("user issue.updated change todo->blocked (into blocked) is false", () => {
+    expect(
+      isExplicitHumanUnblock({
+        actorType: "user",
+        action: "issue.updated",
+        fromStatus: "todo",
+        toStatus: "blocked",
+      }),
+    ).toBe(false);
+  });
+
+  it("user issue.updated change blocked->blocked is false", () => {
+    expect(
+      isExplicitHumanUnblock({
+        actorType: "user",
+        action: "issue.updated",
+        fromStatus: "blocked",
+        toStatus: "blocked",
+      }),
+    ).toBe(false);
+  });
+
+  it("user issue.updated title-edit shape (no status transition) is false", () => {
+    // A later trivial issue.updated (title edit) carries details without a
+    // status transition, so fromStatus/toStatus resolve to null — it must
+    // not count as an unblock and (per the heartbeat re-arm window) must not
+    // shadow a genuine earlier unblock.
+    expect(
+      isExplicitHumanUnblock({
+        actorType: "user",
+        action: "issue.updated",
+        fromStatus: null,
+        toStatus: null,
+      }),
     ).toBe(false);
   });
 

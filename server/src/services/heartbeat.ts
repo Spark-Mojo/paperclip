@@ -360,6 +360,16 @@ import {
   type RunLivenessClassificationInput,
 } from "./run-liveness.js";
 import {
+  buildStallStopNotice,
+  countStallStreak,
+  isExplicitHumanUnblock,
+  shouldStopSurface,
+  STALL_STOP_SURFACE_HELD_REASON,
+  STALL_STOP_SURFACE_TRIPPED_REASON,
+  STALL_STOP_UNBLOCK_ACTIONS,
+  stallStopNoticeMarker,
+} from "./stall-stop-surface.js";
+import {
   ISSUE_NEW_INPUT_ACTIVITY_ACTIONS,
   ISSUE_PROGRESS_ACTIVITY_ACTIONS,
   ISSUE_REWAKE_LOOKBACK_MS,
@@ -29635,6 +29645,7 @@ export function heartbeatService(
               .select({
                 id: heartbeatRuns.id,
                 status: heartbeatRuns.status,
+                errorCode: heartbeatRuns.errorCode,
                 startedAt: heartbeatRuns.startedAt,
                 finishedAt: heartbeatRuns.finishedAt,
               })
@@ -29653,6 +29664,203 @@ export function heartbeatService(
               )
               .orderBy(desc(heartbeatRuns.finishedAt))
               .limit(ISSUE_REWAKE_RUN_SAMPLE_LIMIT);
+
+            // Stop-and-surface for repeated model-stream stalls. This gate
+            // lives here (not on the recovery path) for the same reason the
+            // comment at 29605-29606 notes: server-side recovery retries
+            // insert runs directly and never reach this gate, so they are
+            // unaffected by the stop. Unlike the no-progress breaker below,
+            // this fires for any card (no human-ownership check) and is
+            // evaluated for every breaker-rewake candidate wake, including
+            // handoff reasons — it is NOT gated on
+            // isOrdinaryThrottleCandidate.
+            const stallStreak = countStallStreak(recentTerminalRuns);
+            if (shouldStopSurface(stallStreak.streak)) {
+              const newestStallFinishedAt =
+                recentTerminalRuns[0]?.finishedAt ?? null;
+              // R5 re-arm: an explicit human unblock after the newest counted
+              // run finished resets the streak. A bare board comment never
+              // clears the stop. A later trivial issue.updated (e.g. a title
+              // edit with no status transition) must not shadow a genuine
+              // earlier unblock, so the query reads a small newest-first
+              // window and .some() scans ALL returned rows. Status
+              // moves land in activity_log as "issue.updated" with the
+              // transition in details._previous.status (issue-review-policy
+              // shape) or details.changes.status.from; named unblock actions
+              // count under isExplicitHumanUnblock semantics (actorType
+              // "user" only). "status_changed" is the alias the pure helper
+              // accepts, so it stays in the allowlist too.
+              const postStreakUnblockCandidates = newestStallFinishedAt
+                ? await tx
+                    .select({
+                      actorType: activityLog.actorType,
+                      action: activityLog.action,
+                      details: activityLog.details,
+                    })
+                    .from(activityLog)
+                    .where(
+                      and(
+                        eq(activityLog.companyId, issue.companyId),
+                        eq(activityLog.entityType, "issue"),
+                        eq(activityLog.entityId, issue.id),
+                        eq(activityLog.actorType, "user"),
+                        gt(activityLog.createdAt, newestStallFinishedAt),
+                        inArray(
+                          activityLog.action,
+                          Array.from(
+                            new Set([
+                              "issue.updated",
+                              "status_changed",
+                              ...STALL_STOP_UNBLOCK_ACTIONS,
+                            ]),
+                          ),
+                        ),
+                      ),
+                    )
+                    .orderBy(
+                      desc(activityLog.createdAt),
+                      desc(activityLog.id),
+                    )
+                    .limit(20)
+                : [];
+              const humanUnblockedAfterStreak =
+                postStreakUnblockCandidates.some((row) => {
+                  const details =
+                    (row.details as Record<string, unknown> | null) ?? null;
+                  const previous =
+                    (details?._previous as
+                      | Record<string, unknown>
+                      | undefined) ?? undefined;
+                  const changes =
+                    (details?.changes as
+                      | Record<string, { from?: unknown; to?: unknown }>
+                      | undefined) ?? undefined;
+                  const fromStatus =
+                    typeof previous?.status === "string"
+                      ? (previous.status as string)
+                      : typeof changes?.status?.from === "string"
+                        ? (changes.status.from as string)
+                        : null;
+                  const toStatus =
+                    typeof details?.status === "string"
+                      ? (details.status as string)
+                      : typeof changes?.status?.to === "string"
+                        ? (changes.status.to as string)
+                        : null;
+                  return isExplicitHumanUnblock({
+                    actorType: row.actorType,
+                    action: row.action,
+                    fromStatus,
+                    toStatus,
+                  });
+                });
+              if (!humanUnblockedAfterStreak) {
+                const stallSkipShape = {
+                  ...durableReceiptFields,
+                  companyId: agent.companyId,
+                  agentId,
+                  source,
+                  triggerDetail,
+                  payload: {
+                    ...(payload ?? {}),
+                    issueId,
+                    heartbeatSkip: {
+                      reason: "",
+                      requestedReason: reason,
+                      streak: stallStreak.streak,
+                      runIds: stallStreak.runIds,
+                    },
+                  },
+                  status: "skipped" as const,
+                  requestedByActorType: opts.requestedByActorType ?? null,
+                  requestedByActorId: opts.requestedByActorId ?? null,
+                  idempotencyKey: opts.idempotencyKey ?? null,
+                  finishedAt: throttleNow,
+                };
+                // Per-episode dedup: keyed on THIS streak's marker (newest
+                // counted run), not the bare prefix — a concurrent duplicate
+                // of the same streak still posts exactly one note, while a
+                // genuinely later streak posts a fresh one. Mirrors the
+                // issueRewakeCircuitBreakerNoticeMarker pattern below.
+                const stallNoticeMarker = stallStopNoticeMarker(
+                  stallStreak.runIds[0] ?? "unknown",
+                );
+                const existingStallNotice = await tx
+                  .select({ id: issueComments.id })
+                  .from(issueComments)
+                  .where(
+                    and(
+                      eq(issueComments.companyId, issue.companyId),
+                      eq(issueComments.issueId, issue.id),
+                      sql`${issueComments.body} like ${`${stallNoticeMarker}%`}`,
+                    ),
+                  )
+                  .limit(1)
+                  .then((rows) => rows[0] ?? null);
+                if (
+                  issue.status === "blocked" &&
+                  existingStallNotice
+                ) {
+                  // R4 silence: already held — no new note, no new run.
+                  await tx.insert(agentWakeupRequests).values({
+                    ...stallSkipShape,
+                    reason: STALL_STOP_SURFACE_HELD_REASON,
+                    payload: {
+                      ...(stallSkipShape.payload ?? {}),
+                      heartbeatSkip: {
+                        ...(
+                          stallSkipShape.payload as {
+                            heartbeatSkip: Record<string, unknown>;
+                          }
+                        ).heartbeatSkip,
+                        reason: STALL_STOP_SURFACE_HELD_REASON,
+                      },
+                    },
+                  });
+                  return { kind: "skipped" as const };
+                }
+                // First fire (R3): move to blocked, post exactly one notice.
+                if (issue.status !== "blocked") {
+                  await tx
+                    .update(issues)
+                    .set({
+                      status: "blocked",
+                      updatedAt: throttleNow,
+                    })
+                    .where(
+                      and(
+                        eq(issues.id, issue.id),
+                        eq(issues.companyId, issue.companyId),
+                      ),
+                    );
+                }
+                if (!existingStallNotice) {
+                  await issuesSvc.addComment(
+                    issue.id,
+                    buildStallStopNotice(stallStreak.runIds),
+                    {},
+                    { authorType: "system" },
+                    tx,
+                  );
+                }
+                await tx.insert(agentWakeupRequests).values({
+                  ...stallSkipShape,
+                  reason: STALL_STOP_SURFACE_TRIPPED_REASON,
+                  payload: {
+                    ...(stallSkipShape.payload ?? {}),
+                    heartbeatSkip: {
+                      ...(
+                        stallSkipShape.payload as {
+                          heartbeatSkip: Record<string, unknown>;
+                        }
+                      ).heartbeatSkip,
+                      reason: STALL_STOP_SURFACE_TRIPPED_REASON,
+                    },
+                  },
+                });
+                return { kind: "skipped" as const };
+              }
+            }
 
             if (recentTerminalRuns.length > 0) {
               const sampleRunIds = recentTerminalRuns.map(
