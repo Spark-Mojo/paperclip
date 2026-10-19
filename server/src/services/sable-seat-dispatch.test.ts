@@ -90,6 +90,62 @@ describe("prQualifiesForSableSeat — SPA-13735", () => {
     ).toBe(true);
   });
 
+  it("qualifies gh-workflows only at the repo root", () => {
+    expect(
+      prQualifiesForSableSeat({ changedFiles: [".github/workflows/ci.yml"] })
+        .matchedPatterns,
+    ).toContain("gh-workflows");
+    expect(
+      prQualifiesForSableSeat({
+        changedFiles: ["docs/.github/workflows/example.yml"],
+      }).qualifies,
+    ).toBe(false);
+    expect(
+      prQualifiesForSableSeat({
+        changedFiles: ["fake.github/workflows/example.yml"],
+      }).qualifies,
+    ).toBe(false);
+  });
+
+  it("does not match bench prose (my-bench-notes, benchfile-guide)", () => {
+    expect(
+      prQualifiesForSableSeat({
+        changedFiles: ["docs/my-bench-notes.md"],
+      }).qualifies,
+    ).toBe(false);
+    expect(
+      prQualifiesForSableSeat({
+        changedFiles: ["docs/benchfile-guide.md"],
+      }).qualifies,
+    ).toBe(false);
+    // Positive control: real bench surface still qualifies.
+    expect(
+      prQualifiesForSableSeat({ changedFiles: ["sites/bench.config.json"] })
+        .qualifies,
+    ).toBe(true);
+  });
+
+  it("qualifies bench-setup.sh but not root my-bench-notes.md (left-anchor)", () => {
+    // Right-side `-` delimiter restored: root bench-setup.sh qualifies.
+    expect(
+      prQualifiesForSableSeat({ changedFiles: ["bench-setup.sh"] })
+        .matchedPatterns,
+    ).toContain("bench");
+    // Left side stays segment-anchored: a `my-` prefix blocks the match
+    // even at root (no directory prefix to hide behind).
+    expect(
+      prQualifiesForSableSeat({ changedFiles: ["my-bench-notes.md"] })
+        .qualifies,
+    ).toBe(false);
+    // Positive controls: bare dir segment and bare Benchfile still qualify.
+    expect(
+      prQualifiesForSableSeat({ changedFiles: ["bench/"] }).qualifies,
+    ).toBe(true);
+    expect(
+      prQualifiesForSableSeat({ changedFiles: ["Benchfile"] }).qualifies,
+    ).toBe(true);
+  });
+
   it("ignores malformed changedFiles entries", () => {
     const result = prQualifiesForSableSeat({
       // @ts-expect-error — nulls/numbers are tolerated, not thrown.
