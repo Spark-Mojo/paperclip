@@ -240,11 +240,55 @@ export function githubConnectionEventService(
     return bindingRows(rows);
   }
 
+  async function defaultResolveSeatCardIssue(
+    companyId: string,
+    snapshot: NonNullable<ReturnType<typeof githubSnapshotUpdate>>,
+    matchedPatterns: string[],
+    key: string,
+  ): Promise<{ id: string } | null> {
+    // Real default resolver (SPA-13735 d19): file the seat card via
+    // issues.create. Dynamic import (cycle precedent: issue-thread-interactions
+    // is the static importer here; issues.ts reaches back via dynamic import,
+    // e.g. issues.ts:11645/11757/13722 — verified ./issues.js path, not
+    // invented). UNASSIGNED: no seat→assignee map exists in this codebase; the
+    // Sable-seat owner comes from board context, so no agent id is invented
+    // here. idempotencyKey = dedupeKey: the shared overlap guard with the
+    // SPA-13661 arming path (both filers use the same key so one seat card
+    // per PR event) — SPA-13661 is still comments-only, so until it reads
+    // this key the guard is one-sided here, not yet mutual. On create failure
+    // → log + return null (fail closed, no summons without a card).
+    try {
+      const { issueService } = await import("./issues.js");
+      const issue = await issueService(db).create(companyId, {
+        title: seatCardTitle({ owner: snapshot.owner, repo: snapshot.repo, number: snapshot.number }),
+        description: [
+          `Sable seat review for ${snapshot.owner}/${snapshot.repo}#${snapshot.number}.`,
+          `PR: ${snapshot.repository}#${snapshot.number}`,
+          `Matched surfaces: ${matchedPatterns.join(", ")}.`,
+        ].join("\n"),
+        status: "todo",
+        priority: "medium",
+        idempotencyKey: key,
+      });
+      return { id: issue.id };
+    } catch (error) {
+      logger.warn({
+        err: error,
+        companyId,
+        repository: snapshot.repository,
+        number: snapshot.number,
+        dedupeKey: key,
+      }, "sable-seat seat-card create failed: no summons without a card");
+      return null;
+    }
+  }
+
   type SableSeatSummonsOptions = {
     createSeatSummons?: typeof issueThreadInteractionService;
     resolveSeatCardIssue?: (
       companyId: string,
       snapshot: NonNullable<ReturnType<typeof githubSnapshotUpdate>>,
+      matchedPatterns: string[],
     ) => Promise<{ id: string } | null>;
     interactionService?: ReturnType<typeof issueThreadInteractionService>;
     wakeup?: NonNullable<Parameters<typeof issueThreadInteractionService>[1]>["wakeup"];
@@ -324,9 +368,11 @@ export function githubConnectionEventService(
    * path checks the same key to avoid double-filing).
    *
    * Target resolution: the seat card needs an issue on this company to host
-   * the summons interaction. This seam has no such issue (the snapshot update
-   * writes externalObjects, not issues), so target resolution is ambiguous
-   * and the dispatch fails closed (log + skip, no card). Documented, not
+   * the summons interaction. The default resolver files the seat card via
+   * issues.create (idempotencyKey=dedupeKey, unassigned — the Sable-seat
+   * owner comes from board context, so no agent id is invented here). An
+   * injected resolver may override it; absent any resolved issue the
+   * dispatch fails closed (log + skip, no card). Documented, not
    * silent. This function stays closure-private: there is no test seam export; unit tests cover the exported contract below (pr-seat-dispatch.test.ts covers the qualify/dedupe/title contract; exporting this seam is deferred).
    */
   async function maybeDispatchSableSeatSummons(
@@ -363,8 +409,8 @@ export function githubConnectionEventService(
       logger.warn({ companyId }, "sable-seat dispatch skipped: invalid PR ref");
       return { dispatched: false, reason: "invalid_pr_ref" };
     }
-    const resolveSeatCardIssue = options.resolveSeatCardIssue ?? (async () => null);
-    const seatIssue = await resolveSeatCardIssue(companyId, snapshot);
+    const resolveSeatCardIssue = options.resolveSeatCardIssue ?? ((c, s, m) => defaultResolveSeatCardIssue(c, s, m, key));
+    const seatIssue = await resolveSeatCardIssue(companyId, snapshot, verdict.matchedPatterns);
     if (!seatIssue) {
       logger.info({
         companyId,
@@ -387,15 +433,13 @@ export function githubConnectionEventService(
           version: 1,
           prompt: `Sable review requested for ${snapshot.repository}#${snapshot.number}.`,
           detailsMarkdown: `Matched surfaces: ${verdict.matchedPatterns.join(", ")}.`,
-          // SCHEMA-STRIP GAP (admitted): the request_confirmation zod schema
-          // strips unknown keys at create AND hydrate, so tags /
-          // prAuthorActorId / prAuthorActorType below do NOT survive — a
-          // dispatched summons is currently NOT detectable by
-          // isSeatSummonsInteraction. Detection waits on a schema extension
-          // in a later deliverable (shared validators file is out of scope
-          // here). Dispatch is kept; detection is pending. prAuthorActorId /
+          // d15/d16 extended the schema: optional tags/prAuthor survive
+          // create AND hydrate, and author is server-derived — so tags below
+          // ARE detectable by isSeatSummonsInteraction. prAuthorActorId /
           // prAuthorActorType are null here because the leased payload carries
-          // no PR-author identity.
+          // no PR-author identity; dispatch uses the {systemId} actor → null
+          // author pair, so the d10 guard fail-closes pending the enrichment
+          // leaf that unblocks a real author (never a guess here).
           ...({ tags: ["seat-summons", "sable-seat"], prAuthorActorId: null, prAuthorActorType: null } as {
             tags: string[];
             prAuthorActorId: null;
