@@ -198,6 +198,10 @@ import {
 
 export const DONE_GATE_OPEN_PR_REFUSAL = "issue_done_with_unmerged_pull_request";
 export const DONE_GATE_INCOMPLETE_STAGE_REFUSAL = "issue_done_with_incomplete_execution_stage";
+// SPA-13737 — escalation close-guard: an escalation issue (stranded-issue
+// recovery, harness-liveness escalation) may not reach `done` without an
+// action-evidence receipt on the card.
+export const DONE_GATE_ESCALATION_RECEIPT_REFUSAL = "issue_done_without_escalation_receipt";
 
 export function assertIssueExecutionStagesComplete(issue: {
   executionPolicy?: unknown;
@@ -284,7 +288,8 @@ export type DoneGatePullRequestState = {
 export type DoneGateBlockedReason =
   | { kind: "open_pull_requests"; pullRequests: DoneGatePullRequestState[] }
   | { kind: "unknown_pull_request_state"; pullRequests: DoneGatePullRequestState[] }
-  | { kind: "unresolved_pull_request_reference"; numbers: number[] };
+  | { kind: "unresolved_pull_request_reference"; numbers: number[] }
+  | { kind: "missing_escalation_action_receipt"; originKind: string };
 
 export type DoneGateDecision =
   | { outcome: "allow" }
@@ -394,6 +399,73 @@ function gateStateFromDetails(details: PullRequestMergeDetails): "merged" | "ope
   if (details.workProductState === "closed") return "closed";
   if (details.state === "open") return "open";
   return "unknown";
+}
+
+/**
+ * SPA-13737 — escalation close-guard input. `originKind` is the issue's stored
+ * `origin_kind`; `doneGateOverride` is the route-minted bypass (board-only).
+ */
+export const ESCALATION_CLOSE_GUARD_ORIGIN_KINDS: ReadonlySet<string> = new Set([
+  "stranded_issue_recovery",
+  "harness_liveness_escalation",
+]);
+
+export const ESCALATION_ACTION_EVIDENCE_WORK_PRODUCT_TYPES: ReadonlySet<string> = new Set([
+  "pull_request",
+  "commit",
+  "branch",
+]);
+
+export async function issueHasEscalationActionReceipt(
+  db: Db,
+  issue: { id: string; companyId: string },
+): Promise<boolean> {
+  // Fail closed: no positive control (a qualifying row) means no receipt.
+  const rows = await db
+    .select({
+      id: issueWorkProducts.id,
+      type: issueWorkProducts.type,
+      externalId: issueWorkProducts.externalId,
+      url: issueWorkProducts.url,
+      createdByRunId: issueWorkProducts.createdByRunId,
+    })
+    .from(issueWorkProducts)
+    .where(and(
+      eq(issueWorkProducts.companyId, issue.companyId),
+      eq(issueWorkProducts.issueId, issue.id),
+      inArray(issueWorkProducts.type, [...ESCALATION_ACTION_EVIDENCE_WORK_PRODUCT_TYPES]),
+    ))
+    .limit(100);
+  for (const row of rows) {
+    if (row.externalId !== null && row.externalId !== "") return true;
+    if (row.url !== null && row.url !== "") return true;
+    if (row.createdByRunId !== null && row.createdByRunId !== undefined) return true;
+  }
+  return false;
+}
+
+export async function checkEscalationCloseGuard(
+  db: Db,
+  input: {
+    issue: { id: string; companyId: string; originKind?: string | null };
+    doneGateOverride?: unknown;
+  },
+): Promise<DoneGateDecision> {
+  const originKind = input.issue.originKind ?? null;
+  if (!originKind || !ESCALATION_CLOSE_GUARD_ORIGIN_KINDS.has(originKind)) {
+    return { outcome: "allow" };
+  }
+  // Board-only override bypasses (never agent-supplied; the route rejects
+  // agent overrides before this point). No resolution-note branch: the issue
+  // update path carries no resolution note (verified 2026-10-19 — the update
+  // options type has doneGateOverride/doneGateBypass only, and resolutionNote
+  // lives on recovery-action resolution), so a note branch here would be a
+  // dead allow-path.
+  if (input.doneGateOverride) return { outcome: "allow" };
+  if (await issueHasEscalationActionReceipt(db, input.issue)) {
+    return { outcome: "allow" };
+  }
+  return { outcome: "refuse", reason: { kind: "missing_escalation_action_receipt", originKind } };
 }
 
 export function issueDoneGateService(db: Db, opts: IssueDoneGateServiceOptions = {}) {
@@ -868,8 +940,13 @@ export function issueDoneGateService(db: Db, opts: IssueDoneGateServiceOptions =
   }
 
   async function evaluateDoneGate(
-    issue: { id: string; companyId: string; description?: string | null; identifier?: string | null },
+    issue: { id: string; companyId: string; description?: string | null; identifier?: string | null; originKind?: string | null },
   ): Promise<DoneGateDecision> {
+    // SPA-13737 escalation close-guard first: an escalation close without an
+    // action-evidence receipt refuses before the PR gate runs. Passes through
+    // (allow) for non-escalation cards.
+    const escalation = await checkEscalationCloseGuard(db, { issue });
+    if (escalation.outcome === "refuse") return escalation;
     const bound = await listBoundPullRequests(issue);
     const { productReferences, proseReferences, unresolved, attributionByKey } = bound;
     if (unresolved.length > 0) {
@@ -1020,6 +1097,12 @@ export function issueDoneGateService(db: Db, opts: IssueDoneGateServiceOptions =
    * ship a broken payload.
    */
   function refusalError(reason: DoneGateBlockedReason) {
+    if (reason.kind === "missing_escalation_action_receipt") {
+      return conflict(
+        `Issue cannot be marked done: escalation issue (origin ${reason.originKind}) has no action-evidence receipt. Attach a pull_request/commit/branch work product with an external id or url, or use an explicit board doneOverride.`,
+        { code: DONE_GATE_ESCALATION_RECEIPT_REFUSAL, originKind: reason.originKind },
+      );
+    }
     if (reason.kind === "unresolved_pull_request_reference") {
       return conflict(
         `Issue cannot be marked done: relative PR link(s) ${reason.numbers.map((number) => `#${number}`).join(", ")} lack an adjacent (Spark-Mojo/repo) identity. Add the repository next to each link or attach a pull_request work product.`,
@@ -1073,6 +1156,8 @@ export function issueDoneGateService(db: Db, opts: IssueDoneGateServiceOptions =
     refusalError,
     recordOverride,
     listBoundPullRequests,
+    checkEscalationCloseGuard,
+    issueHasEscalationActionReceipt,
   };
 }
 

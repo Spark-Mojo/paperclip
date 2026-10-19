@@ -11310,33 +11310,49 @@ export function issueService(db: Db) {
       // SPA-8957 card-close DoD gate: refuse a first entry into `done` while
       // the card's pull_request work products are unmerged (or unverifiable).
       // Skipped entirely when the caller carries an explicit override (only
-      // the PATCH route can mint one, and only for a user/board actor) or a
-      // system-supplied bypass for internal callers whose done-write is not a
-      // card completion (e.g. the watchdog evaluation fold).
+      // the PATCH route can mint one, and only for a user/board actor).
+      // SPA-13737: the escalation close-guard ALWAYS runs on a close-to-done
+      // (override excepted) — even when the caller carries the system
+      // doneGateBypass for internal folds (e.g. the watchdog evaluation
+      // fold), which skips only the PR gate below. Non-escalation bypass
+      // folds therefore behave exactly as before.
       if (
         existing.status !== "done" &&
         issueData.status === "done" &&
-        !doneGateOverride &&
-        !doneGateBypass
+        !doneGateOverride
       ) {
-        const { assertIssueExecutionStagesComplete, issueDoneGateService } = await import("./issue-done-gate.js");
-        const closingState = issueData.executionState === undefined ? existing.executionState : issueData.executionState;
-        assertIssueExecutionStagesComplete({ executionPolicy: existing.executionPolicy, executionState: closingState });
-        if (issueData.executionPolicy !== undefined) {
-          assertIssueExecutionStagesComplete({ executionPolicy: issueData.executionPolicy, executionState: closingState });
-        }
+        const { assertIssueExecutionStagesComplete, issueDoneGateService, checkEscalationCloseGuard } = await import("./issue-done-gate.js");
         const gate = issueDoneGateService(db);
-        const decision = await gate.evaluateDoneGate({
-          id: existing.id,
-          companyId: existing.companyId,
-          identifier: existing.identifier,
-          // SPA-9038: the card's own description can carry binding PR links.
-          description: typeof issueData.description === "string"
-            ? issueData.description
-            : existing.description,
+        const escalation = await checkEscalationCloseGuard(db, {
+          issue: {
+            id: existing.id,
+            companyId: existing.companyId,
+            originKind: existing.originKind,
+          },
+          doneGateOverride,
         });
-        if (decision.outcome === "refuse") {
-          throw gate.refusalError(decision.reason);
+        if (escalation.outcome === "refuse") {
+          throw gate.refusalError(escalation.reason);
+        }
+        if (!doneGateBypass) {
+          const closingState = issueData.executionState === undefined ? existing.executionState : issueData.executionState;
+          assertIssueExecutionStagesComplete({ executionPolicy: existing.executionPolicy, executionState: closingState });
+          if (issueData.executionPolicy !== undefined) {
+            assertIssueExecutionStagesComplete({ executionPolicy: issueData.executionPolicy, executionState: closingState });
+          }
+          const decision = await gate.evaluateDoneGate({
+            id: existing.id,
+            companyId: existing.companyId,
+            identifier: existing.identifier,
+            originKind: existing.originKind,
+            // SPA-9038: the card's own description can carry binding PR links.
+            description: typeof issueData.description === "string"
+              ? issueData.description
+              : existing.description,
+          });
+          if (decision.outcome === "refuse") {
+            throw gate.refusalError(decision.reason);
+          }
         }
       }
       if (doneGateOverride) {
