@@ -29,16 +29,4 @@ describe("agent wakeup request schema", () => {
     expect(index?.config.where).toBeDefined();
   });
 
-  it("atomically deduplicates stage-decision reroute attempts per company", () => {
-    const index = getTableConfig(agentWakeupRequests).indexes.find(
-      (candidate) => candidate.config.name === "agent_wakeup_requests_stage_decision_reroute_idempotency_uq",
-    );
-
-    expect(index?.config.unique).toBe(true);
-    expect(index?.config.columns.map((column) => (column as { name: string }).name)).toEqual([
-      "company_id",
-      "idempotency_key",
-    ]);
-    expect(index?.config.where).toBeDefined();
-  });
 });

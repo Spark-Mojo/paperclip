@@ -556,4 +556,66 @@ describeEmbeddedPostgres("issue stage decision routes", () => {
     expect(res.status).toBe(409);
     expect(await countDecisions(issueId, seeded.companyId)).toHaveLength(0);
   });
+
+  // SPA-13732 R2 rehearsal: BOTH blocked-entry 422 branches return without
+  // mutating status — the card stays on its prior wakeable status and never
+  // lands on backlog. Branch 1 = terminal-blocker 422 (~13864: named
+  // blockedByIssueIds resolve to done/cancelled). Branch 2 = generic
+  // baseBlockedRefusal 422 (~13876: no unresolved blocker, no pending
+  // interaction/approval, no descriptor). No new guard code under test — the
+  // 422 arms return before any status write, behavior-preserving.
+  it("forced-422 blocked entry on both branches leaves the prior wakeable status byte-equal and never backlog", async () => {
+    const seeded = await seedCompany("PRK");
+
+    async function seedTodoIssue(identifier: string) {
+      const issueId = randomUUID();
+      await db.insert(issues).values({
+        id: issueId,
+        companyId: seeded.companyId,
+        identifier,
+        title: identifier,
+        description: `Park-guard rehearsal for ${identifier}`,
+        status: "todo",
+        priority: "medium",
+        assigneeAgentId: seeded.assigneeAgentId,
+        createdByAgentId: seeded.assigneeAgentId,
+      });
+      return issueId;
+    }
+
+    // Branch 1: terminal-blocker 422 — named blocker is done.
+    const doneBlockerId = randomUUID();
+    await db.insert(issues).values({
+      id: doneBlockerId,
+      companyId: seeded.companyId,
+      identifier: "PRK-DONE",
+      title: "PRK-DONE",
+      description: "terminal blocker",
+      status: "done",
+      priority: "medium",
+      assigneeAgentId: seeded.assigneeAgentId,
+      createdByAgentId: seeded.assigneeAgentId,
+    });
+    const terminalIssueId = await seedTodoIssue("PRK-1");
+    const terminalRunId = await seedRun(seeded.companyId, seeded.assigneeAgentId, terminalIssueId);
+    const terminal = await request(app(agentActor(seeded.companyId, seeded.assigneeAgentId, terminalRunId)))
+      .patch(`/api/issues/${terminalIssueId}`)
+      .send({ status: "blocked", blockedByIssueIds: [doneBlockerId] });
+    expect(terminal.status, JSON.stringify(terminal.body)).toBe(422);
+    const terminalAfter = await readIssue(terminalIssueId);
+    expect(terminalAfter.status).toBe("todo");
+    expect(terminalAfter.status).not.toBe("backlog");
+
+    // Branch 2: generic baseBlockedRefusal 422 — no blockers, no pending
+    // interaction/approval, no descriptor.
+    const genericIssueId = await seedTodoIssue("PRK-2");
+    const genericRunId = await seedRun(seeded.companyId, seeded.assigneeAgentId, genericIssueId);
+    const generic = await request(app(agentActor(seeded.companyId, seeded.assigneeAgentId, genericRunId)))
+      .patch(`/api/issues/${genericIssueId}`)
+      .send({ status: "blocked" });
+    expect(generic.status, JSON.stringify(generic.body)).toBe(422);
+    const genericAfter = await readIssue(genericIssueId);
+    expect(genericAfter.status).toBe("todo");
+    expect(genericAfter.status).not.toBe("backlog");
+  });
 });

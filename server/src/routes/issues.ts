@@ -13163,9 +13163,67 @@ export function issueRoutes(
         },
       });
 
-      // SPA-13732 R1: tx insert in stageDecisionService.decide is the single
-      // wake source (atomic with reroute); no post-commit wake here to avoid
-      // double-wake.
+      // SPA-13732 R1: a stage-decision reroute to changes_requested must queue
+      // exactly one builder run. decide() commits the execution-state change
+      // with NO wake (unlike the PATCH lane, which fires
+      // buildExecutionStageWakeup via heartbeat.wakeup), so enqueue
+      // post-commit best-effort, mirroring the stalled-review-decision wake
+      // above and the PATCH-lane execution_changes_requested payload shape.
+      // Exactly-once per reroute: duplicates never wake, and the
+      // idempotencyKey is per decisionId. The verdict (approve) path is
+      // untouched, as is auto-merge.
+      if (!result.duplicate && result.decision?.outcome === "changes_requested") {
+        try {
+          const nextState = parseIssueExecutionState(
+            result.issue.executionState,
+          );
+          const returnAgentId =
+            nextState?.returnAssignee?.type === "agent"
+              ? (nextState.returnAssignee.agentId ?? null)
+              : null;
+          if (
+            nextState?.status === "changes_requested" &&
+            result.issue.status !== "backlog" &&
+            returnAgentId &&
+            returnAgentId === result.issue.assigneeAgentId
+          ) {
+            const executionStage = buildExecutionStageWakeContext({
+              state: nextState,
+              wakeRole: "executor",
+              allowedActions: ["address_changes", "resubmit"],
+            });
+            await heartbeat.wakeup(returnAgentId, {
+              source: "assignment",
+              triggerDetail: "system",
+              reason: "execution_changes_requested",
+              payload: {
+                issueId: result.issue.id,
+                mutation: "update",
+                executionStage,
+              },
+              idempotencyKey: `stage-decision-changes-requested:${result.issue.id}:${result.decision.id}`,
+              requestedByActorType: actor.actorType,
+              requestedByActorId: actor.actorId,
+              contextSnapshot: {
+                issueId: result.issue.id,
+                taskId: result.issue.id,
+                wakeReason: "execution_changes_requested",
+                source: "issue.execution_stage",
+                executionStage,
+              },
+            });
+          }
+        } catch (err) {
+          logger.warn(
+            {
+              err,
+              issueId: result.issue.id,
+              decisionId: result.decision?.id,
+            },
+            "failed to enqueue stage-decision changes_requested wake",
+          );
+        }
+      }
 
       res.json({
         issue: result.issue,
