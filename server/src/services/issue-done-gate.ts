@@ -435,6 +435,34 @@ export const ESCALATION_ACTION_EVIDENCE_WORK_PRODUCT_TYPES: ReadonlySet<string> 
   "branch",
 ]);
 
+/**
+ * SPA-13737 R2: API-mutation receipts live on artifact/document rows
+ * (externalId/url carry the mutation receipt). Run-id receipts (createdByRunId)
+ * are valid on ANY of the 7 work-product types — run attribution is itself
+ * the evidence. Keep the constant name meaningful: the (a) git-shape set
+ * above is unchanged; the (c) set below extends it.
+ */
+export const ESCALATION_API_MUTATION_RECEIPT_WORK_PRODUCT_TYPES: ReadonlySet<string> = new Set([
+  "artifact",
+  "document",
+]);
+
+/**
+ * SPA-13737 R2: run-id receipts (createdByRunId) are valid on ANY of the 7
+ * taxonomy types (work-product.ts:9-17) — run attribution is itself the
+ * evidence. Restricts branch (b) to the valid taxonomy so an unknown type
+ * string with a run id stays refused (fail-closed).
+ */
+export const ESCALATION_RUN_RECEIPT_WORK_PRODUCT_TYPES: ReadonlySet<string> = new Set([
+  "preview_url",
+  "runtime_service",
+  "pull_request",
+  "branch",
+  "commit",
+  "artifact",
+  "document",
+]);
+
 export async function issueHasEscalationActionReceipt(
   db: Db,
   issue: { id: string; companyId: string },
@@ -442,17 +470,38 @@ export async function issueHasEscalationActionReceipt(
   // Fail closed: no positive control (a qualifying row) means no receipt.
   // The evidence predicate lives in SQL with limit(1): scanning a capped,
   // unordered page in JS would ignore a valid receipt past row 100.
+  // R2/SPA-13737: a row qualifies if EITHER
+  //   (a) type in {pull_request, commit, branch} with non-blank
+  //       externalId/url or createdByRunId set (unchanged), OR
+  //   (b) ANY of the 7 types with createdByRunId set (run-id receipt), OR
+  //   (c) type artifact/document with non-blank externalId/url
+  //       (API-mutation receipt).
   const rows = await db
     .select({ id: issueWorkProducts.id })
     .from(issueWorkProducts)
     .where(and(
       eq(issueWorkProducts.companyId, issue.companyId),
       eq(issueWorkProducts.issueId, issue.id),
-      inArray(issueWorkProducts.type, [...ESCALATION_ACTION_EVIDENCE_WORK_PRODUCT_TYPES]),
       or(
-        sql`coalesce(${issueWorkProducts.externalId}, '') ~ '[^[:space:]]'`,
-        sql`coalesce(${issueWorkProducts.url}, '') ~ '[^[:space:]]'`,
-        isNotNull(issueWorkProducts.createdByRunId),
+        and(
+          inArray(issueWorkProducts.type, [...ESCALATION_ACTION_EVIDENCE_WORK_PRODUCT_TYPES]),
+          or(
+            sql`coalesce(${issueWorkProducts.externalId}, '') ~ '[^[:space:]]'`,
+            sql`coalesce(${issueWorkProducts.url}, '') ~ '[^[:space:]]'`,
+            isNotNull(issueWorkProducts.createdByRunId),
+          ),
+        ),
+        and(
+          inArray(issueWorkProducts.type, [...ESCALATION_RUN_RECEIPT_WORK_PRODUCT_TYPES]),
+          isNotNull(issueWorkProducts.createdByRunId),
+        ),
+        and(
+          inArray(issueWorkProducts.type, [...ESCALATION_API_MUTATION_RECEIPT_WORK_PRODUCT_TYPES]),
+          or(
+            sql`coalesce(${issueWorkProducts.externalId}, '') ~ '[^[:space:]]'`,
+            sql`coalesce(${issueWorkProducts.url}, '') ~ '[^[:space:]]'`,
+          ),
+        ),
       ),
     ))
     .limit(1);
