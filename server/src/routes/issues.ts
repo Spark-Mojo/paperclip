@@ -332,7 +332,8 @@ import {
 } from "../services/issue-thread-interaction-resolution.js";
 import {
   evaluateSeatSummonsResolve,
-  isSeatSummonsInteraction,
+  getSeatSummonsAuthor,
+  isSeatSummonsHydratedInteraction,
 } from "../services/seat-summons-self-resolve-guard.js";
 import { resolveSelectedSuggestedTasks } from "../services/issue-thread-interactions.js";
 import {
@@ -5859,22 +5860,19 @@ export function issueRoutes(
     const interactionSvc = issueThreadInteractionService(db);
     const current = await interactionSvc.getForIssue(issue, interactionId);
     if (
-      isSeatSummonsInteraction({
+      isSeatSummonsHydratedInteraction({
         kind: current.kind,
-        tags: (current as { tags?: string[] }).tags,
+        payload: current.payload,
       })
     ) {
       const summonsActor = getActorInfo(req);
-      const summonsPrAuthor = current as {
-        prAuthorActorId?: string | null;
-        prAuthorActorType?: string | null;
-      };
+      const summonsPrAuthor = getSeatSummonsAuthor(current);
       const summonsDecision = evaluateSeatSummonsResolve({
         isSummons: true,
         resolverActorId: summonsActor.actorId,
         resolverActorType: summonsActor.actorType,
-        prAuthorActorId: summonsPrAuthor.prAuthorActorId ?? undefined,
-        prAuthorActorType: summonsPrAuthor.prAuthorActorType ?? undefined,
+        prAuthorActorId: summonsPrAuthor?.prAuthorActorId,
+        prAuthorActorType: summonsPrAuthor?.prAuthorActorType,
         creatorAgentId: current.createdByAgentId,
         creatorUserId: current.createdByUserId,
       });
