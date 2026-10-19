@@ -11,8 +11,8 @@ cd "$(dirname "$0")/../../server"
 # Primary: the -t filter matched ONLY the refuse tests and they passed —
 # a green run here proves bad input (escalation close, no receipt) is
 # rejected. (Passing tests never echo the 409 code, so assert the count.)
-grep -qE "Tests +3 passed" /tmp/spa13737-neg-out.txt || {
-  echo "NEG-FAIL: refuse-filter run did not pass its 3 refuse tests" >&2
+grep -qE "Tests +4 passed" /tmp/spa13737-neg-out.txt || {
+  echo "NEG-FAIL: refuse-filter run did not pass its 4 refuse tests" >&2
   exit 1
 }
 # Pinned fail-closed check: grep within the issueHasEscalationActionReceipt

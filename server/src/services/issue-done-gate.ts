@@ -289,7 +289,7 @@ export type DoneGateBlockedReason =
   | { kind: "open_pull_requests"; pullRequests: DoneGatePullRequestState[] }
   | { kind: "unknown_pull_request_state"; pullRequests: DoneGatePullRequestState[] }
   | { kind: "unresolved_pull_request_reference"; numbers: number[] }
-  | { kind: "missing_escalation_action_receipt"; originKind: string };
+  | { kind: "missing_escalation_action_receipt"; originKind: string; signal: "originKind" | "title-fallback" };
 
 export type DoneGateDecision =
   | { outcome: "allow" }
@@ -404,11 +404,22 @@ function gateStateFromDetails(details: PullRequestMergeDetails): "merged" | "ope
 /**
  * SPA-13737 — escalation close-guard input. `originKind` is the issue's stored
  * `origin_kind`; `doneGateOverride` is the route-minted bypass (board-only).
+ * `title` feeds the legacy-fallback branch (see checkEscalationCloseGuard).
  */
 export const ESCALATION_CLOSE_GUARD_ORIGIN_KINDS: ReadonlySet<string> = new Set([
   "stranded_issue_recovery",
   "harness_liveness_escalation",
+  "issue_productivity_review",
+  "stale_active_run_evaluation",
 ]);
+
+/**
+ * SPA-13737 hardened fix (SPA-13683-shaped cards): escalate-filed cards carry
+ * NO explicit originKind, so the server defaults them to "manual". Match the
+ * exact anchored title prefix board-status.sh escalate files
+ * ("Escalation: <card> stuck waiting on <tok>").
+ */
+export const ESCALATION_CLOSE_GUARD_TITLE_PREFIX = "Escalation:";
 
 export const ESCALATION_ACTION_EVIDENCE_WORK_PRODUCT_TYPES: ReadonlySet<string> = new Set([
   "pull_request",
@@ -447,12 +458,25 @@ export async function issueHasEscalationActionReceipt(
 export async function checkEscalationCloseGuard(
   db: Db,
   input: {
-    issue: { id: string; companyId: string; originKind?: string | null };
+    issue: { id: string; companyId: string; originKind?: string | null; title?: string | null };
     doneGateOverride?: unknown;
   },
 ): Promise<DoneGateDecision> {
   const originKind = input.issue.originKind ?? null;
-  if (!originKind || !ESCALATION_CLOSE_GUARD_ORIGIN_KINDS.has(originKind)) {
+  let signal: "originKind" | "title-fallback" | null = null;
+  if (originKind && ESCALATION_CLOSE_GUARD_ORIGIN_KINDS.has(originKind)) {
+    signal = "originKind";
+  } else if (
+    // Legacy-fallback for escalate-filed cards that predate an explicit
+    // originKind: board-status.sh escalate files title
+    // "Escalation: <card> stuck waiting on <tok>" with NO originKind, so the
+    // server defaults originKind to "manual" (services/issues.ts).
+    (!originKind || originKind === "manual") &&
+    (input.issue.title ?? "").startsWith(ESCALATION_CLOSE_GUARD_TITLE_PREFIX)
+  ) {
+    signal = "title-fallback";
+  }
+  if (!signal) {
     return { outcome: "allow" };
   }
   // Board-only override bypasses (never agent-supplied; the route rejects
@@ -465,7 +489,7 @@ export async function checkEscalationCloseGuard(
   if (await issueHasEscalationActionReceipt(db, input.issue)) {
     return { outcome: "allow" };
   }
-  return { outcome: "refuse", reason: { kind: "missing_escalation_action_receipt", originKind } };
+  return { outcome: "refuse", reason: { kind: "missing_escalation_action_receipt", originKind: originKind ?? "manual", signal } };
 }
 
 export function issueDoneGateService(db: Db, opts: IssueDoneGateServiceOptions = {}) {
@@ -940,7 +964,7 @@ export function issueDoneGateService(db: Db, opts: IssueDoneGateServiceOptions =
   }
 
   async function evaluateDoneGate(
-    issue: { id: string; companyId: string; description?: string | null; identifier?: string | null; originKind?: string | null },
+    issue: { id: string; companyId: string; description?: string | null; identifier?: string | null; originKind?: string | null; title?: string | null },
   ): Promise<DoneGateDecision> {
     // SPA-13737 escalation close-guard first: an escalation close without an
     // action-evidence receipt refuses before the PR gate runs. Passes through
@@ -1099,8 +1123,8 @@ export function issueDoneGateService(db: Db, opts: IssueDoneGateServiceOptions =
   function refusalError(reason: DoneGateBlockedReason) {
     if (reason.kind === "missing_escalation_action_receipt") {
       return conflict(
-        `Issue cannot be marked done: escalation issue (origin ${reason.originKind}) has no action-evidence receipt. Attach a pull_request/commit/branch work product with an external id or url, or use an explicit board doneOverride.`,
-        { code: DONE_GATE_ESCALATION_RECEIPT_REFUSAL, originKind: reason.originKind },
+        `Issue cannot be marked done: escalation issue (origin ${reason.originKind}, signal ${reason.signal}) has no action-evidence receipt. Attach a pull_request/commit/branch work product with an external id or url, or use an explicit board doneOverride.`,
+        { code: DONE_GATE_ESCALATION_RECEIPT_REFUSAL, originKind: reason.originKind, signal: reason.signal },
       );
     }
     if (reason.kind === "unresolved_pull_request_reference") {
