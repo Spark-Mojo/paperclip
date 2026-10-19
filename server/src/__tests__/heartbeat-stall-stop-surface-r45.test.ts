@@ -66,7 +66,14 @@ describeEmbeddedPostgres("heartbeat stall stop-and-surface R4/R5", () => {
   beforeAll(async () => {
     tempDb = await startEmbeddedPostgresTestDatabase("paperclip-heartbeat-stall-stop-surface-r45-");
     db = createDb(tempDb.connectionString);
-    heartbeat = heartbeatService(db);
+    // The engine suppresses ALL scheduling (wakeup writes a
+    // "heartbeat.scheduling_suppressed" skipped receipt and returns null)
+    // when PAPERCLIP_IN_WORKTREE is truthy — which it is inside this repo's
+    // own engine worktrees. Same pattern as the main suite
+    // (heartbeat-stall-stop-surface.test.ts lines 74-80).
+    heartbeat = heartbeatService(db, {
+      runtimeEnv: { PAPERCLIP_IN_WORKTREE: "false" },
+    });
   }, 20_000);
 
   afterEach(async () => {
