@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
-import { and, desc, eq, sql } from "drizzle-orm";
-import { agentWakeupRequests, issueExecutionDecisions, issues, type Db } from "@paperclipai/db";
+import { and, desc, eq } from "drizzle-orm";
+import { issueExecutionDecisions, issues, type Db } from "@paperclipai/db";
 import type {
   IssueExecutionDecisionOutcome,
   IssueExecutionStage,
@@ -354,80 +354,6 @@ export function stageDecisionService(db: Db) {
           },
         },
         postCommitActivityPublications);
-
-        // SPA-13732 d9: changes-requested reroute wakes the builder inside
-        // the same transaction (service-lane atomicity; the route lane keys
-        // off a per-decisionId agent_wakeup_requests row) — approve path
-        // untouched, card status never backlog (guarded in_review above).
-        // Payload mirrors the route-lane execution_changes_requested shape
-        // (routes/issues.ts buildExecutionStageWakeup): executionStage with
-        // wakeRole executor + changes_requested context, keyed off nextState.
-        if (
-          input.action === "request_changes" &&
-          nextState.status === "changes_requested" &&
-          existingState.returnAssignee?.type === "agent" &&
-          assigneePatch?.assigneeAgentId != null &&
-          assigneePatch.assigneeAgentId === existingState.returnAssignee.agentId &&
-          lockedIssue.status === "in_review"
-        ) {
-          const idempotencyKey = `stage-decision-changes-requested:${lockedIssue.id}:${decisionId}`;
-          const executionStage = {
-            wakeRole: "executor" as const,
-            stageId: nextState.currentStageId ?? activeStage.id,
-            stageType: nextState.currentStageType ?? activeStage.type,
-            currentParticipant: nextState.currentParticipant ?? null,
-            returnAssignee: existingState.returnAssignee,
-            reviewRequest: nextState.reviewRequest ?? null,
-            lastDecisionOutcome: "changes_requested" as const,
-            allowedActions: ["address_changes", "resubmit"],
-          };
-          // Partial unique index stageDecisionRerouteIdempotencyUq covers
-          // (companyId, idempotencyKey) WHERE key LIKE
-          // 'stage-decision-changes-requested:%' AND status <> 'skipped',
-          // so target must carry the inference predicate (drizzle 0.45.2
-          // reads `where`, not `targetWhere` — see services/issues.ts
-          // agentKeyedReplay comment). Pure-index-target form is wrong here:
-          // (companyId, idempotencyKey) is not unique outside the partial
-          // index, so a bare target would 42P10.
-          try {
-            await tx
-              .insert(agentWakeupRequests)
-              .values({
-                companyId: lockedIssue.companyId,
-                agentId: existingState.returnAssignee.agentId as string,
-                source: "assignment",
-                triggerDetail: "system",
-                reason: "execution_changes_requested",
-                payload: {
-                  issueId: lockedIssue.id,
-                  taskId: lockedIssue.id,
-                  mutation: "update",
-                  executionStage,
-                  _paperclipWakeContext: {
-                    issueId: lockedIssue.id,
-                    taskId: lockedIssue.id,
-                    wakeReason: "execution_changes_requested",
-                    source: "issue.execution_stage",
-                    executionStage,
-                  },
-                },
-                requestedByActorType: input.actor.agentId
-                  ? "agent"
-                  : input.actor.userId
-                    ? "user"
-                    : "system",
-                requestedByActorId: input.actor.agentId ?? input.actor.userId ?? null,
-                idempotencyKey,
-              })
-              .onConflictDoNothing({
-                target: [agentWakeupRequests.companyId, agentWakeupRequests.idempotencyKey],
-                where: sql`${agentWakeupRequests.idempotencyKey} LIKE 'stage-decision-changes-requested:%' AND ${agentWakeupRequests.status} <> 'skipped'`,
-              });
-          } catch (err) {
-            const code = (err as { code?: unknown })?.code;
-            if (code !== "23505") throw err;
-          }
-        }
 
         return { issue: updated, decision, duplicate: false as const };
       });

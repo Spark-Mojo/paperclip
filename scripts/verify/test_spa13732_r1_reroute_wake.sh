@@ -18,10 +18,10 @@ echo "$BLOCK" | grep -q "execution_changes_requested" \
   || fail "no execution_changes_requested wake in stage-decision route"
 echo "$BLOCK" | grep -q "heartbeat.wakeup" \
   || fail "no heartbeat.wakeup call in stage-decision route"
-echo "$BLOCK" | grep -q "result.duplicate" \
-  || fail "wake not gated on non-duplicate decide result"
-echo "$BLOCK" | grep -q 'decision.id' \
-  || fail "idempotency key does not use decisionId"
+echo "$BLOCK" | grep -Eq "if \(!result\.duplicate\b" \
+  || fail "wake not gated on non-duplicate"
+echo "$BLOCK" | grep "idempotencyKey:" | grep -q '\${[^}]*result\.decision\.id[^}]*}' \
+  || fail "idempotencyKey not interpolated with decisionId"
 
 # Exactly-one: a single heartbeat.wakeup call site in the block, keyed per
 # decisionId (one key per reroute => exactly one run per reroute).

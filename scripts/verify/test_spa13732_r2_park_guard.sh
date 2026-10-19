@@ -5,31 +5,46 @@
 set -euo pipefail
 fail() { echo "FAIL: $1" >&2; exit 1; }
 
-# 1. Both 422 branches in the entering-blocked validation return without
-#    mutating status: the 422 responses sit inside `if (enteringBlocked)`
-#    before any status write, and neither 422 arm assigns backlog.
-grep -n "baseBlockedRefusal" server/src/routes/issues.ts | grep -q . \
-  || fail "blocked-entry 422 validation (baseBlockedRefusal) missing"
-awk '/if \(enteringBlocked\)/,0' server/src/routes/issues.ts \
-  | grep -A3 "status(422)" | grep -qi "backlog" \
-  && fail "backlog write adjacent to blocked 422 return" || true
+ISSUES="server/src/routes/issues.ts"
+TEST="server/src/__tests__/issue-stage-decision-routes.test.ts"
+WAKE="server/src/services/issue-assignment-wakeup.ts"
 
-# 2. The PATCH lane never writes status backlog: no `status: "backlog"` /
-#    `status:"backlog"` assignment anywhere in the route file (the only
-#    backlog statuses are reads/comparisons; the sole backlog writer lives
-#    in heartbeat.ts rewake breaker, out of scope).
-if grep -nE 'status:\s*"backlog"' server/src/routes/issues.ts | grep -qv "!=="; then
-  CANDIDATES="$(grep -nE 'status:\s*"backlog"' server/src/routes/issues.ts || true)"
-  echo "$CANDIDATES" | grep -qE '!==|===|statusChangedFromBacklog' \
-    || fail "status backlog write found in issues.ts PATCH lane: $CANDIDATES"
-fi
-grep -nE "status:\s*['\"]backlog['\"]" server/src/routes/issues.ts \
-  | grep -vE "(!==|===|backlog.*&&|&&.*backlog)" \
-  && fail "status backlog write in issues.ts" || true
+# 1. Both blocked-entry 422 arms exist in the entering-blocked region:
+# baseBlockedRefusal present AND at least two res.status(422) returns
+# between `const enteringBlocked =` and the reviewRequest guard below it.
+grep -q "baseBlockedRefusal" "$ISSUES" \
+  || fail "check1: blocked-entry 422 validation (baseBlockedRefusal) missing in $ISSUES"
+REGION="$(awk '/const enteringBlocked =/{f=1} f{print} /reviewRequest !== undefined/{if(f) exit}' "$ISSUES")"
+COUNT422="$(printf '%s\n' "$REGION" | grep -c "res.status(422)" || true)"
+[ "$COUNT422" -ge 2 ] \
+  || fail "check1: expected >=2 res.status(422) arms in enteringBlocked region, found $COUNT422"
 
-# 3. Assignment-wakeup backlog skip is intact (backlog cards never wake).
-grep -q 'input.issue.status === "backlog") return' \
-  server/src/services/issue-assignment-wakeup.ts \
-  || fail "backlog wake skip missing in issue-assignment-wakeup.ts"
+# 2a. No direct backlog mutation: updateFields.status is never assigned
+# the string backlog (covers the direct-mutation syntax Mira thread 2 named).
+HITS="$(grep -nE 'updateFields\.status\s*=\s*["'\'']backlog' "$ISSUES" || true)"
+[ -z "$HITS" ] \
+  || fail "check2a: direct backlog mutation in $ISSUES: $HITS"
 
-echo "PASS: blocked 422 returns without backlog fallback; no backlog park write in PATCH lane; backlog wake skip intact"
+# 2b. No other backlog write in the route file: every `status: "backlog"`
+# (either quote style) line must be a comparison/read, never an assignment.
+CANDIDATES="$(grep -nE 'status:\s*['\''"]backlog['\''"]' "$ISSUES" || true)"
+WRITES="$(printf '%s\n' "$CANDIDATES" | grep -vE '!==|===|statusChangedFromBacklog' || true)"
+[ -z "$WRITES" ] \
+  || fail "check2b: status backlog write found in $ISSUES: $WRITES"
+
+# 3. Behavioral R2 rehearsal test exists: name carries 422 + backlog,
+# body asserts .toBe(422) at least twice, and reads the issue back
+# asserting the status is never backlog.
+grep -E 'it\(.*422.*backlog|it\(.*backlog.*422' "$TEST" | grep -q . \
+  || fail "check3: rehearsal test name containing 422 + backlog missing in $TEST"
+ASSERTS="$(grep -c "toBe(422)" "$TEST" || true)"
+[ "$ASSERTS" -ge 2 ] \
+  || fail "check3: expected >=2 .toBe(422) assertions in $TEST, found $ASSERTS"
+grep -q 'not.toBe("backlog")' "$TEST" \
+  || fail "check3: rehearsal never-backlog readback assertion missing in $TEST"
+
+# 4. Backlog wake skip intact (backlog cards never wake).
+grep -q 'input.issue.status === "backlog") return' "$WAKE" \
+  || fail "check4: backlog wake skip missing in $WAKE"
+
+echo "PASS: r2 park guard — (1) both 422 arms ($COUNT422) with baseBlockedRefusal; (2) no backlog write in PATCH lane; (3) R2 rehearsal test with $ASSERTS x 422 + never-backlog readback; (4) backlog wake skip intact"
