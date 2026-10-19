@@ -29,6 +29,7 @@ import {
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
 import {
+  evaluateSeatSummonsResolve,
   getSeatSummonsAuthor,
   isSeatSummonsHydratedInteraction,
 } from "../services/seat-summons-self-resolve-guard.js";
@@ -158,16 +159,13 @@ describe.sequential("seat-summons self-resolve route wiring (SPA-13735)", () => 
   });
 });
 
-// Persistence-gap proof (SPA-13735 d12): the request_confirmation zod schema
-// (packages/shared/src/validators/issue.ts `requestConfirmationPayloadSchema`)
-// strips unknown keys at create AND hydrate, so summons marker tags and the
-// PR-author pair never survive the real pipeline and the guard never fires
-// through it. This test proves the gap with real evidence through
-// interactionService.create -> getForIssue. The FIX is a schema extension in
-// that shared validators file (merge/extend the summons payload extension, or
-// `.catchall` it) — validators are out of scope here, so this file extends
-// NOTHING. Existing mock tests above stay untouched: they prove the guard
-// logic against realistic shapes the pipeline cannot yet carry.
+// Persistence proof (SPA-13735 d15/d16/d18): the request_confirmation zod
+// schema now carries additive OPTIONAL `tags` / `prAuthorActorId` /
+// `prAuthorActorType`, and the server derives the author pair at create time
+// (client-supplied values are ignored/overwritten). This test proves the NEW
+// behavior through interactionService.create -> getForIssue at service level
+// (full-route with real DB is infeasible — the vi.mock registry above is
+// file-scoped; the mock test above already pins 403 + audit).
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
 
@@ -206,10 +204,15 @@ describeEmbeddedPostgres("seat-summons persistence gap (SPA-13735 d12)", () => {
     await tempDb?.cleanup();
   });
 
-  it("strips tags/prAuthor through create+hydrate so the summons guard does not fire", async () => {
+  it("round-trips tags plus server-derived author, and the guard refuses self-resolve", async () => {
     const companyId = randomUUID();
     const goalId = randomUUID();
     const issueId = randomUUID();
+    const authorAgentId = randomUUID();
+    // Distinct from the server-derived author: the create path stamps author
+    // == actor, so the author!=creator evaluator branch takes creator from
+    // here (pure-function input, not a row).
+    const creatorAgentId = randomUUID();
     await db.insert(companies).values({
       id: companyId,
       name: "Paperclip",
@@ -226,6 +229,17 @@ describeEmbeddedPostgres("seat-summons persistence gap (SPA-13735 d12)", () => {
       status: "in_progress",
       priority: "medium",
     });
+    await db.insert(agents).values({
+      id: authorAgentId,
+      companyId,
+      name: "SeatAuthor",
+      role: "engineer",
+      status: "active",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
 
     const created = await interactionsSvc.create(
       { id: issueId, companyId },
@@ -234,32 +248,48 @@ describeEmbeddedPostgres("seat-summons persistence gap (SPA-13735 d12)", () => {
         payload: {
           version: 1,
           prompt: "Take the seat?",
-          // Summons markers + PR-author identity: admitted to be stripped by
-          // the strict request_confirmation schema (no `tags` / prAuthor
-          // keys). FIX = extend that schema (see header comment); do NOT
-          // extend it here — this test pins the pre-fix gap.
-          ...({ tags: ["seat-summons", "sable-seat"], prAuthorActorId: "agent-pr-author", prAuthorActorType: "agent" } as {
-            tags: string[];
-            prAuthorActorId: string;
-            prAuthorActorType: string;
-          }),
+          tags: ["seat-summons", "sable-seat"],
+          // FORGED: server must ignore/overwrite with the actor below.
+          prAuthorActorId: "forged-attacker-id",
+          prAuthorActorType: "agent",
         },
       } as unknown as CreateIssueThreadInteraction,
-      { userId: "local-board" },
+      { agentId: authorAgentId },
     );
 
     const hydrated = await interactionsSvc.getForIssue({ id: issueId, companyId }, created.id);
     expect(hydrated.kind).toBe("request_confirmation");
     if (hydrated.kind !== "request_confirmation") throw new Error("expected request_confirmation");
-    // Registered field round-trips intact: proves selective stripping (an
-    // empty payload would also satisfy the absence assertions above).
+    // Tags + server-derived author survive the real pipeline.
     expect(hydrated.payload).toMatchObject({ version: 1, prompt: "Take the seat?" });
-    // Stripped at create AND hydrate: neither survives the real pipeline.
-    expect(hydrated.payload).not.toHaveProperty("tags");
-    expect(hydrated.payload).not.toHaveProperty("prAuthorActorId");
-    expect(hydrated.payload).not.toHaveProperty("prAuthorActorType");
-    expect(getSeatSummonsAuthor(hydrated)).toBeNull();
-    // So the guard never fires on the hydrated shape through the real path.
-    expect(isSeatSummonsHydratedInteraction(hydrated)).toBe(false);
+    expect(hydrated.payload.tags).toEqual(["seat-summons", "sable-seat"]);
+    expect(hydrated.payload.prAuthorActorId).toBe(authorAgentId);
+    expect(hydrated.payload.prAuthorActorId).not.toBe("forged-attacker-id");
+    expect(hydrated.payload.prAuthorActorType).toBe("agent");
+    expect(isSeatSummonsHydratedInteraction(hydrated)).toBe(true);
+    expect(getSeatSummonsAuthor(hydrated)).toEqual({
+      prAuthorActorId: authorAgentId,
+      prAuthorActorType: "agent",
+    });
+
+    const base = {
+      isSummons: true,
+      prAuthorActorId: authorAgentId,
+      prAuthorActorType: "agent",
+      creatorAgentId,
+      creatorUserId: null,
+    } as const;
+    // Resolver IS the PR author -> author self-resolve refused.
+    expect(
+      evaluateSeatSummonsResolve({ ...base, resolverActorId: authorAgentId, resolverActorType: "agent" }),
+    ).toMatchObject({ allowed: false, code: "author_actor_self_resolve_refused" });
+    // Resolver IS the creator (not the author) -> creator self-resolve refused.
+    expect(
+      evaluateSeatSummonsResolve({ ...base, resolverActorId: creatorAgentId, resolverActorType: "agent" }),
+    ).toMatchObject({ allowed: false, code: "creator_self_resolve_refused" });
+    // Third party (neither author nor creator) -> allow.
+    expect(
+      evaluateSeatSummonsResolve({ ...base, resolverActorId: randomUUID(), resolverActorType: "agent" }),
+    ).toMatchObject({ allowed: true, code: "allow" });
   });
 });
