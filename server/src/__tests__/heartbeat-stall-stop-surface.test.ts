@@ -71,7 +71,14 @@ describeEmbeddedPostgres("heartbeat stall stop-and-surface", () => {
   beforeAll(async () => {
     tempDb = await startEmbeddedPostgresTestDatabase("paperclip-heartbeat-stall-stop-surface-");
     db = createDb(tempDb.connectionString);
-    heartbeat = heartbeatService(db);
+    // The engine suppresses ALL scheduling (wakeup writes a
+    // "heartbeat.scheduling_suppressed" skipped receipt and returns null)
+    // when PAPERCLIP_IN_WORKTREE is truthy — which it is inside this repo's
+    // own engine worktrees. Same bypass as
+    // heartbeat-lock-release-on-reassignment.test.ts lines 61-66.
+    heartbeat = heartbeatService(db, {
+      runtimeEnv: { PAPERCLIP_IN_WORKTREE: "false" },
+    });
   }, 20_000);
 
   afterEach(async () => {
@@ -282,6 +289,28 @@ describeEmbeddedPostgres("heartbeat stall stop-and-surface", () => {
 
     expect(await runCount(companyId)).toBe(3);
     expect(await latestWakeReason(agentId)).toBe(STALL_STOP_SURFACE_HELD_REASON);
+  });
+
+  it("binding: two same-code stalls still start a run on a breaker wake", async () => {
+    const { companyId, agentId, issueId } = await seedCompanyAgentIssue();
+
+    await seedStalledRun({ companyId, agentId, issueId, finishedSecondsAgo: 120 });
+    await seedStalledRun({ companyId, agentId, issueId, finishedSecondsAgo: 40 });
+
+    const wake = await breakerWake(agentId, issueId);
+    expect(wake).not.toBeNull();
+    expect(await runCount(companyId)).toBe(3);
+  });
+
+  it("R2: three same-code stalls spread beyond the 6h window still hold the breaker", async () => {
+    const { companyId, agentId, issueId } = await seedCompanyAgentIssue();
+
+    await seedStalledRun({ companyId, agentId, issueId, finishedSecondsAgo: 25000 });
+    await seedStalledRun({ companyId, agentId, issueId, finishedSecondsAgo: 20000 });
+    await seedStalledRun({ companyId, agentId, issueId, finishedSecondsAgo: 15000 });
+
+    expect(await breakerWake(agentId, issueId)).toBeNull();
+    expect(await runCount(companyId)).toBe(3);
   });
 
   it("R2: a mid-streak human todo→in_progress resets the streak so the next wake starts a run", async () => {
