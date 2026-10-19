@@ -85,6 +85,13 @@ export const agentWakeupRequests = pgTable(
       .where(
         sql`${table.idempotencyKey} LIKE 'issue_disposition_repair:%' AND ${table.status} <> 'skipped'`,
       ),
+    stageDecisionRerouteIdempotencyUq: uniqueIndex(
+      "agent_wakeup_requests_stage_decision_reroute_idempotency_uq",
+    )
+      .on(table.companyId, table.idempotencyKey)
+      .where(
+        sql`${table.idempotencyKey} LIKE 'stage-decision-changes-requested:%' AND ${table.status} <> 'skipped'`,
+      ),
     handoffBoundedContinuationIdempotencyUq:
       uniqueIndex("agent_wakeup_requests_handoff_bounded_continuation_uq")
         .on(table.companyId, table.agentId, table.idempotencyKey)
