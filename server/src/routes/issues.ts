@@ -330,6 +330,10 @@ import {
   type IssueThreadInteractionResolverAudienceDecision,
   type IssueThreadInteractionResolverRestriction,
 } from "../services/issue-thread-interaction-resolution.js";
+import {
+  evaluateSeatSummonsResolve,
+  isSeatSummonsInteraction,
+} from "../services/seat-summons-self-resolve-guard.js";
 import { resolveSelectedSuggestedTasks } from "../services/issue-thread-interactions.js";
 import {
   crossIssueInfluenceLimitError,
@@ -5854,6 +5858,51 @@ export function issueRoutes(
 
     const interactionSvc = issueThreadInteractionService(db);
     const current = await interactionSvc.getForIssue(issue, interactionId);
+    if (
+      isSeatSummonsInteraction({
+        kind: current.kind,
+        tags: (current as { tags?: string[] }).tags,
+      })
+    ) {
+      const summonsActor = getActorInfo(req);
+      const summonsPrAuthor = current as {
+        prAuthorActorId?: string | null;
+        prAuthorActorType?: string | null;
+      };
+      const summonsDecision = evaluateSeatSummonsResolve({
+        isSummons: true,
+        resolverActorId: summonsActor.actorId,
+        resolverActorType: summonsActor.actorType,
+        prAuthorActorId: summonsPrAuthor.prAuthorActorId ?? undefined,
+        prAuthorActorType: summonsPrAuthor.prAuthorActorType ?? undefined,
+        creatorAgentId: current.createdByAgentId,
+        creatorUserId: current.createdByUserId,
+      });
+      if (!summonsDecision.allowed) {
+        await logActivity(db, {
+          companyId: issue.companyId,
+          actorType: summonsActor.actorType,
+          actorId: summonsActor.actorId,
+          agentId: summonsActor.agentId,
+          runId: summonsActor.runId,
+          agentApiKeyId: summonsActor.agentApiKeyId,
+          action: "issue.thread_interaction_seat_summons_self_resolve_refused",
+          entityType: "issue",
+          entityId: issue.id,
+          details: {
+            interactionId,
+            code: summonsDecision.code,
+            auditNote: summonsDecision.auditNote,
+          },
+        });
+        return denyIssueThreadInteractionResolution(res, {
+          status: 403,
+          code: summonsDecision.code,
+          message: summonsDecision.auditNote,
+          details: { interactionId },
+        });
+      }
+    }
     const resolutionAuthorization =
       await assertIssueThreadInteractionResolutionAllowed(
         req,
