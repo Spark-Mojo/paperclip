@@ -40,6 +40,17 @@ export function stallStopNoticeMarker(newestRunId: string): string {
   return `${STALL_STOP_SURFACE_MARKER} (run ${newestRunId})`;
 }
 
+/**
+ * Escape SQL LIKE metacharacters (`%`, `_`, and the escape char itself) so a
+ * literal marker can be embedded in a LIKE pattern with an explicit
+ * `ESCAPE '\\'` clause. The stall marker itself contains underscores, which
+ * would otherwise act as single-character wildcards; run ids are
+ * caller-controlled, so escape those too before appending the trailing `%`.
+ */
+export function escapeLikePattern(value: string): string {
+  return value.replace(/[\\%_]/g, "\\$&");
+}
+
 /** agentWakeupRequests reason recorded when the stop first trips (R3). */
 export const STALL_STOP_SURFACE_TRIPPED_REASON = "stall_stop_surface_tripped";
 
@@ -85,6 +96,30 @@ export function countStallStreak(runs: StallStopRunSample[]): {
 /** True once the streak reaches the stop-and-surface threshold. */
 export function shouldStopSurface(streak: number): boolean {
   return streak >= STALL_STOP_THRESHOLD;
+}
+
+/**
+ * True only for a system-authored trip notice. The trip path posts the
+ * notice via issuesSvc.addComment with authorType "system", and the
+ * heartbeat hold/trip lookups mirror this rule in SQL with
+ * eq(authorType, "system") — a user-authored comment whose body happens to
+ * contain the marker is NOT a trusted notice and never holds the stop.
+ */
+export function isTrustedStallNotice(authorType: string): boolean {
+  return authorType === "system";
+}
+
+/**
+ * Hold decision for the R4 hold gate: hold whenever a trusted trip notice
+ * exists and no explicit human unblock came after it. Takes NO status
+ * param by design — the hold is status-independent, so a non-human status
+ * move off `blocked` cannot bypass it.
+ */
+export function shouldHoldStallStop(
+  hasTrustedNotice: boolean,
+  unblockedAfterNotice: boolean,
+): boolean {
+  return hasTrustedNotice && !unblockedAfterNotice;
 }
 
 /**

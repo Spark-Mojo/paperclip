@@ -4,8 +4,11 @@ import {
   STALL_STOP_SURFACE_MARKER,
   buildStallStopNotice,
   countStallStreak,
+  escapeLikePattern,
   extractStatusTransition,
   isExplicitHumanUnblock,
+  isTrustedStallNotice,
+  shouldHoldStallStop,
   shouldStopSurface,
   stallStopNoticeMarker,
   type StallStopRunSample,
@@ -244,6 +247,22 @@ describe("isExplicitHumanUnblock", () => {
   });
 });
 
+describe("escapeLikePattern", () => {
+  it("escapes %, _, and backslash", () => {
+    expect(escapeLikePattern("a%b_c\\d")).toBe("a\\%b\\_c\\\\d");
+  });
+
+  it("escapes the underscores in the stall marker itself", () => {
+    expect(escapeLikePattern(STALL_STOP_SURFACE_MARKER)).toBe(
+      "stop-and-surface:model\\_stream\\_stalled",
+    );
+  });
+
+  it("leaves plain run ids untouched", () => {
+    expect(escapeLikePattern("abc123-xyz")).toBe("abc123-xyz");
+  });
+});
+
 describe("extractStatusTransition", () => {
   it("_previous shape resolves from/to", () => {
     expect(
@@ -268,5 +287,47 @@ describe("extractStatusTransition", () => {
       fromStatus: null,
       toStatus: null,
     });
+  });
+});
+
+describe("isTrustedStallNotice", () => {
+  it("user-authored marker is ignored (not trusted)", () => {
+    expect(isTrustedStallNotice("user")).toBe(false);
+  });
+
+  it("agent-authored marker is ignored (not trusted)", () => {
+    expect(isTrustedStallNotice("agent")).toBe(false);
+  });
+
+  it("system-authored marker is trusted", () => {
+    expect(isTrustedStallNotice("system")).toBe(true);
+  });
+});
+
+describe("shouldHoldStallStop (status-independent: no status input exists)", () => {
+  it("(true,false) -> holds", () => {
+    expect(shouldHoldStallStop(true, false)).toBe(true);
+  });
+
+  it("(true,true) -> unblocked, no hold", () => {
+    expect(shouldHoldStallStop(true, true)).toBe(false);
+  });
+
+  it("(false,false) -> no notice, no hold", () => {
+    expect(shouldHoldStallStop(false, false)).toBe(false);
+  });
+
+  it("(false,true) -> no notice, no hold", () => {
+    expect(shouldHoldStallStop(false, true)).toBe(false);
+  });
+});
+
+describe("escapeLikePattern LIKE-injection control", () => {
+  it('escapeLikePattern("run%_x") escapes % and _ and differs from raw input', () => {
+    const escaped = escapeLikePattern("run%_x");
+    expect(escaped).toBe("run\\%\\_x");
+    expect(escaped).not.toBe("run%_x");
+    expect(escaped).toContain("\\%");
+    expect(escaped).toContain("\\_");
   });
 });

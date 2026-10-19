@@ -362,8 +362,11 @@ import {
 import {
   buildStallStopNotice,
   countStallStreak,
+  escapeLikePattern,
   extractStatusTransition,
   isExplicitHumanUnblock,
+  isTrustedStallNotice,
+  shouldHoldStallStop,
   shouldStopSurface,
   STALL_STOP_SURFACE_HELD_REASON,
   STALL_STOP_SURFACE_MARKER,
@@ -29633,13 +29636,17 @@ export function heartbeatService(
           // skip the isBreakerRewakeCandidate block below entirely, and
           // deferred_comment_wake, which re-queues as issue_commented. A
           // bare comment is never an unblock; only an explicit human unblock
-          // after the notice lets the wake through. Hold-only: never trips,
-          // never posts notes, never moves status — the in-block trip logic
+          // after the notice lets the wake through. The hold is decided
+          // from (trusted trip notice AND no later explicit human unblock)
+          // regardless of current status, so a non-human status move off
+          // `blocked` cannot bypass it. Hold-only: never trips, never
+          // posts notes, never moves status — the in-block trip logic
           // below stays the only trip site.
-          if (issue.status === "blocked") {
+          {
             const holdNotice = await tx
               .select({
                 id: issueComments.id,
+                authorType: issueComments.authorType,
                 createdAt: issueComments.createdAt,
               })
               .from(issueComments)
@@ -29647,7 +29654,10 @@ export function heartbeatService(
                 and(
                   eq(issueComments.companyId, issue.companyId),
                   eq(issueComments.issueId, issue.id),
-                  sql`${issueComments.body} like ${`${STALL_STOP_SURFACE_MARKER}%`}`,
+                  // Trusted-notice rule mirrored from isTrustedStallNotice
+                  // (stall-stop-surface.ts): only authorType "system" counts.
+                  eq(issueComments.authorType, "system"),
+                  sql`${issueComments.body} like ${`${escapeLikePattern(STALL_STOP_SURFACE_MARKER)}%`} escape '\\'`,
                 ),
               )
               .orderBy(
@@ -29657,8 +29667,10 @@ export function heartbeatService(
               .limit(1)
               .then((rows) => rows[0] ?? null);
             if (holdNotice) {
-              // Limit-20 window caveat: an unblock older than the 20 newest
-              // user rows could be missed — acceptable, noted.
+              // Full candidate scan (order desc, no limit): an unblock older
+              // than any fixed window must still be found. The action
+              // allowlist + isExplicitHumanUnblock keep the read cheap in
+              // practice (only named unblock/status-move rows qualify).
               const holdUnblockCandidates = await tx
                 .select({
                   actorType: activityLog.actorType,
@@ -29688,8 +29700,7 @@ export function heartbeatService(
                 .orderBy(
                   desc(activityLog.createdAt),
                   desc(activityLog.id),
-                )
-                .limit(20);
+                );
               const holdUnblockedAfterNotice =
                 holdUnblockCandidates.some((row) => {
                   const { fromStatus, toStatus } =
@@ -29704,7 +29715,19 @@ export function heartbeatService(
                     toStatus,
                   });
                 });
-              if (!holdUnblockedAfterNotice) {
+              // Status-independent by design: shouldHoldStallStop takes no
+              // status — a non-human move off `blocked` cannot bypass it.
+              // First arg folds in isTrustedStallNotice: only a
+              // system-authored notice holds (the SQL above already filters
+              // authorType "system"; this keeps the rule explicit if the
+              // lookup ever changes).
+              if (
+                shouldHoldStallStop(
+                  !!holdNotice &&
+                    isTrustedStallNotice(holdNotice.authorType),
+                  holdUnblockedAfterNotice,
+                )
+              ) {
                 const holdNow = new Date();
                 await tx.insert(agentWakeupRequests).values({
                   ...durableReceiptFields,
@@ -29885,8 +29908,17 @@ export function heartbeatService(
                 // of the same streak still posts exactly one note, while a
                 // genuinely later streak posts a fresh one. Mirrors the
                 // issueRewakeCircuitBreakerNoticeMarker pattern below.
+                // Race guard: the outer wake txn already holds
+                // SELECT..FOR UPDATE on this issue row (see the `for update`
+                // at the top of this transaction), so concurrent wake txns
+                // for the same issue serialize before this SELECT-then-insert
+                // sequence. Re-assert here so the dedup stays bound to that
+                // lock even if the outer acquisition ever moves.
                 const stallNoticeMarker = stallStopNoticeMarker(
                   stallStreak.runIds[0] ?? "unknown",
+                );
+                await tx.execute(
+                  sql`select id from issues where id = ${issue.id} and company_id = ${issue.companyId} for update`,
                 );
                 const existingStallNotice = await tx
                   .select({ id: issueComments.id })
@@ -29895,7 +29927,10 @@ export function heartbeatService(
                     and(
                       eq(issueComments.companyId, issue.companyId),
                       eq(issueComments.issueId, issue.id),
-                      sql`${issueComments.body} like ${`${stallNoticeMarker}%`}`,
+                      // Trusted-notice rule mirrored from isTrustedStallNotice
+                      // (stall-stop-surface.ts): only authorType "system" counts.
+                      eq(issueComments.authorType, "system"),
+                      sql`${issueComments.body} like ${`${escapeLikePattern(stallNoticeMarker)}%`} escape '\\'`,
                     ),
                   )
                   .limit(1)
