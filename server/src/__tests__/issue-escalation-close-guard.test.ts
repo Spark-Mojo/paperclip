@@ -378,4 +378,73 @@ describeEmbeddedPostgres("issue done gate — escalation close-guard (SPA-13737)
     const updated = await issueService(db).update(card.id, { status: "done" });
     expect(updated?.status).toBe("done");
   });
+
+  it("allows done for escalation close with only an artifact run-id receipt (no url/externalId, R2/SPA-13737)", async () => {
+    const card = await createCard(db, companyId, {
+      assigneeAgentId: agentId,
+      originKind: "stranded_issue_recovery",
+    });
+    const [run] = await db.insert(heartbeatRuns).values({
+      companyId,
+      agentId,
+      status: "running",
+    }).returning();
+    await db.insert(issueWorkProducts).values({
+      companyId: card.companyId,
+      issueId: card.id,
+      type: "artifact",
+      provider: "engine",
+      title: "Run-id receipt",
+      externalId: null,
+      url: null,
+      status: "open",
+      createdByRunId: run!.id,
+    });
+    const updated = await issueService(db).update(card.id, { status: "done" });
+    expect(updated?.status).toBe("done");
+  });
+
+  it("allows done for escalation close with only a document externalId receipt (no run, R2/SPA-13737)", async () => {
+    const card = await createCard(db, companyId, {
+      assigneeAgentId: agentId,
+      originKind: "stranded_issue_recovery",
+    });
+    await db.insert(issueWorkProducts).values({
+      companyId: card.companyId,
+      issueId: card.id,
+      type: "document",
+      provider: "engine",
+      title: "API-mutation receipt",
+      externalId: "mutation:reassign:9f2c",
+      url: null,
+      status: "open",
+    });
+    const updated = await issueService(db).update(card.id, { status: "done" });
+    expect(updated?.status).toBe("done");
+  });
+
+  it("refuses done for escalation close with blank artifact receipt and no run (R2/SPA-13737)", async () => {
+    const card = await createCard(db, companyId, {
+      assigneeAgentId: agentId,
+      originKind: "stranded_issue_recovery",
+    });
+    await db.insert(issueWorkProducts).values({
+      companyId: card.companyId,
+      issueId: card.id,
+      type: "artifact",
+      provider: "engine",
+      title: "Blank artifact",
+      externalId: "   ",
+      url: "  ",
+      status: "open",
+    });
+    await expect(
+      issueService(db).update(card.id, { status: "done" }),
+    ).rejects.toMatchObject({
+      status: 409,
+      details: { code: "issue_done_without_escalation_receipt" },
+    });
+    const after = await db.select().from(issues).where(eq(issues.id, card.id)).then((rows) => rows[0]!);
+    expect(after.status).toBe("in_progress");
+  });
 });
