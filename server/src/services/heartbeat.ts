@@ -29657,7 +29657,7 @@ export function heartbeatService(
                   // Trusted-notice rule mirrored from isTrustedStallNotice
                   // (stall-stop-surface.ts): only authorType "system" counts.
                   eq(issueComments.authorType, "system"),
-                  sql`${issueComments.body} like ${`${escapeLikePattern(STALL_STOP_SURFACE_MARKER)}%`} escape '\\'`,
+                  sql`${issueComments.body} like ${`${escapeLikePattern(`${STALL_STOP_SURFACE_MARKER} (run `)}%`} escape '\\'`,
                 ),
               )
               .orderBy(

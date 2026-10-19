@@ -331,3 +331,33 @@ describe("escapeLikePattern LIKE-injection control", () => {
     expect(escaped).toContain("\\_");
   });
 });
+
+describe("hold-notice LIKE prefix (narrowed to ` (run `)", () => {
+  // The heartbeat R4 hold gate builds its LIKE pattern from the literal
+  // `${STALL_STOP_SURFACE_MARKER} (run ` (see heartbeat.ts holdNotice query),
+  // never the bare marker alone, so an unrelated system comment such as
+  // `...model_stream_stalled recovery completed` cannot activate the hold.
+  const holdPrefix = `${STALL_STOP_SURFACE_MARKER} (run `;
+
+  it("escaped hold prefix matches the exact LIKE literal the hold query builds", () => {
+    expect(escapeLikePattern(holdPrefix)).toBe(
+      "stop-and-surface:model\\_stream\\_stalled (run ",
+    );
+    expect(escapeLikePattern(holdPrefix)).toContain(" (run ");
+  });
+
+  it("trip notice first line starts with the hold prefix", () => {
+    const notice = buildStallStopNotice(["r3", "r2", "r1"]);
+    expect(notice.split("\n")[0].startsWith(holdPrefix)).toBe(true);
+  });
+
+  it("per-episode marker starts with the hold prefix", () => {
+    expect(stallStopNoticeMarker("r3").startsWith(holdPrefix)).toBe(true);
+  });
+
+  it("bare-marker decoy text does not start with the hold prefix", () => {
+    expect(
+      `${STALL_STOP_SURFACE_MARKER} recovery completed`.startsWith(holdPrefix),
+    ).toBe(false);
+  });
+});
