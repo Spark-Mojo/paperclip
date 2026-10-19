@@ -3389,6 +3389,34 @@ export function issueThreadInteractionService(
       const data = normalizeCreateInteractionInput(
         createIssueThreadInteractionSchema.parse(input),
       );
+      // Trust boundary (SPA-13735 d16): the PR-author actor pair is derived
+      // server-side from the create actor, and the derivation below is the
+      // ONLY writer. Client-supplied values are stripped BEFORE deriving so
+      // a forged pair can never survive to the stored payload; the schema
+      // enum on prAuthorActorType additionally rejects forged type strings
+      // at parse. Out of scope (deliberately untouched): direct-insert paths
+      // that build request_confirmation payloads server-side with no author
+      // fields — tool-access.ts:14810, tool-gateway.ts:4264,
+      // secret-proposals.ts:184-222 — safe-but-fragile (a missing pair keeps
+      // the summons guard fail-closed); a future pass should route them
+      // through this derivation.
+      if (data.kind === "request_confirmation") {
+        delete data.payload.prAuthorActorId;
+        delete data.payload.prAuthorActorType;
+        // System-authored brick (SPA-13735 d16): the guard accepts only
+        // agent|user author pairs, so emitting a "system" pair would store an
+        // identity nobody can satisfy. Store a null pair (no fields) when no
+        // agent/user principal exists — the guard then fail-closes on missing
+        // author instead of carrying an unresolvable identity.
+        const authorId = actor.agentId ?? actor.userId ?? null;
+        const authorType = actor.agentId
+          ? "agent"
+          : actor.userId
+            ? "user"
+            : null;
+        data.payload.prAuthorActorId = authorId ?? undefined;
+        data.payload.prAuthorActorType = authorType ?? undefined;
+      }
       const usedDeprecatedResolverPolicyAlias =
         data.resolverPolicy === "board_or_agents" ||
         data.resolverPolicy === "board_only";
