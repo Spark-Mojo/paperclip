@@ -24,15 +24,18 @@ export const QUALIFYING_PATH_PATTERNS: NamedPathPattern[] = [
   // Dockerfile, Dockerfile.prod — but not Dockerfile-guide.md (trailing
   // prose after a "-" is a doc, not a build surface).
   { id: "dockerfile", test: /(^|\/)Dockerfile(\.[^/]*)?$/i },
-  { id: "gh-workflows", test: /\.github\/workflows\//i },
+  { id: "gh-workflows", test: /^\.github\/workflows\//i },
   { id: "infra", test: /(^|\/)infra\//i },
   { id: "secrets", test: /(^|\/)secrets?\//i },
   { id: "provisioning", test: /(^|\/)provisioning([/._-]|$)/i },
   { id: "deploy", test: /(^|\/)deploy\//i },
   { id: "certs", test: /(^|\/)certs?\//i },
   // Path segment `bench` (bench/, bench.config) or a Benchfile basename —
-  // never benchmark/ or workbench.
-  { id: "bench", test: /(^|[/._-])bench([/._-]|$)|(^|\/)benchfile/i },
+  // never benchmark/ or workbench, and never prose like my-bench-notes.md
+  // or benchfile-guide.md. Deviation from the review suggestion documented:
+  // suggested `(^\/)` requires a leading slash, which never matches relative
+  // repo paths (e.g. sites/bench.config.json), so `(^|\/)` is used instead.
+  { id: "bench", test: /(^|\/)bench(?:\/|[-._][^/]*$|$)|(^|\/)benchfile(?:\.[^/]*)?$/i },
   // Infra container surfaces only (.devcontainer/, Containerfile,
   // containers/ outside src/). React src/containers/ is app code, not infra.
   {
