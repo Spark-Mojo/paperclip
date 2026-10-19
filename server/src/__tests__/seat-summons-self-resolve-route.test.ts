@@ -1,5 +1,37 @@
+import { randomUUID } from "node:crypto";
 import request from "supertest";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import {
+  activityLog,
+  agents,
+  companies,
+  createDb,
+  documentRevisions,
+  documents,
+  executionWorkspaces,
+  goals,
+  heartbeatRuns,
+  issueComments,
+  issueDocuments,
+  instanceSettings,
+  issueRelations,
+  issueThreadInteractions,
+  issues,
+  projectWorkspaces,
+  projects,
+  workspaceOperations,
+} from "@paperclipai/db";
+import type { CreateIssueThreadInteraction } from "@paperclipai/shared";
+import { instanceSettingsService } from "../services/instance-settings.js";
+import { issueThreadInteractionService } from "../services/issue-thread-interactions.js";
+import {
+  getEmbeddedPostgresTestSupport,
+  startEmbeddedPostgresTestDatabase,
+} from "./helpers/embedded-postgres.js";
+import {
+  getSeatSummonsAuthor,
+  isSeatSummonsHydratedInteraction,
+} from "../services/seat-summons-self-resolve-guard.js";
 import {
   ASSIGNEE_AGENT_ID,
   createSummonsApp,
@@ -123,5 +155,111 @@ describe.sequential("seat-summons self-resolve route wiring (SPA-13735)", () => 
         details: expect.objectContaining({ interactionId: "interaction-summons", code: "creator_self_resolve_refused" }),
       }),
     );
+  });
+});
+
+// Persistence-gap proof (SPA-13735 d12): the request_confirmation zod schema
+// (packages/shared/src/validators/issue.ts `requestConfirmationPayloadSchema`)
+// strips unknown keys at create AND hydrate, so summons marker tags and the
+// PR-author pair never survive the real pipeline and the guard never fires
+// through it. This test proves the gap with real evidence through
+// interactionService.create -> getForIssue. The FIX is a schema extension in
+// that shared validators file (merge/extend the summons payload extension, or
+// `.catchall` it) — validators are out of scope here, so this file extends
+// NOTHING. Existing mock tests above stay untouched: they prove the guard
+// logic against realistic shapes the pipeline cannot yet carry.
+const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
+const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
+
+describeEmbeddedPostgres("seat-summons persistence gap (SPA-13735 d12)", () => {
+  let db!: ReturnType<typeof createDb>;
+  let interactionsSvc!: ReturnType<typeof issueThreadInteractionService>;
+  let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
+
+  beforeAll(async () => {
+    tempDb = await startEmbeddedPostgresTestDatabase("paperclip-seat-summons-gap-");
+    db = createDb(tempDb.connectionString);
+    interactionsSvc = issueThreadInteractionService(db);
+  }, 90_000);
+
+  afterEach(async () => {
+    await db.delete(issueThreadInteractions);
+    await db.delete(activityLog);
+    await db.delete(issueComments);
+    await db.delete(issueDocuments);
+    await db.delete(documentRevisions);
+    await db.delete(documents);
+    await db.delete(issueRelations);
+    await db.delete(heartbeatRuns);
+    await db.delete(workspaceOperations);
+    await db.delete(issues);
+    await db.delete(executionWorkspaces);
+    await db.delete(projectWorkspaces);
+    await db.delete(projects);
+    await db.delete(goals);
+    await db.delete(agents);
+    await db.delete(instanceSettings);
+    await db.delete(companies);
+  });
+
+  afterAll(async () => {
+    await tempDb?.cleanup();
+  });
+
+  it("strips tags/prAuthor through create+hydrate so the summons guard does not fire", async () => {
+    const companyId = randomUUID();
+    const goalId = randomUUID();
+    const issueId = randomUUID();
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await instanceSettingsService(db).updateExperimental({ enableIsolatedWorkspaces: false });
+    await db.insert(goals).values({ id: goalId, companyId, title: "Summons gap", level: "task", status: "active" });
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      goalId,
+      title: "Seat summons parent",
+      status: "in_progress",
+      priority: "medium",
+    });
+
+    const created = await interactionsSvc.create(
+      { id: issueId, companyId },
+      {
+        kind: "request_confirmation",
+        payload: {
+          version: 1,
+          prompt: "Take the seat?",
+          // Summons markers + PR-author identity: admitted to be stripped by
+          // the strict request_confirmation schema (no `tags` / prAuthor
+          // keys). FIX = extend that schema (see header comment); do NOT
+          // extend it here — this test pins the pre-fix gap.
+          ...({ tags: ["seat-summons", "sable-seat"], prAuthorActorId: "agent-pr-author", prAuthorActorType: "agent" } as {
+            tags: string[];
+            prAuthorActorId: string;
+            prAuthorActorType: string;
+          }),
+        },
+      } as unknown as CreateIssueThreadInteraction,
+      { userId: "local-board" },
+    );
+
+    const hydrated = await interactionsSvc.getForIssue({ id: issueId, companyId }, created.id);
+    expect(hydrated.kind).toBe("request_confirmation");
+    if (hydrated.kind !== "request_confirmation") throw new Error("expected request_confirmation");
+    // Registered field round-trips intact: proves selective stripping (an
+    // empty payload would also satisfy the absence assertions above).
+    expect(hydrated.payload).toMatchObject({ version: 1, prompt: "Take the seat?" });
+    // Stripped at create AND hydrate: neither survives the real pipeline.
+    expect(hydrated.payload).not.toHaveProperty("tags");
+    expect(hydrated.payload).not.toHaveProperty("prAuthorActorId");
+    expect(hydrated.payload).not.toHaveProperty("prAuthorActorType");
+    expect(getSeatSummonsAuthor(hydrated)).toBeNull();
+    // So the guard never fires on the hydrated shape through the real path.
+    expect(isSeatSummonsHydratedInteraction(hydrated)).toBe(false);
   });
 });
