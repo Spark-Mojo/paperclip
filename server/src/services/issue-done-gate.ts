@@ -1,4 +1,4 @@
-import { and, desc, eq, inArray, isNotNull, isNull, ne } from "drizzle-orm";
+import { and, desc, eq, inArray, isNotNull, isNull, ne, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
   executionWorkspaces,
@@ -432,53 +432,66 @@ export async function issueHasEscalationActionReceipt(
   issue: { id: string; companyId: string },
 ): Promise<boolean> {
   // Fail closed: no positive control (a qualifying row) means no receipt.
+  // The evidence predicate lives in SQL with limit(1): scanning a capped,
+  // unordered page in JS would ignore a valid receipt past row 100.
   const rows = await db
-    .select({
-      id: issueWorkProducts.id,
-      type: issueWorkProducts.type,
-      externalId: issueWorkProducts.externalId,
-      url: issueWorkProducts.url,
-      createdByRunId: issueWorkProducts.createdByRunId,
-    })
+    .select({ id: issueWorkProducts.id })
     .from(issueWorkProducts)
     .where(and(
       eq(issueWorkProducts.companyId, issue.companyId),
       eq(issueWorkProducts.issueId, issue.id),
       inArray(issueWorkProducts.type, [...ESCALATION_ACTION_EVIDENCE_WORK_PRODUCT_TYPES]),
+      or(
+        sql`coalesce(${issueWorkProducts.externalId}, '') ~ '[^[:space:]]'`,
+        sql`coalesce(${issueWorkProducts.url}, '') ~ '[^[:space:]]'`,
+        isNotNull(issueWorkProducts.createdByRunId),
+      ),
     ))
-    .limit(100);
-  for (const row of rows) {
-    if (row.externalId !== null && row.externalId !== "") return true;
-    if (row.url !== null && row.url !== "") return true;
-    if (row.createdByRunId !== null && row.createdByRunId !== undefined) return true;
-  }
-  return false;
+    .limit(1);
+  return rows.length > 0;
 }
 
 export async function checkEscalationCloseGuard(
   db: Db,
   input: {
     issue: { id: string; companyId: string; originKind?: string | null; title?: string | null };
+    /**
+     * SPA-13737 de-escalation evasion fix: the CLOSING snapshot (incoming
+     * values when defined, else stored). The guard signals if EITHER the
+     * stored or the closing snapshot matches — a stored escalation flipped
+     * to manual/routine-title + done in one op must still refuse, and a
+     * closing flip into an escalation signal must still refuse. Absent =
+     * evaluate `issue` alone (evaluateDoneGate's internal call passes the
+     * closing values as `issue`, so it is unchanged).
+     */
+    closingIssue?: { originKind?: string | null; title?: string | null };
     doneGateOverride?: unknown;
   },
 ): Promise<DoneGateDecision> {
-  const originKind = input.issue.originKind ?? null;
-  let signal: "originKind" | "title-fallback" | null = null;
-  if (originKind && ESCALATION_CLOSE_GUARD_ORIGIN_KINDS.has(originKind)) {
-    signal = "originKind";
-  } else if (
-    // Legacy-fallback for escalate-filed cards that predate an explicit
-    // originKind: board-status.sh escalate files title
-    // "Escalation: <card> stuck waiting on <tok>" with NO originKind, so the
-    // server defaults originKind to "manual" (services/issues.ts).
-    (!originKind || originKind === "manual") &&
-    (input.issue.title ?? "").startsWith(ESCALATION_CLOSE_GUARD_TITLE_PREFIX)
-  ) {
-    signal = "title-fallback";
-  }
+  const escalationSignalOf = (snapshot: { originKind?: string | null; title?: string | null }): "originKind" | "title-fallback" | null => {
+    const originKind = snapshot.originKind ?? null;
+    if (originKind && ESCALATION_CLOSE_GUARD_ORIGIN_KINDS.has(originKind)) {
+      return "originKind";
+    }
+    if (
+      // Legacy-fallback for escalate-filed cards that predate an explicit
+      // originKind: board-status.sh escalate files title
+      // "Escalation: <card> stuck waiting on <tok>" with NO originKind, so the
+      // server defaults originKind to "manual" (services/issues.ts).
+      (!originKind || originKind === "manual") &&
+      (snapshot.title ?? "").startsWith(ESCALATION_CLOSE_GUARD_TITLE_PREFIX)
+    ) {
+      return "title-fallback";
+    }
+    return null;
+  };
+  const storedSignal = escalationSignalOf(input.issue);
+  const closingSignal = input.closingIssue ? escalationSignalOf(input.closingIssue) : null;
+  const signal = storedSignal ?? closingSignal;
   if (!signal) {
     return { outcome: "allow" };
   }
+  const signalingOriginKind = (storedSignal ? input.issue.originKind : input.closingIssue?.originKind) ?? null;
   // Board-only override bypasses (never agent-supplied; the route rejects
   // agent overrides before this point). No resolution-note branch: the issue
   // update path carries no resolution note (verified 2026-10-19 — the update
@@ -489,7 +502,7 @@ export async function checkEscalationCloseGuard(
   if (await issueHasEscalationActionReceipt(db, input.issue)) {
     return { outcome: "allow" };
   }
-  return { outcome: "refuse", reason: { kind: "missing_escalation_action_receipt", originKind: originKind ?? "manual", signal } };
+  return { outcome: "refuse", reason: { kind: "missing_escalation_action_receipt", originKind: signalingOriginKind ?? "manual", signal } };
 }
 
 export function issueDoneGateService(db: Db, opts: IssueDoneGateServiceOptions = {}) {

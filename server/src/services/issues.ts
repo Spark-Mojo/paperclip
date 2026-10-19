@@ -11323,12 +11323,25 @@ export function issueService(db: Db) {
       ) {
         const { assertIssueExecutionStagesComplete, issueDoneGateService, checkEscalationCloseGuard } = await import("./issue-done-gate.js");
         const gate = issueDoneGateService(db);
+        // SPA-13737 TOCTOU: this same op can flip originKind/title while
+        // closing, so resolve the CLOSING values (incoming when defined,
+        // else stored) exactly like executionState/description below. Both
+        // fields are mutable here — the update input is
+        // Partial<inferInsert> and only executionWorkspace* keys are
+        // stripped above — so pre-update `existing` alone is not the guard
+        // signal.
+        const closingOriginKind = issueData.originKind !== undefined ? issueData.originKind : existing.originKind;
+        const closingTitle = issueData.title !== undefined ? issueData.title : existing.title;
         const escalation = await checkEscalationCloseGuard(db, {
           issue: {
             id: existing.id,
             companyId: existing.companyId,
             originKind: existing.originKind,
             title: existing.title,
+          },
+          closingIssue: {
+            originKind: closingOriginKind,
+            title: closingTitle,
           },
           doneGateOverride,
         });
@@ -11345,8 +11358,8 @@ export function issueService(db: Db) {
             id: existing.id,
             companyId: existing.companyId,
             identifier: existing.identifier,
-            originKind: existing.originKind,
-            title: existing.title,
+            originKind: closingOriginKind,
+            title: closingTitle,
             // SPA-9038: the card's own description can carry binding PR links.
             description: typeof issueData.description === "string"
               ? issueData.description
