@@ -28,5 +28,4 @@ describe("agent wakeup request schema", () => {
     ]);
     expect(index?.config.where).toBeDefined();
   });
-
 });
