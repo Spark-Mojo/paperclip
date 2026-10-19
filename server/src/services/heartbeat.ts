@@ -362,9 +362,11 @@ import {
 import {
   buildStallStopNotice,
   countStallStreak,
+  extractStatusTransition,
   isExplicitHumanUnblock,
   shouldStopSurface,
   STALL_STOP_SURFACE_HELD_REASON,
+  STALL_STOP_SURFACE_MARKER,
   STALL_STOP_SURFACE_TRIPPED_REASON,
   STALL_STOP_UNBLOCK_ACTIONS,
   stallStopNoticeMarker,
@@ -29624,6 +29626,112 @@ export function heartbeatService(
           // isOrdinaryThrottleCandidate keeps gating the escalating cooldown
           // exactly as before, so handoff wake timing is unaffected — only
           // the breaker below additionally watches it.
+          //
+          // Stop-and-surface hold gate (R4): once the stall stop has tripped
+          // for this issue, ALL wake reasons stay silent — including user
+          // board-comment wakes (issue_commented with a user comment), which
+          // skip the isBreakerRewakeCandidate block below entirely, and
+          // deferred_comment_wake, which re-queues as issue_commented. A
+          // bare comment is never an unblock; only an explicit human unblock
+          // after the notice lets the wake through. Hold-only: never trips,
+          // never posts notes, never moves status — the in-block trip logic
+          // below stays the only trip site.
+          if (issue.status === "blocked") {
+            const holdNotice = await tx
+              .select({
+                id: issueComments.id,
+                createdAt: issueComments.createdAt,
+              })
+              .from(issueComments)
+              .where(
+                and(
+                  eq(issueComments.companyId, issue.companyId),
+                  eq(issueComments.issueId, issue.id),
+                  sql`${issueComments.body} like ${`${STALL_STOP_SURFACE_MARKER}%`}`,
+                ),
+              )
+              .orderBy(
+                desc(issueComments.createdAt),
+                desc(issueComments.id),
+              )
+              .limit(1)
+              .then((rows) => rows[0] ?? null);
+            if (holdNotice) {
+              // Limit-20 window caveat: an unblock older than the 20 newest
+              // user rows could be missed — acceptable, noted.
+              const holdUnblockCandidates = await tx
+                .select({
+                  actorType: activityLog.actorType,
+                  action: activityLog.action,
+                  details: activityLog.details,
+                })
+                .from(activityLog)
+                .where(
+                  and(
+                    eq(activityLog.companyId, issue.companyId),
+                    eq(activityLog.entityType, "issue"),
+                    eq(activityLog.entityId, issue.id),
+                    eq(activityLog.actorType, "user"),
+                    gt(activityLog.createdAt, holdNotice.createdAt),
+                    inArray(
+                      activityLog.action,
+                      Array.from(
+                        new Set([
+                          "issue.updated",
+                          "status_changed",
+                          ...STALL_STOP_UNBLOCK_ACTIONS,
+                        ]),
+                      ),
+                    ),
+                  ),
+                )
+                .orderBy(
+                  desc(activityLog.createdAt),
+                  desc(activityLog.id),
+                )
+                .limit(20);
+              const holdUnblockedAfterNotice =
+                holdUnblockCandidates.some((row) => {
+                  const { fromStatus, toStatus } =
+                    extractStatusTransition(
+                      (row.details as Record<string, unknown> | null) ??
+                        null,
+                    );
+                  return isExplicitHumanUnblock({
+                    actorType: row.actorType,
+                    action: row.action,
+                    fromStatus,
+                    toStatus,
+                  });
+                });
+              if (!holdUnblockedAfterNotice) {
+                const holdNow = new Date();
+                await tx.insert(agentWakeupRequests).values({
+                  ...durableReceiptFields,
+                  companyId: agent.companyId,
+                  agentId,
+                  source,
+                  triggerDetail,
+                  reason: STALL_STOP_SURFACE_HELD_REASON,
+                  payload: {
+                    ...(payload ?? {}),
+                    issueId,
+                    heartbeatSkip: {
+                      reason: STALL_STOP_SURFACE_HELD_REASON,
+                      requestedReason: reason,
+                      heldSince: holdNotice.createdAt.toISOString(),
+                    },
+                  },
+                  status: "skipped" as const,
+                  requestedByActorType: opts.requestedByActorType ?? null,
+                  requestedByActorId: opts.requestedByActorId ?? null,
+                  idempotencyKey: opts.idempotencyKey ?? null,
+                  finishedAt: holdNow,
+                });
+                return { kind: "skipped" as const };
+              }
+            }
+          }
           const issueRewakeCandidateInput = {
             reason,
             wakeCommentId: wakeCommentId ?? null,
@@ -29674,87 +29782,82 @@ export function heartbeatService(
             // evaluated for every breaker-rewake candidate wake, including
             // handoff reasons — it is NOT gated on
             // isOrdinaryThrottleCandidate.
-            const stallStreak = countStallStreak(recentTerminalRuns);
+            //
+            // R2 reset: truncate the streak at the latest explicit human
+            // unblock BEFORE counting. Old runs finished before the unblock
+            // never count, so an unblock + 1 new stall yields streak 1, not
+            // 4 (3 old + 1 new). Newest-first limit-20 window: an unblock
+            // older than the 20 newest user rows could be missed —
+            // acceptable, noted. Status moves land in activity_log as
+            // "issue.updated" with the transition in details._previous.status
+            // (issue-review-policy shape) or details.changes.status.from;
+            // named unblock actions count under isExplicitHumanUnblock
+            // semantics (actorType "user" only). "status_changed" is the
+            // alias the pure helper accepts, so it stays in the allowlist
+            // too. This pre-filter subsumes the old post-streak re-arm
+            // check: a bare board comment never clears the stop (comment
+            // rows fail isExplicitHumanUnblock), and a later trivial
+            // issue.updated (e.g. a title edit with no status transition)
+            // fails it too, so neither shadows a genuine earlier unblock —
+            // the loop below takes the NEWEST passing row as unblockAt.
+            const unblockCandidates = await tx
+              .select({
+                actorType: activityLog.actorType,
+                action: activityLog.action,
+                details: activityLog.details,
+                createdAt: activityLog.createdAt,
+              })
+              .from(activityLog)
+              .where(
+                and(
+                  eq(activityLog.companyId, issue.companyId),
+                  eq(activityLog.entityType, "issue"),
+                  eq(activityLog.entityId, issue.id),
+                  eq(activityLog.actorType, "user"),
+                  inArray(
+                    activityLog.action,
+                    Array.from(
+                      new Set([
+                        "issue.updated",
+                        "status_changed",
+                        ...STALL_STOP_UNBLOCK_ACTIONS,
+                      ]),
+                    ),
+                  ),
+                ),
+              )
+              .orderBy(
+                desc(activityLog.createdAt),
+                desc(activityLog.id),
+              )
+              .limit(20);
+            let unblockAt: Date | null = null;
+            for (const row of unblockCandidates) {
+              const { fromStatus, toStatus } = extractStatusTransition(
+                (row.details as Record<string, unknown> | null) ?? null,
+              );
+              if (
+                isExplicitHumanUnblock({
+                  actorType: row.actorType,
+                  action: row.action,
+                  fromStatus,
+                  toStatus,
+                })
+              ) {
+                unblockAt = row.createdAt;
+                break;
+              }
+            }
+            const unblockCutoff: Date | null = unblockAt;
+            const postUnblockRuns = unblockCutoff
+              ? recentTerminalRuns.filter(
+                  (run) =>
+                    run.finishedAt != null &&
+                    run.finishedAt > unblockCutoff,
+                )
+              : recentTerminalRuns;
+            const stallStreak = countStallStreak(postUnblockRuns);
             if (shouldStopSurface(stallStreak.streak)) {
-              const newestStallFinishedAt =
-                recentTerminalRuns[0]?.finishedAt ?? null;
-              // R5 re-arm: an explicit human unblock after the newest counted
-              // run finished resets the streak. A bare board comment never
-              // clears the stop. A later trivial issue.updated (e.g. a title
-              // edit with no status transition) must not shadow a genuine
-              // earlier unblock, so the query reads a small newest-first
-              // window and .some() scans ALL returned rows. Status
-              // moves land in activity_log as "issue.updated" with the
-              // transition in details._previous.status (issue-review-policy
-              // shape) or details.changes.status.from; named unblock actions
-              // count under isExplicitHumanUnblock semantics (actorType
-              // "user" only). "status_changed" is the alias the pure helper
-              // accepts, so it stays in the allowlist too.
-              const postStreakUnblockCandidates = newestStallFinishedAt
-                ? await tx
-                    .select({
-                      actorType: activityLog.actorType,
-                      action: activityLog.action,
-                      details: activityLog.details,
-                    })
-                    .from(activityLog)
-                    .where(
-                      and(
-                        eq(activityLog.companyId, issue.companyId),
-                        eq(activityLog.entityType, "issue"),
-                        eq(activityLog.entityId, issue.id),
-                        eq(activityLog.actorType, "user"),
-                        gt(activityLog.createdAt, newestStallFinishedAt),
-                        inArray(
-                          activityLog.action,
-                          Array.from(
-                            new Set([
-                              "issue.updated",
-                              "status_changed",
-                              ...STALL_STOP_UNBLOCK_ACTIONS,
-                            ]),
-                          ),
-                        ),
-                      ),
-                    )
-                    .orderBy(
-                      desc(activityLog.createdAt),
-                      desc(activityLog.id),
-                    )
-                    .limit(20)
-                : [];
-              const humanUnblockedAfterStreak =
-                postStreakUnblockCandidates.some((row) => {
-                  const details =
-                    (row.details as Record<string, unknown> | null) ?? null;
-                  const previous =
-                    (details?._previous as
-                      | Record<string, unknown>
-                      | undefined) ?? undefined;
-                  const changes =
-                    (details?.changes as
-                      | Record<string, { from?: unknown; to?: unknown }>
-                      | undefined) ?? undefined;
-                  const fromStatus =
-                    typeof previous?.status === "string"
-                      ? (previous.status as string)
-                      : typeof changes?.status?.from === "string"
-                        ? (changes.status.from as string)
-                        : null;
-                  const toStatus =
-                    typeof details?.status === "string"
-                      ? (details.status as string)
-                      : typeof changes?.status?.to === "string"
-                        ? (changes.status.to as string)
-                        : null;
-                  return isExplicitHumanUnblock({
-                    actorType: row.actorType,
-                    action: row.action,
-                    fromStatus,
-                    toStatus,
-                  });
-                });
-              if (!humanUnblockedAfterStreak) {
                 const stallSkipShape = {
                   ...durableReceiptFields,
                   companyId: agent.companyId,
@@ -29859,7 +29962,6 @@ export function heartbeatService(
                   },
                 });
                 return { kind: "skipped" as const };
-              }
             }
 
             if (recentTerminalRuns.length > 0) {

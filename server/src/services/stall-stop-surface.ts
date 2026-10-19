@@ -131,11 +131,32 @@ export function isExplicitHumanUnblock(input: {
 }
 
 /**
- * Silence decision for an already-held card: once stop-and-surface has
- * tripped, further wakes stay held (no new run, no new note) until an
- * explicit human unblock. Otherwise defers to shouldStopSurface.
+ * Extract a status transition (from/to) from an activity_log details blob.
+ * Status moves land as "issue.updated" with the transition in
+ * details._previous.status (issue-review-policy shape) or
+ * details.changes.status.from/.to; a plain details.status carries the new
+ * status. Missing/non-string parts resolve to null (never an unblock).
  */
-export function evaluateStallWake(stopHeld: boolean, streak: number): { held: boolean } {
-  if (stopHeld) return { held: true };
-  return { held: shouldStopSurface(streak) };
+export function extractStatusTransition(
+  details: Record<string, unknown> | null,
+): { fromStatus: string | null; toStatus: string | null } {
+  const previous =
+    (details?._previous as Record<string, unknown> | undefined) ?? undefined;
+  const changes =
+    (details?.changes as
+      | Record<string, { from?: unknown; to?: unknown }>
+      | undefined) ?? undefined;
+  const fromStatus =
+    typeof previous?.status === "string"
+      ? (previous.status as string)
+      : typeof changes?.status?.from === "string"
+        ? (changes.status.from as string)
+        : null;
+  const toStatus =
+    typeof details?.status === "string"
+      ? (details.status as string)
+      : typeof changes?.status?.to === "string"
+        ? (changes.status.to as string)
+        : null;
+  return { fromStatus, toStatus };
 }

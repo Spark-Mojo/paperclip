@@ -4,7 +4,7 @@ import {
   STALL_STOP_SURFACE_MARKER,
   buildStallStopNotice,
   countStallStreak,
-  evaluateStallWake,
+  extractStatusTransition,
   isExplicitHumanUnblock,
   shouldStopSurface,
   stallStopNoticeMarker,
@@ -244,15 +244,29 @@ describe("isExplicitHumanUnblock", () => {
   });
 });
 
-describe("evaluateStallWake silence", () => {
-  it("stopHeld stays held across repeated wakes with the same streak", () => {
-    expect(evaluateStallWake(true, 3)).toEqual({ held: true });
-    expect(evaluateStallWake(true, 3)).toEqual({ held: true });
-    expect(evaluateStallWake(true, 3)).toEqual({ held: true });
+describe("extractStatusTransition", () => {
+  it("_previous shape resolves from/to", () => {
+    expect(
+      extractStatusTransition({ _previous: { status: "blocked" }, status: "todo" }),
+    ).toEqual({ fromStatus: "blocked", toStatus: "todo" });
   });
 
-  it("not held below threshold, held at threshold", () => {
-    expect(evaluateStallWake(false, 2)).toEqual({ held: false });
-    expect(evaluateStallWake(false, 3)).toEqual({ held: true });
+  it("changes shape resolves from/to", () => {
+    expect(
+      extractStatusTransition({
+        changes: { status: { from: "blocked", to: "in_progress" } },
+      }),
+    ).toEqual({ fromStatus: "blocked", toStatus: "in_progress" });
+  });
+
+  it("title-edit shape (no transition) resolves nulls", () => {
+    expect(extractStatusTransition({ title: "renamed" })).toEqual({
+      fromStatus: null,
+      toStatus: null,
+    });
+    expect(extractStatusTransition(null)).toEqual({
+      fromStatus: null,
+      toStatus: null,
+    });
   });
 });
