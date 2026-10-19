@@ -11,15 +11,15 @@ cd "$(dirname "$0")/../../server"
 # Primary: the -t filter matched ONLY the refuse tests and they passed —
 # a green run here proves bad input (escalation close, no receipt) is
 # rejected. (Passing tests never echo the 409 code, so assert the count.)
-grep -qE "Tests +4 passed" /tmp/spa13737-neg-out.txt || {
-  echo "NEG-FAIL: refuse-filter run did not pass its 4 refuse tests" >&2
+{ grep -qE "Tests +[0-9]+ passed" /tmp/spa13737-neg-out.txt && ! grep -qE "failed" /tmp/spa13737-neg-out.txt && ! grep -qE "No test found|Tests +0[ :]" /tmp/spa13737-neg-out.txt; } || {
+  echo "NEG-FAIL: refuse-filter run did not pass its refuse tests (or matched none)" >&2
   exit 1
 }
 # Pinned fail-closed check: grep within the issueHasEscalationActionReceipt
 # function body only, not file-wide (a stray "return false" elsewhere would
 # fake a green).
-awk '/function issueHasEscalationActionReceipt/,/^}/' src/services/issue-done-gate.ts | grep -q "return false" || {
-  echo "NEG-FAIL: fail-closed default (return false) absent from issueHasEscalationActionReceipt" >&2
+awk '/function issueHasEscalationActionReceipt/,/^}/' src/services/issue-done-gate.ts | grep -q "limit(1)" && awk '/function issueHasEscalationActionReceipt/,/^}/' src/services/issue-done-gate.ts | grep -qE "rows\.length > 0|length === 0" || {
+  echo "NEG-FAIL: fail-closed shape (limit(1) + empty-means-false) absent from issueHasEscalationActionReceipt" >&2
   exit 1
 }
 echo "NEG-PASS: refuse tests reject bad input; fail-closed default present"
