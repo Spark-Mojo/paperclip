@@ -188,6 +188,43 @@ describeEmbeddedPostgres("issue done gate — escalation close-guard (SPA-13737)
     expect(updated?.status).toBe("done");
   });
 
+  it("refuses done for manual Escalation-titled card without a receipt (SPA-13683 shape)", async () => {
+    const card = await createCard(db, companyId, {
+      assigneeAgentId: agentId,
+      originKind: "manual",
+      title: "Escalation: SPA-13683 stuck waiting on blocked",
+    });
+    await expect(
+      issueService(db).update(card.id, { status: "done" }),
+    ).rejects.toMatchObject({
+      status: 409,
+      details: { code: "issue_done_without_escalation_receipt", signal: "title-fallback" },
+    });
+    const after = await db.select().from(issues).where(eq(issues.id, card.id)).then((rows) => rows[0]!);
+    expect(after.status).toBe("in_progress");
+  });
+
+  it("allows done for manual Escalation-titled card with a commit receipt", async () => {
+    const card = await createCard(db, companyId, {
+      assigneeAgentId: agentId,
+      originKind: "manual",
+      title: "Escalation: SPA-13683 stuck waiting on blocked",
+    });
+    await attachCommitReceipt(db, card);
+    const updated = await issueService(db).update(card.id, { status: "done" });
+    expect(updated?.status).toBe("done");
+  });
+
+  it("allows done for plain manual card with non-escalation title and no receipt", async () => {
+    const card = await createCard(db, companyId, {
+      assigneeAgentId: agentId,
+      originKind: "manual",
+      title: "Routine follow-up work",
+    });
+    const updated = await issueService(db).update(card.id, { status: "done" });
+    expect(updated?.status).toBe("done");
+  });
+
   it("allows done for non-escalation card with doneGateBypass and no receipt", async () => {
     const card = await createCard(db, companyId, { assigneeAgentId: agentId });
     const updated = await issueService(db).update(card.id, { status: "done", doneGateBypass: true });

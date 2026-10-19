@@ -11328,6 +11328,7 @@ export function issueService(db: Db) {
             id: existing.id,
             companyId: existing.companyId,
             originKind: existing.originKind,
+            title: existing.title,
           },
           doneGateOverride,
         });
@@ -11345,6 +11346,7 @@ export function issueService(db: Db) {
             companyId: existing.companyId,
             identifier: existing.identifier,
             originKind: existing.originKind,
+            title: existing.title,
             // SPA-9038: the card's own description can carry binding PR links.
             description: typeof issueData.description === "string"
               ? issueData.description
