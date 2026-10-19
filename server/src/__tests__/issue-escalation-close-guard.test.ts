@@ -230,4 +230,116 @@ describeEmbeddedPostgres("issue done gate — escalation close-guard (SPA-13737)
     const updated = await issueService(db).update(card.id, { status: "done", doneGateBypass: true });
     expect(updated?.status).toBe("done");
   });
+
+  it("refuses originKind flip + done in one op without a receipt (closing-origin TOCTOU)", async () => {
+    const card = await createCard(db, companyId, {
+      assigneeAgentId: agentId,
+      originKind: "manual",
+      title: "Routine follow-up work",
+    });
+    await expect(
+      issueService(db).update(card.id, { status: "done", originKind: "stranded_issue_recovery" }),
+    ).rejects.toMatchObject({
+      status: 409,
+      details: { code: "issue_done_without_escalation_receipt" },
+    });
+    const after = await db.select().from(issues).where(eq(issues.id, card.id)).then((rows) => rows[0]!);
+    expect(after.status).toBe("in_progress");
+  });
+
+  it("refuses title flip to Escalation: + done in one op without a receipt (closing-title TOCTOU)", async () => {
+    const card = await createCard(db, companyId, {
+      assigneeAgentId: agentId,
+      originKind: "manual",
+      title: "Routine follow-up work",
+    });
+    await expect(
+      issueService(db).update(card.id, { status: "done", title: "Escalation: SPA-13737 stuck waiting on blocked" }),
+    ).rejects.toMatchObject({
+      status: 409,
+      details: { code: "issue_done_without_escalation_receipt", signal: "title-fallback" },
+    });
+    const after = await db.select().from(issues).where(eq(issues.id, card.id)).then((rows) => rows[0]!);
+    expect(after.status).toBe("in_progress");
+  });
+
+  it("refuses stored-escalation flipped to manual + routine title + done in one op without a receipt (de-escalation evasion)", async () => {
+    const card = await createCard(db, companyId, {
+      assigneeAgentId: agentId,
+      originKind: "stranded_issue_recovery",
+      title: "Escalation: SPA-13737 stuck waiting on blocked",
+    });
+    await expect(
+      issueService(db).update(card.id, { status: "done", originKind: "manual", title: "Routine follow-up work" }),
+    ).rejects.toMatchObject({
+      status: 409,
+      details: { code: "issue_done_without_escalation_receipt" },
+    });
+    const after = await db.select().from(issues).where(eq(issues.id, card.id)).then((rows) => rows[0]!);
+    expect(after.status).toBe("in_progress");
+    expect(after.originKind).toBe("stranded_issue_recovery");
+  });
+
+  it("refuses stored Escalation-titled card flipped to routine title + done in one op without a receipt (title de-escalation evasion)", async () => {
+    const card = await createCard(db, companyId, {
+      assigneeAgentId: agentId,
+      originKind: "manual",
+      title: "Escalation: SPA-13683 stuck waiting on blocked",
+    });
+    await expect(
+      issueService(db).update(card.id, { status: "done", title: "Routine follow-up work" }),
+    ).rejects.toMatchObject({
+      status: 409,
+      details: { code: "issue_done_without_escalation_receipt", signal: "title-fallback" },
+    });
+    const after = await db.select().from(issues).where(eq(issues.id, card.id)).then((rows) => rows[0]!);
+    expect(after.status).toBe("in_progress");
+  });
+
+  it("finds a receipt past the first 100 rows (predicate in SQL, limit 1)", async () => {
+    const card = await createCard(db, companyId, {
+      assigneeAgentId: agentId,
+      originKind: "stranded_issue_recovery",
+    });
+    await db.insert(issueWorkProducts).values(
+      Array.from({ length: 101 }, (_, i) => ({
+        companyId: card.companyId,
+        issueId: card.id,
+        type: "commit",
+        provider: "github",
+        title: `Empty decoy ${i}`,
+        externalId: null,
+        url: null,
+        status: "open",
+      })),
+    );
+    await attachCommitReceipt(db, card);
+    const updated = await issueService(db).update(card.id, { status: "done" });
+    expect(updated?.status).toBe("done");
+  });
+
+  it("refuses whitespace-only externalId/url as receipt evidence", async () => {
+    const card = await createCard(db, companyId, {
+      assigneeAgentId: agentId,
+      originKind: "stranded_issue_recovery",
+    });
+    await db.insert(issueWorkProducts).values({
+      companyId: card.companyId,
+      issueId: card.id,
+      type: "commit",
+      provider: "github",
+      title: "Blank receipt",
+      externalId: "   ",
+      url: "  ",
+      status: "open",
+    });
+    await expect(
+      issueService(db).update(card.id, { status: "done" }),
+    ).rejects.toMatchObject({
+      status: 409,
+      details: { code: "issue_done_without_escalation_receipt" },
+    });
+    const after = await db.select().from(issues).where(eq(issues.id, card.id)).then((rows) => rows[0]!);
+    expect(after.status).toBe("in_progress");
+  });
 });
