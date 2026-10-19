@@ -409,8 +409,16 @@ function gateStateFromDetails(details: PullRequestMergeDetails): "merged" | "ope
 export const ESCALATION_CLOSE_GUARD_ORIGIN_KINDS: ReadonlySet<string> = new Set([
   "stranded_issue_recovery",
   "harness_liveness_escalation",
-  "issue_productivity_review",
-  "stale_active_run_evaluation",
+  // SPA-13753: "issue_productivity_review" and "stale_active_run_evaluation"
+  // are deliberately NOT guarded. They are system-fold closures, not human
+  // escalation closes: the source-resolved watchdog fold
+  // (active-run-watchdog/adapters/postgres.ts foldSourceResolvedRun) closes
+  // the evaluation card via update({status:"done", doneGateBypass:true}) with
+  // no work product attached, and the guard runs even under doneGateBypass
+  // by design — so guarding these kinds 409s the fold and rolls back its
+  // transaction (heartbeat-active-run-output-watchdog.test.ts expects the
+  // evaluation to land done). The guard's purpose is human escalation-close
+  // evidence; these kinds carry none by design.
 ]);
 
 /**
