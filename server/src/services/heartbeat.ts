@@ -29802,6 +29802,30 @@ export function heartbeatService(
             .orderBy(desc(heartbeatRuns.finishedAt))
             .limit(ISSUE_REWAKE_RUN_SAMPLE_LIMIT);
 
+            // R2 fix: the STALL count must not share the 6h rewake-throttle
+            // window above — 3 stalls spread over >6h would never trip.
+            // Separate count-capped (no wall-clock filter) sample for the
+            // stall streak only; the 6h query keeps its throttle semantics.
+            const stallRuns = await tx
+              .select({
+                id: heartbeatRuns.id,
+                status: heartbeatRuns.status,
+                errorCode: heartbeatRuns.errorCode,
+                startedAt: heartbeatRuns.startedAt,
+                finishedAt: heartbeatRuns.finishedAt,
+              })
+              .from(heartbeatRuns)
+              .where(
+                and(
+                  eq(heartbeatRuns.companyId, agent.companyId),
+                  eq(heartbeatRuns.agentId, agentId),
+                  sql`${heartbeatRuns.finishedAt} is not null`,
+                  sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${issue.id}`,
+                ),
+              )
+              .orderBy(desc(heartbeatRuns.finishedAt))
+              .limit(10);
+
             // Cheap early exit: when the raw (pre-reset) streak is already
             // below the trip threshold AND no trusted trip notice is on
             // record, neither the R3 fire nor the R4 silence branch can
@@ -29809,7 +29833,7 @@ export function heartbeatService(
             // below and fall through to the throttle-gated section. The
             // notice probe is a limit-1 lookup mirroring the hold gate
             // above; FOR UPDATE runs only on the fire path.
-            const rawStallStreak = countStallStreak(recentTerminalRuns);
+            const rawStallStreak = countStallStreak(stallRuns);
             let stallTripNoticeProbe: { id: string } | null = null;
             if (!shouldStopSurface(rawStallStreak.streak)) {
               stallTripNoticeProbe = await tx
@@ -29919,12 +29943,12 @@ export function heartbeatService(
                 ? (unblockAt > resetAt ? unblockAt : resetAt)
                 : (unblockAt ?? resetAt);
             const postUnblockRuns = stallResetCutoff
-              ? recentTerminalRuns.filter(
+              ? stallRuns.filter(
                   (run) =>
                     run.finishedAt != null &&
                     run.finishedAt > stallResetCutoff,
                 )
-              : recentTerminalRuns;
+              : stallRuns;
             const stallStreak = countStallStreak(postUnblockRuns);
             if (shouldStopSurface(stallStreak.streak)) {
                 const stallSkipShape = {
