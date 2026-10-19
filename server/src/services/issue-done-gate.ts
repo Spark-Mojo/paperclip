@@ -1,4 +1,4 @@
-import { and, desc, eq, inArray, isNotNull, isNull, ne } from "drizzle-orm";
+import { and, desc, eq, inArray, isNotNull, isNull, ne, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
   executionWorkspaces,
@@ -198,6 +198,10 @@ import {
 
 export const DONE_GATE_OPEN_PR_REFUSAL = "issue_done_with_unmerged_pull_request";
 export const DONE_GATE_INCOMPLETE_STAGE_REFUSAL = "issue_done_with_incomplete_execution_stage";
+// SPA-13737 — escalation close-guard: an escalation issue (stranded-issue
+// recovery, harness-liveness escalation) may not reach `done` without an
+// action-evidence receipt on the card.
+export const DONE_GATE_ESCALATION_RECEIPT_REFUSAL = "issue_done_without_escalation_receipt";
 
 export function assertIssueExecutionStagesComplete(issue: {
   executionPolicy?: unknown;
@@ -284,7 +288,8 @@ export type DoneGatePullRequestState = {
 export type DoneGateBlockedReason =
   | { kind: "open_pull_requests"; pullRequests: DoneGatePullRequestState[] }
   | { kind: "unknown_pull_request_state"; pullRequests: DoneGatePullRequestState[] }
-  | { kind: "unresolved_pull_request_reference"; numbers: number[] };
+  | { kind: "unresolved_pull_request_reference"; numbers: number[] }
+  | { kind: "missing_escalation_action_receipt"; originKind: string; signal: "originKind" | "title-fallback" };
 
 export type DoneGateDecision =
   | { outcome: "allow" }
@@ -394,6 +399,167 @@ function gateStateFromDetails(details: PullRequestMergeDetails): "merged" | "ope
   if (details.workProductState === "closed") return "closed";
   if (details.state === "open") return "open";
   return "unknown";
+}
+
+/**
+ * SPA-13737 — escalation close-guard input. `originKind` is the issue's stored
+ * `origin_kind`; `doneGateOverride` is the route-minted bypass (board-only).
+ * `title` feeds the legacy-fallback branch (see checkEscalationCloseGuard).
+ */
+export const ESCALATION_CLOSE_GUARD_ORIGIN_KINDS: ReadonlySet<string> = new Set([
+  "stranded_issue_recovery",
+  "harness_liveness_escalation",
+  // SPA-13753: "issue_productivity_review" and "stale_active_run_evaluation"
+  // are deliberately NOT guarded. They are system-fold closures, not human
+  // escalation closes: the source-resolved watchdog fold
+  // (active-run-watchdog/adapters/postgres.ts foldSourceResolvedRun) closes
+  // the evaluation card via update({status:"done", doneGateBypass:true}) with
+  // no work product attached, and the guard runs even under doneGateBypass
+  // by design — so guarding these kinds 409s the fold and rolls back its
+  // transaction (heartbeat-active-run-output-watchdog.test.ts expects the
+  // evaluation to land done). The guard's purpose is human escalation-close
+  // evidence; these kinds carry none by design.
+]);
+
+/**
+ * SPA-13737 hardened fix (SPA-13683-shaped cards): escalate-filed cards carry
+ * NO explicit originKind, so the server defaults them to "manual". Match the
+ * exact anchored title prefix board-status.sh escalate files
+ * ("Escalation: <card> stuck waiting on <tok>").
+ */
+export const ESCALATION_CLOSE_GUARD_TITLE_PREFIX = "Escalation:";
+
+export const ESCALATION_ACTION_EVIDENCE_WORK_PRODUCT_TYPES: ReadonlySet<string> = new Set([
+  "pull_request",
+  "commit",
+  "branch",
+]);
+
+/**
+ * SPA-13737 R2: API-mutation receipts live on artifact/document rows
+ * (externalId/url carry the mutation receipt). Run-id receipts (createdByRunId)
+ * are valid on ANY of the 7 work-product types — run attribution is itself
+ * the evidence. Keep the constant name meaningful: the (a) git-shape set
+ * above is unchanged; the (c) set below extends it.
+ */
+export const ESCALATION_API_MUTATION_RECEIPT_WORK_PRODUCT_TYPES: ReadonlySet<string> = new Set([
+  "artifact",
+  "document",
+]);
+
+/**
+ * SPA-13737 R2: run-id receipts (createdByRunId) are valid on ANY of the 7
+ * taxonomy types (work-product.ts:9-17) — run attribution is itself the
+ * evidence. Restricts branch (b) to the valid taxonomy so an unknown type
+ * string with a run id stays refused (fail-closed).
+ */
+export const ESCALATION_RUN_RECEIPT_WORK_PRODUCT_TYPES: ReadonlySet<string> = new Set([
+  "preview_url",
+  "runtime_service",
+  "pull_request",
+  "branch",
+  "commit",
+  "artifact",
+  "document",
+]);
+
+export async function issueHasEscalationActionReceipt(
+  db: Db,
+  issue: { id: string; companyId: string },
+): Promise<boolean> {
+  // Fail closed: no positive control (a qualifying row) means no receipt.
+  // The evidence predicate lives in SQL with limit(1): scanning a capped,
+  // unordered page in JS would ignore a valid receipt past row 100.
+  // R2/SPA-13737: a row qualifies if EITHER
+  //   (a) type in {pull_request, commit, branch} with non-blank
+  //       externalId/url or createdByRunId set (unchanged), OR
+  //   (b) ANY of the 7 types with createdByRunId set (run-id receipt), OR
+  //   (c) type artifact/document with non-blank externalId/url
+  //       (API-mutation receipt).
+  const rows = await db
+    .select({ id: issueWorkProducts.id })
+    .from(issueWorkProducts)
+    .where(and(
+      eq(issueWorkProducts.companyId, issue.companyId),
+      eq(issueWorkProducts.issueId, issue.id),
+      or(
+        and(
+          inArray(issueWorkProducts.type, [...ESCALATION_ACTION_EVIDENCE_WORK_PRODUCT_TYPES]),
+          or(
+            sql`coalesce(${issueWorkProducts.externalId}, '') ~ '[^[:space:]]'`,
+            sql`coalesce(${issueWorkProducts.url}, '') ~ '[^[:space:]]'`,
+            isNotNull(issueWorkProducts.createdByRunId),
+          ),
+        ),
+        and(
+          inArray(issueWorkProducts.type, [...ESCALATION_RUN_RECEIPT_WORK_PRODUCT_TYPES]),
+          isNotNull(issueWorkProducts.createdByRunId),
+        ),
+        and(
+          inArray(issueWorkProducts.type, [...ESCALATION_API_MUTATION_RECEIPT_WORK_PRODUCT_TYPES]),
+          or(
+            sql`coalesce(${issueWorkProducts.externalId}, '') ~ '[^[:space:]]'`,
+            sql`coalesce(${issueWorkProducts.url}, '') ~ '[^[:space:]]'`,
+          ),
+        ),
+      ),
+    ))
+    .limit(1);
+  return rows.length > 0;
+}
+
+export async function checkEscalationCloseGuard(
+  db: Db,
+  input: {
+    issue: { id: string; companyId: string; originKind?: string | null; title?: string | null };
+    /**
+     * SPA-13737 de-escalation evasion fix: the CLOSING snapshot (incoming
+     * values when defined, else stored). The guard signals if EITHER the
+     * stored or the closing snapshot matches — a stored escalation flipped
+     * to manual/routine-title + done in one op must still refuse, and a
+     * closing flip into an escalation signal must still refuse. Absent =
+     * evaluate `issue` alone (evaluateDoneGate's internal call passes the
+     * closing values as `issue`, so it is unchanged).
+     */
+    closingIssue?: { originKind?: string | null; title?: string | null };
+    doneGateOverride?: unknown;
+  },
+): Promise<DoneGateDecision> {
+  const escalationSignalOf = (snapshot: { originKind?: string | null; title?: string | null }): "originKind" | "title-fallback" | null => {
+    const originKind = snapshot.originKind ?? null;
+    if (originKind && ESCALATION_CLOSE_GUARD_ORIGIN_KINDS.has(originKind)) {
+      return "originKind";
+    }
+    if (
+      // Legacy-fallback for escalate-filed cards that predate an explicit
+      // originKind: board-status.sh escalate files title
+      // "Escalation: <card> stuck waiting on <tok>" with NO originKind, so the
+      // server defaults originKind to "manual" (services/issues.ts).
+      (!originKind || originKind === "manual") &&
+      (snapshot.title ?? "").startsWith(ESCALATION_CLOSE_GUARD_TITLE_PREFIX)
+    ) {
+      return "title-fallback";
+    }
+    return null;
+  };
+  const storedSignal = escalationSignalOf(input.issue);
+  const closingSignal = input.closingIssue ? escalationSignalOf(input.closingIssue) : null;
+  const signal = storedSignal ?? closingSignal;
+  if (!signal) {
+    return { outcome: "allow" };
+  }
+  const signalingOriginKind = (storedSignal ? input.issue.originKind : input.closingIssue?.originKind) ?? null;
+  // Board-only override bypasses (never agent-supplied; the route rejects
+  // agent overrides before this point). No resolution-note branch: the issue
+  // update path carries no resolution note (verified 2026-10-19 — the update
+  // options type has doneGateOverride/doneGateBypass only, and resolutionNote
+  // lives on recovery-action resolution), so a note branch here would be a
+  // dead allow-path.
+  if (input.doneGateOverride) return { outcome: "allow" };
+  if (await issueHasEscalationActionReceipt(db, input.issue)) {
+    return { outcome: "allow" };
+  }
+  return { outcome: "refuse", reason: { kind: "missing_escalation_action_receipt", originKind: signalingOriginKind ?? "manual", signal } };
 }
 
 export function issueDoneGateService(db: Db, opts: IssueDoneGateServiceOptions = {}) {
@@ -868,8 +1034,13 @@ export function issueDoneGateService(db: Db, opts: IssueDoneGateServiceOptions =
   }
 
   async function evaluateDoneGate(
-    issue: { id: string; companyId: string; description?: string | null; identifier?: string | null },
+    issue: { id: string; companyId: string; description?: string | null; identifier?: string | null; originKind?: string | null; title?: string | null },
   ): Promise<DoneGateDecision> {
+    // SPA-13737 escalation close-guard first: an escalation close without an
+    // action-evidence receipt refuses before the PR gate runs. Passes through
+    // (allow) for non-escalation cards.
+    const escalation = await checkEscalationCloseGuard(db, { issue });
+    if (escalation.outcome === "refuse") return escalation;
     const bound = await listBoundPullRequests(issue);
     const { productReferences, proseReferences, unresolved, attributionByKey } = bound;
     if (unresolved.length > 0) {
@@ -1020,6 +1191,12 @@ export function issueDoneGateService(db: Db, opts: IssueDoneGateServiceOptions =
    * ship a broken payload.
    */
   function refusalError(reason: DoneGateBlockedReason) {
+    if (reason.kind === "missing_escalation_action_receipt") {
+      return conflict(
+        `Issue cannot be marked done: escalation issue (origin ${reason.originKind}, signal ${reason.signal}) has no action-evidence receipt. Attach a pull_request/commit/branch work product with an external id or url, or use an explicit board doneOverride.`,
+        { code: DONE_GATE_ESCALATION_RECEIPT_REFUSAL, originKind: reason.originKind, signal: reason.signal },
+      );
+    }
     if (reason.kind === "unresolved_pull_request_reference") {
       return conflict(
         `Issue cannot be marked done: relative PR link(s) ${reason.numbers.map((number) => `#${number}`).join(", ")} lack an adjacent (Spark-Mojo/repo) identity. Add the repository next to each link or attach a pull_request work product.`,
@@ -1073,6 +1250,8 @@ export function issueDoneGateService(db: Db, opts: IssueDoneGateServiceOptions =
     refusalError,
     recordOverride,
     listBoundPullRequests,
+    checkEscalationCloseGuard,
+    issueHasEscalationActionReceipt,
   };
 }
 
