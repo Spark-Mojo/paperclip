@@ -166,6 +166,24 @@ export function isExplicitHumanUnblock(input: {
 }
 
 /**
+ * True for ANY human ("user") status transition: fromStatus and toStatus are
+ * both present strings and differ. Unlike isExplicitHumanUnblock this is NOT
+ * limited to moves off `blocked` — any human status change (todo->blocked,
+ * todo->in_progress, blocked->todo, ...) truncates the pre-fire stall streak
+ * (R2). Agent/system writes never reset: actorType must be "user".
+ */
+export function isHumanStatusChangeReset(
+  actorType: string | null,
+  fromStatus: string | null,
+  toStatus: string | null,
+): boolean {
+  if (actorType !== "user") return false;
+  if (typeof fromStatus !== "string" || typeof toStatus !== "string")
+    return false;
+  return fromStatus !== toStatus;
+}
+
+/**
  * Extract a status transition (from/to) from an activity_log details blob.
  * Status moves land as "issue.updated" with the transition in
  * details._previous.status (issue-review-policy shape) or

@@ -365,6 +365,7 @@ import {
   escapeLikePattern,
   extractStatusTransition,
   isExplicitHumanUnblock,
+  isHumanStatusChangeReset,
   isTrustedStallNotice,
   shouldHoldStallStop,
   shouldStopSurface,
@@ -29770,59 +29771,94 @@ export function heartbeatService(
             issueRewakeCandidateInput,
             BREAKER_EXTRA_GATED_REASONS,
           );
-          if (isBreakerRewakeCandidate) {
-            const throttleNow = new Date();
-            const recentTerminalRuns = await tx
-              .select({
-                id: heartbeatRuns.id,
-                status: heartbeatRuns.status,
-                errorCode: heartbeatRuns.errorCode,
-                startedAt: heartbeatRuns.startedAt,
-                finishedAt: heartbeatRuns.finishedAt,
-              })
-              .from(heartbeatRuns)
-              .where(
-                and(
-                  eq(heartbeatRuns.companyId, agent.companyId),
-                  eq(heartbeatRuns.agentId, agentId),
-                  sql`${heartbeatRuns.finishedAt} is not null`,
-                  gte(
-                    heartbeatRuns.finishedAt,
-                    new Date(throttleNow.getTime() - ISSUE_REWAKE_LOOKBACK_MS),
-                  ),
-                  sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${issue.id}`,
+          // Stop-and-surface stall evaluation (R2/R3): hoisted out of the
+          // `if (isBreakerRewakeCandidate)` block below so it runs on EVERY
+          // wake path before any run insert. Server-side recovery retries
+          // bypass this gate by construction — they insert runs directly
+          // (~14939/~16717) and never reach this code. A fired gate returns
+          // skipped before any run insert below.
+          const throttleNow = new Date();
+          const recentTerminalRuns = await tx
+            .select({
+              id: heartbeatRuns.id,
+              status: heartbeatRuns.status,
+              errorCode: heartbeatRuns.errorCode,
+              startedAt: heartbeatRuns.startedAt,
+              finishedAt: heartbeatRuns.finishedAt,
+            })
+            .from(heartbeatRuns)
+            .where(
+              and(
+                eq(heartbeatRuns.companyId, agent.companyId),
+                eq(heartbeatRuns.agentId, agentId),
+                sql`${heartbeatRuns.finishedAt} is not null`,
+                gte(
+                  heartbeatRuns.finishedAt,
+                  new Date(throttleNow.getTime() - ISSUE_REWAKE_LOOKBACK_MS),
                 ),
-              )
-              .orderBy(desc(heartbeatRuns.finishedAt))
-              .limit(ISSUE_REWAKE_RUN_SAMPLE_LIMIT);
+                sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${issue.id}`,
+              ),
+            )
+            .orderBy(desc(heartbeatRuns.finishedAt))
+            .limit(ISSUE_REWAKE_RUN_SAMPLE_LIMIT);
 
+            // Cheap early exit: when the raw (pre-reset) streak is already
+            // below the trip threshold AND no trusted trip notice is on
+            // record, neither the R3 fire nor the R4 silence branch can
+            // trigger — skip the uncapped reset scan and the FOR UPDATE
+            // below and fall through to the throttle-gated section. The
+            // notice probe is a limit-1 lookup mirroring the hold gate
+            // above; FOR UPDATE runs only on the fire path.
+            const rawStallStreak = countStallStreak(recentTerminalRuns);
+            let stallTripNoticeProbe: { id: string } | null = null;
+            if (!shouldStopSurface(rawStallStreak.streak)) {
+              stallTripNoticeProbe = await tx
+                .select({ id: issueComments.id })
+                .from(issueComments)
+                .where(
+                  and(
+                    eq(issueComments.companyId, issue.companyId),
+                    eq(issueComments.issueId, issue.id),
+                    eq(issueComments.authorType, "system"),
+                    sql`${issueComments.body} like ${`${escapeLikePattern(`${STALL_STOP_SURFACE_MARKER} (run `)}%`} escape '\\'`,
+                  ),
+                )
+                .limit(1)
+                .then((rows) => rows[0] ?? null);
+            }
+            if (
+              shouldStopSurface(rawStallStreak.streak) ||
+              stallTripNoticeProbe
+            ) {
             // Stop-and-surface for repeated model-stream stalls. This gate
             // lives here (not on the recovery path) for the same reason the
             // comment at 29605-29606 notes: server-side recovery retries
             // insert runs directly and never reach this gate, so they are
             // unaffected by the stop. Unlike the no-progress breaker below,
-            // this fires for any card (no human-ownership check) and is
-            // evaluated for every breaker-rewake candidate wake, including
-            // handoff reasons — it is NOT gated on
+            // this fires for any card (no human-ownership check) on EVERY
+            // wake path — it is NOT gated on isBreakerRewakeCandidate or
             // isOrdinaryThrottleCandidate.
             //
-            // R2 reset: truncate the streak at the latest explicit human
-            // unblock BEFORE counting. Old runs finished before the unblock
-            // never count, so an unblock + 1 new stall yields streak 1, not
-            // 4 (3 old + 1 new). Newest-first limit-20 window: an unblock
-            // older than the 20 newest user rows could be missed —
-            // acceptable, noted. Status moves land in activity_log as
+            // R2 pre-fire reset: ANY human status change resets the streak,
+            // not just an explicit unblock. Truncate at the latest of
+            // (newest explicit human unblock, newest human status change)
+            // BEFORE counting: old runs finished before the cutoff never
+            // count, so a reset + 1 new stall yields streak 1. Uncapped by
+            // design (Mira rejected row-count caps): the (company, entity,
+            // entityId, actorType=user) filters + desc ordering bound it in
+            // practice, and the cheap early exit above skips the scan
+            // entirely when the raw streak is below threshold with no trip
+            // notice on record. Status moves land in activity_log as
             // "issue.updated" with the transition in details._previous.status
             // (issue-review-policy shape) or details.changes.status.from;
             // named unblock actions count under isExplicitHumanUnblock
             // semantics (actorType "user" only). "status_changed" is the
             // alias the pure helper accepts, so it stays in the allowlist
-            // too. This pre-filter subsumes the old post-streak re-arm
-            // check: a bare board comment never clears the stop (comment
-            // rows fail isExplicitHumanUnblock), and a later trivial
-            // issue.updated (e.g. a title edit with no status transition)
-            // fails it too, so neither shadows a genuine earlier unblock —
-            // the loop below takes the NEWEST passing row as unblockAt.
+            // too. A bare board comment never resets (comment rows carry no
+            // status transition), and a later trivial issue.updated (e.g. a
+            // title edit with no status transition) fails both predicates,
+            // so neither shadows a genuine earlier reset — the loop below
+            // takes the NEWEST passing row of each kind.
             const unblockCandidates = await tx
               .select({
                 actorType: activityLog.actorType,
@@ -29852,14 +29888,15 @@ export function heartbeatService(
               .orderBy(
                 desc(activityLog.createdAt),
                 desc(activityLog.id),
-              )
-              .limit(20);
+              );
             let unblockAt: Date | null = null;
+            let resetAt: Date | null = null;
             for (const row of unblockCandidates) {
               const { fromStatus, toStatus } = extractStatusTransition(
                 (row.details as Record<string, unknown> | null) ?? null,
               );
               if (
+                unblockAt === null &&
                 isExplicitHumanUnblock({
                   actorType: row.actorType,
                   action: row.action,
@@ -29868,15 +29905,24 @@ export function heartbeatService(
                 })
               ) {
                 unblockAt = row.createdAt;
-                break;
               }
+              if (
+                resetAt === null &&
+                isHumanStatusChangeReset(row.actorType, fromStatus, toStatus)
+              ) {
+                resetAt = row.createdAt;
+              }
+              if (unblockAt !== null && resetAt !== null) break;
             }
-            const unblockCutoff: Date | null = unblockAt;
-            const postUnblockRuns = unblockCutoff
+            const stallResetCutoff: Date | null =
+              unblockAt !== null && resetAt !== null
+                ? (unblockAt > resetAt ? unblockAt : resetAt)
+                : (unblockAt ?? resetAt);
+            const postUnblockRuns = stallResetCutoff
               ? recentTerminalRuns.filter(
                   (run) =>
                     run.finishedAt != null &&
-                    run.finishedAt > unblockCutoff,
+                    run.finishedAt > stallResetCutoff,
                 )
               : recentTerminalRuns;
             const stallStreak = countStallStreak(postUnblockRuns);
@@ -29998,8 +30044,10 @@ export function heartbeatService(
                 });
                 return { kind: "skipped" as const };
             }
-
-            if (recentTerminalRuns.length > 0) {
+            } // end hoisted stall probe-guard: below this line the ordinary
+            // throttle-gated section resumes, still gated on
+            // isBreakerRewakeCandidate exactly as before.
+            if (isBreakerRewakeCandidate && recentTerminalRuns.length > 0) {
               const sampleRunIds = recentTerminalRuns.map(
                 (sampleRun) => sampleRun.id,
               );
@@ -30345,7 +30393,6 @@ export function heartbeatService(
                 return { kind: "skipped" as const };
               }
             }
-          }
 
           const dailyCapBlock = await getHeartbeatDailyCapBlock(
             agent,
