@@ -19,6 +19,11 @@ import {
   type SealedConnectorEvents,
 } from "./paperclip-cloud-connector.js";
 import { issueThreadInteractionService } from "./issue-thread-interactions.js";
+import {
+  dedupeKey,
+  prQualifiesForSableSeat,
+  seatCardTitle,
+} from "./sable-seat-dispatch.js";
 import { logger } from "../middleware/logger.js";
 
 type LeasedEvent = SealedConnectorEvents["events"][number];
@@ -207,6 +212,293 @@ function githubSnapshotUpdate(payload: Record<string, unknown>) {
   } as const;
 }
 
+/**
+ * SPA-13735 d22 (SPA-13818 rulings 2+3+4+5) — additive exported Sable-seat
+ * PR dispatch seam. Pure dispatch logic (gates + card/summons shaping +
+ * one-sided dedupe) driven entirely by injected deps: no Db, no network, no
+ * live infra. The closure-private production path below shares this logic
+ * via a dep bridge (default resolver + service.create); the production
+ * pollOnce path, the dynamic issueService import and the default resolver
+ * behavior are unchanged.
+ *
+ * Ruling 2: repo-qualified dispatch on opened/synchronize/reopened with NO
+ * changedFiles gate (the leased pull_request allowlist carries no
+ * changedFiles; a file list is opportunistic triage surface only, never a
+ * gate). Fail-closed skips stay for malformed payloads only (bad action,
+ * invalid PR ref, non-platform repo, resolver null).
+ * Ruling 3 (d27 cut-b): a null prAuthor pair is never dispatched — the
+ * seat card is filed via the resolver, then the summons is a logged
+ * "no_author_identity" skip. The summons path requires a server-established
+ * author pair (input.serverAuthor, never client input). No sender→PR-author
+ * linkage is invented here (the leased payload's sender fields are the EVENT
+ * SENDER, not the PR author). Enrichment is SPA-13821, path precision is
+ * SPA-13820.
+ * Ruling 4: one-sided dedupeKey/idempotencyKey contract; no wait on SPA-13661.
+ */
+
+export type SableSeatPrSnapshot = {
+  repository: string;
+  owner: string;
+  repo: string;
+  number: number;
+};
+
+export type SableSeatDispatchInput = {
+  companyId: string;
+  action: string;
+  changedFiles?: unknown;
+  snapshot: SableSeatPrSnapshot;
+  /**
+   * d27 (Ty ruling 3 cut-b) — server-derived PR-author identity, used ONLY
+   * when the production path can establish it server-side (enrichment
+   * SPA-13821; absent in production today). NEVER populated from client
+   * input: the leased payload's sender fields are the EVENT SENDER, not the
+   * PR author, and no sender→PR-author linkage is invented here. Tests drive
+   * it directly as the stand-in for server establishment.
+   */
+  serverAuthor?: { actorId: string; actorType: string } | null;
+};
+
+export type SableSeatSummonsCreateInput = {
+  title: string;
+  prompt: string;
+  detailsMarkdown: string;
+  idempotencyKey: string;
+  tags: string[];
+  prAuthorActorId: string | null;
+  prAuthorActorType: string | null;
+};
+
+export type SableSeatDispatchDeps = {
+  resolveSeatCardIssue: (
+    companyId: string,
+    snapshot: SableSeatPrSnapshot,
+    matchedPatterns: string[],
+    key: string,
+  ) => Promise<{ id: string } | null>;
+  createSummons: (
+    seatIssueId: string,
+    summons: SableSeatSummonsCreateInput,
+  ) => Promise<{ id: string } | null>;
+  dispatchedKeys: Set<string>;
+  logInfo: (fields: Record<string, unknown>, message: string) => void;
+  logWarn: (fields: Record<string, unknown>, message: string) => void;
+};
+
+export type SableSeatDispatchResult = {
+  dispatched: boolean;
+  reason: string;
+};
+
+/** Seat-dispatch repos (case-insensitive): engine fork + platform repo. */
+export function isSableSeatDispatchRepo(repository: unknown): boolean {
+  if (typeof repository !== "string") return false;
+  const normalized = repository.trim().toLowerCase();
+  return normalized === "spark-mojo/paperclip" ||
+    normalized === "spark-mojo/spark-mojo-platform";
+}
+
+/**
+ * SPA-13735 d25 — MINIMAL Sable review stage on the seat card.
+ *
+ * Constraints honored: status stays "todo" (in_progress requires an
+ * assignee); no seat→assignee agent id is invented (no seat→assignee map
+ * exists anywhere in this codebase — verified by grep, no sable agent/user
+ * identity referenced in-tree); no execution-policy stage machinery
+ * (heavy, out of slice); no labelIds/assigneeUserId (nothing assignable
+ * exists in-tree to point them at).
+ *
+ * So the stage is: the card lands unassigned as todo, marked
+ * unmistakably as awaiting Sable review (title via seatCardTitle +
+ * SABLE_SEAT_REVIEW_MARKER + PR link in the description), and the
+ * seat-summons request_confirmation thread ON the card (tags
+ * seat-summons/sable-seat, already guard-protected) IS the review
+ * surface: Sable resolves it, the seat-summons guard refuses
+ * self-resolve. Shared by the production default resolver below so the
+ * filed card and the tested shape cannot drift.
+ */
+export const SABLE_SEAT_REVIEW_MARKER = "Awaiting Sable review";
+
+export function seatCardCreateInput(
+  snapshot: SableSeatPrSnapshot,
+  matchedPatterns: string[],
+  key: string,
+): {
+  title: string;
+  description: string;
+  status: "todo";
+  priority: "medium";
+  idempotencyKey: string;
+} {
+  const ref = `${snapshot.owner}/${snapshot.repo}#${snapshot.number}`;
+  return {
+    title: seatCardTitle({ owner: snapshot.owner, repo: snapshot.repo, number: snapshot.number }),
+    description: [
+      `${SABLE_SEAT_REVIEW_MARKER} — Sable seat review for ${ref}.`,
+      `PR: https://github.com/${snapshot.owner}/${snapshot.repo}/pull/${snapshot.number}`,
+      `Matched surfaces: ${matchedPatterns.length > 0 ? matchedPatterns.join(", ") : "none (no changed-file signal on leased payload)"}.`,
+      `Review surface: Sable resolves the seat-summons request_confirmation thread on this card; the seat-summons guard refuses self-resolve.`,
+    ].join("\n"),
+    status: "todo",
+    priority: "medium",
+    idempotencyKey: key,
+  };
+}
+
+export async function dispatchSableSeatSummonsForPullRequest(
+  input: SableSeatDispatchInput,
+  deps: SableSeatDispatchDeps,
+): Promise<SableSeatDispatchResult> {
+  const snapshot = input.snapshot;
+  if (
+    input.action !== "opened" &&
+    input.action !== "synchronize" &&
+    input.action !== "reopened"
+  ) {
+    deps.logInfo(
+      { companyId: input.companyId, action: input.action },
+      "sable-seat dispatch skipped: action not dispatchable",
+    );
+    return { dispatched: false, reason: "action_not_dispatchable" };
+  }
+  if (!isSableSeatDispatchRepo(snapshot.repository)) {
+    deps.logInfo(
+      { companyId: input.companyId, repository: snapshot.repository },
+      "sable-seat dispatch skipped: repo not dispatchable",
+    );
+    return { dispatched: false, reason: "repo_not_dispatchable" };
+  }
+  const key = dedupeKey({
+    owner: snapshot.owner,
+    repo: snapshot.repo,
+    number: snapshot.number,
+  });
+  if (!key) {
+    deps.logWarn(
+      { companyId: input.companyId },
+      "sable-seat dispatch skipped: invalid PR ref",
+    );
+    return { dispatched: false, reason: "invalid_pr_ref" };
+  }
+  if (deps.dispatchedKeys.has(key)) {
+    deps.logInfo(
+      { companyId: input.companyId, repository: snapshot.repository, number: snapshot.number, dedupeKey: key },
+      "sable-seat dispatch skipped: duplicate key already dispatched",
+    );
+    return { dispatched: false, reason: "duplicate_suppressed" };
+  }
+  // Opportunistic triage surface only — never a gate (ruling 2). Defensive
+  // cap bounds a future allowlist entry; absent today, matchedPatterns is [].
+  const rawFiles = Array.isArray(input.changedFiles)
+    ? input.changedFiles.filter((file): file is string => typeof file === "string").slice(0, 200)
+    : null;
+  const matchedPatterns = rawFiles
+    ? prQualifiesForSableSeat({ changedFiles: rawFiles }).matchedPatterns
+    : [];
+  const seatIssue = await deps.resolveSeatCardIssue(
+    input.companyId,
+    snapshot,
+    matchedPatterns,
+    key,
+  );
+  if (!seatIssue) {
+    deps.logInfo(
+      {
+        companyId: input.companyId,
+        repository: snapshot.repository,
+        number: snapshot.number,
+        dedupeKey: key,
+      },
+      "sable-seat dispatch skipped: no seat-card issue resolved for company",
+    );
+    return { dispatched: false, reason: "no_seat_card_issue" };
+  }
+  const ref = `${snapshot.owner}/${snapshot.repo}#${snapshot.number}`;
+  // d27 (Ty ruling 3 cut-b): a summons whose author identity cannot be
+  // established server-side is never dispatched. The leased payload carries
+  // no PR-author identity and the {systemId} create actor yields an absent
+  // pair, so production (input.serverAuthor null/absent) files the seat
+  // CARD via the resolver as today, then SKIPS the summons with a logged
+  // "no_author_identity" skip — the card lands (Sable triages per event)
+  // with no unresolvable summons thread on it. The exported seam drives the
+  // summons path WITH an established author via input.serverAuthor (the
+  // stand-in for server establishment — never client input).
+  const rawAuthor = input.serverAuthor ?? null;
+  const establishedAuthor = rawAuthor &&
+      typeof rawAuthor.actorId === "string" && rawAuthor.actorId.trim().length > 0 &&
+      typeof rawAuthor.actorType === "string" && rawAuthor.actorType.trim().length > 0
+    ? { actorId: rawAuthor.actorId.trim(), actorType: rawAuthor.actorType.trim() }
+    : null;
+  if (!establishedAuthor) {
+    deps.logInfo(
+      {
+        companyId: input.companyId,
+        repository: snapshot.repository,
+        number: snapshot.number,
+        dedupeKey: key,
+        seatIssueId: seatIssue.id,
+      },
+      "sable-seat dispatch skipped: no establishable PR-author identity, card filed without summons",
+    );
+    return { dispatched: false, reason: "no_author_identity" };
+  }
+  const summons: SableSeatSummonsCreateInput = {
+    title: seatCardTitle({ owner: snapshot.owner, repo: snapshot.repo, number: snapshot.number }),
+    prompt: `Sable review requested for ${snapshot.repository}#${snapshot.number}.`,
+    detailsMarkdown: [
+      `Sable seat review for ${ref}.`,
+      `PR: https://github.com/${snapshot.owner}/${snapshot.repo}/pull/${snapshot.number}`,
+      `Matched surfaces: ${matchedPatterns.length > 0 ? matchedPatterns.join(", ") : "none (no changed-file signal on leased payload)"}.`,
+    ].join("\n"),
+    idempotencyKey: key,
+    tags: ["seat-summons", "sable-seat"],
+    // d27: established server-side (see serverAuthor trust boundary above).
+    // Follow-ups: enrichment SPA-13821, path precision SPA-13820.
+    prAuthorActorId: establishedAuthor.actorId,
+    prAuthorActorType: establishedAuthor.actorType,
+  };
+  try {
+    const createdSummons = await deps.createSummons(seatIssue.id, summons);
+    if (!createdSummons) {
+      deps.logWarn(
+        {
+          companyId: input.companyId,
+          repository: snapshot.repository,
+          number: snapshot.number,
+          dedupeKey: key,
+          err: "summons create returned null",
+        },
+        "sable-seat dispatch skipped: summons create failed, fail-closed",
+      );
+      return { dispatched: false, reason: "summons_create_failed" };
+    }
+  } catch (error) {
+    deps.logWarn(
+      {
+        companyId: input.companyId,
+        repository: snapshot.repository,
+        number: snapshot.number,
+        dedupeKey: key,
+        err: error instanceof Error ? error.message : "summons create failed",
+      },
+      "sable-seat dispatch skipped: summons create failed, fail-closed",
+    );
+    return { dispatched: false, reason: "summons_create_failed" };
+  }
+  deps.dispatchedKeys.add(key);
+  deps.logInfo(
+    {
+      companyId: input.companyId,
+      repository: snapshot.repository,
+      number: snapshot.number,
+      dedupeKey: key,
+      seatIssueId: seatIssue.id,
+    },
+    "sable-seat dispatch filed seat card + summons",
+  );
+  return { dispatched: true, reason: "dispatched" };
+}
+
 export function githubConnectionEventService(
   db: Db,
   options: {
@@ -235,8 +527,69 @@ export function githubConnectionEventService(
     return bindingRows(rows);
   }
 
-  async function applyPullRequestEvent(companyId: string, event: LeasedEvent) {
-    const snapshot = githubSnapshotUpdate(event.payload);
+  async function defaultResolveSeatCardIssue(
+    companyId: string,
+    snapshot: NonNullable<ReturnType<typeof githubSnapshotUpdate>>,
+    matchedPatterns: string[],
+    key: string,
+  ): Promise<{ id: string } | null> {
+    // Real default resolver (SPA-13735 d19): file the seat card via
+    // issues.create. Dynamic import (cycle precedent: issue-thread-interactions
+    // is the static importer here; issues.ts reaches back via dynamic import,
+    // e.g. issues.ts:11645/11757/13722 — verified ./issues.js path, not
+    // invented). UNASSIGNED: no seat→assignee map exists in this codebase; the
+    // Sable-seat owner comes from board context, so no agent id is invented
+    // here. idempotencyKey = dedupeKey: the shared overlap guard with the
+    // SPA-13661 arming path (both filers use the same key so one seat card
+    // per PR event) — SPA-13661 is still comments-only, so until it reads
+    // this key the guard is one-sided here, not yet mutual. On create failure
+    // → log + return null (fail closed, no summons without a card).
+    try {
+      const { issueService } = await import("./issues.js");
+      // d25 minimal Sable review stage: filed unassigned as todo, marked
+      // awaiting Sable review; the seat-summons request_confirmation thread
+      // on the card IS the review surface (Sable resolves it, the
+      // seat-summons guard refuses self-resolve). No assignable Sable
+      // identity exists in-tree, so no assignee/label is set — see
+      // seatCardCreateInput above.
+      const issue = await issueService(db).create(companyId, seatCardCreateInput(snapshot, matchedPatterns, key));
+      return { id: issue.id };
+    } catch (error) {
+      logger.warn({
+        err: error,
+        companyId,
+        repository: snapshot.repository,
+        number: snapshot.number,
+        dedupeKey: key,
+      }, "sable-seat seat-card create failed: no summons without a card");
+      return null;
+    }
+  }
+
+  type SableSeatSummonsOptions = {
+    createSeatSummons?: typeof issueThreadInteractionService;
+    resolveSeatCardIssue?: (
+      companyId: string,
+      snapshot: NonNullable<ReturnType<typeof githubSnapshotUpdate>>,
+      matchedPatterns: string[],
+    ) => Promise<{ id: string } | null>;
+    interactionService?: ReturnType<typeof issueThreadInteractionService>;
+    wakeup?: NonNullable<Parameters<typeof issueThreadInteractionService>[1]>["wakeup"];
+  };
+
+  async function applyPullRequestEvent(
+    companyId: string,
+    event: LeasedEvent,
+    seatOptions: SableSeatSummonsOptions = {},
+  ) {
+    const summonsOptions: SableSeatSummonsOptions = {
+      createSeatSummons: seatOptions.createSeatSummons,
+      resolveSeatCardIssue: seatOptions.resolveSeatCardIssue,
+      interactionService: seatOptions.interactionService,
+      wakeup: options.wakeup ?? seatOptions.wakeup,
+    };
+    const normalizedPayload = record(event.payload);
+    const snapshot = githubSnapshotUpdate(normalizedPayload);
     if (!snapshot) return;
     const appliedAt = now();
     await db.update(externalObjects).set({
@@ -259,7 +612,7 @@ export function githubConnectionEventService(
       sql`lower(${externalObjects.externalId}) = lower(${snapshot.externalId})`,
     ));
     if (snapshot.merged && event.action === "closed") {
-      await issueThreadInteractionService(db, { wakeup: options.wakeup })
+      await issueThreadInteractionService(db, { wakeup: summonsOptions.wakeup })
         .sweepMergedPullRequestConfirmations([{
           companyId,
           owner: snapshot.owner,
@@ -267,6 +620,113 @@ export function githubConnectionEventService(
           number: snapshot.number,
         }]);
     }
+    await maybeDispatchSableSeatSummons(
+      companyId,
+      normalizedPayload,
+      snapshot,
+      summonsOptions,
+    );
+  }
+
+  /**
+   * R1 automatic Sable seat dispatch (SPA-13735 d11; shared-logic bridge d22
+   * per SPA-13818 rulings 2+3+4+5).
+   *
+   * Hook point: after the existing snapshot update in applyPullRequestEvent.
+   * Runs on opened/synchronize/reopened with NO changedFiles gate (ruling 2:
+   * the leased pull_request allowlist carries no changedFiles; a file list is
+   * opportunistic triage surface only, never a gate). Dispatch reads the SAME
+   * normalized payload object passed to githubSnapshotUpdate (never raw
+   * event.payload, which would bypass the normalizeLeasedPayload allowlist).
+   * Fail-closed skips stay for malformed payloads only (bad action, invalid
+   * PR ref, non-platform repo, resolver null). Never add a GitHub API fetch
+   * here.
+   *
+   * Author source (d27 cut-b): the leased payload's sender fields are the
+   * EVENT SENDER, NOT the PR author, and there is no author identity on the
+   * leased payload — so production dispatches with no serverAuthor, files
+   * the seat card, and skips the summons as "no_author_identity" (never an
+   * unattributed summons; no sender→PR-author linkage invented). The
+   * create path below uses the {systemId} actor, which the d16 server
+   * derivation turns into the absent/null pair. Enrichment SPA-13821 may one
+   * day populate input.serverAuthor here; path precision SPA-13820 — never
+   * a guess here.
+   *
+   * Coordination: dedupeKey is the shared overlap guard with the SPA-13661
+   * arming path — both filers use the same key so one seat card per PR event
+   * (ruling 4: one-sided here until SPA-13661 reads it; the dispatch passes
+   * it as the interaction idempotencyKey, the arming path checks the same
+   * key to avoid double-filing). Production idempotency beyond this call is
+   * at the Db level (issue create idempotencyKey + interaction
+   * idempotencyKey conflict handling); the dispatchedKeys set below is a
+   * fresh per-call set, so production behavior on that surface is unchanged.
+   *
+   * Target resolution: the seat card needs an issue on this company to host
+   * the summons interaction. The default resolver files the seat card via
+   * issues.create (idempotencyKey=dedupeKey, unassigned — the Sable-seat
+   * owner comes from board context, so no agent id is invented here). An
+   * injected resolver may override it; absent any resolved issue the
+   * dispatch fails closed (log + skip, no card). Documented, not
+   * silent. This function is a thin bridge over the exported
+   * dispatchSableSeatSummonsForPullRequest above (ruling 5): the
+   * pollOnce path, the dynamic issueService import and the default resolver
+   * behavior are unchanged.
+   */
+  async function maybeDispatchSableSeatSummons(
+    companyId: string,
+    payload: Record<string, unknown>,
+    snapshot: NonNullable<ReturnType<typeof githubSnapshotUpdate>>,
+    options: SableSeatSummonsOptions = {},
+  ): Promise<{ dispatched: boolean; reason: string }> {
+    const action = typeof payload.action === "string" ? payload.action : "";
+    const serviceFactory = options.createSeatSummons ?? issueThreadInteractionService;
+    const service = options.interactionService ?? serviceFactory(db, { wakeup: options.wakeup });
+    const resolveSeatCardIssue: SableSeatDispatchDeps["resolveSeatCardIssue"] = options.resolveSeatCardIssue
+      ? async (c, s, m) => options.resolveSeatCardIssue!(c, s as NonNullable<ReturnType<typeof githubSnapshotUpdate>>, m)
+      : async (c, s, m, k) => defaultResolveSeatCardIssue(c, s as NonNullable<ReturnType<typeof githubSnapshotUpdate>>, m, k);
+    return dispatchSableSeatSummonsForPullRequest(
+      {
+        companyId,
+        action,
+        changedFiles: (payload as { changedFiles?: unknown }).changedFiles,
+        snapshot,
+      },
+      {
+        resolveSeatCardIssue,
+        createSummons: async (seatIssueId, summons) => {
+          const created = await service.create(
+            { id: seatIssueId, companyId },
+            {
+              kind: "request_confirmation",
+              idempotencyKey: summons.idempotencyKey,
+              continuationPolicy: "none",
+              title: summons.title,
+              payload: {
+                version: 1,
+                prompt: summons.prompt,
+                detailsMarkdown: summons.detailsMarkdown,
+                // d15/d16 extended the schema: tags/prAuthor survive create
+                // AND hydrate, and author is server-derived (the
+                // {systemId} actor below yields the absent/null pair) — so
+                // these tags ARE detectable by isSeatSummonsInteraction and
+                // the d10 guard fail-closes on the null pair.
+                tags: summons.tags,
+                prAuthorActorId: summons.prAuthorActorId,
+                prAuthorActorType: summons.prAuthorActorType,
+              } as unknown as Extract<
+                import("@paperclipai/shared").CreateIssueThreadInteraction,
+                { kind: "request_confirmation" }
+              >["payload"],
+            },
+            { systemId: "system:sable-seat-dispatch" },
+          );
+          return { id: created.id };
+        },
+        dispatchedKeys: new Set<string>(),
+        logInfo: (fields, message) => logger.info(fields, message),
+        logWarn: (fields, message) => logger.warn(fields, message),
+      },
+    );
   }
 
   async function applyInstallationEvent(database: Db, binding: GitHubBinding, event: LeasedEvent) {
@@ -370,7 +830,7 @@ export function githubConnectionEventService(
     const postCommitPublications: ActivityPublication[] = [];
     try {
       const applyAndFinalize = async (database: Db) => {
-        if (event.event === "pull_request") await applyPullRequestEvent(companyId, normalizedEvent);
+        if (event.event === "pull_request") await applyPullRequestEvent(companyId, normalizedEvent, { wakeup: options.wakeup });
         if (event.event === "installation" || event.event === "installation_repositories") {
           for (const binding of bindings) await applyInstallationEvent(database, binding, normalizedEvent);
         } else {
