@@ -375,6 +375,7 @@ import {
   resolveBreakerExtraProgressWindowStart,
   shouldTripIssueRewakeCircuitBreaker,
 } from "./issue-rewake-throttle.js";
+import { buildSessionRotationHandoff, countConsecutiveSameCodeTerminalFailures, SESSION_ROTATION_HANDOFF_REASON, SESSION_ROTATION_THRESHOLD, shouldRotateSession } from "./session-rotation.js";
 import {
   logActivity,
   publishPluginDomainEvent,
@@ -24376,6 +24377,60 @@ export function heartbeatService(
           runtimeWorkspaceWarnings.push(
             `Starting a fresh session because ${sessionCompaction.reason}.`,
           );
+        }
+      } else if (typeof issueId === "string" && issueId.length > 0) {
+        // Session rotation (R6): same-code terminal streak while compaction
+        // does NOT rotate → fresh session + handoff, nothing else touched.
+        try {
+          const recentTerminalRuns = await db
+            .select({
+              id: heartbeatRuns.id,
+              status: heartbeatRuns.status,
+              errorCode: heartbeatRuns.errorCode,
+            })
+            .from(heartbeatRuns)
+            .where(
+              and(
+                eq(heartbeatRuns.companyId, agent.companyId),
+                eq(heartbeatRuns.agentId, agent.id),
+                isNotNull(heartbeatRuns.finishedAt),
+                sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${issueId}`,
+              ),
+            )
+            .orderBy(desc(heartbeatRuns.finishedAt), desc(heartbeatRuns.id))
+            .limit(8);
+          const streak = countConsecutiveSameCodeTerminalFailures(
+            recentTerminalRuns,
+          );
+          if (
+            streak.code !== null &&
+            shouldRotateSession({ count: streak.count, code: streak.code })
+          ) {
+            const stalledSessionId =
+              previousSessionDisplayId ?? runtimeSessionIdForAdapter;
+            context.paperclipSessionHandoffMarkdown =
+              buildSessionRotationHandoff({
+                code: streak.code,
+                count: streak.count,
+                stalledSessionId,
+                runIds: streak.runIds,
+              });
+            context.paperclipSessionRotationReason =
+              SESSION_ROTATION_HANDOFF_REASON;
+            context.paperclipPreviousSessionId = stalledSessionId;
+            runtimeSessionIdForAdapter = null;
+            runtimeSessionParamsForAdapter = null;
+            previousSessionDisplayId = null;
+            runtimeWorkspaceWarnings.push(
+              `Starting a fresh session because ${SESSION_ROTATION_HANDOFF_REASON} (${streak.code} x${streak.count}).`,
+            );
+          } else {
+            delete context.paperclipSessionHandoffMarkdown;
+            delete context.paperclipSessionRotationReason;
+            delete context.paperclipPreviousSessionId;
+          }
+        } catch {
+          // Fail-closed: rotation query errors never block the run.
         }
       } else {
         delete context.paperclipSessionHandoffMarkdown;
