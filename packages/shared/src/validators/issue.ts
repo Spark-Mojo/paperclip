@@ -1548,8 +1548,8 @@ export const requestConfirmationPayloadSchema = z.object({
   // Trust boundary (SPA-13735 d16): the PR-author actor pair is
   // server-derived at create time (the create path overwrites any client
   // value). The enum rejects forged type strings at parse.
-  prAuthorActorId: z.string().optional(),
-  prAuthorActorType: z.enum(["agent", "user", "system"]).optional(),
+  prAuthorActorId: z.string().nullable().optional(),
+  prAuthorActorType: z.enum(["agent", "user", "system"]).nullable().optional(),
 });
 
 export const requestCheckboxConfirmationOptionSchema = z.object({
