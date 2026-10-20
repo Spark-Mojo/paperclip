@@ -14,8 +14,9 @@
 import { randomUUID } from "node:crypto";
 import { spawn } from "node:child_process";
 import { setTimeout as delay } from "node:timers/promises";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { runChildProcess } from "./server-utils.js";
+import { createPerStreamLogChains } from "./server-utils.js";
 import {
   createStreamStallDetector,
   MODEL_STREAM_STALLED_ERROR_CODE,
@@ -158,6 +159,192 @@ describe("stream-stall-detector (SPA-11981)", () => {
     it("emits the closed-class error code 'model_stream_stalled'", () => {
       expect(MODEL_STREAM_STALLED_ERROR_CODE).toBe("model_stream_stalled");
     });
+  });
+
+  describe("per-stream log chains (SPA-13853 d2, DB-free)", () => {
+    it("preserves per-stream ordering within each chain", async () => {
+      const errors: unknown[] = [];
+      const { append, settled } = createPerStreamLogChains((err) => {
+        errors.push(err);
+      });
+      const order: string[] = [];
+      append("stdout", async () => {
+        await delay(10);
+        order.push("out-1");
+      });
+      append("stdout", async () => {
+        order.push("out-2");
+      });
+      append("stderr", async () => {
+        order.push("err-1");
+      });
+      await settled();
+      expect(errors).toEqual([]);
+      expect(order.filter((x) => x.startsWith("out-"))).toEqual([
+        "out-1",
+        "out-2",
+      ]);
+      expect(order).toContain("err-1");
+    });
+
+    it("routes onLog errors per stream without breaking the chain", async () => {
+      const seen: Array<{ stream: string }> = [];
+      const { append, settled } = createPerStreamLogChains((_, stream) => {
+        seen.push({ stream });
+      });
+      const after: string[] = [];
+      append("stderr", async () => {
+        throw new Error("slow persist failed");
+      });
+      append("stderr", async () => {
+        after.push("err-after-failure");
+      });
+      append("stdout", async () => {
+        after.push("out-ok");
+      });
+      await settled();
+      expect(seen).toEqual([{ stream: "stderr" }]);
+      expect(after).toContain("err-after-failure");
+      expect(after).toContain("out-ok");
+    });
+
+    it("a hung stderr append never blocks stdout drain (stdout resume still happens)", async () => {
+      const { append, settled } = createPerStreamLogChains(() => {});
+      let releaseStderr!: () => void;
+      const stderrGate = new Promise<void>((resolve) => {
+        releaseStderr = resolve;
+      });
+      const events: string[] = [];
+
+      // Simulate the stderr data handler: pause, then a hung onLog persist.
+      append("stderr", () => stderrGate);
+      // Simulate the stdout data handler arriving while stderr is stuck:
+      // its onLog + resume must still run (proves decoupled chains).
+      append("stdout", async () => {
+        events.push("stdout-resumed");
+      });
+
+      // Give the microtask queue a chance to run the stdout chain while the
+      // stderr gate is still shut. If both streams shared one chain, the
+      // stdout work could never run until releaseStderr().
+      await delay(50);
+      expect(events).toEqual(["stdout-resumed"]);
+
+      releaseStderr();
+      await settled();
+    });
+
+    it("settled(timeoutMs) resolves even when a chain append never settles", async () => {
+      const { append, settled } = createPerStreamLogChains(() => {});
+      append("stdout", () => new Promise<void>(() => {}));
+      // A hung onLog persist must not pend the close path: the bounded
+      // wait resolves regardless after the timeout.
+      await settled(50);
+    });
+
+    it("settled cutoff fires onCutoff with per-stream pending counts (SPA-13853 review T3)", async () => {
+      const { append, settled } = createPerStreamLogChains(() => {});
+      // One hung stdout append, one hung stderr append: the cutoff must
+      // report both streams' pending counts so tail loss is observable.
+      append("stdout", () => new Promise<void>(() => {}));
+      append("stderr", () => new Promise<void>(() => {}));
+      const cutoffs: Array<{ pendingCounts: { stdout: number; stderr: number } }> = [];
+      await settled(50, (info) => cutoffs.push(info));
+      expect(cutoffs).toHaveLength(1);
+      expect(cutoffs[0].pendingCounts.stdout).toBeGreaterThanOrEqual(1);
+      expect(cutoffs[0].pendingCounts.stderr).toBeGreaterThanOrEqual(1);
+    });
+
+    it("settled cutoff does NOT fire when chains settle within the window (SPA-13853 review T3)", async () => {
+      const { append, settled } = createPerStreamLogChains(() => {});
+      append("stdout", async () => {
+        await delay(5);
+      });
+      append("stderr", async () => {
+        await delay(5);
+      });
+      const onCutoff = vi.fn();
+      await settled(500, onCutoff);
+      expect(onCutoff).not.toHaveBeenCalled();
+    });
+
+    it("settled cutoff still resolves when onCutoff throws (SPA-13853 review PRRT_kwDOTwBwe86uTYai)", async () => {
+      const { append, settled } = createPerStreamLogChains(() => {});
+      // Both chains hung: the cutoff timer is the ONLY path to settlement,
+      // so a throwing advisory must not skip resolve() and must not let
+      // the error escape the timer uncaught.
+      append("stdout", () => new Promise<void>(() => {}));
+      append("stderr", () => new Promise<void>(() => {}));
+      const unhandled: unknown[] = [];
+      const uncaught: unknown[] = [];
+      const onUnhandled = (reason: unknown) => unhandled.push(reason);
+      const onUncaught = (err: unknown) => uncaught.push(err);
+      process.on("unhandledRejection", onUnhandled);
+      process.on("uncaughtException", onUncaught);
+      try {
+        const startedAt = Date.now();
+        // Must settle (within the window) even though the advisory throws.
+        await settled(50, () => {
+          throw new Error("cutoff advisory boom");
+        });
+        const elapsedMs = Date.now() - startedAt;
+        expect(elapsedMs).toBeLessThan(5_000);
+        // Nothing escaped the timer as an unhandled rejection/uncaught error.
+        expect(unhandled).toEqual([]);
+        expect(uncaught).toEqual([]);
+      } finally {
+        process.off("unhandledRejection", onUnhandled);
+        process.off("uncaughtException", onUncaught);
+      }
+    });
+
+    it("a throwing per-stream onError cannot strand later appends", async () => {
+      const { append, settled } = createPerStreamLogChains(() => {
+        throw new Error("advisory boom");
+      });
+      const after: string[] = [];
+      append("stdout", async () => {
+        throw new Error("persist failed");
+      });
+      append("stdout", async () => {
+        after.push("still-ran");
+      });
+      await settled();
+      expect(after).toEqual(["still-ran"]);
+    });
+  });
+
+  describe("close-path drain bound (SPA-13853 d2, critic #1)", () => {
+    it("child exit with a hung onLog still resolves runChildProcess within the settle bound", async () => {
+      const previous = process.env.PAPERCLIP_LOG_CHAIN_SETTLE_TIMEOUT_MS;
+      process.env.PAPERCLIP_LOG_CHAIN_SETTLE_TIMEOUT_MS = "300";
+      try {
+        const startedAt = Date.now();
+        const result = await runChildProcess(
+          randomUUID(),
+          process.execPath,
+          ["-e", "process.stdout.write('hi');"],
+          {
+            cwd: process.cwd(),
+            env: {},
+            timeoutSec: 10,
+            graceSec: 1,
+            // Hung persist: never resolves. Without the close-path bound
+            // the `close` handler's settled() wait would pend forever.
+            onLog: () => new Promise<void>(() => {}),
+          },
+        );
+        const elapsedMs = Date.now() - startedAt;
+        expect(result.exitCode).toBe(0);
+        expect(result.stdout).toContain("hi");
+        expect(elapsedMs).toBeLessThan(10_000);
+      } finally {
+        if (previous === undefined)
+          delete process.env.PAPERCLIP_LOG_CHAIN_SETTLE_TIMEOUT_MS;
+        else
+          process.env.PAPERCLIP_LOG_CHAIN_SETTLE_TIMEOUT_MS = previous;
+      }
+    }, 15_000);
   });
 });
 
