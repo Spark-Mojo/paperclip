@@ -1043,6 +1043,132 @@ export {
 } from "./recovery/service.js";
 export const ACTIVE_RUN_OUTPUT_PROGRESS_FLUSH_INTERVAL_MS = 60 * 1000;
 export const ACTIVE_RUN_LOG_RUNTIME_STATUS_REFRESH_INTERVAL_MS = 5 * 1000;
+// onLog stdout-drain bound: persistence section (fs append + progress flush +
+// runtime-status touch) races this timeout so the caller's resumeReadable()
+// always runs. Env PAPERCLIP_ONLOG_TIMEOUT_MS overrides; garbage falls back.
+export const ONLOG_DRAIN_TIMEOUT_MS = 3000;
+export const ONLOG_DRAIN_TIMEOUT_ENV_VAR = "PAPERCLIP_ONLOG_TIMEOUT_MS";
+export function resolveOnLogDrainTimeoutMs(
+  env?: Record<string, string | undefined>,
+): number {
+  const raw = (env ?? process.env)[ONLOG_DRAIN_TIMEOUT_ENV_VAR];
+  if (raw == null || raw === "") return ONLOG_DRAIN_TIMEOUT_MS;
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed) || parsed <= 0) return ONLOG_DRAIN_TIMEOUT_MS;
+  return Math.floor(parsed);
+}
+export type OnLogAwaitingLabel = "fs" | "db_flush" | "heartbeat_touch";
+export type OnLogStageElapsedMs = Record<OnLogAwaitingLabel, number>;
+const ONLOG_AWAITING_LABEL_ORDER: readonly OnLogAwaitingLabel[] = [
+  "fs",
+  "db_flush",
+  "heartbeat_touch",
+];
+// Picks the stage with the largest elapsed ms; ties break deterministically
+// to the earliest stage (fs first) via strict greater-than comparison.
+export function selectOnLogAwaitingLabel(
+  stageElapsedMs: OnLogStageElapsedMs,
+): OnLogAwaitingLabel {
+  let best: OnLogAwaitingLabel = ONLOG_AWAITING_LABEL_ORDER[0];
+  let bestMs = Number.NEGATIVE_INFINITY;
+  for (const label of ONLOG_AWAITING_LABEL_ORDER) {
+    const elapsed = stageElapsedMs[label];
+    if (elapsed > bestMs) {
+      best = label;
+      bestMs = elapsed;
+    }
+  }
+  return best;
+}
+// ~10% sampler for onLog instrumentation so the hot path stays quiet.
+export const ONLOG_INSTRUMENT_SAMPLE_ENV_VAR = "PAPERCLIP_ONLOG_INSTRUMENT_SAMPLE";
+export const ONLOG_INSTRUMENT_SAMPLE_DEFAULT = 0.1;
+export function resolveOnLogInstrumentSampleRate(
+  env?: Record<string, string | undefined>,
+): number {
+  const source = env ?? process.env;
+  const raw = source[ONLOG_INSTRUMENT_SAMPLE_ENV_VAR];
+  if (raw == null || raw === "") return ONLOG_INSTRUMENT_SAMPLE_DEFAULT;
+  const parsed = Number(raw);
+  return Number.isFinite(parsed) ? parsed : ONLOG_INSTRUMENT_SAMPLE_DEFAULT;
+}
+export function shouldSampleOnLogInstrumentation(rate?: number): boolean {
+  let resolved = rate ?? resolveOnLogInstrumentSampleRate();
+  if (!Number.isFinite(resolved)) resolved = ONLOG_INSTRUMENT_SAMPLE_DEFAULT;
+  if (!(resolved > 0)) return false;
+  if (resolved >= 1) return true;
+  return Math.random() < resolved;
+}
+export type OnLogPersistenceOutcome = "persisted" | "dropped";
+// Numeric timeoutMs sanitizer for the race below: NaN, non-numbers and
+// non-positive values fall back to the 3000ms default instead of arming a
+// zero/NaN timer (which would fire immediately and drop every chunk).
+export function normalizeOnLogRaceTimeoutMs(timeoutMs: unknown): number {
+  if (
+    typeof timeoutMs !== "number" ||
+    !Number.isFinite(timeoutMs) ||
+    timeoutMs <= 0
+  )
+    return ONLOG_DRAIN_TIMEOUT_MS;
+  return Math.floor(timeoutMs);
+}
+// Per-chunk guard core for onLog's persistWork (pure so tests can pin the
+// late-settle ordering). Continuations settle in any order and the timeout
+// race never cancels them, so a timed-out chunk can land after a newer chunk
+// already wrote the pending slot. ownsPendingSlot is true only for the latest
+// chunk (strict equality: seqs are unique and monotonic, so a chunkSeq above
+// latestSeq must never own — that shape is impossible, not newest).
+// A stale chunk folds its bytes into the total (exactly once, here)
+// and the caller refreshes the newer pending's byte count instead of
+// clobbering the slot.
+export function resolveOnLogChunkApplication(input: {
+  persistedLogBytes: number;
+  chunkSeq: number;
+  latestSeq: number;
+  appendedBytes: number;
+}): { persistedLogBytes: number; ownsPendingSlot: boolean } {
+  return {
+    persistedLogBytes: input.persistedLogBytes + input.appendedBytes,
+    ownsPendingSlot: input.chunkSeq === input.latestSeq,
+  };
+}
+// Pure throttle check for the onLog runtime-status touch (see persistWork
+// below). touchMs is only ever assigned a ts strictly ahead of it
+// (diff >= INTERVAL > 0), so it is monotonic non-decreasing: a late chunk
+// carrying an earlier ts yields a negative diff and skips — it can never
+// move the watermark backwards.
+export function shouldRefreshLogRuntimeStatus(input: {
+  logActivityAtMs: number;
+  lastTouchMs: number;
+  intervalMs?: number;
+}): boolean {
+  const interval =
+    input.intervalMs ?? ACTIVE_RUN_LOG_RUNTIME_STATUS_REFRESH_INTERVAL_MS;
+  return input.logActivityAtMs - input.lastTouchMs >= interval;
+}
+// Races persistence work against a timeout. Never rejects on timeout: the
+// work promise is NOT cancelled (a settled fs append still applies via the
+// work closure's own continuation); the caller just stops waiting.
+export function raceOnLogPersistence<T>(
+  work: Promise<T>,
+  timeoutMs: number,
+): Promise<{ outcome: OnLogPersistenceOutcome; value?: T }> {
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => {
+      resolve({ outcome: "dropped" });
+    }, timeoutMs);
+    work.then(
+      (value) => {
+        clearTimeout(timer);
+        resolve({ outcome: "persisted", value });
+      },
+      () => {
+        clearTimeout(timer);
+        resolve({ outcome: "dropped" });
+      },
+    );
+  });
+}
 export const BOUNDED_TRANSIENT_HEARTBEAT_RETRY_DELAYS_MS = [
   30_000, 30_000,
 ] as const;
@@ -24458,6 +24584,8 @@ export function heartbeatService(
       let outputSeq = Number(run.lastOutputSeq ?? 0);
       let lastOutputFlushAt: Date | null = run.lastOutputAt ?? null;
       let lastLogRuntimeStatusTouchMs = 0;
+      let onLogDrainQueueDepth = 0;
+      const onLogDrainTimeoutMs = resolveOnLogDrainTimeoutMs();
       const outputProgressState: {
         pending: {
           at: Date;
@@ -24584,79 +24712,163 @@ export function heartbeatService(
         const currentUserRedactionOptions =
           await getCurrentUserRedactionOptions();
         const onLog = async (stream: "stdout" | "stderr", chunk: string) => {
-          const sanitizedChunk = compactRunLogChunk(
-            redactCurrentUserText(chunk, currentUserRedactionOptions),
-          );
-          if (stream === "stdout")
-            stdoutExcerpt = appendExcerpt(stdoutExcerpt, sanitizedChunk);
-          if (stream === "stderr")
-            stderrExcerpt = appendExcerpt(stderrExcerpt, sanitizedChunk);
-          const ts = new Date().toISOString();
-
-          outputSeq += 1;
-          const chunkSeq = outputSeq;
-          let appendedBytes = 0;
-          if (handle) {
-            appendedBytes = await runLogStore.append(handle, {
-              stream,
-              chunk: sanitizedChunk,
-              ts,
-              seq: chunkSeq,
-            });
-            persistedLogBytes += appendedBytes;
+          onLogDrainQueueDepth += 1;
+          const onLogEntryMs = Date.now();
+          const sampled = shouldSampleOnLogInstrumentation();
+          if (sampled) {
+            logger.info(
+              { source: stream, queue: onLogDrainQueueDepth, runId: run.id },
+              "onLog_start",
+            );
           }
-          outputProgressState.pending = {
-            at: new Date(ts),
-            seq: chunkSeq,
-            stream,
-            bytes: persistedLogBytes,
-          };
-          await flushOutputProgress();
+          try {
+            const sanitizedChunk = compactRunLogChunk(
+              redactCurrentUserText(chunk, currentUserRedactionOptions),
+            );
+            if (stream === "stdout")
+              stdoutExcerpt = appendExcerpt(stdoutExcerpt, sanitizedChunk);
+            if (stream === "stderr")
+              stderrExcerpt = appendExcerpt(stderrExcerpt, sanitizedChunk);
+            const ts = new Date().toISOString();
 
-          // Streamed CLI output is real run activity: keep the in-memory
-          // runtime status ("Working... / X ago") fresh between structured
-          // events so sandbox runs with mid-run log streaming never show a
-          // minutes-stale timestamp. Throttled to avoid churning the live
-          // event stream on every 250ms tail chunk.
-          const logActivityAt = new Date(ts);
-          if (
-            isHeartbeatRunRuntimeStatusActive(run.status) &&
-            logActivityAt.getTime() - lastLogRuntimeStatusTouchMs >=
-              ACTIVE_RUN_LOG_RUNTIME_STATUS_REFRESH_INTERVAL_MS
-          ) {
-            lastLogRuntimeStatusTouchMs = logActivityAt.getTime();
-            const touchedStatus = touchHeartbeatRunRuntimeStatus({
+            outputSeq += 1;
+            const chunkSeq = outputSeq;
+            const stageElapsedMs: OnLogStageElapsedMs = {
+              fs: 0,
+              db_flush: 0,
+              heartbeat_touch: 0,
+            };
+            const persistWork = (async () => {
+              let stageStart = Date.now();
+              let appendedBytes = 0;
+              if (handle) {
+                appendedBytes = await runLogStore.append(handle, {
+                  stream,
+                  chunk: sanitizedChunk,
+                  ts,
+                  seq: chunkSeq,
+                });
+              }
+              stageElapsedMs.fs = Date.now() - stageStart;
+              // Late-settle guard: this continuation may land after a newer
+              // chunk already wrote the pending slot (the timeout race never
+              // cancels work). Own the slot only when still the newest chunk;
+              // a stale chunk accumulates its bytes exactly once here and the
+              // refresh below folds them into the newest pending entry instead
+              // of clobbering it.
+              const applied = resolveOnLogChunkApplication({
+                persistedLogBytes,
+                chunkSeq,
+                latestSeq: outputSeq,
+                appendedBytes,
+              });
+              persistedLogBytes = applied.persistedLogBytes;
+              if (applied.ownsPendingSlot) {
+                outputProgressState.pending = {
+                  at: new Date(ts),
+                  seq: chunkSeq,
+                  stream,
+                  bytes: persistedLogBytes,
+                };
+              } else if (outputProgressState.pending) {
+                outputProgressState.pending.bytes = persistedLogBytes;
+              }
+              stageStart = Date.now();
+              if (applied.ownsPendingSlot) {
+                await flushOutputProgress();
+                stageElapsedMs.db_flush = Date.now() - stageStart;
+              } else {
+                // Stale chunk: bytes already folded into the newer pending
+                // above; flushing here would persist (or throttle-consume) the
+                // newer chunk's entry under the stale chunk's turn. Skip and
+                // leave the flush to the owning chunk.
+                stageElapsedMs.db_flush = 0;
+              }
+              // flushOutputProgress clears pending only when it actually
+              // flushes. A pending surviving the flush was throttled, so the
+              // next chunk's flush supersedes it — this entry is left in
+              // place, never retried.
+              stageStart = Date.now();
+              const logActivityAt = new Date(ts);
+              // Stale-chunk touch is already guarded by the throttle
+              // arithmetic: touchMs only moves forward (assigned only when
+              // diff >= INTERVAL > 0), so a late chunk with an earlier ts
+              // yields a negative diff and skips — it can never regress the
+              // watermark. Route through the pure helper so tests pin it.
+              if (
+                isHeartbeatRunRuntimeStatusActive(run.status) &&
+                shouldRefreshLogRuntimeStatus({
+                  logActivityAtMs: logActivityAt.getTime(),
+                  lastTouchMs: lastLogRuntimeStatusTouchMs,
+                })
+              ) {
+                lastLogRuntimeStatusTouchMs = logActivityAt.getTime();
+                const touchedStatus = touchHeartbeatRunRuntimeStatus({
+                  companyId: run.companyId,
+                  issueId,
+                  agentId: run.agentId,
+                  runId: run.id,
+                  at: logActivityAt,
+                });
+                if (touchedStatus)
+                  publishHeartbeatRunRuntimeProgress(touchedStatus);
+              }
+              stageElapsedMs.heartbeat_touch = Date.now() - stageStart;
+              return { seq: chunkSeq };
+            })();
+            const persistence = await raceOnLogPersistence(
+              persistWork,
+              normalizeOnLogRaceTimeoutMs(onLogDrainTimeoutMs),
+            );
+            if (persistence.outcome === "dropped") {
+              logger.warn(
+                {
+                  runId: run.id,
+                  elapsed_ms: Date.now() - onLogEntryMs,
+                },
+                "progress_flush_dropped",
+              );
+            }
+
+            // Streamed CLI output is real run activity: keep the in-memory
+            // runtime status ("Working... / X ago") fresh between structured
+            // events so sandbox runs with mid-run log streaming never show a
+            // minutes-stale timestamp. Throttled to avoid churning the live
+            // event stream on every 250ms tail chunk.
+
+            const payloadChunk =
+              sanitizedChunk.length > MAX_LIVE_LOG_CHUNK_BYTES
+                ? sanitizedChunk.slice(
+                    sanitizedChunk.length - MAX_LIVE_LOG_CHUNK_BYTES,
+                  )
+                : sanitizedChunk;
+
+            publishLiveEvent({
               companyId: run.companyId,
-              issueId,
-              agentId: run.agentId,
-              runId: run.id,
-              at: logActivityAt,
+              type: "heartbeat.run.log",
+              payload: {
+                runId: run.id,
+                agentId: run.agentId,
+                issueId,
+                ts,
+                seq: chunkSeq,
+                stream,
+                chunk: payloadChunk,
+                truncated: payloadChunk.length !== sanitizedChunk.length,
+              },
             });
-            if (touchedStatus)
-              publishHeartbeatRunRuntimeProgress(touchedStatus);
+            if (sampled) {
+              logger.info(
+                {
+                  elapsed_ms: Date.now() - onLogEntryMs,
+                  awaiting: selectOnLogAwaitingLabel(stageElapsedMs),
+                },
+                "onLog_resolve",
+              );
+            }
+          } finally {
+            onLogDrainQueueDepth = Math.max(0, onLogDrainQueueDepth - 1);
           }
-
-          const payloadChunk =
-            sanitizedChunk.length > MAX_LIVE_LOG_CHUNK_BYTES
-              ? sanitizedChunk.slice(
-                  sanitizedChunk.length - MAX_LIVE_LOG_CHUNK_BYTES,
-                )
-              : sanitizedChunk;
-
-          publishLiveEvent({
-            companyId: run.companyId,
-            type: "heartbeat.run.log",
-            payload: {
-              runId: run.id,
-              agentId: run.agentId,
-              issueId,
-              ts,
-              seq: chunkSeq,
-              stream,
-              chunk: payloadChunk,
-              truncated: payloadChunk.length !== sanitizedChunk.length,
-            },
-          });
         };
         if (runScopedMentionedSkillKeys.length > 0) {
           await onLog(
