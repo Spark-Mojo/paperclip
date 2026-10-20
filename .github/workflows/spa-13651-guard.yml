@@ -1,0 +1,52 @@
+name: SPA-13651 replay guard
+
+# Fork-scoped CI for PR #221 (R1..R5 replay suites). The repo's only
+# pull_request trigger (pr.yml) routes to upstream-pinned pr-trusted.yml,
+# which fails its repo-identity gate on this fork, so no other workflow
+# fires on fork PRs. This workflow is PR-scoped, runs no secrets, and
+# deploys nothing. It is intentionally NOT a required check.
+
+on:
+  pull_request:
+    branches:
+      - rebuild/v2026.916.0-survivors
+
+permissions:
+  actions: read
+  contents: read
+  pull-requests: read
+
+jobs:
+  replay-suites:
+    name: R1..R5 replay suites
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    steps:
+      - name: Checkout PR head
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version: 24
+          package-manager-cache: false
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6
+        env:
+          NPM_CONFIG_AUDIT: "false"
+          NPM_CONFIG_FUND: "false"
+          NPM_CONFIG_UPDATE_NOTIFIER: "false"
+        with:
+          version: 9.15.4
+          run_install: false
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Run stall-stop replay suites
+        working-directory: server
+        run: timeout 1200 pnpm exec vitest run src/services/stall-stop-surface.test.ts src/__tests__/heartbeat-stall-stop-surface.test.ts src/__tests__/heartbeat-stall-stop-surface-r45.test.ts
