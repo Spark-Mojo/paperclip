@@ -24858,6 +24858,19 @@ export function heartbeatService(
                   bytes: persistedLogBytes,
                 };
               } else if (outputProgressState.pending) {
+                // Monotonic-counter invariant (verified PR #227 review T5):
+                // `bytes` is the run-level TOTAL of persisted log bytes, not
+                // a per-chunk size tied to pending.seq. persistedLogBytes
+                // only ever grows (each chunk folds its appendedBytes in
+                // exactly once, in this sync no-await block, so no lost
+                // update), so this refresh can only move pending.bytes UP.
+                // pending.at/seq/stream stay the OWNING (newest) chunk's,
+                // and flushOutputProgress writes bytes into
+                // lastOutputBytes as a monotonic total — it never assumes
+                // bytes corresponds to pending.seq. When pending is null
+                // (the owner already flushed) this stale continuation is a
+                // slot no-op: its bytes live in persistedLogBytes and reach
+                // the DB via the next owning chunk or the final flush.
                 outputProgressState.pending.bytes = persistedLogBytes;
               }
               stageStart = Date.now();

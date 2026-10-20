@@ -100,6 +100,11 @@ describe("databaseClientOptionsFromEnv", () => {
 
 describe("resolveDatabaseClientOptions", () => {
   it("reaps idle connections and names the pool when the environment sets nothing", () => {
+    // Pinned per PR #227 review T1: the statement default is the generous 60s
+    // runaway backstop; the 5s lock default bounds the diagnosed row-lock
+    // wait class. A regression to 5s aborts long migrations/analytics.
+    expect(DEFAULT_DATABASE_STATEMENT_TIMEOUT_MS).toBe(60_000);
+    expect(DEFAULT_DATABASE_LOCK_TIMEOUT_MS).toBe(5000);
     expect(resolveDatabaseClientOptions({})).toEqual({
       maxConnections: DEFAULT_DATABASE_POOL_MAX,
       idleTimeoutSeconds: DEFAULT_DATABASE_IDLE_TIMEOUT_SECONDS,
