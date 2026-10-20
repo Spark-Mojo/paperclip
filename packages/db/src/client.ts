@@ -12,7 +12,12 @@ const DRIZZLE_MIGRATIONS_TABLE = "__drizzle_migrations";
 const MIGRATIONS_JOURNAL_JSON = fileURLToPath(new URL("./migrations/meta/_journal.json", import.meta.url));
 
 function createUtilitySql(url: string) {
-  return postgres(url, { max: 1, onnotice: () => {} });
+  // Same resolved options as createDb (pool bounds, timeouts, app name from
+  // env), with max forced to 1: migration/utility work is serial, but must
+  // still honor DATABASE_STATEMENT_TIMEOUT_MS and friends. Call sites pass
+  // only a url; options come from env, exactly like createDb.
+  const resolved = resolveDatabaseClientOptions(databaseClientOptionsFromEnv());
+  return postgres(url, { ...postgresJsOptions(resolved), max: 1, onnotice: () => {} });
 }
 
 type RegisteredPostgresClient = ReturnType<typeof postgres>;
@@ -156,6 +161,26 @@ export interface DatabaseClientOptions {
    * `postgres.js`).
    */
   applicationName?: string;
+  /**
+   * Per-connection `statement_timeout` in milliseconds. The engine database
+   * runs with `statement_timeout=0` (unbounded), so an unlucky row-lock wait
+   * blocks a pooled connection forever. Set on every connection (see
+   * `postgresJsOptions`), not per transaction — the per-transaction escape
+   * hatch (`set_config('statement_timeout', ...)`, cf.
+   * `server/src/services/execution-control-reconciliation.ts`) stays for
+   * statements that need a tighter bound. `0` disables the timeout
+   * (Postgres semantics: 0 means no timeout); set
+   * `DATABASE_STATEMENT_TIMEOUT_MS=0` to restore unbounded for long-query
+   * workloads.
+   */
+  statementTimeoutMs?: number;
+  /**
+   * Per-connection `lock_timeout` in milliseconds. Bounds the wait for a row
+   * or table lock the same way `statementTimeoutMs` bounds total query time.
+   * `0` disables the timeout (Postgres semantics); set
+   * `DATABASE_LOCK_TIMEOUT_MS=0` to restore unbounded lock waits.
+   */
+  lockTimeoutMs?: number;
 }
 
 /**
@@ -168,6 +193,33 @@ export interface DatabaseClientOptions {
 export const DEFAULT_DATABASE_IDLE_TIMEOUT_SECONDS = 60;
 /** `application_name` reported to PostgreSQL unless `DATABASE_APPLICATION_NAME` overrides it. */
 export const DEFAULT_DATABASE_APPLICATION_NAME = "paperclip";
+/**
+ * Per-connection `statement_timeout` in milliseconds unless
+ * `DATABASE_STATEMENT_TIMEOUT_MS` says otherwise. The engine database runs
+ * with `statement_timeout=0` (unbounded), so without this a row-lock wait
+ * blocks a pooled connection forever. Set `DATABASE_STATEMENT_TIMEOUT_MS=0`
+ * to restore unbounded (Postgres semantics: 0 disables the timeout) for
+ * long-query workloads; for queries over 5s that should stay bounded, raise
+ * the timeout per transaction with `set_config('statement_timeout', ...)`.
+ */
+export const DEFAULT_DATABASE_STATEMENT_TIMEOUT_MS = 5000;
+/**
+ * Per-connection `lock_timeout` in milliseconds unless
+ * `DATABASE_LOCK_TIMEOUT_MS` overrides it. Set `DATABASE_LOCK_TIMEOUT_MS=0`
+ * to restore unbounded (0 disables the timeout); raise per transaction with
+ * `set_config('lock_timeout', ...)` for lock waits over 5s that should stay
+ * bounded.
+ */
+export const DEFAULT_DATABASE_LOCK_TIMEOUT_MS = 5000;
+/**
+ * Pool size unless `DATABASE_POOL_MAX` says otherwise. Formula: the engine
+ * runs ~2-9 concurrent heartbeat runs (observed), each holding at most one
+ * connection for its short DB interactions, plus headroom for migrations,
+ * utility clients and bursts — so 10 (also the driver default) is sized as
+ * `ceil(peak concurrent runs) + slack`, not as a guess. Raise
+ * `DATABASE_POOL_MAX` only alongside the DB's `max_connections`.
+ */
+export const DEFAULT_DATABASE_POOL_MAX = 10;
 
 function envBoolean(env: NodeJS.ProcessEnv, name: string): boolean | undefined {
   const value = env[name]?.trim().toLowerCase();
@@ -224,21 +276,33 @@ export function databaseClientOptionsFromEnv(env: NodeJS.ProcessEnv = process.en
   if (maxLifetimeSeconds !== undefined) options.maxLifetimeSeconds = maxLifetimeSeconds;
   const applicationName = envNonEmptyString(env, "DATABASE_APPLICATION_NAME");
   if (applicationName !== undefined) options.applicationName = applicationName;
+  // `0` disables the timeout (Postgres semantics: 0 means no timeout),
+  // restoring unbounded behavior for long-query workloads.
+  const statementTimeoutMs = envNonNegativeInteger(env, "DATABASE_STATEMENT_TIMEOUT_MS");
+  if (statementTimeoutMs !== undefined) options.statementTimeoutMs = statementTimeoutMs;
+  const lockTimeoutMs = envNonNegativeInteger(env, "DATABASE_LOCK_TIMEOUT_MS");
+  if (lockTimeoutMs !== undefined) options.lockTimeoutMs = lockTimeoutMs;
   return options;
 }
 
 /**
  * Fills in Paperclip's defaults for the options the caller left unset: idle
- * connections are reaped after `DEFAULT_DATABASE_IDLE_TIMEOUT_SECONDS`, and the
- * pool identifies itself as `DEFAULT_DATABASE_APPLICATION_NAME`. Everything
- * else stays at the driver default. An explicit value (including
- * `idleTimeoutSeconds: 0`) always wins over the default.
+ * connections are reaped after `DEFAULT_DATABASE_IDLE_TIMEOUT_SECONDS`, the
+ * pool identifies itself as `DEFAULT_DATABASE_APPLICATION_NAME`, every
+ * connection carries `statement_timeout`/`lock_timeout` defaults (the engine
+ * DB runs unbounded), and the pool is sized at `DEFAULT_DATABASE_POOL_MAX`
+ * (see its formula comment). Everything else stays at the driver default. An
+ * explicit value (including `idleTimeoutSeconds: 0`) always wins over the
+ * default.
  */
 export function resolveDatabaseClientOptions(options: DatabaseClientOptions): DatabaseClientOptions {
   return {
     ...options,
+    maxConnections: options.maxConnections ?? DEFAULT_DATABASE_POOL_MAX,
     idleTimeoutSeconds: options.idleTimeoutSeconds ?? DEFAULT_DATABASE_IDLE_TIMEOUT_SECONDS,
     applicationName: options.applicationName ?? DEFAULT_DATABASE_APPLICATION_NAME,
+    statementTimeoutMs: options.statementTimeoutMs ?? DEFAULT_DATABASE_STATEMENT_TIMEOUT_MS,
+    lockTimeoutMs: options.lockTimeoutMs ?? DEFAULT_DATABASE_LOCK_TIMEOUT_MS,
   };
 }
 
@@ -249,9 +313,15 @@ export function postgresJsOptions(options: DatabaseClientOptions): Record<string
   if (options.idleTimeoutSeconds !== undefined) driverOptions.idle_timeout = options.idleTimeoutSeconds;
   if (options.connectTimeoutSeconds !== undefined) driverOptions.connect_timeout = options.connectTimeoutSeconds;
   if (options.maxLifetimeSeconds !== undefined) driverOptions.max_lifetime = options.maxLifetimeSeconds;
-  if (options.applicationName !== undefined) {
-    driverOptions.connection = { application_name: options.applicationName };
-  }
+  // postgres.js forwards unknown `connection.*` entries as startup connection
+  // parameters (the same `options` object it already uses for
+  // `application_name`), so every pooled connection gets session-level
+  // `statement_timeout`/`lock_timeout` without a per-transaction SET.
+  const connection: Record<string, unknown> = {};
+  if (options.applicationName !== undefined) connection.application_name = options.applicationName;
+  if (options.statementTimeoutMs !== undefined) connection.statement_timeout = String(options.statementTimeoutMs);
+  if (options.lockTimeoutMs !== undefined) connection.lock_timeout = String(options.lockTimeoutMs);
+  if (Object.keys(connection).length > 0) driverOptions.connection = connection;
   return driverOptions;
 }
 
