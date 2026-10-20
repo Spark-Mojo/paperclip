@@ -3894,6 +3894,8 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
               status: issues.status,
               assigneeAgentId: issues.assigneeAgentId,
               assigneeUserId: issues.assigneeUserId,
+              createdByAgentId: issues.createdByAgentId,
+              createdByUserId: issues.createdByUserId,
               executionPolicy: issues.executionPolicy,
               executionState: issues.executionState,
               monitorNextCheckAt: issues.monitorNextCheckAt,
