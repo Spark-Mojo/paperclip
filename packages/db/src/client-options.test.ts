@@ -2,6 +2,9 @@ import { describe, expect, it } from "vitest";
 import {
   DEFAULT_DATABASE_APPLICATION_NAME,
   DEFAULT_DATABASE_IDLE_TIMEOUT_SECONDS,
+  DEFAULT_DATABASE_LOCK_TIMEOUT_MS,
+  DEFAULT_DATABASE_POOL_MAX,
+  DEFAULT_DATABASE_STATEMENT_TIMEOUT_MS,
   databaseClientOptionsFromEnv,
   postgresJsOptions,
   resolveDatabaseClientOptions,
@@ -97,13 +100,26 @@ describe("databaseClientOptionsFromEnv", () => {
 
 describe("resolveDatabaseClientOptions", () => {
   it("reaps idle connections and names the pool when the environment sets nothing", () => {
+    // Pinned per PR #227 review T1: the statement default is the generous 60s
+    // runaway backstop; the 5s lock default bounds the diagnosed row-lock
+    // wait class. A regression to 5s aborts long migrations/analytics.
+    expect(DEFAULT_DATABASE_STATEMENT_TIMEOUT_MS).toBe(60_000);
+    expect(DEFAULT_DATABASE_LOCK_TIMEOUT_MS).toBe(5000);
     expect(resolveDatabaseClientOptions({})).toEqual({
+      maxConnections: DEFAULT_DATABASE_POOL_MAX,
       idleTimeoutSeconds: DEFAULT_DATABASE_IDLE_TIMEOUT_SECONDS,
       applicationName: DEFAULT_DATABASE_APPLICATION_NAME,
+      statementTimeoutMs: DEFAULT_DATABASE_STATEMENT_TIMEOUT_MS,
+      lockTimeoutMs: DEFAULT_DATABASE_LOCK_TIMEOUT_MS,
     });
     expect(postgresJsOptions(resolveDatabaseClientOptions(databaseClientOptionsFromEnv({})))).toEqual({
+      max: DEFAULT_DATABASE_POOL_MAX,
       idle_timeout: DEFAULT_DATABASE_IDLE_TIMEOUT_SECONDS,
-      connection: { application_name: DEFAULT_DATABASE_APPLICATION_NAME },
+      connection: {
+        application_name: DEFAULT_DATABASE_APPLICATION_NAME,
+        statement_timeout: String(DEFAULT_DATABASE_STATEMENT_TIMEOUT_MS),
+        lock_timeout: String(DEFAULT_DATABASE_LOCK_TIMEOUT_MS),
+      },
     });
   });
 
@@ -114,7 +130,13 @@ describe("resolveDatabaseClientOptions", () => {
         idleTimeoutSeconds: 0,
         applicationName: "paperclip-cli",
       }),
-    ).toEqual({ maxConnections: 3, idleTimeoutSeconds: 0, applicationName: "paperclip-cli" });
+    ).toEqual({
+      maxConnections: 3,
+      idleTimeoutSeconds: 0,
+      applicationName: "paperclip-cli",
+      statementTimeoutMs: DEFAULT_DATABASE_STATEMENT_TIMEOUT_MS,
+      lockTimeoutMs: DEFAULT_DATABASE_LOCK_TIMEOUT_MS,
+    });
     expect(postgresJsOptions(resolveDatabaseClientOptions({ idleTimeoutSeconds: 0 }))).toMatchObject({
       idle_timeout: 0,
     });
