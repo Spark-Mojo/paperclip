@@ -18,6 +18,8 @@ import { describe, expect, it } from "vitest";
 import {
   dispatchSableSeatSummonsForPullRequest,
   isSableSeatDispatchRepo,
+  SABLE_SEAT_REVIEW_MARKER,
+  seatCardCreateInput,
   type SableSeatDispatchDeps,
   type SableSeatSummonsCreateInput,
 } from "./github-connection-events.js";
@@ -94,8 +96,7 @@ describe("pr-seat-dispatch e2e — seat card + summons filed (d22)", () => {
     expect(isSableSeatDispatchRepo(null)).toBe(false);
   });
 
-  it("files the seat card and the summons with seat-summons/sable-seat tags", async () => {
-    const { deps, created, resolved } = makeDeps();
+  it("files the seat card and the summons with seat-summons/sable-seat tags", async () => {    const { deps, created, resolved } = makeDeps();
     const result = await dispatchSableSeatSummonsForPullRequest(
       { ...openedInput(), changedFiles: ["docker-compose.yml"] },
       deps,
@@ -120,6 +121,31 @@ describe("pr-seat-dispatch e2e — seat card + summons filed (d22)", () => {
     expect(summons.detailsMarkdown).toContain(`${OWNER}/${REPO}#${NUMBER}`);
     expect(summons.tags).toContain("seat-summons");
     expect(summons.tags).toContain("sable-seat");
+  });
+
+  it("d25 minimal Sable review stage: card payload carries review marker + PR link, status stays todo", () => {
+    const snapshot = {
+      repository: `${OWNER}/${REPO}`,
+      owner: OWNER,
+      repo: REPO,
+      number: NUMBER,
+    };
+    const payload = seatCardCreateInput(snapshot, ["docker-compose"], KEY);
+    // Honest stage: todo + unassigned (no assignee keys at all), marked
+    // unmistakably for Sable review; the summons thread on the card IS the
+    // review surface (Sable resolves it, guard refuses self-resolve).
+    expect(payload.status).toBe("todo");
+    expect(payload.priority).toBe("medium");
+    expect(payload.idempotencyKey).toBe(KEY);
+    expect(Object.keys(payload).sort()).toEqual(
+      ["description", "idempotencyKey", "priority", "status", "title"].sort(),
+    );
+    expect(payload.title).toContain("Sable review");
+    expect(payload.description).toContain(SABLE_SEAT_REVIEW_MARKER);
+    expect(payload.description).toContain(
+      `https://github.com/${OWNER}/${REPO}/pull/${NUMBER}`,
+    );
+    expect(payload.description).toContain("seat-summons");
   });
 
   it("replay with the same key dedupes: second event suppressed", async () => {
