@@ -226,8 +226,10 @@ function githubSnapshotUpdate(payload: Record<string, unknown>) {
  * changedFiles; a file list is opportunistic triage surface only, never a
  * gate). Fail-closed skips stay for malformed payloads only (bad action,
  * invalid PR ref, non-platform repo, resolver null).
- * Ruling 3: the null prAuthor pair is kept and fail-closed — never a
- * refuse-everyone fallback, never audit-flag-and-proceed. No sender→PR-author
+ * Ruling 3 (d27 cut-b): a null prAuthor pair is never dispatched — the
+ * seat card is filed via the resolver, then the summons is a logged
+ * "no_author_identity" skip. The summons path requires a server-established
+ * author pair (input.serverAuthor, never client input). No sender→PR-author
  * linkage is invented here (the leased payload's sender fields are the EVENT
  * SENDER, not the PR author). Enrichment is SPA-13821, path precision is
  * SPA-13820.
@@ -246,6 +248,15 @@ export type SableSeatDispatchInput = {
   action: string;
   changedFiles?: unknown;
   snapshot: SableSeatPrSnapshot;
+  /**
+   * d27 (Ty ruling 3 cut-b) — server-derived PR-author identity, used ONLY
+   * when the production path can establish it server-side (enrichment
+   * SPA-13821; absent in production today). NEVER populated from client
+   * input: the leased payload's sender fields are the EVENT SENDER, not the
+   * PR author, and no sender→PR-author linkage is invented here. Tests drive
+   * it directly as the stand-in for server establishment.
+   */
+  serverAuthor?: { actorId: string; actorType: string } | null;
 };
 
 export type SableSeatSummonsCreateInput = {
@@ -279,10 +290,12 @@ export type SableSeatDispatchResult = {
   reason: string;
 };
 
-/** Platform repos that qualify for seat dispatch (case-insensitive). */
+/** Seat-dispatch repos (case-insensitive): engine fork + platform repo. */
 export function isSableSeatDispatchRepo(repository: unknown): boolean {
-  return typeof repository === "string" &&
-    repository.trim().toLowerCase() === "spark-mojo/paperclip";
+  if (typeof repository !== "string") return false;
+  const normalized = repository.trim().toLowerCase();
+  return normalized === "spark-mojo/paperclip" ||
+    normalized === "spark-mojo/spark-mojo-platform";
 }
 
 /**
@@ -401,6 +414,34 @@ export async function dispatchSableSeatSummonsForPullRequest(
     return { dispatched: false, reason: "no_seat_card_issue" };
   }
   const ref = `${snapshot.owner}/${snapshot.repo}#${snapshot.number}`;
+  // d27 (Ty ruling 3 cut-b): a summons whose author identity cannot be
+  // established server-side is never dispatched. The leased payload carries
+  // no PR-author identity and the {systemId} create actor yields an absent
+  // pair, so production (input.serverAuthor null/absent) files the seat
+  // CARD via the resolver as today, then SKIPS the summons with a logged
+  // "no_author_identity" skip — the card lands (Sable triages per event)
+  // with no unresolvable summons thread on it. The exported seam drives the
+  // summons path WITH an established author via input.serverAuthor (the
+  // stand-in for server establishment — never client input).
+  const rawAuthor = input.serverAuthor ?? null;
+  const establishedAuthor = rawAuthor &&
+      typeof rawAuthor.actorId === "string" && rawAuthor.actorId.trim().length > 0 &&
+      typeof rawAuthor.actorType === "string" && rawAuthor.actorType.trim().length > 0
+    ? { actorId: rawAuthor.actorId.trim(), actorType: rawAuthor.actorType.trim() }
+    : null;
+  if (!establishedAuthor) {
+    deps.logInfo(
+      {
+        companyId: input.companyId,
+        repository: snapshot.repository,
+        number: snapshot.number,
+        dedupeKey: key,
+        seatIssueId: seatIssue.id,
+      },
+      "sable-seat dispatch skipped: no establishable PR-author identity, card filed without summons",
+    );
+    return { dispatched: false, reason: "no_author_identity" };
+  }
   const summons: SableSeatSummonsCreateInput = {
     title: seatCardTitle({ owner: snapshot.owner, repo: snapshot.repo, number: snapshot.number }),
     prompt: `Sable review requested for ${snapshot.repository}#${snapshot.number}.`,
@@ -411,13 +452,10 @@ export async function dispatchSableSeatSummonsForPullRequest(
     ].join("\n"),
     idempotencyKey: key,
     tags: ["seat-summons", "sable-seat"],
-    // Ruling 3: unattributed is a logged dispatch, not a refuse-everyone
-    // fallback and not audit-flag-and-proceed. The leased payload carries no
-    // PR-author identity (sender fields are the event sender), so the null
-    // pair is kept and the resolve guard fail-closes instead. Follow-ups:
-    // enrichment SPA-13821, path precision SPA-13820.
-    prAuthorActorId: null,
-    prAuthorActorType: null,
+    // d27: established server-side (see serverAuthor trust boundary above).
+    // Follow-ups: enrichment SPA-13821, path precision SPA-13820.
+    prAuthorActorId: establishedAuthor.actorId,
+    prAuthorActorType: establishedAuthor.actorType,
   };
   try {
     const createdSummons = await deps.createSummons(seatIssue.id, summons);
@@ -604,15 +642,15 @@ export function githubConnectionEventService(
    * PR ref, non-platform repo, resolver null). Never add a GitHub API fetch
    * here.
    *
-   * Author source: the leased payload's sender fields are the EVENT SENDER,
-   * NOT the PR author. There is no author identity on the leased payload, so
-   * the summons keeps the null prAuthorActor pair (ruling 3: never a
-   * refuse-everyone fallback, never audit-flag-and-proceed; no
-   * sender→PR-author linkage invented). The create path below uses the
-   * {systemId} actor, which the d16 server derivation turns into the
-   * absent/null pair, so the d10 route guard fail-closes pending the
-   * enrichment leaf (SPA-13821; path precision SPA-13820) — never a guess
-   * here.
+   * Author source (d27 cut-b): the leased payload's sender fields are the
+   * EVENT SENDER, NOT the PR author, and there is no author identity on the
+   * leased payload — so production dispatches with no serverAuthor, files
+   * the seat card, and skips the summons as "no_author_identity" (never an
+   * unattributed summons; no sender→PR-author linkage invented). The
+   * create path below uses the {systemId} actor, which the d16 server
+   * derivation turns into the absent/null pair. Enrichment SPA-13821 may one
+   * day populate input.serverAuthor here; path precision SPA-13820 — never
+   * a guess here.
    *
    * Coordination: dedupeKey is the shared overlap guard with the SPA-13661
    * arming path — both filers use the same key so one seat card per PR event
