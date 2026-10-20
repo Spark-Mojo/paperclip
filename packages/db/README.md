@@ -37,6 +37,14 @@ The two timeouts bound different failure classes:
   3s (`progress_flush_dropped`, `server/src/services/heartbeat.ts`), so the
   pooled-client statement bound is a second line of defense, not the primary.
 
+### Heartbeat progress-flush scope (PR #227 review T1 follow-up)
+
+The `heartbeat_runs` output-progress UPDATE runs inside a transaction that sets
+`statement_timeout` and `lock_timeout` to 5s transaction-locally via
+`set_config(..., true)`, so the diagnosed row-lock wait fails fast instead of
+gating the stdout drain. The pooled client default stays 60s and the
+utility/migration client stays exempt.
+
 ### Utility / migration client exemption (PR #227 review T2)
 
 The utility client (`createUtilitySql`, used for migrations, inspection and
