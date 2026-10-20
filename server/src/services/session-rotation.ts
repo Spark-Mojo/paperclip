@@ -14,6 +14,21 @@ export const SESSION_ROTATION_THRESHOLD = 2;
 export const SESSION_ROTATION_HANDOFF_REASON =
   "session_rotation_same_stall_code";
 
+/**
+ * Fail-closed clear of the three rotation-scoped context keys. Rotation query
+ * errors must never block the run, so the catch path clears any stale
+ * handoff/rotation/previous-session fields before continuing on the existing
+ * session. Operates in place on the run context record.
+ */
+export function clearStaleRotationState(
+  context: Record<string, unknown> | null | undefined,
+): void {
+  if (!context || typeof context !== "object") return;
+  delete context.paperclipSessionHandoffMarkdown;
+  delete context.paperclipSessionRotationReason;
+  delete context.paperclipPreviousSessionId;
+}
+
 export interface SameCodeStreakRun {
   id: string;
   status: string;

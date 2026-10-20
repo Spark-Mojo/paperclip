@@ -375,7 +375,7 @@ import {
   resolveBreakerExtraProgressWindowStart,
   shouldTripIssueRewakeCircuitBreaker,
 } from "./issue-rewake-throttle.js";
-import { buildSessionRotationHandoff, countConsecutiveSameCodeTerminalFailures, SESSION_ROTATION_HANDOFF_REASON, SESSION_ROTATION_THRESHOLD, shouldRotateSession } from "./session-rotation.js";
+import { buildSessionRotationHandoff, clearStaleRotationState, countConsecutiveSameCodeTerminalFailures, SESSION_ROTATION_HANDOFF_REASON, SESSION_ROTATION_THRESHOLD, shouldRotateSession } from "./session-rotation.js";
 import {
   logActivity,
   publishPluginDomainEvent,
@@ -24425,17 +24425,14 @@ export function heartbeatService(
               `Starting a fresh session because ${SESSION_ROTATION_HANDOFF_REASON} (${streak.code} x${streak.count}).`,
             );
           } else {
-            delete context.paperclipSessionHandoffMarkdown;
-            delete context.paperclipSessionRotationReason;
-            delete context.paperclipPreviousSessionId;
+            clearStaleRotationState(context);
           }
         } catch {
           // Fail-closed: rotation query errors never block the run.
+          clearStaleRotationState(context);
         }
       } else {
-        delete context.paperclipSessionHandoffMarkdown;
-        delete context.paperclipSessionRotationReason;
-        delete context.paperclipPreviousSessionId;
+        clearStaleRotationState(context);
       }
 
       if (managedAiRuntime) {
