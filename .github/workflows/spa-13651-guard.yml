@@ -10,6 +10,10 @@ on:
   pull_request:
     branches:
       - rebuild/v2026.916.0-survivors
+  push:
+    branches:
+      - engine-fork/SPA-13651
+  workflow_dispatch:
 
 permissions:
   actions: read
