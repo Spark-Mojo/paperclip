@@ -1,94 +1,292 @@
 /**
- * SPA-13735 d14 — PR seat-dispatch tests at the reachable service boundary.
+ * SPA-13735 d22 — PR seat-dispatch end-to-end at the exported seam.
  *
- * HONEST GAP (do not paper over): maybeDispatchSableSeatSummons and
- * applyPullRequestEvent are closure-private inside
- * githubConnectionEventService(...) in github-connection-events.ts — the
- * service returns only { pollOnce }, so the injected-options seam named in
- * the brief (createSeatSummons factory mock + resolveSeatCardIssue mock) is
- * NOT reachable from a test, and applyPullRequestEvent requires a live Db
- * (db.update(externalObjects)... runs before any dispatch logic). Exporting
- * that seam is d13's path — this file does NOT refactor the service.
+ * Drives dispatchSableSeatSummonsForPullRequest (exported from
+ * github-connection-events.ts, additive seam per SPA-13818 ruling 5 — the
+ * production pollOnce path, the dynamic issueService import and the default
+ * resolver behavior are unchanged) with stubbed resolve/create deps, so a PR
+ * event → seat card + summons runs with no live Db and no live infra.
  *
- * What this file pins instead: the exported decision contract the dispatch
- * path depends on (sable-seat-dispatch.ts pure functions) —
- * qualify → dedupeKey (passed verbatim as the interaction idempotencyKey in
- * the unexported dispatch) → seatCardTitle. If d13 exports the seam, these
- * become the fixtures for the create-called-once / tags assertions.
- *
- * Why changedFiles-carrying payloads: the leased seam fail-closes without a
- * file list (no_changed_files → log + skip; normalizeLeasedPayload carries
- * no changedFiles and no GitHub fetch may be added), so every dispatch case
- * below carries changedFiles explicitly.
- *
- * NOT proven here (needs the d13 seam): service.create called once,
- * payload.tags containing "seat-summons", and end-to-end second-event
- * suppression. The idempotency half IS proven: the dispatch passes
- * idempotencyKey = dedupeKey(ref), and dedupeKey stability across two
- * invocations for the same PR is asserted below.
+ * Scope per SPA-13818 rulings 2+3+4: repo-qualified dispatch with NO
+ * changedFiles gate (the leased pull_request allowlist carries no
+ * changedFiles; fail-closed skips stay for malformed payloads only);
+ * one-sided dedupeKey/idempotencyKey contract (no wait on SPA-13661); the
+ * null author pair is kept and fail-closed (enrichment SPA-13821, path
+ * precision SPA-13820 — no attribution is invented here).
  */
 import { describe, expect, it } from "vitest";
 import {
-  dedupeKey,
-  prQualifiesForSableSeat,
-  seatCardTitle,
-} from "./sable-seat-dispatch.js";
+  dispatchSableSeatSummonsForPullRequest,
+  isSableSeatDispatchRepo,
+  type SableSeatDispatchDeps,
+  type SableSeatSummonsCreateInput,
+} from "./github-connection-events.js";
+import { dedupeKey } from "./sable-seat-dispatch.js";
+import { evaluateSeatSummonsResolve } from "./seat-summons-self-resolve-guard.js";
 
+const COMPANY = "company-d22";
 const OWNER = "spark-mojo";
 const REPO = "paperclip";
 const NUMBER = 42;
+const KEY = dedupeKey({ owner: OWNER, repo: REPO, number: NUMBER })!;
 
-describe("pr-seat-dispatch — qualifying payload dispatches (d14)", () => {
-  it("qualifying changedFiles mark the PR dispatch-eligible", () => {
-    // opened/synchronize/reopened carrying a file list, no network involved.
-    const verdict = prQualifiesForSableSeat({
-      changedFiles: ["docker-compose.yml"],
+function makeLogs() {
+  const info: Array<{ fields: Record<string, unknown>; message: string }> = [];
+  const warn: Array<{ fields: Record<string, unknown>; message: string }> = [];
+  return {
+    info,
+    warn,
+    logInfo: (fields: Record<string, unknown>, message: string) => {
+      info.push({ fields, message });
+    },
+    logWarn: (fields: Record<string, unknown>, message: string) => {
+      warn.push({ fields, message });
+    },
+  };
+}
+
+function makeDeps(overrides: Partial<SableSeatDispatchDeps> = {}) {
+  const created: Array<{
+    seatIssueId: string;
+    summons: SableSeatSummonsCreateInput;
+  }> = [];
+  const resolved: Array<{
+    companyId: string;
+    matchedPatterns: string[];
+    key: string;
+  }> = [];
+  const logs = makeLogs();
+  const deps: SableSeatDispatchDeps = {
+    resolveSeatCardIssue: async (companyId, _snapshot, matchedPatterns, key) => {
+      resolved.push({ companyId, matchedPatterns, key });
+      return { id: "seat-issue-1" };
+    },
+    createSummons: async (seatIssueId, summons) => {
+      created.push({ seatIssueId, summons });
+      return { id: "summons-1" };
+    },
+    dispatchedKeys: new Set<string>(),
+    logInfo: logs.logInfo,
+    logWarn: logs.logWarn,
+    ...overrides,
+  };
+  return { deps, created, resolved, logs };
+}
+
+function openedInput() {
+  return {
+    companyId: COMPANY,
+    action: "opened",
+    snapshot: {
+      repository: `${OWNER}/${REPO}`,
+      owner: OWNER,
+      repo: REPO,
+      number: NUMBER,
+    },
+  };
+}
+
+describe("pr-seat-dispatch e2e — seat card + summons filed (d22)", () => {
+  it("platform repo qualifies for dispatch", () => {
+    expect(isSableSeatDispatchRepo("Spark-Mojo/paperclip")).toBe(true);
+    expect(isSableSeatDispatchRepo("spark-mojo/paperclip")).toBe(true);
+    expect(isSableSeatDispatchRepo("spark-mojo/other")).toBe(false);
+    expect(isSableSeatDispatchRepo(null)).toBe(false);
+  });
+
+  it("files the seat card and the summons with seat-summons/sable-seat tags", async () => {
+    const { deps, created, resolved } = makeDeps();
+    const result = await dispatchSableSeatSummonsForPullRequest(
+      { ...openedInput(), changedFiles: ["docker-compose.yml"] },
+      deps,
+    );
+    expect(result).toEqual({ dispatched: true, reason: "dispatched" });
+    // Seat card resolved once, one-sided idempotencyKey = dedupeKey.
+    expect(resolved).toHaveLength(1);
+    expect(resolved[0]!.companyId).toBe(COMPANY);
+    expect(resolved[0]!.key).toBe(KEY);
+    // Per-event triage surface recorded (opportunistic, never a gate).
+    expect(resolved[0]!.matchedPatterns).toContain("docker-compose");
+    // Summons filed once on the seat card, carrying the PR link + tags.
+    expect(created).toHaveLength(1);
+    const summons = created[0]!.summons;
+    expect(created[0]!.seatIssueId).toBe("seat-issue-1");
+    expect(summons.idempotencyKey).toBe(KEY);
+    expect(summons.title).toContain(`${OWNER}/${REPO}#${NUMBER}`);
+    expect(summons.prompt).toContain(`${OWNER}/${REPO}#${NUMBER}`);
+    expect(summons.detailsMarkdown).toContain(
+      `https://github.com/${OWNER}/${REPO}/pull/${NUMBER}`,
+    );
+    expect(summons.detailsMarkdown).toContain(`${OWNER}/${REPO}#${NUMBER}`);
+    expect(summons.tags).toContain("seat-summons");
+    expect(summons.tags).toContain("sable-seat");
+  });
+
+  it("replay with the same key dedupes: second event suppressed", async () => {
+    const { deps, created, resolved, logs } = makeDeps();
+    const first = await dispatchSableSeatSummonsForPullRequest(
+      openedInput(),
+      deps,
+    );
+    expect(first).toEqual({ dispatched: true, reason: "dispatched" });
+    const second = await dispatchSableSeatSummonsForPullRequest(
+      { ...openedInput(), action: "synchronize" },
+      deps,
+    );
+    expect(second).toEqual({
+      dispatched: false,
+      reason: "duplicate_suppressed",
     });
-    expect(verdict.qualifies).toBe(true);
-    expect(verdict.matchedPatterns.length).toBeGreaterThan(0);
-  });
-
-  it("idempotencyKey equals dedupeKey for that owner/repo/number", () => {
-    // The dispatch passes idempotencyKey: dedupeKey({owner, repo, number}).
-    expect(dedupeKey({ owner: OWNER, repo: REPO, number: NUMBER })).toBe(
-      `sable-seat:${OWNER}/${REPO}#${NUMBER}`,
-    );
-  });
-
-  it("seat card title names the same PR the key identifies", () => {
-    expect(seatCardTitle({ owner: OWNER, repo: REPO, number: NUMBER })).toBe(
-      `Sable review: ${OWNER}/${REPO}#${NUMBER}`,
-    );
+    expect(resolved).toHaveLength(1);
+    expect(created).toHaveLength(1);
+    expect(logs.info.length).toBeGreaterThan(0);
   });
 });
 
-describe("pr-seat-dispatch — non-qualifying payload does not create (d14)", () => {
-  it("unrelated paths do not qualify, so no summons is filed", () => {
-    const verdict = prQualifiesForSableSeat({
-      changedFiles: ["docs/README.md"],
+describe("pr-seat-dispatch e2e — logged skip paths (d22)", () => {
+  it("resolver failure is a logged skip: no summons filed", async () => {
+    const { deps, created, resolved, logs } = makeDeps({
+      resolveSeatCardIssue: async (companyId, _snapshot, matchedPatterns, key) => {
+        resolved.push({ companyId, matchedPatterns, key });
+        return null;
+      },
     });
-    expect(verdict.qualifies).toBe(false);
-    expect(verdict.matchedPatterns).toEqual([]);
-  });
-
-  it("empty file list does not qualify (fail-closed, no fetch added)", () => {
-    expect(prQualifiesForSableSeat({ changedFiles: [] }).qualifies).toBe(
-      false,
+    const result = await dispatchSableSeatSummonsForPullRequest(
+      openedInput(),
+      deps,
     );
-  });
-});
-
-describe("pr-seat-dispatch — same PR twice suppressed by idempotencyKey (d14)", () => {
-  it("two invocations for the same PR yield the same idempotencyKey", () => {
-    const first = dedupeKey({ owner: OWNER, repo: REPO, number: NUMBER });
-    const second = dedupeKey({ owner: OWNER, repo: REPO, number: NUMBER });
-    expect(first).not.toBeNull();
-    expect(second).toBe(first);
+    expect(result).toEqual({ dispatched: false, reason: "no_seat_card_issue" });
+    expect(resolved).toHaveLength(1);
+    expect(created).toHaveLength(0);
+    expect(logs.info.length).toBeGreaterThan(0);
   });
 
-  it("different PRs yield different keys (no cross-PR suppression)", () => {
-    expect(
-      dedupeKey({ owner: OWNER, repo: REPO, number: NUMBER }),
-    ).not.toBe(dedupeKey({ owner: OWNER, repo: REPO, number: NUMBER + 1 }));
+  it("create failure is a logged skip: fail-closed, nothing escapes", async () => {
+    const { deps, created, logs } = makeDeps({
+      createSummons: async () => {
+        throw new Error("summons store unavailable");
+      },
+    });
+    const result = await dispatchSableSeatSummonsForPullRequest(
+      openedInput(),
+      deps,
+    );
+    expect(result).toEqual({
+      dispatched: false,
+      reason: "summons_create_failed",
+    });
+    expect(created).toHaveLength(0);
+    expect(logs.warn.length).toBeGreaterThan(0);
+  });
+
+  it("null summons create is a logged skip: fail-closed, no key added", async () => {
+    const { deps, logs } = makeDeps({
+      createSummons: async () => null,
+    });
+    const result = await dispatchSableSeatSummonsForPullRequest(
+      openedInput(),
+      deps,
+    );
+    expect(result).toEqual({
+      dispatched: false,
+      reason: "summons_create_failed",
+    });
+    expect(deps.dispatchedKeys.has(KEY)).toBe(false);
+    expect(logs.warn.length).toBeGreaterThan(0);
+  });
+
+  it("unattributed summons dispatches with null pair; guard fail-closes downstream", async () => {
+    const { deps, created } = makeDeps();
+    const result = await dispatchSableSeatSummonsForPullRequest(
+      openedInput(),
+      deps,
+    );
+    // No refuse-everyone fallback: the dispatch still files despite the
+    // unknown author; the resolve guard fail-closes instead.
+    expect(result).toEqual({ dispatched: true, reason: "dispatched" });
+    expect(created).toHaveLength(1);
+    const summons = created[0]!.summons;
+    // No attribution invented, and no audit-flag-and-proceed smuggled in.
+    expect(summons.prAuthorActorId).toBeNull();
+    expect(summons.prAuthorActorType).toBeNull();
+    expect(Object.keys(summons).sort()).toEqual(
+      [
+        "detailsMarkdown",
+        "idempotencyKey",
+        "prAuthorActorId",
+        "prAuthorActorType",
+        "prompt",
+        "tags",
+        "title",
+      ].sort(),
+    );
+    // The stored null pair fail-closes at resolve time.
+    const decision = evaluateSeatSummonsResolve({
+      isSummons: true,
+      resolverActorId: "agent-9",
+      resolverActorType: "agent",
+      prAuthorActorId: summons.prAuthorActorId,
+      prAuthorActorType: summons.prAuthorActorType,
+      creatorAgentId: "agent-other",
+    });
+    expect(decision.allowed).toBe(false);
+  });
+
+  it("non-platform repo is a logged skip: resolver never called", async () => {
+    const { deps, created, resolved, logs } = makeDeps();
+    const result = await dispatchSableSeatSummonsForPullRequest(
+      {
+        ...openedInput(),
+        snapshot: {
+          repository: "spark-mojo/other",
+          owner: "spark-mojo",
+          repo: "other",
+          number: NUMBER,
+        },
+      },
+      deps,
+    );
+    expect(result).toEqual({
+      dispatched: false,
+      reason: "repo_not_dispatchable",
+    });
+    expect(resolved).toHaveLength(0);
+    expect(created).toHaveLength(0);
+    expect(logs.info.length).toBeGreaterThan(0);
+  });
+
+  it("closed action is a logged skip", async () => {
+    const { deps, created, resolved, logs } = makeDeps();
+    const result = await dispatchSableSeatSummonsForPullRequest(
+      { ...openedInput(), action: "closed" },
+      deps,
+    );
+    expect(result).toEqual({
+      dispatched: false,
+      reason: "action_not_dispatchable",
+    });
+    expect(resolved).toHaveLength(0);
+    expect(created).toHaveLength(0);
+    expect(logs.info.length).toBeGreaterThan(0);
+  });
+
+  it("malformed PR ref is a logged skip: invalid_pr_ref", async () => {
+    const { deps, created, resolved, logs } = makeDeps();
+    const result = await dispatchSableSeatSummonsForPullRequest(
+      {
+        ...openedInput(),
+        snapshot: {
+          repository: `${OWNER}/${REPO}`,
+          owner: OWNER,
+          repo: REPO,
+          number: Number.NaN,
+        },
+      },
+      deps,
+    );
+    expect(result).toEqual({ dispatched: false, reason: "invalid_pr_ref" });
+    expect(resolved).toHaveLength(0);
+    expect(created).toHaveLength(0);
+    expect(logs.warn.length).toBeGreaterThan(0);
   });
 });
