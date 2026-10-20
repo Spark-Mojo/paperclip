@@ -1,0 +1,68 @@
+# SPA-13831: durable fork replay runner.
+#
+# WHY THIS FILE EXISTS: a workflow file that exists only on a PR branch never
+# registers its triggers -- only files present on the DEFAULT branch fire. PR
+# #221 carried a PR-scoped guard (.github/workflows/spa-13651-guard.yml) that
+# recorded zero check-runs on its head for exactly this reason. This file lives
+# on the default branch (rebuild/v2026.916.0-survivors) so its pull_request
+# trigger fires for PRs targeting that branch. New files merge in enabled
+# state, bypassing disabled_manually states stuck on older workflows.
+#
+# NOT A REQUIRED CHECK: advisory replay signal only; required checks are
+# unchanged. Deploys nothing, touches no routing/model config, uses no secrets.
+# Manual probe via workflow_dispatch.
+#
+# NOTE: .github/CODEOWNERS requires .github/** review
+# (@cryppadotta @devinfoley @nickyleach @forgottendev), so the PR landing
+# this file needs a codeowner review.
+
+name: Fork replay runner
+
+on:
+  pull_request:
+    branches:
+      - rebuild/v2026.916.0-survivors
+    paths:
+      - server/src/services/stall-stop-surface*
+      - server/src/__tests__/heartbeat-stall-stop*
+      - .github/workflows/spa-*-guard.yml
+      - .github/workflows/spa-replay-runner.yml
+  workflow_dispatch:
+
+permissions:
+  actions: read
+  contents: read
+  pull-requests: read
+
+jobs:
+  replay:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version: 24
+          package-manager-cache: false
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6
+        with:
+          version: 9.15.4
+          run_install: false
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Run stall-stop replay suites
+        working-directory: server
+        run: >-
+          timeout 1200 pnpm exec vitest run
+          src/services/stall-stop-surface.test.ts
+          src/__tests__/heartbeat-stall-stop-surface.test.ts
+          src/__tests__/heartbeat-stall-stop-surface-r45.test.ts
