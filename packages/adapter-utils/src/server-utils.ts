@@ -778,6 +778,91 @@ function resumeReadable(
   readable.resume();
 }
 
+export type ChildLogStreamName = "stdout" | "stderr";
+
+/**
+ * Per-stream serial chains for adapter log appends (SPA-13853 d2).
+ *
+ * stdout and stderr each get their own serial promise chain so a slow
+ * `onLog("stderr", …)` persist never serializes (and never delays the
+ * pause/resume of) the stdout drain, and vice versa. Ordering is preserved
+ * per stream; there is no cross-stream ordering guarantee.
+ *
+ * `settled(timeoutMs)` bounds the close-path wait: after the timeout the
+ * wait resolves regardless of still-pending appends, so a hung `onLog`
+ * persist can never pend `runChildProcess` forever. A call with no timeout
+ * waits unbounded (the pre-existing unit-test shape).
+ */
+export const LOG_CHAIN_CLOSE_SETTLE_TIMEOUT_MS = 4_000;
+
+export function resolveLogChainCloseSettleTimeoutMs(): number {
+  const raw = process.env.PAPERCLIP_LOG_CHAIN_SETTLE_TIMEOUT_MS?.trim();
+  if (raw !== undefined && raw !== "") {
+    const parsed = Number(raw);
+    if (Number.isFinite(parsed) && parsed >= 0) return parsed;
+  }
+  return LOG_CHAIN_CLOSE_SETTLE_TIMEOUT_MS;
+}
+
+export function createPerStreamLogChains(
+  onError: (err: unknown, stream: ChildLogStreamName) => void,
+) {
+  const chains: Record<ChildLogStreamName, Promise<void>> = {
+    stdout: Promise.resolve(),
+    stderr: Promise.resolve(),
+  };
+  const append = (stream: ChildLogStreamName, work: () => Promise<void>): void => {
+    chains[stream] = chains[stream]
+      .then(work)
+      .catch((err) => {
+        // A throwing per-stream onError must never strand the chain: an
+        // uncaught throw here would leave `chains[stream]` rejected, and
+        // every later `.then(work)` would skip its work (starving
+        // resumeReadable) while `settled()` still reported green.
+        try {
+          onError(err, stream);
+        } catch {
+          // Swallowed: the advisory failed, the chain stays live.
+        }
+      })
+      .then(() => undefined);
+  };
+  const settled = (timeoutMs?: number): Promise<void> => {
+    const pending = Promise.all([
+      chains.stdout.then(
+        () => undefined,
+        () => undefined,
+      ),
+      chains.stderr.then(
+        () => undefined,
+        () => undefined,
+      ),
+    ]).then(() => undefined);
+    if (
+      timeoutMs === undefined ||
+      !Number.isFinite(timeoutMs) ||
+      timeoutMs < 0
+    ) {
+      return pending;
+    }
+    return new Promise<void>((resolve) => {
+      let timer: NodeJS.Timeout | null = setTimeout(() => {
+        timer = null;
+        resolve();
+      }, timeoutMs);
+      if (typeof timer.unref === "function") timer.unref();
+      void pending.then(() => {
+        if (timer) {
+          clearTimeout(timer);
+          timer = null;
+        }
+        resolve();
+      });
+    });
+  };
+  return { append, settled };
+}
+
 export function resolvePathValue(
   obj: Record<string, unknown>,
   dottedPath: string,
@@ -5082,7 +5167,18 @@ export async function runChildProcess(
         let timedOut = false;
         let stdout = "";
         let stderr = "";
-        let logChain: Promise<void> = Promise.resolve();
+        // Per-stream serial chains (SPA-13853 d2): a slow stderr append must
+        // never stall the stdout drain, and vice versa. Per-stream ordering
+        // is preserved; there is no cross-stream ordering guarantee.
+        const logChains = createPerStreamLogChains((err, stream) =>
+          onLogError(
+            err,
+            runId,
+            stream === "stdout"
+              ? "failed to append stdout log chunk"
+              : "failed to append stderr log chunk",
+          ),
+        );
         let terminalResultSeen = false;
         let terminalCleanupStarted = false;
         let terminalCleanupSignal: NodeJS.Signals | null = null;
@@ -5206,15 +5302,14 @@ export async function runChildProcess(
           stdout = appendWithCap(stdout, text);
           streamStallDetector.noteActivity();
           maybeArmTerminalResultCleanup();
-          logChain = logChain
-            .then(() => opts.onLog("stdout", text))
-            .catch((err) =>
-              onLogError(err, runId, "failed to append stdout log chunk"),
-            )
-            .finally(() => {
+          logChains.append("stdout", async () => {
+            try {
+              await opts.onLog("stdout", text);
+            } finally {
               maybeArmTerminalResultCleanup();
               resumeReadable(readable);
-            });
+            }
+          });
         });
 
         child.stderr?.on("data", (chunk: unknown) => {
@@ -5225,15 +5320,14 @@ export async function runChildProcess(
           stderr = appendWithCap(stderr, text);
           streamStallDetector.noteActivity();
           maybeArmTerminalResultCleanup();
-          logChain = logChain
-            .then(() => opts.onLog("stderr", text))
-            .catch((err) =>
-              onLogError(err, runId, "failed to append stderr log chunk"),
-            )
-            .finally(() => {
+          logChains.append("stderr", async () => {
+            try {
+              await opts.onLog("stderr", text);
+            } finally {
               maybeArmTerminalResultCleanup();
               resumeReadable(readable);
-            });
+            }
+          });
         });
 
         const stdin = child.stdin;
@@ -5286,7 +5380,9 @@ export async function runChildProcess(
             clearTerminalCleanupTimers();
             streamStallDetector.stop();
             runningProcesses.delete(runId);
-            void logChain.finally(async () => {
+            void logChains
+              .settled(resolveLogChainCloseSettleTimeoutMs())
+              .then(async () => {
               const scopeStopped = await cleanupScope();
               if (!scopeStopped) {
                 reject(new Error("run_scope_stop_failed"));
