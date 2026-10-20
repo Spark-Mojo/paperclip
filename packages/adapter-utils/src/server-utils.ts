@@ -886,12 +886,16 @@ export function createPerStreamLogChains(
           // Chains had unsettled work when the window closed. If every
           // append had settled, `pending.then` would have cleared this
           // timer before it could fire.
-          onCutoff({
-            pendingCounts: {
-              stdout: pendingAppends.stdout,
-              stderr: pendingAppends.stderr,
-            },
-          });
+          try {
+            onCutoff({
+              pendingCounts: {
+                stdout: pendingAppends.stdout,
+                stderr: pendingAppends.stderr,
+              },
+            });
+          } catch {
+            // Swallowed: the cutoff advisory must not prevent settlement.
+          }
         }
         resolve();
       }, timeoutMs);
