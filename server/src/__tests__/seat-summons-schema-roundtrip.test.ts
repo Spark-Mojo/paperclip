@@ -249,6 +249,39 @@ describeEmbeddedPostgres("seat-summons schema roundtrip (SPA-13735 d15)", () => 
     ).toBe(false);
   });
 
+  it("system-authored dispatch shape: EXACT null pair parses and create+hydrate succeeds", async () => {
+    const { companyId, issueId } = await seedIssue();
+    // Production shape from github-connection-events.ts dispatch: the leased
+    // payload carries no PR-author identity, so the summons payload emits the
+    // EXACT null pair. The schema must accept null (nullable) — previously
+    // .optional() only rejected this and killed every system-authored summons.
+    const created = await interactionsSvc.create(
+      { id: issueId, companyId },
+      {
+        kind: "request_confirmation",
+        payload: {
+          version: 1,
+          prompt: "Sable review requested for owner/repo#1.",
+          detailsMarkdown: "Matched surfaces: foo.",
+          tags: ["seat-summons", "sable-seat"],
+          prAuthorActorId: null,
+          prAuthorActorType: null,
+        },
+      } as unknown as CreateIssueThreadInteraction,
+      { systemId: "system:sable-seat-dispatch" },
+    );
+
+    const hydrated = await interactionsSvc.getForIssue({ id: issueId, companyId }, created.id);
+    expect(hydrated.kind).toBe("request_confirmation");
+    if (hydrated.kind !== "request_confirmation") throw new Error("expected request_confirmation");
+    expect(hydrated.payload.tags).toEqual(["seat-summons", "sable-seat"]);
+    // Create path erases client values and derives server-side: system actor
+    // has no agent/user principal, so no author is stored and the guard
+    // fail-closes (trust boundary intact).
+    expect(getSeatSummonsAuthor(hydrated)).toBeNull();
+    expect(isSeatSummonsHydratedInteraction(hydrated)).toBe(true);
+  });
+
   it("legacy old-shape rows hydrate fine and the summons guard does not fire", async () => {
     const { companyId, issueId } = await seedIssue();
     const interactionId = randomUUID();
