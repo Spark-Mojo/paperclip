@@ -1057,6 +1057,10 @@ export function resolveOnLogDrainTimeoutMs(
   if (!Number.isFinite(parsed) || parsed <= 0) return ONLOG_DRAIN_TIMEOUT_MS;
   return Math.floor(parsed);
 }
+// Label set is fs|db_flush|heartbeat_touch only. publish stays excluded
+// because publishLiveEvent is sync (live-events.ts:28-37 — plain
+// emitter.emit, no promise), so publishing is never an awaited stage and
+// must not win the awaiting label.
 export type OnLogAwaitingLabel = "fs" | "db_flush" | "heartbeat_touch";
 export type OnLogStageElapsedMs = Record<OnLogAwaitingLabel, number>;
 const ONLOG_AWAITING_LABEL_ORDER: readonly OnLogAwaitingLabel[] = [
@@ -1145,6 +1149,79 @@ export function shouldRefreshLogRuntimeStatus(input: {
   const interval =
     input.intervalMs ?? ACTIVE_RUN_LOG_RUNTIME_STATUS_REFRESH_INTERVAL_MS;
   return input.logActivityAtMs - input.lastTouchMs >= interval;
+}
+// Extracted persist-with-race + logging flow so the dropped-path label and
+// the progress_flush_dropped settlement are unit-testable without a DB. The
+// caller owns the actual per-stage awaits; it reports the in-flight stage via
+// setCurrentStage before each await (stageElapsedMs only fills in AFTER a
+// stage finishes, so on the dropped path the timer — not the elapsed map —
+// names the stalled stage). Keep selectOnLogAwaitingLabel for the persisted
+// path where every stage completed and the elapsed map is full.
+export interface OnLogPersistenceRunOptions<T> {
+  persistWork: Promise<T>;
+  timeoutMs: number;
+  onLogEntryMs: number;
+  sampled: boolean;
+  currentStage: () => OnLogAwaitingLabel;
+  stageElapsedMs: OnLogStageElapsedMs;
+  runId: string;
+  log?: {
+    info: (fields: Record<string, unknown>, msg: string) => void;
+    warn: (fields: Record<string, unknown>, msg: string) => void;
+  };
+  now?: () => number;
+}
+export async function runOnLogPersistenceWithTimeout<T>(
+  options: OnLogPersistenceRunOptions<T>,
+): Promise<{ outcome: OnLogPersistenceOutcome; value?: T }> {
+  const normalizedTimeout = normalizeOnLogRaceTimeoutMs(options.timeoutMs);
+  const now = options.now ?? Date.now;
+  const log =
+    options.log ??
+    (logger as unknown as {
+      info: (fields: Record<string, unknown>, msg: string) => void;
+      warn: (fields: Record<string, unknown>, msg: string) => void;
+    });
+  const persistence = await raceOnLogPersistence(
+    options.persistWork,
+    normalizedTimeout,
+  );
+  if (persistence.outcome === "dropped") {
+    // In-flight stage was still pending when the timeout fired; its elapsed
+    // entry is still 0, so the awaiting label comes from the tracked stage.
+    log.warn(
+      {
+        runId: options.runId,
+        elapsed_ms: now() - options.onLogEntryMs,
+        awaiting: options.currentStage(),
+      },
+      "progress_flush_dropped",
+    );
+  }
+  if (options.sampled) {
+    // Persisted path: every stage finished, so the max-elapsed stage is the
+    // honest waiter. Dropped path: the in-flight stage never recorded an
+    // elapsed, so the tracked stage names the stall.
+    const awaiting =
+      persistence.outcome === "persisted"
+        ? selectOnLogAwaitingLabel(options.stageElapsedMs)
+        : options.currentStage();
+    log.info(
+      {
+        elapsed_ms: now() - options.onLogEntryMs,
+        awaiting,
+      },
+      "onLog_resolve",
+    );
+  }
+  return persistence;
+}
+export function buildOnLogStartFields(input: {
+  source: string;
+  queue: number;
+  runId: string;
+}): { source: string; queue: number; runId: string } {
+  return { source: input.source, queue: input.queue, runId: input.runId };
 }
 // Races persistence work against a timeout. Never rejects on timeout: the
 // work promise is NOT cancelled (a settled fs append still applies via the
@@ -24717,7 +24794,11 @@ export function heartbeatService(
           const sampled = shouldSampleOnLogInstrumentation();
           if (sampled) {
             logger.info(
-              { source: stream, queue: onLogDrainQueueDepth, runId: run.id },
+              buildOnLogStartFields({
+                source: stream,
+                queue: onLogDrainQueueDepth,
+                runId: run.id,
+              }),
               "onLog_start",
             );
           }
@@ -24738,10 +24819,16 @@ export function heartbeatService(
               db_flush: 0,
               heartbeat_touch: 0,
             };
+            // In-flight stage tracker: stageElapsedMs only fills in AFTER a
+            // stage finishes, so on the dropped path the stalled stage's
+            // elapsed is still 0 and the max-elapsed pick would misreport
+            // (usually fs). The tracked stage names the stall instead.
+            let currentOnLogStage: OnLogAwaitingLabel = "fs";
             const persistWork = (async () => {
               let stageStart = Date.now();
               let appendedBytes = 0;
               if (handle) {
+                currentOnLogStage = "fs";
                 appendedBytes = await runLogStore.append(handle, {
                   stream,
                   chunk: sanitizedChunk,
@@ -24775,6 +24862,7 @@ export function heartbeatService(
               }
               stageStart = Date.now();
               if (applied.ownsPendingSlot) {
+                currentOnLogStage = "db_flush";
                 await flushOutputProgress();
                 stageElapsedMs.db_flush = Date.now() - stageStart;
               } else {
@@ -24789,6 +24877,7 @@ export function heartbeatService(
               // next chunk's flush supersedes it — this entry is left in
               // place, never retried.
               stageStart = Date.now();
+              currentOnLogStage = "heartbeat_touch";
               const logActivityAt = new Date(ts);
               // Stale-chunk touch is already guarded by the throttle
               // arithmetic: touchMs only moves forward (assigned only when
@@ -24816,19 +24905,15 @@ export function heartbeatService(
               stageElapsedMs.heartbeat_touch = Date.now() - stageStart;
               return { seq: chunkSeq };
             })();
-            const persistence = await raceOnLogPersistence(
+            await runOnLogPersistenceWithTimeout({
               persistWork,
-              normalizeOnLogRaceTimeoutMs(onLogDrainTimeoutMs),
-            );
-            if (persistence.outcome === "dropped") {
-              logger.warn(
-                {
-                  runId: run.id,
-                  elapsed_ms: Date.now() - onLogEntryMs,
-                },
-                "progress_flush_dropped",
-              );
-            }
+              timeoutMs: onLogDrainTimeoutMs,
+              onLogEntryMs,
+              sampled,
+              currentStage: () => currentOnLogStage,
+              stageElapsedMs,
+              runId: run.id,
+            });
 
             // Streamed CLI output is real run activity: keep the in-memory
             // runtime status ("Working... / X ago") fresh between structured
@@ -24857,15 +24942,9 @@ export function heartbeatService(
                 truncated: payloadChunk.length !== sanitizedChunk.length,
               },
             });
-            if (sampled) {
-              logger.info(
-                {
-                  elapsed_ms: Date.now() - onLogEntryMs,
-                  awaiting: selectOnLogAwaitingLabel(stageElapsedMs),
-                },
-                "onLog_resolve",
-              );
-            }
+            // onLog_resolve is emitted inside runOnLogPersistenceWithTimeout
+            // (persisted path: awaiting=max-elapsed stage; dropped path:
+            // awaiting=in-flight stage), so the resolve fields live there.
           } finally {
             onLogDrainQueueDepth = Math.max(0, onLogDrainQueueDepth - 1);
           }

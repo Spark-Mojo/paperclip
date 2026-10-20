@@ -4,15 +4,34 @@ import {
   ONLOG_DRAIN_TIMEOUT_MS,
   ONLOG_INSTRUMENT_SAMPLE_DEFAULT,
   ONLOG_INSTRUMENT_SAMPLE_ENV_VAR,
+  buildOnLogStartFields,
   normalizeOnLogRaceTimeoutMs,
   raceOnLogPersistence,
   resolveOnLogChunkApplication,
   resolveOnLogDrainTimeoutMs,
   resolveOnLogInstrumentSampleRate,
+  runOnLogPersistenceWithTimeout,
   selectOnLogAwaitingLabel,
   shouldRefreshLogRuntimeStatus,
   shouldSampleOnLogInstrumentation,
 } from "../services/heartbeat.ts";
+
+function makeCapturingLogger() {
+  const infos: Array<{ fields: Record<string, unknown>; msg: string }> = [];
+  const warns: Array<{ fields: Record<string, unknown>; msg: string }> = [];
+  return {
+    infos,
+    warns,
+    log: {
+      info: (fields: Record<string, unknown>, msg: string) => {
+        infos.push({ fields, msg });
+      },
+      warn: (fields: Record<string, unknown>, msg: string) => {
+        warns.push({ fields, msg });
+      },
+    },
+  };
+}
 
 describe("heartbeat onLog drain helpers", () => {
   it("select_on_log_awaiting_label_picks_max_stage", () => {
@@ -204,6 +223,95 @@ describe("heartbeat onLog drain helpers", () => {
         lastTouchMs: newerTouchMs,
       }),
     ).toBe(true);
+  });
+
+  it("onlog_start_fields_carry_source_queue_run", () => {
+    expect(
+      buildOnLogStartFields({ source: "stdout", queue: 3, runId: "run-1" }),
+    ).toEqual({ source: "stdout", queue: 3, runId: "run-1" });
+  });
+
+  it("persistence_helper_hung_work_logs_dropped_with_inflight_stage_and_settles", async () => {
+    // db_flush hangs past the race: elapsed map still reads 0 for the
+    // stalled stage, so awaiting must name the in-flight stage, not fs.
+    const cap = makeCapturingLogger();
+    const hung = new Promise<{ seq: number }>(() => {});
+    const result = await runOnLogPersistenceWithTimeout({
+      persistWork: hung,
+      timeoutMs: 20,
+      onLogEntryMs: 1000,
+      sampled: true,
+      currentStage: () => "db_flush",
+      stageElapsedMs: { fs: 4, db_flush: 0, heartbeat_touch: 0 },
+      runId: "run-1",
+      log: cap.log,
+      now: () => 1020,
+    });
+    expect(result.outcome).toBe("dropped");
+    expect(cap.warns).toHaveLength(1);
+    expect(cap.warns[0].msg).toBe("progress_flush_dropped");
+    expect(cap.warns[0].fields.runId).toBe("run-1");
+    expect(cap.warns[0].fields.awaiting).toBe("db_flush");
+    const resolve = cap.infos.find((e) => e.msg === "onLog_resolve");
+    expect(resolve).toBeDefined();
+    expect(resolve?.fields.awaiting).toBe("db_flush");
+    expect(typeof resolve?.fields.elapsed_ms).toBe("number");
+  });
+
+  it("persistence_helper_persisted_path_uses_max_elapsed_label", async () => {
+    const cap = makeCapturingLogger();
+    const result = await runOnLogPersistenceWithTimeout({
+      persistWork: Promise.resolve({ seq: 7 }),
+      timeoutMs: 1000,
+      onLogEntryMs: 1000,
+      sampled: true,
+      currentStage: () => "heartbeat_touch",
+      stageElapsedMs: { fs: 5, db_flush: 120, heartbeat_touch: 3 },
+      runId: "run-1",
+      log: cap.log,
+      now: () => 1128,
+    });
+    expect(result).toEqual({ outcome: "persisted", value: { seq: 7 } });
+    expect(cap.warns).toHaveLength(0);
+    expect(cap.infos).toHaveLength(1);
+    expect(cap.infos[0].msg).toBe("onLog_resolve");
+    expect(cap.infos[0].fields.awaiting).toBe("db_flush");
+    expect(cap.infos[0].fields.elapsed_ms).toBe(128);
+  });
+
+  it("persistence_helper_unsampled_emits_no_resolve", async () => {
+    const cap = makeCapturingLogger();
+    await runOnLogPersistenceWithTimeout({
+      persistWork: Promise.resolve("ok"),
+      timeoutMs: 1000,
+      onLogEntryMs: 1000,
+      sampled: false,
+      currentStage: () => "fs",
+      stageElapsedMs: { fs: 1, db_flush: 1, heartbeat_touch: 1 },
+      runId: "run-1",
+      log: cap.log,
+      now: () => 1001,
+    });
+    expect(cap.infos).toHaveLength(0);
+    expect(cap.warns).toHaveLength(0);
+  });
+
+  it("persistence_helper_garbage_timeout_falls_back_to_default", async () => {
+    // NEGATIVE: garbage timeout must not arm a zero/NaN timer that drops
+    // every chunk — settled work still persists.
+    const cap = makeCapturingLogger();
+    const result = await runOnLogPersistenceWithTimeout({
+      persistWork: Promise.resolve("ok"),
+      timeoutMs: Number.NaN,
+      onLogEntryMs: 1000,
+      sampled: false,
+      currentStage: () => "fs",
+      stageElapsedMs: { fs: 1, db_flush: 0, heartbeat_touch: 0 },
+      runId: "run-1",
+      log: cap.log,
+      now: () => 1001,
+    });
+    expect(result).toEqual({ outcome: "persisted", value: "ok" });
   });
 
   it("sampler_returns_false_when_rate_zero", () => {
