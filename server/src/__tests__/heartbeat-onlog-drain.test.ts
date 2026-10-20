@@ -172,6 +172,113 @@ describe("heartbeat onLog drain helpers", () => {
     expect(pending).toEqual({ seq: 2, bytes: 120 });
   });
 
+  it("stale_interleave_pending_flushed_bytes_monotonic_and_null_pending_noop", () => {
+    // Regression (PR #227 review T5): an older chunk that timed out settles
+    // AFTER the newer chunk created AND flushed the pending slot. Models the
+    // persistWork pending-slot logic in heartbeat.ts. bytes is a run-level
+    // monotonic counter: the stale continuation must only move it upward,
+    // and a null pending makes it a slot no-op — its bytes reach the DB via
+    // the next owning chunk's flush with that owner's identity.
+    interface Pending {
+      at: number;
+      seq: number;
+      stream: "stdout" | "stderr";
+      bytes: number;
+    }
+    let persistedLogBytes = 100;
+    let pending: Pending | null = null;
+    const flushed: Pending[] = [];
+    const flush = () => {
+      if (!pending) return;
+      flushed.push({ ...pending });
+      pending = null;
+    };
+
+    // Newer chunk 5 owns the slot and flushes: DB gets seq 5 with 120 bytes.
+    const newer = resolveOnLogChunkApplication({
+      persistedLogBytes,
+      chunkSeq: 5,
+      latestSeq: 5,
+      appendedBytes: 20,
+    });
+    expect(newer.ownsPendingSlot).toBe(true);
+    persistedLogBytes = newer.persistedLogBytes;
+    pending = { at: 200, seq: 5, stream: "stdout", bytes: persistedLogBytes };
+    flush();
+    expect(flushed).toEqual([{ at: 200, seq: 5, stream: "stdout", bytes: 120 }]);
+
+    // Stale chunk 4 (timed out earlier) settles late against a null pending:
+    // no slot write, no flush of the newer chunk's identity under the stale
+    // turn — bytes fold into the closure total only.
+    const stale = resolveOnLogChunkApplication({
+      persistedLogBytes,
+      chunkSeq: 4,
+      latestSeq: 5,
+      appendedBytes: 10,
+    });
+    expect(stale.ownsPendingSlot).toBe(false);
+    persistedLogBytes = stale.persistedLogBytes;
+    if (!stale.ownsPendingSlot && pending) pending.bytes = persistedLogBytes;
+    expect(persistedLogBytes).toBe(130);
+    expect(pending).toBeNull();
+    expect(flushed).toHaveLength(1);
+
+    // Next owner chunk 6 flushes the full monotonic total under its own
+    // identity — 130, never regressing to the pre-stale 120.
+    const next = resolveOnLogChunkApplication({
+      persistedLogBytes,
+      chunkSeq: 6,
+      latestSeq: 6,
+      appendedBytes: 5,
+    });
+    persistedLogBytes = next.persistedLogBytes;
+    pending = { at: 300, seq: 6, stream: "stderr", bytes: persistedLogBytes };
+    flush();
+    expect(flushed[1]).toEqual({ at: 300, seq: 6, stream: "stderr", bytes: 135 });
+    for (let i = 1; i < flushed.length; i++) {
+      expect(flushed[i].bytes).toBeGreaterThanOrEqual(flushed[i - 1].bytes);
+    }
+  });
+
+  it("stale_interleave_pending_unflushed_owner_identity_kept_bytes_move_up", () => {
+    // Regression (PR #227 review T5), other order: the newer chunk's pending
+    // exists but has NOT flushed when the stale chunk lands. The refresh
+    // moves bytes upward while at/seq/stream stay the owner's, so a flush
+    // triggered by the owner writes owner identity with the refreshed total.
+    interface Pending {
+      at: number;
+      seq: number;
+      stream: "stdout" | "stderr";
+      bytes: number;
+    }
+    let persistedLogBytes = 100;
+    let pending: Pending | null = null;
+    // Owner chunk 6 created the slot (not yet flushed).
+    const owner = resolveOnLogChunkApplication({
+      persistedLogBytes,
+      chunkSeq: 6,
+      latestSeq: 6,
+      appendedBytes: 20,
+    });
+    persistedLogBytes = owner.persistedLogBytes;
+    pending = { at: 400, seq: 6, stream: "stdout", bytes: persistedLogBytes };
+
+    // Stale chunk 5 (timed out earlier) settles late: refresh bytes only.
+    const stale = resolveOnLogChunkApplication({
+      persistedLogBytes,
+      chunkSeq: 5,
+      latestSeq: 6,
+      appendedBytes: 10,
+    });
+    expect(stale.ownsPendingSlot).toBe(false);
+    persistedLogBytes = stale.persistedLogBytes;
+    if (!stale.ownsPendingSlot && pending) pending.bytes = persistedLogBytes;
+    expect(persistedLogBytes).toBe(130);
+    expect(pending).toEqual({ at: 400, seq: 6, stream: "stdout", bytes: 130 });
+    // Flush content: owner identity, refreshed monotonic bytes.
+    expect(pending.bytes).toBeGreaterThanOrEqual(120);
+  });
+
   it("chunk_guard_future_seq_never_owns_pending_slot", () => {
     // Seqs are unique/monotonic, so chunkSeq > latestSeq is impossible — but
     // if it ever happens the chunk must NOT own (strict ===, never >=).

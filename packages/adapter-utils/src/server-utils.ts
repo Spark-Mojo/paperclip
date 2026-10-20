@@ -788,10 +788,25 @@ export type ChildLogStreamName = "stdout" | "stderr";
  * pause/resume of) the stdout drain, and vice versa. Ordering is preserved
  * per stream; there is no cross-stream ordering guarantee.
  *
- * `settled(timeoutMs)` bounds the close-path wait: after the timeout the
- * wait resolves regardless of still-pending appends, so a hung `onLog`
- * persist can never pend `runChildProcess` forever. A call with no timeout
- * waits unbounded (the pre-existing unit-test shape).
+ * `settled(timeoutMs, onCutoff?)` bounds the close-path wait: after the
+ * timeout the wait resolves regardless of still-pending appends, so a hung
+ * `onLog` persist can never pend `runChildProcess` forever. Bounded settle
+ * with possible tail loss (a chunk whose append was still pending at the
+ * cutoff is not persisted) is an accepted tradeoff — run finalization must
+ * never block on a hung append — and the cutoff is made observable: when the
+ * timer fires with appends still pending, the caller's `onCutoff` receives
+ * the per-stream pending counts so the loss is visible in logs. A call with
+ * no timeout waits unbounded (the pre-existing unit-test shape).
+ *
+ * Relationship to the server's onLog drain bound (SPA-13853 review T6): the
+ * heartbeat onLog path drops a chunk's persistence wait after 3s by default
+ * (`PAPERCLIP_ONLOG_TIMEOUT_MS`, server/src/services/heartbeat.ts) while
+ * this close-path settle waits 4s by default. If you raise
+ * `PAPERCLIP_ONLOG_TIMEOUT_MS`, raise `PAPERCLIP_LOG_CHAIN_SETTLE_TIMEOUT_MS`
+ * to at least the same value — otherwise the close path cuts appends
+ * earlier than onLog would have. adapter-utils deliberately does not read
+ * the server-side env var (cross-package boundary), so no clamp is
+ * enforced here.
  */
 export const LOG_CHAIN_CLOSE_SETTLE_TIMEOUT_MS = 4_000;
 
@@ -804,6 +819,11 @@ export function resolveLogChainCloseSettleTimeoutMs(): number {
   return LOG_CHAIN_CLOSE_SETTLE_TIMEOUT_MS;
 }
 
+/** Payload handed to `settled`'s `onCutoff` when the settle window expires. */
+export type SettleCutoffInfo = {
+  pendingCounts: Record<ChildLogStreamName, number>;
+};
+
 export function createPerStreamLogChains(
   onError: (err: unknown, stream: ChildLogStreamName) => void,
 ) {
@@ -811,7 +831,15 @@ export function createPerStreamLogChains(
     stdout: Promise.resolve(),
     stderr: Promise.resolve(),
   };
+  // Per-stream count of appended-but-not-yet-settled work. Read at the
+  // settle cutoff to report how many chunks per stream were still pending
+  // (and therefore lost to the close path's bounded wait).
+  const pendingAppends: Record<ChildLogStreamName, number> = {
+    stdout: 0,
+    stderr: 0,
+  };
   const append = (stream: ChildLogStreamName, work: () => Promise<void>): void => {
+    pendingAppends[stream] += 1;
     chains[stream] = chains[stream]
       .then(work)
       .catch((err) => {
@@ -825,9 +853,15 @@ export function createPerStreamLogChains(
           // Swallowed: the advisory failed, the chain stays live.
         }
       })
-      .then(() => undefined);
+      .then(() => {
+        pendingAppends[stream] = Math.max(0, pendingAppends[stream] - 1);
+        return undefined;
+      });
   };
-  const settled = (timeoutMs?: number): Promise<void> => {
+  const settled = (
+    timeoutMs?: number,
+    onCutoff?: (info: SettleCutoffInfo) => void,
+  ): Promise<void> => {
     const pending = Promise.all([
       chains.stdout.then(
         () => undefined,
@@ -848,6 +882,17 @@ export function createPerStreamLogChains(
     return new Promise<void>((resolve) => {
       let timer: NodeJS.Timeout | null = setTimeout(() => {
         timer = null;
+        if (onCutoff) {
+          // Chains had unsettled work when the window closed. If every
+          // append had settled, `pending.then` would have cleared this
+          // timer before it could fire.
+          onCutoff({
+            pendingCounts: {
+              stdout: pendingAppends.stdout,
+              stderr: pendingAppends.stderr,
+            },
+          });
+        }
         resolve();
       }, timeoutMs);
       if (typeof timer.unref === "function") timer.unref();
@@ -5381,7 +5426,21 @@ export async function runChildProcess(
             streamStallDetector.stop();
             runningProcesses.delete(runId);
             void logChains
-              .settled(resolveLogChainCloseSettleTimeoutMs())
+              .settled(resolveLogChainCloseSettleTimeoutMs(), (cutoff) => {
+                // Bounded-settle cutoff: tail log chunks whose appends were
+                // still pending are silently lost. Accepted tradeoff (a hung
+                // append must never block run finalization — see the
+                // createPerStreamLogChains doc), but never silent: log the
+                // per-stream pending counts so tail loss is visible.
+                console.warn(
+                  {
+                    runId,
+                    pendingStdout: cutoff.pendingCounts.stdout,
+                    pendingStderr: cutoff.pendingCounts.stderr,
+                  },
+                  "log_chain_close_settle_timeout",
+                );
+              })
               .then(async () => {
               const scopeStopped = await cleanupScope();
               if (!scopeStopped) {

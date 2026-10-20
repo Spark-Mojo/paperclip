@@ -11,13 +11,35 @@ const MIGRATIONS_FOLDER = fileURLToPath(new URL("./migrations", import.meta.url)
 const DRIZZLE_MIGRATIONS_TABLE = "__drizzle_migrations";
 const MIGRATIONS_JOURNAL_JSON = fileURLToPath(new URL("./migrations/meta/_journal.json", import.meta.url));
 
-function createUtilitySql(url: string) {
-  // Same resolved options as createDb (pool bounds, timeouts, app name from
-  // env), with max forced to 1: migration/utility work is serial, but must
-  // still honor DATABASE_STATEMENT_TIMEOUT_MS and friends. Call sites pass
-  // only a url; options come from env, exactly like createDb.
-  const resolved = resolveDatabaseClientOptions(databaseClientOptionsFromEnv());
-  return postgres(url, { ...postgresJsOptions(resolved), max: 1, onnotice: () => {} });
+/**
+ * Driver options for the utility/migration client (SPA-13853 review T2).
+ * Inherits the pooled client's pool bounds, idle reaping and application
+ * name, but deliberately does NOT inherit its statement/lock timeout
+ * DEFAULTS: migrations and repair SQL may legitimately exceed them. Only an
+ * explicitly-set `DATABASE_STATEMENT_TIMEOUT_MS` / `DATABASE_LOCK_TIMEOUT_MS`
+ * bounds utility work — `databaseClientOptionsFromEnv` returns the timeout
+ * keys only when the environment sets them, so spreading that result over
+ * the resolved options erases the defaults while keeping real overrides.
+ */
+export function utilityClientDriverOptions(
+  env: NodeJS.ProcessEnv = process.env,
+): Record<string, unknown> {
+  const envOptions = databaseClientOptionsFromEnv(env);
+  const resolved = resolveDatabaseClientOptions(envOptions);
+  const utilityOptions: DatabaseClientOptions = {
+    ...resolved,
+    statementTimeoutMs: envOptions.statementTimeoutMs,
+    lockTimeoutMs: envOptions.lockTimeoutMs,
+  };
+  return postgresJsOptions(utilityOptions);
+}
+
+/** Exported for tests: live checks assert the utility client's timeouts. */
+export function createUtilitySql(url: string) {
+  // Same pool bounds, idle reaping and app name as createDb (from env), with
+  // max forced to 1: migration/utility work is serial. Timeouts differ per
+  // T2: no defaults, explicit env overrides only (utilityClientDriverOptions).
+  return postgres(url, { ...utilityClientDriverOptions(), max: 1, onnotice: () => {} });
 }
 
 type RegisteredPostgresClient = ReturnType<typeof postgres>;
@@ -162,16 +184,16 @@ export interface DatabaseClientOptions {
    */
   applicationName?: string;
   /**
-   * Per-connection `statement_timeout` in milliseconds. The engine database
-   * runs with `statement_timeout=0` (unbounded), so an unlucky row-lock wait
-   * blocks a pooled connection forever. Set on every connection (see
-   * `postgresJsOptions`), not per transaction — the per-transaction escape
-   * hatch (`set_config('statement_timeout', ...)`, cf.
+   * Per-connection `statement_timeout` in milliseconds. Applied on every
+   * connection (see `postgresJsOptions`), not per transaction — the
+   * per-transaction escape hatch (`set_config('statement_timeout', ...)`, cf.
    * `server/src/services/execution-control-reconciliation.ts`) stays for
-   * statements that need a tighter bound. `0` disables the timeout
-   * (Postgres semantics: 0 means no timeout); set
-   * `DATABASE_STATEMENT_TIMEOUT_MS=0` to restore unbounded for long-query
-   * workloads.
+   * statements that need a tighter bound. The default (see
+   * `DEFAULT_DATABASE_STATEMENT_TIMEOUT_MS`) is a runaway backstop, not the
+   * hang-killer: it is deliberately generous so long migrations/analytics are
+   * not aborted, while `lockTimeoutMs` bounds the diagnosed row-lock wait
+   * class. `0` disables the timeout (Postgres semantics: 0 means no
+   * timeout); set `DATABASE_STATEMENT_TIMEOUT_MS=0` to restore unbounded.
    */
   statementTimeoutMs?: number;
   /**
@@ -195,14 +217,22 @@ export const DEFAULT_DATABASE_IDLE_TIMEOUT_SECONDS = 60;
 export const DEFAULT_DATABASE_APPLICATION_NAME = "paperclip";
 /**
  * Per-connection `statement_timeout` in milliseconds unless
- * `DATABASE_STATEMENT_TIMEOUT_MS` says otherwise. The engine database runs
- * with `statement_timeout=0` (unbounded), so without this a row-lock wait
- * blocks a pooled connection forever. Set `DATABASE_STATEMENT_TIMEOUT_MS=0`
- * to restore unbounded (Postgres semantics: 0 disables the timeout) for
- * long-query workloads; for queries over 5s that should stay bounded, raise
- * the timeout per transaction with `set_config('statement_timeout', ...)`.
+ * `DATABASE_STATEMENT_TIMEOUT_MS` says otherwise. `0` disables the timeout
+ * (Postgres semantics: 0 means no timeout).
+ *
+ * Default is 60s (raised from 5s in PR #227 review, SPA-13853 T1): a 5s
+ * statement default applied to every pooled connection could abort
+ * long-running statements — migrations, analytics, backfills — that
+ * previously ran unbounded against the engine database
+ * (`statement_timeout=0`). The diagnosed incident class is unbounded
+ * row-LOCK waits, which `DEFAULT_DATABASE_LOCK_TIMEOUT_MS` (5s) bounds; the
+ * heartbeat onLog path additionally drops its progress flush after 3s
+ * (`progress_flush_dropped`, server/src/services/heartbeat.ts). The 60s
+ * statement bound is a runaway backstop, not the hang-killer. For queries
+ * over 60s that should stay bounded, raise the timeout per transaction with
+ * `set_config('statement_timeout', ...)`.
  */
-export const DEFAULT_DATABASE_STATEMENT_TIMEOUT_MS = 5000;
+export const DEFAULT_DATABASE_STATEMENT_TIMEOUT_MS = 60_000;
 /**
  * Per-connection `lock_timeout` in milliseconds unless
  * `DATABASE_LOCK_TIMEOUT_MS` overrides it. Set `DATABASE_LOCK_TIMEOUT_MS=0`

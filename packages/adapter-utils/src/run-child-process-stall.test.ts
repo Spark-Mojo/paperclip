@@ -14,7 +14,7 @@
 import { randomUUID } from "node:crypto";
 import { spawn } from "node:child_process";
 import { setTimeout as delay } from "node:timers/promises";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { runChildProcess } from "./server-utils.js";
 import { createPerStreamLogChains } from "./server-utils.js";
 import {
@@ -240,6 +240,32 @@ describe("stream-stall-detector (SPA-11981)", () => {
       // A hung onLog persist must not pend the close path: the bounded
       // wait resolves regardless after the timeout.
       await settled(50);
+    });
+
+    it("settled cutoff fires onCutoff with per-stream pending counts (SPA-13853 review T3)", async () => {
+      const { append, settled } = createPerStreamLogChains(() => {});
+      // One hung stdout append, one hung stderr append: the cutoff must
+      // report both streams' pending counts so tail loss is observable.
+      append("stdout", () => new Promise<void>(() => {}));
+      append("stderr", () => new Promise<void>(() => {}));
+      const cutoffs: Array<{ pendingCounts: { stdout: number; stderr: number } }> = [];
+      await settled(50, (info) => cutoffs.push(info));
+      expect(cutoffs).toHaveLength(1);
+      expect(cutoffs[0].pendingCounts.stdout).toBeGreaterThanOrEqual(1);
+      expect(cutoffs[0].pendingCounts.stderr).toBeGreaterThanOrEqual(1);
+    });
+
+    it("settled cutoff does NOT fire when chains settle within the window (SPA-13853 review T3)", async () => {
+      const { append, settled } = createPerStreamLogChains(() => {});
+      append("stdout", async () => {
+        await delay(5);
+      });
+      append("stderr", async () => {
+        await delay(5);
+      });
+      const onCutoff = vi.fn();
+      await settled(500, onCutoff);
+      expect(onCutoff).not.toHaveBeenCalled();
     });
 
     it("a throwing per-stream onError cannot strand later appends", async () => {
