@@ -268,6 +268,36 @@ describe("stream-stall-detector (SPA-11981)", () => {
       expect(onCutoff).not.toHaveBeenCalled();
     });
 
+    it("settled cutoff still resolves when onCutoff throws (SPA-13853 review PRRT_kwDOTwBwe86uTYai)", async () => {
+      const { append, settled } = createPerStreamLogChains(() => {});
+      // Both chains hung: the cutoff timer is the ONLY path to settlement,
+      // so a throwing advisory must not skip resolve() and must not let
+      // the error escape the timer uncaught.
+      append("stdout", () => new Promise<void>(() => {}));
+      append("stderr", () => new Promise<void>(() => {}));
+      const unhandled: unknown[] = [];
+      const uncaught: unknown[] = [];
+      const onUnhandled = (reason: unknown) => unhandled.push(reason);
+      const onUncaught = (err: unknown) => uncaught.push(err);
+      process.on("unhandledRejection", onUnhandled);
+      process.on("uncaughtException", onUncaught);
+      try {
+        const startedAt = Date.now();
+        // Must settle (within the window) even though the advisory throws.
+        await settled(50, () => {
+          throw new Error("cutoff advisory boom");
+        });
+        const elapsedMs = Date.now() - startedAt;
+        expect(elapsedMs).toBeLessThan(5_000);
+        // Nothing escaped the timer as an unhandled rejection/uncaught error.
+        expect(unhandled).toEqual([]);
+        expect(uncaught).toEqual([]);
+      } finally {
+        process.off("unhandledRejection", onUnhandled);
+        process.off("uncaughtException", onUncaught);
+      }
+    });
+
     it("a throwing per-stream onError cannot strand later appends", async () => {
       const { append, settled } = createPerStreamLogChains(() => {
         throw new Error("advisory boom");
