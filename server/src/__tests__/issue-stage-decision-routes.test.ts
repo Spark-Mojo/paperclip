@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import express from "express";
 import request from "supertest";
 import { and, eq } from "drizzle-orm";
-import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   activityLog,
   agentWakeupRequests,
@@ -29,6 +29,10 @@ import {
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
+
+vi.hoisted(() => {
+  process.env.PAPERCLIP_IN_WORKTREE = "false";
+});
 
 if (!embeddedPostgresSupport.supported) {
   console.warn(
@@ -555,5 +559,148 @@ describeEmbeddedPostgres("issue stage decision routes", () => {
       .send({ action: "approve", body: "Too late.", stageId: stageId1 });
     expect(res.status).toBe(409);
     expect(await countDecisions(issueId, seeded.companyId)).toHaveLength(0);
+  });
+
+  // SPA-13732 R1 behavioral: a request_changes reroute enqueues exactly one
+  // builder wake (agent_wakeup_requests row, reason
+  // execution_changes_requested, per-decisionId idempotency key) and reassigns
+  // the card to the builder (returnAssignee); duplicate replays never
+  // re-wake. Table-rows assertion: the route closes over
+  // heartbeatService(db) imported via ../services/index.js, so a
+  // ../services/heartbeat.js mock cannot intercept this static-import
+  // harness — the durable wake row plus the card assignee ARE the contract.
+  it("R1 reroute: request_changes enqueues exactly one execution_changes_requested builder wake; duplicate replay never re-wakes", async () => {
+    const seeded = await seedCompany("RR1");
+    const { issueId, stageId1 } = await seedStageIssue({
+      companyId: seeded.companyId,
+      builderAgentId: seeded.assigneeAgentId,
+      reviewerAgentId: seeded.reviewerAgentId,
+      identifier: "RR1-1",
+    });
+    const runId = await seedRun(seeded.companyId, seeded.reviewerAgentId, issueId);
+    // d17: finish the reviewer run so the legacy scan does not promote it to
+    // activeExecutionRun and divert the builder wake to issue_execution_deferred.
+    await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date(), updatedAt: new Date() }).where(eq(heartbeatRuns.id, runId));
+    const actor = agentActor(seeded.companyId, seeded.reviewerAgentId, runId);
+    const payload = { action: "request_changes", body: "R1 reroute needs a null-check on line 42.", stageId: stageId1 };
+
+    async function builderWakes(key: string) {
+      return db.select({ id: agentWakeupRequests.id })
+        .from(agentWakeupRequests)
+        .where(and(
+          eq(agentWakeupRequests.companyId, seeded.companyId),
+          eq(agentWakeupRequests.agentId, seeded.assigneeAgentId),
+          eq(agentWakeupRequests.reason, "execution_changes_requested"),
+          eq(agentWakeupRequests.idempotencyKey, key),
+        ));
+    }
+
+    // Exactly-one-wake-total: company+agent ONLY (no payload filter) so a
+    // second wake with null/missing payload cannot hide — filtered-total is
+    // not table-total. Builder has no other wakes in this test (fresh RR1
+    // company), so total==1 is exact. Payload binding is kept via the
+    // explicit payload.issueId assert below.
+    async function allBuilderWakesForIssue() {
+      return db.select({ id: agentWakeupRequests.id, reason: agentWakeupRequests.reason, payload: agentWakeupRequests.payload })
+        .from(agentWakeupRequests)
+        .where(and(
+          eq(agentWakeupRequests.companyId, seeded.companyId),
+          eq(agentWakeupRequests.agentId, seeded.assigneeAgentId),
+        ));
+    }
+
+    const first = await request(app(actor))
+      .post(`/api/issues/${issueId}/stage-decision`)
+      .send(payload);
+    expect(first.status, JSON.stringify(first.body)).toBe(200);
+    expect(first.body.duplicate).toBe(false);
+    expect(typeof first.body.decision?.id).toBe("string");
+    expect(first.body.decision?.id?.length).toBeGreaterThan(0);
+    const key = `stage-decision-changes-requested:${issueId}:${first.body.decision.id}`;
+    expect(await builderWakes(key)).toHaveLength(1);
+    const allFirst = await allBuilderWakesForIssue();
+    expect(allFirst).toHaveLength(1);
+    expect((allFirst[0]?.payload as Record<string, unknown> | null)?.["issueId"]).toBe(issueId);
+    expect(allFirst.filter((row) => row.reason === "issue_execution_deferred")).toHaveLength(0);
+
+    // Assignee condition: the card is back with the builder (returnAssignee).
+    const [issueRow] = await db.select({ assigneeAgentId: issues.assigneeAgentId })
+      .from(issues)
+      .where(eq(issues.id, issueId));
+    expect(issueRow?.assigneeAgentId).toBe(seeded.assigneeAgentId);
+
+    const second = await request(app(actor))
+      .post(`/api/issues/${issueId}/stage-decision`)
+      .send(payload);
+    expect(second.status, JSON.stringify(second.body)).toBe(200);
+    expect(second.body.duplicate).toBe(true);
+    expect(second.body.decision.id).toBe(first.body.decision.id);
+    expect(await builderWakes(key)).toHaveLength(1);
+    const allSecond = await allBuilderWakesForIssue();
+    expect(allSecond).toHaveLength(1);
+    expect((allSecond[0]?.payload as Record<string, unknown> | null)?.["issueId"]).toBe(issueId);
+    expect(allSecond.filter((row) => row.reason === "issue_execution_deferred")).toHaveLength(0);
+  });
+
+  // SPA-13732 R2 rehearsal: BOTH blocked-entry 422 branches return without
+  // mutating status — the card stays on its prior wakeable status and never
+  // lands on backlog. Branch 1 = terminal-blocker 422 (~13864: named
+  // blockedByIssueIds resolve to done/cancelled). Branch 2 = generic
+  // baseBlockedRefusal 422 (~13876: no unresolved blocker, no pending
+  // interaction/approval, no descriptor). No new guard code under test — the
+  // 422 arms return before any status write, behavior-preserving.
+  it("forced-422 blocked entry on both branches leaves the prior wakeable status byte-equal and never backlog", async () => {
+    const seeded = await seedCompany("PRK");
+
+    async function seedTodoIssue(identifier: string) {
+      const issueId = randomUUID();
+      await db.insert(issues).values({
+        id: issueId,
+        companyId: seeded.companyId,
+        identifier,
+        title: identifier,
+        description: `Park-guard rehearsal for ${identifier}`,
+        status: "todo",
+        priority: "medium",
+        assigneeAgentId: seeded.assigneeAgentId,
+        createdByAgentId: seeded.assigneeAgentId,
+      });
+      return issueId;
+    }
+
+    // Branch 1: terminal-blocker 422 — named blocker is done.
+    const doneBlockerId = randomUUID();
+    await db.insert(issues).values({
+      id: doneBlockerId,
+      companyId: seeded.companyId,
+      identifier: "PRK-DONE",
+      title: "PRK-DONE",
+      description: "terminal blocker",
+      status: "done",
+      priority: "medium",
+      assigneeAgentId: seeded.assigneeAgentId,
+      createdByAgentId: seeded.assigneeAgentId,
+    });
+    const terminalIssueId = await seedTodoIssue("PRK-1");
+    const terminalRunId = await seedRun(seeded.companyId, seeded.assigneeAgentId, terminalIssueId);
+    const terminal = await request(app(agentActor(seeded.companyId, seeded.assigneeAgentId, terminalRunId)))
+      .patch(`/api/issues/${terminalIssueId}`)
+      .send({ status: "blocked", blockedByIssueIds: [doneBlockerId] });
+    expect(terminal.status, JSON.stringify(terminal.body)).toBe(422);
+    const terminalAfter = await readIssue(terminalIssueId);
+    expect(terminalAfter.status).toBe("todo");
+    expect(terminalAfter.status).not.toBe("backlog");
+
+    // Branch 2: generic baseBlockedRefusal 422 — no blockers, no pending
+    // interaction/approval, no descriptor.
+    const genericIssueId = await seedTodoIssue("PRK-2");
+    const genericRunId = await seedRun(seeded.companyId, seeded.assigneeAgentId, genericIssueId);
+    const generic = await request(app(agentActor(seeded.companyId, seeded.assigneeAgentId, genericRunId)))
+      .patch(`/api/issues/${genericIssueId}`)
+      .send({ status: "blocked" });
+    expect(generic.status, JSON.stringify(generic.body)).toBe(422);
+    const genericAfter = await readIssue(genericIssueId);
+    expect(genericAfter.status).toBe("todo");
+    expect(genericAfter.status).not.toBe("backlog");
   });
 });
