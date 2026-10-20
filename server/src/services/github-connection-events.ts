@@ -285,6 +285,53 @@ export function isSableSeatDispatchRepo(repository: unknown): boolean {
     repository.trim().toLowerCase() === "spark-mojo/paperclip";
 }
 
+/**
+ * SPA-13735 d25 — MINIMAL Sable review stage on the seat card.
+ *
+ * Constraints honored: status stays "todo" (in_progress requires an
+ * assignee); no seat→assignee agent id is invented (no seat→assignee map
+ * exists anywhere in this codebase — verified by grep, no sable agent/user
+ * identity referenced in-tree); no execution-policy stage machinery
+ * (heavy, out of slice); no labelIds/assigneeUserId (nothing assignable
+ * exists in-tree to point them at).
+ *
+ * So the stage is: the card lands unassigned as todo, marked
+ * unmistakably as awaiting Sable review (title via seatCardTitle +
+ * SABLE_SEAT_REVIEW_MARKER + PR link in the description), and the
+ * seat-summons request_confirmation thread ON the card (tags
+ * seat-summons/sable-seat, already guard-protected) IS the review
+ * surface: Sable resolves it, the seat-summons guard refuses
+ * self-resolve. Shared by the production default resolver below so the
+ * filed card and the tested shape cannot drift.
+ */
+export const SABLE_SEAT_REVIEW_MARKER = "Awaiting Sable review";
+
+export function seatCardCreateInput(
+  snapshot: SableSeatPrSnapshot,
+  matchedPatterns: string[],
+  key: string,
+): {
+  title: string;
+  description: string;
+  status: "todo";
+  priority: "medium";
+  idempotencyKey: string;
+} {
+  const ref = `${snapshot.owner}/${snapshot.repo}#${snapshot.number}`;
+  return {
+    title: seatCardTitle({ owner: snapshot.owner, repo: snapshot.repo, number: snapshot.number }),
+    description: [
+      `${SABLE_SEAT_REVIEW_MARKER} — Sable seat review for ${ref}.`,
+      `PR: https://github.com/${snapshot.owner}/${snapshot.repo}/pull/${snapshot.number}`,
+      `Matched surfaces: ${matchedPatterns.length > 0 ? matchedPatterns.join(", ") : "none (no changed-file signal on leased payload)"}.`,
+      `Review surface: Sable resolves the seat-summons request_confirmation thread on this card; the seat-summons guard refuses self-resolve.`,
+    ].join("\n"),
+    status: "todo",
+    priority: "medium",
+    idempotencyKey: key,
+  };
+}
+
 export async function dispatchSableSeatSummonsForPullRequest(
   input: SableSeatDispatchInput,
   deps: SableSeatDispatchDeps,
@@ -461,17 +508,13 @@ export function githubConnectionEventService(
     // → log + return null (fail closed, no summons without a card).
     try {
       const { issueService } = await import("./issues.js");
-      const issue = await issueService(db).create(companyId, {
-        title: seatCardTitle({ owner: snapshot.owner, repo: snapshot.repo, number: snapshot.number }),
-        description: [
-          `Sable seat review for ${snapshot.owner}/${snapshot.repo}#${snapshot.number}.`,
-          `PR: ${snapshot.repository}#${snapshot.number}`,
-          `Matched surfaces: ${matchedPatterns.join(", ")}.`,
-        ].join("\n"),
-        status: "todo",
-        priority: "medium",
-        idempotencyKey: key,
-      });
+      // d25 minimal Sable review stage: filed unassigned as todo, marked
+      // awaiting Sable review; the seat-summons request_confirmation thread
+      // on the card IS the review surface (Sable resolves it, the
+      // seat-summons guard refuses self-resolve). No assignable Sable
+      // identity exists in-tree, so no assignee/label is set — see
+      // seatCardCreateInput above.
+      const issue = await issueService(db).create(companyId, seatCardCreateInput(snapshot, matchedPatterns, key));
       return { id: issue.id };
     } catch (error) {
       logger.warn({
