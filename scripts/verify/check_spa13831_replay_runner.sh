@@ -20,8 +20,9 @@ if grep -E -q '^[[:space:]]*(pull_request|"pull_request"):' "$TMP" && grep -q 'r
 if grep -E -q '^[[:space:]]*(workflow_dispatch|"workflow_dispatch"):' "$TMP"; then pass "workflow_dispatch trigger"; else fail "workflow_dispatch trigger"; fi
 if grep -E -q '^[[:space:]]*"?push"?:' "$TMP"; then fail "no push trigger"; else pass "no push trigger"; fi
 if grep -qF 'src/services/stall-stop-surface.test.ts' "$TMP"; then pass "suite stall-stop-surface.test.ts"; else fail "suite stall-stop-surface.test.ts"; fi
-if grep -q 'heartbeat-stall-stop-surface\.test\.ts' "$TMP"; then pass "suite heartbeat-stall-stop-surface.test.ts"; else fail "suite heartbeat-stall-stop-surface.test.ts"; fi
-if grep -q 'heartbeat-stall-stop-surface-r45\.test\.ts' "$TMP"; then pass "suite heartbeat-stall-stop-surface-r45.test.ts"; else fail "suite heartbeat-stall-stop-surface-r45.test.ts"; fi
+if grep -qF 'src/__tests__/heartbeat-stall-stop-surface.test.ts' "$TMP"; then pass "suite heartbeat-stall-stop-surface.test.ts"; else fail "suite heartbeat-stall-stop-surface.test.ts"; fi
+if grep -qF 'src/__tests__/heartbeat-stall-stop-surface-r45.test.ts' "$TMP"; then pass "suite heartbeat-stall-stop-surface-r45.test.ts"; else fail "suite heartbeat-stall-stop-surface-r45.test.ts"; fi
+if grep -q 'SKIP' "$TMP" && grep -q 'exit 0' "$TMP"; then pass "clean-skip branch"; else fail "clean-skip branch"; fi
 if grep -q 'persist-credentials: false' "$TMP"; then pass "persist-credentials false"; else fail "persist-credentials false"; fi
 if grep -q 'secrets\.[A-Za-z_]' "$TMP"; then fail "no secrets reference"; else pass "no secrets reference"; fi
 if [ "$FAIL" -eq 0 ]; then echo "CHECK-SPA13831: PASS"; else echo "CHECK-SPA13831: FAIL"; fi

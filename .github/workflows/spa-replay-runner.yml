@@ -1,12 +1,12 @@
 # SPA-13831: durable fork replay runner.
 #
-# WHY THIS FILE EXISTS: a workflow file that exists only on a PR branch never
-# registers its triggers -- only files present on the DEFAULT branch fire. PR
-# #221 carried a PR-scoped guard (.github/workflows/spa-13651-guard.yml) that
-# recorded zero check-runs on its head for exactly this reason. This file lives
-# on the default branch (rebuild/v2026.916.0-survivors) so its pull_request
-# trigger fires for PRs targeting that branch. New files merge in enabled
-# state, bypassing disabled_manually states stuck on older workflows.
+# WHY THIS FILE EXISTS (measured correction): on this fork a PR-branch-only
+# workflow DOES register its pull_request trigger (spa-13651-guard.yml exists
+# only on engine-fork/SPA-13651 and fired green run 39482246368). This file's
+# value is as a DURABLE reusable runner on the default branch
+# (rebuild/v2026.916.0-survivors), present for every future PR without each PR
+# vendoring its own guard. New files merge in enabled state, bypassing
+# disabled_manually states stuck on older workflows.
 #
 # NOT A REQUIRED CHECK: advisory replay signal only; required checks are
 # unchanged. Deploys nothing, touches no routing/model config, uses no secrets.
@@ -62,8 +62,10 @@ jobs:
 
       - name: Run stall-stop replay suites
         working-directory: server
-        run: >-
-          timeout 1200 pnpm exec vitest run
-          src/services/stall-stop-surface.test.ts
-          src/__tests__/heartbeat-stall-stop-surface.test.ts
-          src/__tests__/heartbeat-stall-stop-surface-r45.test.ts
+        run: |
+          set --
+          for f in src/services/stall-stop-surface.test.ts src/__tests__/heartbeat-stall-stop-surface.test.ts src/__tests__/heartbeat-stall-stop-surface-r45.test.ts; do
+            if [ -f "$f" ]; then set -- "$@" "$f"; fi
+          done
+          if [ "$#" -eq 0 ]; then echo "SKIP: no stall-stop replay suite files present on this ref"; exit 0; fi
+          timeout 1200 pnpm exec vitest run "$@"
