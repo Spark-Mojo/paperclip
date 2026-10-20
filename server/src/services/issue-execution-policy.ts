@@ -11,7 +11,7 @@ import type {
   IssueMonitorScheduledBy,
 } from "@paperclipai/shared";
 import { issueExecutionPolicySchema, issueExecutionStateSchema } from "@paperclipai/shared";
-import { unprocessable } from "../errors.js";
+import { forbidden, unprocessable } from "../errors.js";
 
 type AssigneeLike = {
   assigneeAgentId?: string | null;
@@ -21,6 +21,7 @@ type AssigneeLike = {
 type IssueLike = AssigneeLike & {
   status: string;
   responsibleUserId?: string | null;
+  createdByAgentId?: string | null;
   createdByUserId?: string | null;
   executionPolicy?: IssueExecutionPolicy | Record<string, unknown> | null;
   executionState?: IssueExecutionState | Record<string, unknown> | null;
@@ -807,6 +808,21 @@ function applyIssueExecutionStageTransition(input: TransitionInput): TransitionR
     }
 
     if (principalsEqual(currentParticipant, actor)) {
+      // Builder ban is absolute (self-approval is impossible even if
+      // misconfigured as participant): it keys on the build executor — the
+      // parked build-stage returnAssignee — not the card creator (filing a
+      // card is not building it). Legacy cards with a null returnAssignee
+      // fall back to the createdBy check. Mirrors issue-stage-decisions.
+      if (existingState?.returnAssignee) {
+        if (principalsEqual(existingState.returnAssignee, actor)) {
+          throw forbidden("The card builder cannot record a stage decision");
+        }
+      } else if (
+        (input.actor.agentId && input.issue.createdByAgentId === input.actor.agentId) ||
+        (input.actor.userId && input.issue.createdByUserId === input.actor.userId)
+      ) {
+        throw forbidden("The card builder cannot record a stage decision");
+      }
       if (requestedStatus === "done") {
         if (!input.commentBody?.trim()) {
           throw unprocessable(`Approving a review or approval stage requires a comment. ${STAGE_DECISION_COMMENT_HINT}`);
