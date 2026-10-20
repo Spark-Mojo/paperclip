@@ -1,11 +1,16 @@
 import { describe, expect, it, vi } from "vitest";
+import type { Db } from "@paperclipai/db";
+import { DEFAULT_DATABASE_STATEMENT_TIMEOUT_MS } from "@paperclipai/db/client";
 import {
   ACTIVE_RUN_LOG_RUNTIME_STATUS_REFRESH_INTERVAL_MS,
+  HEARTBEAT_FLUSH_LOCK_TIMEOUT_MS,
+  HEARTBEAT_FLUSH_STATEMENT_TIMEOUT_MS,
   ONLOG_DRAIN_TIMEOUT_MS,
   ONLOG_INSTRUMENT_SAMPLE_DEFAULT,
   ONLOG_INSTRUMENT_SAMPLE_ENV_VAR,
   buildOnLogStartFields,
   normalizeOnLogRaceTimeoutMs,
+  persistHeartbeatOutputProgress,
   raceOnLogPersistence,
   resolveOnLogChunkApplication,
   resolveOnLogDrainTimeoutMs,
@@ -462,5 +467,139 @@ describe("heartbeat onLog drain helpers", () => {
     } finally {
       vi.restoreAllMocks();
     }
+  });
+});
+
+describe("heartbeat progress-flush transaction-local timeouts (SPA-13853 d9)", () => {
+  type FlushSet = {
+    lastOutputAt: Date;
+    lastOutputSeq: number;
+    lastOutputStream: "stdout" | "stderr";
+    lastOutputBytes: number;
+    updatedAt: Date;
+  };
+
+  function makeFlushSpy() {
+    const order: string[] = [];
+    let capturedSet: FlushSet | null = null;
+    const executedStatements: string[] = [];
+
+    const txUpdateChain = {
+      set(values: FlushSet) {
+        capturedSet = values;
+        return txUpdateChain;
+      },
+      where() {
+        order.push("tx.update.where");
+        return Promise.resolve(undefined);
+      },
+    };
+    const tx = {
+      execute(statement: unknown) {
+        order.push("tx.execute");
+        executedStatements.push(renderStatement(statement));
+        return Promise.resolve(undefined);
+      },
+      update(_table: unknown) {
+        order.push("tx.update");
+        return txUpdateChain;
+      },
+    };
+    const db = {
+      transaction(callback: (tx: typeof tx) => Promise<unknown>) {
+        order.push("db.transaction");
+        return callback(tx);
+      },
+      update() {
+        order.push("db.update");
+        throw new Error(
+          "db.update must not be called outside the flush transaction",
+        );
+      },
+    } as unknown as Db;
+
+    return {
+      db,
+      order,
+      executedStatements,
+      get capturedSet() {
+        return capturedSet;
+      },
+    };
+  }
+
+  function renderStatement(statement: unknown): string {
+    const chunks = (statement as { queryChunks?: unknown[] }).queryChunks ?? [];
+    return chunks
+      .map((chunk) => {
+        const value = (chunk as { value?: unknown }).value;
+        if (Array.isArray(value)) return value.join("");
+        return "";
+      })
+      .join("");
+  }
+
+  it("applies the 5s set_config INSIDE the transaction and BEFORE the update", async () => {
+    const spy = makeFlushSpy();
+    await persistHeartbeatOutputProgress(spy.db, "run_123", {
+      at: new Date("2026-10-20T00:00:00.000Z"),
+      seq: 42,
+      stream: "stdout",
+      bytes: 4096,
+    });
+
+    expect(spy.order[0]).toBe("db.transaction");
+    expect(spy.order.indexOf("tx.execute")).toBeGreaterThan(-1);
+    expect(spy.order.indexOf("tx.execute")).toBeLessThan(
+      spy.order.indexOf("tx.update"),
+    );
+    // The set_config statement is the transaction-local 5s scope.
+    expect(spy.executedStatements).toHaveLength(1);
+    expect(spy.executedStatements[0]).toContain("set_config('statement_timeout', '5000', true)");
+    expect(spy.executedStatements[0]).toContain("set_config('lock_timeout', '5000', true)");
+    // The scope is transaction-local (the `true` third argument), not a
+    // session-level setting that would leak to the pooled client.
+    expect(spy.executedStatements[0]).toContain(", true)");
+  });
+
+  it("runs the update on the tx handle, never on db directly", async () => {
+    const spy = makeFlushSpy();
+    await persistHeartbeatOutputProgress(spy.db, "run_123", {
+      at: new Date("2026-10-20T00:00:00.000Z"),
+      seq: 42,
+      stream: "stderr",
+      bytes: 4096,
+    });
+
+    expect(spy.order).not.toContain("db.update");
+    expect(spy.order).toContain("tx.update");
+  });
+
+  it("sets lastOutputAt/Seq/Stream/Bytes to the passed values", async () => {
+    const spy = makeFlushSpy();
+    const at = new Date("2026-10-20T01:02:03.000Z");
+    await persistHeartbeatOutputProgress(spy.db, "run_123", {
+      at,
+      seq: 77,
+      stream: "stderr",
+      bytes: 12345,
+    });
+
+    const set = spy.capturedSet;
+    expect(set).not.toBeNull();
+    expect(set?.lastOutputAt).toBe(at);
+    expect(set?.lastOutputSeq).toBe(77);
+    expect(set?.lastOutputStream).toBe("stderr");
+    expect(set?.lastOutputBytes).toBe(12345);
+    // updatedAt is stamped by the helper, not passed in.
+    expect(set?.updatedAt).toBeInstanceOf(Date);
+  });
+
+  it("keeps the heartbeat scope per-transaction: 5s flush bounds, 60s client default", () => {
+    expect(HEARTBEAT_FLUSH_STATEMENT_TIMEOUT_MS).toBe(5000);
+    expect(HEARTBEAT_FLUSH_LOCK_TIMEOUT_MS).toBe(5000);
+    // The pooled client default is untouched: the 5s scope is applied
+    // per-transaction, not as a client-wide default.
+    expect(DEFAULT_DATABASE_STATEMENT_TIMEOUT_MS).toBe(60000);
   });
 });

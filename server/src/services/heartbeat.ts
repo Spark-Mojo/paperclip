@@ -1043,6 +1043,49 @@ export {
 } from "./recovery/service.js";
 export const ACTIVE_RUN_OUTPUT_PROGRESS_FLUSH_INTERVAL_MS = 60 * 1000;
 export const ACTIVE_RUN_LOG_RUNTIME_STATUS_REFRESH_INTERVAL_MS = 5 * 1000;
+// SPA-13853: the heartbeat output-progress flush is scoped to a 5s
+// statement/lock bound, applied TRANSACTION-LOCALLY (set_config(..., true))
+// so the pooled client default stays 60s.
+export const HEARTBEAT_FLUSH_STATEMENT_TIMEOUT_MS = 5000;
+export const HEARTBEAT_FLUSH_LOCK_TIMEOUT_MS = 5000;
+// The diagnosed hang class is an unbounded row-lock wait on the
+// `heartbeat_runs` row this flush UPDATEs; the flush must fail fast.
+// The pooled client default stays 60s on purpose (long migrations and
+// analytics must not abort) and the utility client stays exempt, so the
+// 5s scope is applied per-transaction here, not as a client default.
+// The statement text is exported so tests and production cannot drift.
+export const HEARTBEAT_FLUSH_TIMEOUT_SET_CONFIG_SQL =
+  "select set_config('statement_timeout', '5000', true), set_config('lock_timeout', '5000', true)";
+// Persists the run's output-progress marker under a transaction-local
+// 5s statement/lock bound: the diagnosed hang class is an unbounded
+// row-lock wait on this very `heartbeat_runs` row, and it must fail
+// fast instead of gating the stdout drain. The pooled client default
+// stays 60s (migrations/analytics) and the utility client stays exempt,
+// so the scope is applied here, per-transaction.
+export async function persistHeartbeatOutputProgress(
+  db: Db,
+  runId: string,
+  progress: {
+    at: Date;
+    seq: number;
+    stream: "stdout" | "stderr";
+    bytes: number;
+  },
+): Promise<void> {
+  await db.transaction(async (tx) => {
+    await tx.execute(sql.raw(HEARTBEAT_FLUSH_TIMEOUT_SET_CONFIG_SQL));
+    await tx
+      .update(heartbeatRuns)
+      .set({
+        lastOutputAt: progress.at,
+        lastOutputSeq: progress.seq,
+        lastOutputStream: progress.stream,
+        lastOutputBytes: progress.bytes,
+        updatedAt: new Date(),
+      })
+      .where(eq(heartbeatRuns.id, runId));
+  });
+}
 // onLog stdout-drain bound: persistence section (fs append + progress flush +
 // runtime-status touch) races this timeout so the caller's resumeReadable()
 // always runs. Env PAPERCLIP_ONLOG_TIMEOUT_MS overrides; garbage falls back.
@@ -24681,16 +24724,12 @@ export function heartbeatService(
           pendingOutputProgress.at.getTime() - lastOutputFlushAt.getTime() >=
             ACTIVE_RUN_OUTPUT_PROGRESS_FLUSH_INTERVAL_MS;
         if (!shouldFlush) return;
-        await db
-          .update(heartbeatRuns)
-          .set({
-            lastOutputAt: pendingOutputProgress.at,
-            lastOutputSeq: pendingOutputProgress.seq,
-            lastOutputStream: pendingOutputProgress.stream,
-            lastOutputBytes: pendingOutputProgress.bytes,
-            updatedAt: new Date(),
-          })
-          .where(eq(heartbeatRuns.id, run.id));
+        await persistHeartbeatOutputProgress(db, run.id, {
+          at: pendingOutputProgress.at,
+          seq: pendingOutputProgress.seq,
+          stream: pendingOutputProgress.stream,
+          bytes: pendingOutputProgress.bytes,
+        });
         lastOutputFlushAt = pendingOutputProgress.at;
         outputProgressState.pending = null;
       };
