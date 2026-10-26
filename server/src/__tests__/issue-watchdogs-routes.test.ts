@@ -19,6 +19,7 @@ import {
   issueWatchdogs,
   issues,
   principalPermissionGrants,
+  projects,
 } from "@paperclipai/db";
 import {
   getEmbeddedPostgresTestSupport,
@@ -89,6 +90,7 @@ describeEmbeddedPostgres("issue watchdog routes", () => {
     await db.delete(agents);
     await db.delete(companySkills);
     await db.delete(principalPermissionGrants);
+    await db.delete(projects);
     await db.delete(companyMemberships);
     await db.delete(companies);
   });
@@ -516,6 +518,134 @@ describeEmbeddedPostgres("issue watchdog routes", () => {
       .send({ title: "Allowed watched child" });
     expect(allowedChild.status, JSON.stringify(allowedChild.body)).toBe(201);
     expect(allowedChild.body.parentId).toBe(watchedChildId);
+  });
+
+  it("rejects inline watchdog config on create payloads from a watchdog-scoped run (SPA-14162)", async () => {
+    const companyId = await seedCompany();
+    const watchdogAgentId = await seedAgent(companyId, { name: "Scoped Watchdog" });
+    const watchedRootId = await seedIssue(companyId, { title: "Watched root", identifier: "WDOG-ROOT" });
+    const watchedChildId = await seedIssue(companyId, { title: "Watched child", parentId: watchedRootId });
+    const watchdogIssueId = await seedIssue(companyId, {
+      title: "Reusable watchdog issue",
+      parentId: watchedRootId,
+      assigneeAgentId: watchdogAgentId,
+      originKind: "task_watchdog",
+      originId: watchedRootId,
+    });
+    const runId = await seedWatchdogRun({
+      companyId,
+      watchdogAgentId,
+      watchedIssueId: watchedRootId,
+      watchdogIssueId,
+    });
+    const app = createApp(companyId, {
+      type: "agent",
+      agentId: watchdogAgentId,
+      companyId,
+      runId,
+      source: "agent_jwt",
+    });
+
+    // Create route with inline watchdog from inside the watched subtree: the
+    // config-mutation lockout must hold on create too (SPA-14162).
+    const deniedCreate = await request(app)
+      .post(`/api/companies/${companyId}/issues`)
+      .send({
+        title: "Escalation child",
+        parentId: watchedChildId,
+        watchdog: {
+          agentId: watchdogAgentId,
+          instructions: "Minted via create-inline",
+        },
+      });
+    expect(deniedCreate.status, JSON.stringify(deniedCreate.body)).toBe(403);
+    expect(deniedCreate.body.error).toBe(
+      "Task-watchdog runs cannot change watchdog configuration.",
+    );
+    expect(deniedCreate.body.details.watchedIssueId).toBe(watchedRootId);
+
+    // Children route shares the inline-watchdog mint path via createChild.
+    const deniedChild = await request(app)
+      .post(`/api/issues/${watchedChildId}/children`)
+      .send({
+        title: "Escalation grandchild",
+        watchdog: { agentId: watchdogAgentId },
+      });
+    expect(deniedChild.status, JSON.stringify(deniedChild.body)).toBe(403);
+    expect(deniedChild.body.error).toBe(
+      "Task-watchdog runs cannot change watchdog configuration.",
+    );
+
+    // Decomposition children carry the same field; the guard fires before any
+    // child is created (the bogus revision id must never be reached).
+    const deniedDecomposition = await request(app)
+      .post(`/api/issues/${watchedChildId}/accepted-plan-decompositions`)
+      .send({
+        acceptedPlanRevisionId: randomUUID(),
+        children: [
+          { title: "Escalation step", watchdog: { agentId: watchdogAgentId } },
+        ],
+      });
+    expect(deniedDecomposition.status, JSON.stringify(deniedDecomposition.body)).toBe(403);
+    expect(deniedDecomposition.body.error).toBe(
+      "Task-watchdog runs cannot change watchdog configuration.",
+    );
+
+    // Nothing minted anywhere: the only watchdog row is the seeded one, and the
+    // denied create left no issue behind.
+    const watchdogRows = await db
+      .select({ issueId: issueWatchdogs.issueId })
+      .from(issueWatchdogs)
+      .where(eq(issueWatchdogs.companyId, companyId));
+    expect(watchdogRows).toHaveLength(1);
+    expect(watchdogRows[0]?.issueId).toBe(watchedRootId);
+    const escalationIssues = await db
+      .select({ id: issues.id })
+      .from(issues)
+      .where(and(eq(issues.companyId, companyId), eq(issues.title, "Escalation child")));
+    expect(escalationIssues).toHaveLength(0);
+
+    // Same scoped actor, payload WITHOUT watchdog: create behavior unchanged.
+    const allowedScopedCreate = await request(app)
+      .post(`/api/companies/${companyId}/issues`)
+      .send({ title: "Plain scoped child", parentId: watchedChildId });
+    expect(allowedScopedCreate.status, JSON.stringify(allowedScopedCreate.body)).toBe(201);
+    expect(allowedScopedCreate.body.parentId).toBe(watchedChildId);
+
+    // Non-watchdog-scoped actor with inline watchdog: untouched — the create
+    // still succeeds and still mints the watchdog atomically. The plain agent
+    // creates a root task, so it names a project per the root-task rule.
+    const projectId = randomUUID();
+    await db.insert(projects).values({
+      id: projectId,
+      companyId,
+      name: "Inline Watchdog Control Project",
+    });
+    const plainAgentId = await seedAgent(companyId, { name: "Plain Agent" });
+    const plainApp = createApp(companyId, {
+      type: "agent",
+      agentId: plainAgentId,
+      companyId,
+      source: "agent_jwt",
+    });
+    const plainCreate = await request(plainApp)
+      .post(`/api/companies/${companyId}/issues`)
+      .send({
+        title: "Plain actor inline watchdog",
+        projectId,
+        watchdog: { agentId: watchdogAgentId },
+      });
+    expect(plainCreate.status, JSON.stringify(plainCreate.body)).toBe(201);
+    const plainWatchdogs = await db
+      .select({ id: issueWatchdogs.id })
+      .from(issueWatchdogs)
+      .where(
+        and(
+          eq(issueWatchdogs.companyId, companyId),
+          eq(issueWatchdogs.issueId, plainCreate.body.id),
+        ),
+      );
+    expect(plainWatchdogs).toHaveLength(1);
   });
 
   it("routes watchdog-discovered product bugs outside the watched source tree with evidence links", async () => {

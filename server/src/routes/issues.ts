@@ -5580,6 +5580,46 @@ export function issueRoutes(
     return true;
   }
 
+  // Create-surface twin of rejectTaskWatchdogConfigMutation (SPA-14162): the
+  // inline `watchdog` field on a create payload mints the same persistent
+  // scoped mutation grant (and wake-on-stop) that PUT/DELETE
+  // /issues/:id/watchdog are locked out of, so a task-watchdog run must not
+  // carry it on a create either. Payloads without `watchdog` are untouched,
+  // and so is every non-watchdog-scoped actor. The field rides at the top
+  // level on issue/child creates and per-child on decomposition creates; this
+  // scan is shape-specific by design (no schema recursion) — a new nested
+  // mintable-config location would need its own case here, or a schema-level
+  // forbid for watchdog-scoped creators.
+  async function rejectTaskWatchdogCreateInlineWatchdog(
+    req: Request,
+    res: Response,
+  ) {
+    if (req.actor.type !== "agent") return false;
+    const body = req.body as
+      | { watchdog?: unknown; children?: Array<{ watchdog?: unknown }> }
+      | undefined;
+    const carriesWatchdogConfig =
+      Boolean(body?.watchdog) ||
+      (Array.isArray(body?.children) &&
+        body.children.some((child) => Boolean(child?.watchdog)));
+    if (!carriesWatchdogConfig) return false;
+    const scope = await resolveTaskWatchdogMutationScope(db, req.actor);
+    if (scope.kind !== "watchdog") return false;
+    res.status(403).json({
+      error: "Task-watchdog runs cannot change watchdog configuration.",
+      details: {
+        watchedIssueId: scope.watchedIssueId,
+        watchdogId: scope.watchdogId,
+        securityPrinciples: [
+          "Least Privilege",
+          "Complete Mediation",
+          "Fail Securely",
+        ],
+      },
+    });
+    return true;
+  }
+
   async function assertTaskWatchdogIssueMutationAllowed(
     req: Request,
     res: Response,
@@ -12092,6 +12132,7 @@ export function issueRoutes(
         ))
       )
         return;
+      if (await rejectTaskWatchdogCreateInlineWatchdog(req, res)) return;
       const normalizedAssigneeAgentId =
         await normalizeIssueAssigneeAgentReference(
           companyId,
@@ -12493,6 +12534,7 @@ export function issueRoutes(
         ))
       )
         return;
+      if (await rejectTaskWatchdogCreateInlineWatchdog(req, res)) return;
       if (
         await assertLowTrustControlPlaneDenied(
           req,
@@ -12734,6 +12776,7 @@ export function issueRoutes(
       if (!sourceIssue) return;
       if (!(await assertAgentIssueMutationAllowed(req, res, sourceIssue)))
         return;
+      if (await rejectTaskWatchdogCreateInlineWatchdog(req, res)) return;
 
       const requestedChildren = [];
       for (const child of req.body.children as Array<
