@@ -654,7 +654,6 @@ async function seedLowTrustFixture(db: Db) {
     .where(eq(issues.id, standardChild!.id));
   standardChild!.checkoutRunId = standardReportRun!.id;
   standardChild!.executionRunId = standardReportRun!.id;
-
   await db.insert(issueComments).values({
     companyId: company!.id,
     issueId: siblingOutOfScope!.id,
@@ -954,6 +953,28 @@ describeEmbeddedPostgres(
       const fixture = await seedLowTrustFixture(db);
       const standardApp = createApp(db, standardReportActor(fixture));
       const lowTrustApp = createApp(db, agentActor(fixture));
+
+      // SPA-14148: the peer run lock fires on a LIVE assignee run plus the
+      // checkout field, so mirror an actually-active checkout here: a running
+      // cto run bound to reviewRoot via contextSnapshot.issueId (resolved
+      // through getActiveRunForAgent) AND reviewRoot.checkoutRunId pointing at
+      // it. Scoped to this test — the shared seed must stay run-free on
+      // reviewRoot, otherwise heartbeat.wakeup's wake-queue admission defers
+      // the standard agent's wake (issue_execution_deferred) in the
+      // wake-redaction test.
+      const [ctoReviewRootRun] = await db
+        .insert(heartbeatRuns)
+        .values({
+          companyId: fixture.company.id,
+          agentId: fixture.agents.cto.id,
+          status: "running",
+          contextSnapshot: { issueId: fixture.issues.reviewRoot.id },
+        })
+        .returning();
+      await db
+        .update(issues)
+        .set({ checkoutRunId: ctoReviewRootRun!.id })
+        .where(eq(issues.id, fixture.issues.reviewRoot.id));
 
       const parentComment = await request(standardApp)
         .post(`/api/issues/${fixture.issues.reviewRoot.id}/comments`)

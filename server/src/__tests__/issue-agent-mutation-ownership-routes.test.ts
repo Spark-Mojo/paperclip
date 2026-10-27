@@ -12,6 +12,25 @@ const ownerAgentId = "33333333-3333-4333-8333-333333333333";
 const peerAgentId = "44444444-4444-4444-8444-444444444444";
 const ownerRunId = "55555555-5555-4555-8555-555555555555";
 const recoveryActionId = "77777777-7777-4777-8777-777777777777";
+// SPA-14148: live/terminal heartbeat run stubbed behind heartbeatService.getRun
+// for the checkout-field path of the assignee run lock.
+const liveCheckoutRunId = "88888888-aaaa-4bbb-8ccc-dddddddddddd";
+// Active run returned by heartbeatService.getActiveRunForAgent for the
+// assignee-fallback path of the run lock.
+const agentActiveRunId = "88888888-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+// A different issue id used to prove the fallback only locks when the active
+// run's contextSnapshot is bound to THIS issue.
+const otherAssignedIssueId = "99999999-cccc-4ddd-8eee-ffffffffffff";
+// SPA-14163: live heartbeat run reached through the executionRunId field
+// path (the checkout field is null on that fixture).
+const liveExecutionRunId = "88888888-cccc-4ddd-8eee-eeeeeeeeeeee";
+// SPA-14163: both-fields fixtures. The checkout pointer resolves to a
+// TERMINAL run while the execution pointer resolves to a LIVE one (and its
+// terminal/terminal sibling), so a resolver that reads only the first field
+// — or only checkoutRunId — cannot satisfy these rows.
+const bothFieldsTerminalCheckoutRunId = "88888888-dddd-4eee-8fff-000000000000";
+const bothFieldsLiveExecutionRunId = "88888888-eeee-4fff-8000-111111111111";
+const bothFieldsTerminalExecutionRunId = "88888888-ffff-4000-8000-222222222222";
 
 const mockIssueService = vi.hoisted(() => ({
   addComment: vi.fn(),
@@ -119,6 +138,10 @@ const mockHeartbeatService = vi.hoisted(() => ({
   getRun: vi.fn(async () => null),
   getActiveRunForAgent: vi.fn(async () => null),
   cancelRun: vi.fn(async () => null),
+  // The route fires this fire-and-forget on todo -> done transitions; without a
+  // stub every done-PATCH test leaks an unhandled
+  // "autoUnblockReadyDependents is not a function" rejection into the run.
+  autoUnblockReadyDependents: vi.fn(async () => null),
 }));
 const mockRunnerGoalService = vi.hoisted(() => ({
   projection: vi.fn(async () => null),
@@ -800,7 +823,13 @@ describe("agent issue mutation checkout ownership", () => {
     expect(res.status).toBe(403);
     expect(res.body.error).toContain("Task bridge keys cannot use company-wide issue list APIs");
     expect(mockIssueService.list).not.toHaveBeenCalled();
-  });
+    // createApp resolves the real route module via vi.importActual, and as the
+    // first test in this file this one pays the cold transform+execute of that
+    // import graph (~20s observed) against the default 15s testTimeout — the
+    // import only completes after this test has already been failed. Later
+    // tests import warm in milliseconds. The explicit timeout only widens the
+    // window for that cold import; the assertions above are unchanged.
+  }, 60_000);
 
   it("uses the company-scope fast path on the issue list route", async () => {
     mockAccessService.decide.mockImplementation(async (input: { action: string }) => {
@@ -865,6 +894,12 @@ describe("agent issue mutation checkout ownership", () => {
     ],
     ["attachment delete", (app: express.Express) => request(app).delete("/api/attachments/attachment-1")],
   ])("rejects peer agent %s on another agent's active checkout", async (_name, sendRequest) => {
+    // SPA-14148: the run lock must gate on live run state, so this fixture pins
+    // the checkout field path: a non-null checkoutRunId resolving to a live
+    // (running) heartbeat run for the issue.
+    mockIssueService.getById.mockResolvedValue(makeIssue({ checkoutRunId: liveCheckoutRunId }));
+    mockHeartbeatService.getRun.mockResolvedValue({ id: liveCheckoutRunId, status: "running" });
+
     const res = await sendRequest(await createApp(peerActor()));
 
     expect(res.status, JSON.stringify(res.body)).toBe(409);
@@ -881,6 +916,437 @@ describe("agent issue mutation checkout ownership", () => {
     expect(mockWorkProductService.update).not.toHaveBeenCalled();
     expect(mockStorageService.putFile).not.toHaveBeenCalled();
     expect(mockStorageService.deleteObject).not.toHaveBeenCalled();
+  });
+
+  it("run lock matrix (SPA-14148): peer patch succeeds on a run-less in_progress issue assigned to another agent", async () => {
+    // Incident SPA-14148: peers 409 forever on in_progress issues that have no
+    // run at all. With both lock fields null and no live assignee run, the lock
+    // must be ABSENT and the default-open patch route must succeed.
+    mockIssueService.getById.mockResolvedValue(makeIssue({ checkoutRunId: null, executionRunId: null }));
+    mockHeartbeatService.getActiveRunForAgent.mockResolvedValue(null);
+
+    const res = await request(await createApp(peerActor()))
+      .patch(`/api/issues/${issueId}`)
+      .send({ title: "Peer update on run-less issue" });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(mockIssueService.update).toHaveBeenCalled();
+    expect(JSON.stringify(res.body)).not.toContain("issue_write_assignee_run_lock");
+  });
+
+  it("run lock matrix (SPA-14148): peer delete falls back to the ownership denial on a run-less in_progress issue", async () => {
+    mockIssueService.getById.mockResolvedValue(makeIssue({ checkoutRunId: null, executionRunId: null }));
+    mockHeartbeatService.getActiveRunForAgent.mockResolvedValue(null);
+
+    const res = await request(await createApp(peerActor())).delete(`/api/issues/${issueId}`);
+
+    // Delete is not default-open, so the peer falls through the absent run lock
+    // into the plain ownership denial — never the run lock.
+    expect(res.status, JSON.stringify(res.body)).toBe(403);
+    expect(res.body.error).toBe("Agent cannot mutate another agent's issue");
+    expect(JSON.stringify(res.body)).not.toContain("issue_write_assignee_run_lock");
+    expect(mockIssueService.remove).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    [
+      "patch",
+      200,
+      (app: express.Express) => request(app).patch(`/api/issues/${issueId}`).send({ title: "Peer update" }),
+      null,
+    ],
+    ["delete", 403, (app: express.Express) => request(app).delete(`/api/issues/${issueId}`), null],
+    [
+      "document upsert",
+      403,
+      (app: express.Express) =>
+        request(app).put(`/api/issues/${issueId}/documents/plan`).send({ format: "markdown", body: "# peer" }),
+      "Agent cannot mutate another agent's issue",
+    ],
+    [
+      "work product update",
+      403,
+      (app: express.Express) => request(app).patch("/api/work-products/product-1").send({ title: "Peer update" }),
+      "Agent cannot mutate another agent's issue",
+    ],
+    [
+      "low-trust promotion",
+      403,
+      (app: express.Express) =>
+        request(app).post(`/api/issues/${issueId}/low-trust/promotions`).send({
+          sourceArtifactKind: "comment",
+          sourceArtifactId: recoveryActionId,
+          title: "Promoted artifact",
+          summary: "Sanitized output",
+        }),
+      "Agent cannot mutate another agent's issue",
+    ],
+    [
+      "attachment upload",
+      403,
+      (app: express.Express) =>
+        request(app)
+          .post(`/api/companies/${companyId}/issues/${issueId}/attachments`)
+          .attach("file", Buffer.from("report"), { filename: "report.txt", contentType: "text/plain" }),
+      "Agent cannot mutate another agent's issue",
+    ],
+    [
+      "attachment delete",
+      403,
+      (app: express.Express) => request(app).delete("/api/attachments/attachment-1"),
+      "Agent cannot mutate another agent's issue",
+    ],
+  ])(
+    "run lock matrix (SPA-14148): peer %s never receives the assignee run lock on a run-less in_progress issue",
+    async (kind, expectedStatus, sendRequest, expectedDenialError) => {
+      mockIssueService.getById.mockResolvedValue(makeIssue({ checkoutRunId: null, executionRunId: null }));
+      mockHeartbeatService.getActiveRunForAgent.mockResolvedValue(null);
+
+      const res = await sendRequest(await createApp(peerActor()));
+
+      // The run lock may only fire when a live run exists for the issue. On a
+      // run-less in_progress issue the peer write must land on the route's own
+      // exact outcome — default-open writes succeed, default-closed writes are
+      // refused by the ownership boundary — and never on the 409 run lock.
+      // Asserting the exact status (not merely "not 409") is what makes a
+      // regression that swaps the refusal for a 500 or a 404 visible.
+      expect(res.status, JSON.stringify(res.body)).toBe(expectedStatus);
+      expect(JSON.stringify(res.body)).not.toContain("issue_write_assignee_run_lock");
+      if (kind === "patch") {
+        // The default-open patch really reached the issue service.
+        expect(mockIssueService.update).toHaveBeenCalled();
+      }
+      if (kind === "delete") {
+        // Delete is not default-open: the peer falls through the absent run
+        // lock into the plain ownership denial — never the run lock.
+        expect(res.body.error).toBe("Agent cannot mutate another agent's issue");
+      }
+      if (expectedDenialError !== null) {
+        // Pin the denial REASON, not just its status: a wrong resolver that
+        // refuses the peer write for a different reason (a stale checkout
+        // message, a cross-issue-influence denial, a missing-run error) would
+        // still answer 403 and still omit the run lock code, so the status
+        // alone cannot distinguish it from the ownership boundary.
+        expect(res.body.error).toBe(expectedDenialError);
+      }
+    },
+  );
+
+  it("run lock matrix (SPA-14148): peer writes fall through when the checkout run is terminal (succeeded)", async () => {
+    mockIssueService.getById.mockResolvedValue(makeIssue({ checkoutRunId: liveCheckoutRunId }));
+    mockHeartbeatService.getRun.mockResolvedValue({ id: liveCheckoutRunId, status: "succeeded" });
+
+    const app = await createApp(peerActor());
+
+    const patched = await request(app)
+      .patch(`/api/issues/${issueId}`)
+      .send({ title: "Peer update after terminal run" });
+
+    expect(patched.status, JSON.stringify(patched.body)).toBe(200);
+    expect(mockIssueService.update).toHaveBeenCalled();
+    expect(JSON.stringify(patched.body)).not.toContain("issue_write_assignee_run_lock");
+
+    const deleted = await request(app).delete(`/api/issues/${issueId}`);
+
+    expect(deleted.status, JSON.stringify(deleted.body)).toBe(403);
+    expect(deleted.body.error).toBe("Agent cannot mutate another agent's issue");
+    expect(JSON.stringify(deleted.body)).not.toContain("issue_write_assignee_run_lock");
+  });
+
+  it("run lock fail-safe (SPA-14148): peer writes still receive the run lock when the assignee's live run is bound to this issue", async () => {
+    mockIssueService.getById.mockResolvedValue(makeIssue({ checkoutRunId: null, executionRunId: null }));
+    mockHeartbeatService.getActiveRunForAgent.mockResolvedValue({
+      id: agentActiveRunId,
+      companyId,
+      agentId: ownerAgentId,
+      status: "running",
+      contextSnapshot: { issueId },
+    });
+
+    const res = await request(await createApp(peerActor()))
+      .patch(`/api/issues/${issueId}`)
+      .send({ title: "Peer update while assignee run is live" });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(409);
+    expect(res.body.details.code).toBe("issue_write_assignee_run_lock");
+    expect(mockIssueService.update).not.toHaveBeenCalled();
+  });
+
+  it("run lock matrix (SPA-14148): peer writes fall through when the assignee's live run is bound to a different issue", async () => {
+    mockIssueService.getById.mockResolvedValue(makeIssue({ checkoutRunId: null, executionRunId: null }));
+    mockHeartbeatService.getActiveRunForAgent.mockResolvedValue({
+      id: agentActiveRunId,
+      companyId,
+      agentId: ownerAgentId,
+      status: "running",
+      contextSnapshot: { issueId: otherAssignedIssueId },
+    });
+
+    const app = await createApp(peerActor());
+
+    const patched = await request(app)
+      .patch(`/api/issues/${issueId}`)
+      .send({ title: "Peer update, run bound elsewhere" });
+
+    expect(patched.status, JSON.stringify(patched.body)).toBe(200);
+    expect(mockIssueService.update).toHaveBeenCalled();
+    expect(JSON.stringify(patched.body)).not.toContain("issue_write_assignee_run_lock");
+
+    const deleted = await request(app).delete(`/api/issues/${issueId}`);
+
+    expect(deleted.status, JSON.stringify(deleted.body)).toBe(403);
+    expect(deleted.body.error).toBe("Agent cannot mutate another agent's issue");
+    expect(JSON.stringify(deleted.body)).not.toContain("issue_write_assignee_run_lock");
+  });
+
+  it("run lock matrix (SPA-14148): heartbeat lookup failures propagate instead of unlocking the peer write", async () => {
+    mockIssueService.getById.mockResolvedValue(makeIssue({ checkoutRunId: liveCheckoutRunId }));
+    mockHeartbeatService.getRun.mockRejectedValue(new Error("heartbeat lookup failed"));
+
+    const res = await request(await createApp(peerActor()))
+      .patch(`/api/issues/${issueId}`)
+      .send({ title: "Peer update during heartbeat outage" });
+
+    // A failed liveness lookup is fail-closed: the error surfaces as a 5xx
+    // instead of being mapped to ABSENT (which would unlock the peer write).
+    // The exact status is pinned: the route's error handler answers a plain
+    // (non-HttpError) throw with 500, so a regression that remaps the failure
+    // to another 5xx — or worse to a 409 lock or a 200 unlock — is visible.
+    expect(res.status, JSON.stringify(res.body)).toBe(500);
+    expect(res.body.error).toBe("Internal server error");
+    expect(mockIssueService.update).not.toHaveBeenCalled();
+    expect(JSON.stringify(res.body)).not.toContain("issue_write_assignee_run_lock");
+  });
+
+  it("run lock matrix (SPA-14163): peer patch is locked by a live run reached through the executionRunId field", async () => {
+    // The field path tries checkoutRunId first and then executionRunId. This
+    // fixture carries ONLY the execution pointer, so the lock can only fire if
+    // the route actually walks the second pointer.
+    mockIssueService.getById.mockResolvedValue(
+      makeIssue({ checkoutRunId: null, executionRunId: liveExecutionRunId }),
+    );
+    mockHeartbeatService.getRun.mockResolvedValue({ id: liveExecutionRunId, status: "running" });
+    mockHeartbeatService.getActiveRunForAgent.mockResolvedValue(null);
+
+    const res = await request(await createApp(peerActor()))
+      .patch(`/api/issues/${issueId}`)
+      .send({ title: "Peer update on execution-locked issue" });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(409);
+    expect(res.body.details.code).toBe("issue_write_assignee_run_lock");
+    expect(mockIssueService.update).not.toHaveBeenCalled();
+  });
+
+  it.each([["queued"], ["running"], ["scheduled_retry"]])(
+    "run lock matrix (SPA-14163): peer patch is locked by a live checkout run with status %s",
+    async (status) => {
+      // Every LIVE execution-path status must arm the run lock on the field
+      // path: queued | running | scheduled_retry.
+      mockIssueService.getById.mockResolvedValue(makeIssue({ checkoutRunId: liveCheckoutRunId }));
+      mockHeartbeatService.getRun.mockResolvedValue({ id: liveCheckoutRunId, status });
+      mockHeartbeatService.getActiveRunForAgent.mockResolvedValue(null);
+
+      const res = await request(await createApp(peerActor()))
+        .patch(`/api/issues/${issueId}`)
+        .send({ title: `Peer update with live run ${status}` });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(409);
+      expect(res.body.details.code).toBe("issue_write_assignee_run_lock");
+      expect(mockIssueService.update).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each([["succeeded"], ["interrupted"], ["failed"], ["cancelled"], ["timed_out"]])(
+    "run lock matrix (SPA-14163): peer patch falls through when the checkout run is terminal (%s)",
+    async (status) => {
+      // Every TERMINAL status must leave the lock ABSENT on the field path.
+      // The fallback is pinned to null here so it cannot rescue the row: this
+      // test is about the field path's status set, not about the fallback.
+      mockIssueService.getById.mockResolvedValue(makeIssue({ checkoutRunId: liveCheckoutRunId }));
+      mockHeartbeatService.getRun.mockResolvedValue({ id: liveCheckoutRunId, status });
+      mockHeartbeatService.getActiveRunForAgent.mockResolvedValue(null);
+
+      const res = await request(await createApp(peerActor()))
+        .patch(`/api/issues/${issueId}`)
+        .send({ title: `Peer update with terminal run ${status}` });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      expect(mockIssueService.update).toHaveBeenCalled();
+      expect(JSON.stringify(res.body)).not.toContain("issue_write_assignee_run_lock");
+    },
+  );
+
+  it("run lock matrix (SPA-14163): peer patch is locked by a live execution run when the checkout field points at a terminal run", async () => {
+    // Both field pointers are set AND they disagree: checkoutRunId resolves to
+    // a TERMINAL run while executionRunId resolves to a LIVE one. A resolver
+    // that reads only checkoutRunId — or that stops at the first pointer — would
+    // miss the live run and let the peer write through.
+    mockIssueService.getById.mockResolvedValue(
+      makeIssue({
+        checkoutRunId: bothFieldsTerminalCheckoutRunId,
+        executionRunId: bothFieldsLiveExecutionRunId,
+      }),
+    );
+    mockHeartbeatService.getRun.mockImplementation(async (runId: string) =>
+      runId === bothFieldsLiveExecutionRunId
+        ? { id: bothFieldsLiveExecutionRunId, status: "running" }
+        : { id: bothFieldsTerminalCheckoutRunId, status: "succeeded" },
+    );
+    mockHeartbeatService.getActiveRunForAgent.mockResolvedValue(null);
+
+    const res = await request(await createApp(peerActor()))
+      .patch(`/api/issues/${issueId}`)
+      .send({ title: "Peer update on a both-fields issue" });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(409);
+    expect(res.body.details.code).toBe("issue_write_assignee_run_lock");
+    expect(mockIssueService.update).not.toHaveBeenCalled();
+  });
+
+  it("run lock matrix (SPA-14163): peer patch falls through when both field pointers resolve to terminal runs", async () => {
+    // The mirror of the row above: both pointers are set and BOTH are terminal,
+    // so the lock must be ABSENT and the peer write must land.
+    mockIssueService.getById.mockResolvedValue(
+      makeIssue({
+        checkoutRunId: bothFieldsTerminalCheckoutRunId,
+        executionRunId: bothFieldsTerminalExecutionRunId,
+      }),
+    );
+    mockHeartbeatService.getRun.mockImplementation(async (runId: string) =>
+      runId === bothFieldsTerminalExecutionRunId
+        ? { id: bothFieldsTerminalExecutionRunId, status: "failed" }
+        : { id: bothFieldsTerminalCheckoutRunId, status: "succeeded" },
+    );
+    mockHeartbeatService.getActiveRunForAgent.mockResolvedValue(null);
+
+    const res = await request(await createApp(peerActor()))
+      .patch(`/api/issues/${issueId}`)
+      .send({ title: "Peer update on a both-terminal issue" });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(mockIssueService.update).toHaveBeenCalled();
+    expect(JSON.stringify(res.body)).not.toContain("issue_write_assignee_run_lock");
+  });
+
+  it.each([["queued"], ["scheduled_retry"]])(
+    "run lock matrix (SPA-14163): peer patch falls through when the assignee's active run is %s (the fallback counts running runs only)",
+    async (status) => {
+      // The FALLBACK path has its own status set: only a "running" active run
+      // counts. A fallback that reused the execution-path set (queued |
+      // running | scheduled_retry) would lock here and wrongly 409 the peer,
+      // even though the run is bound to this issue.
+      mockIssueService.getById.mockResolvedValue(makeIssue({ checkoutRunId: null, executionRunId: null }));
+      mockHeartbeatService.getActiveRunForAgent.mockResolvedValue({
+        id: agentActiveRunId,
+        companyId,
+        agentId: ownerAgentId,
+        status,
+        contextSnapshot: { issueId },
+      });
+
+      const res = await request(await createApp(peerActor()))
+        .patch(`/api/issues/${issueId}`)
+        .send({ title: `Peer update with a ${status} active run` });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      expect(mockIssueService.update).toHaveBeenCalled();
+      expect(JSON.stringify(res.body)).not.toContain("issue_write_assignee_run_lock");
+    },
+  );
+
+  it("run lock matrix (SPA-14163): peer patch falls through when the assignee's running active run carries no issue binding", async () => {
+    // The running run is bound to the owner agent but NOT to this issue (no
+    // contextSnapshot.issueId at all), so the fallback cannot prove the run is
+    // live FOR THIS ISSUE. A resolver that treated a missing binding as a
+    // valid one would lock here.
+    mockIssueService.getById.mockResolvedValue(makeIssue({ checkoutRunId: null, executionRunId: null }));
+    mockHeartbeatService.getActiveRunForAgent.mockResolvedValue({
+      id: agentActiveRunId,
+      companyId,
+      agentId: ownerAgentId,
+      status: "running",
+      contextSnapshot: { agentId: ownerAgentId },
+    });
+
+    const res = await request(await createApp(peerActor()))
+      .patch(`/api/issues/${issueId}`)
+      .send({ title: "Peer update with an unbound active run" });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(mockIssueService.update).toHaveBeenCalled();
+    expect(JSON.stringify(res.body)).not.toContain("issue_write_assignee_run_lock");
+  });
+
+  it("run lock fail-safe (SPA-14163): a failed active-run lookup propagates instead of unlocking the peer write", async () => {
+    // The fallback lookup is a liveness read too: its rejection must surface
+    // as a 5xx, not be mapped to ABSENT (which would silently unlock the peer
+    // write). A resolver that swallowed fallback errors would pass every other
+    // row in this file and must fail here.
+    mockIssueService.getById.mockResolvedValue(makeIssue({ checkoutRunId: null, executionRunId: null }));
+    mockHeartbeatService.getActiveRunForAgent.mockRejectedValue(
+      new Error("heartbeat active-run lookup failed"),
+    );
+
+    const res = await request(await createApp(peerActor()))
+      .patch(`/api/issues/${issueId}`)
+      .send({ title: "Peer update during an active-run outage" });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(500);
+    expect(res.body.error).toBe("Internal server error");
+    expect(mockIssueService.update).not.toHaveBeenCalled();
+    expect(JSON.stringify(res.body)).not.toContain("issue_write_assignee_run_lock");
+  });
+
+  it("run lock matrix (SPA-14163): the assignee's own write never consults the heartbeat for run liveness", async () => {
+    // Ordering: the assignee passes the ownership boundary before any run
+    // lookup, so the heartbeat must not be consulted at all for its own
+    // write. A lock that queried the heartbeat first would 409 the owner.
+    mockIssueService.getById.mockResolvedValue(
+      makeIssue({ assigneeAgentId: ownerAgentId, checkoutRunId: liveCheckoutRunId }),
+    );
+    mockHeartbeatService.getRun.mockResolvedValue({ id: liveCheckoutRunId, status: "running" });
+
+    const res = await request(await createApp(ownerActor()))
+      .patch(`/api/issues/${issueId}`)
+      .send({ title: "Owner update on a live checkout" });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(mockIssueService.update).toHaveBeenCalled();
+    expect(mockHeartbeatService.getRun).not.toHaveBeenCalled();
+    expect(mockHeartbeatService.getActiveRunForAgent).not.toHaveBeenCalled();
+  });
+
+  it("run lock matrix (SPA-14163): an active-checkout management grant bypasses the heartbeat run lookup", async () => {
+    // Ordering: the management override resolves before the run lock, so the
+    // heartbeat is not consulted even though the issue carries a live
+    // checkout run.
+    mockAccessService.decide.mockImplementation(async (input: { action: string }) => ({
+      allowed: input.action === "issue:mutate" || input.action === "tasks:manage_active_checkouts",
+      action: input.action,
+      reason:
+        input.action === "issue:mutate" || input.action === "tasks:manage_active_checkouts"
+          ? "allow_explicit_grant"
+          : "deny_missing_grant",
+      explanation:
+        input.action === "tasks:manage_active_checkouts"
+          ? "Allowed by checkout management grant."
+          : input.action === "issue:mutate"
+            ? "Allowed by test boundary default."
+            : "Missing permission.",
+    }));
+    mockIssueService.getById.mockResolvedValue(
+      makeIssue({ status: "in_progress", checkoutRunId: liveCheckoutRunId }),
+    );
+    mockHeartbeatService.getRun.mockResolvedValue({ id: liveCheckoutRunId, status: "running" });
+
+    const res = await request(await createApp(peerActor()))
+      .patch(`/api/issues/${issueId}`)
+      .send({ title: "Managed update on a live checkout" });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(mockIssueService.update).toHaveBeenCalled();
+    expect(mockHeartbeatService.getRun).not.toHaveBeenCalled();
+    expect(mockHeartbeatService.getActiveRunForAgent).not.toHaveBeenCalled();
   });
 
   it("allows mentioned peer agents to post comments without ownership of an active checkout", async () => {

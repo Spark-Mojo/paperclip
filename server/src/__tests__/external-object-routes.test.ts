@@ -32,6 +32,18 @@ const mockInstanceSettingsService = vi.hoisted(() => ({
   getExperimental: vi.fn(),
 }));
 
+// Hoisted so individual tests can stub heartbeat run lookups (the assignee run
+// lock resolves live run state through this service).
+const mockHeartbeatService = vi.hoisted(() => ({
+  wakeup: vi.fn(async () => undefined),
+  reportRunActivity: vi.fn(async () => undefined),
+  getRun: vi.fn(async () => null),
+  getActiveRunForAgent: vi.fn(async () => null),
+  cancelRun: vi.fn(async () => null),
+}));
+
+const liveCheckoutRunId = "88888888-aaaa-4bbb-8ccc-dddddddddddd";
+
 function registerRouteMocks() {
   vi.doMock("../services/external-objects.js", () => ({
     externalObjectService: () => mockExternalObjectsService,
@@ -60,13 +72,7 @@ function registerRouteMocks() {
     executionWorkspaceService: () => ({}),
     feedbackService: () => ({}),
     goalService: () => ({}),
-    heartbeatService: () => ({
-      wakeup: vi.fn(async () => undefined),
-      reportRunActivity: vi.fn(async () => undefined),
-      getRun: vi.fn(async () => null),
-      getActiveRunForAgent: vi.fn(async () => null),
-      cancelRun: vi.fn(async () => null),
-    }),
+    heartbeatService: () => mockHeartbeatService,
     issueApprovalService: () => ({}),
     issueRecoveryActionService: () => ({}),
     issueReferenceService: () => ({
@@ -95,6 +101,8 @@ function makeIssue(overrides: Record<string, unknown> = {}) {
     identifier: "PAP-2265",
     title: "External object routes",
     executionWorkspaceId: null,
+    checkoutRunId: null,
+    executionRunId: null,
     ...overrides,
   };
 }
@@ -174,6 +182,8 @@ describe("external object routes", () => {
     vi.doUnmock("../services/external-objects.js");
     registerRouteMocks();
     vi.resetAllMocks();
+    mockHeartbeatService.getRun.mockResolvedValue(null);
+    mockHeartbeatService.getActiveRunForAgent.mockResolvedValue(null);
     mockIssueService.getById.mockResolvedValue(makeIssue());
     mockIssueService.assertCheckoutOwner.mockResolvedValue({ adoptedFromRunId: null });
     mockAccessService.hasPermission.mockResolvedValue(false);
@@ -275,6 +285,12 @@ describe("external object routes", () => {
   });
 
   it("requires active checkout ownership for agent manual refresh", async () => {
+    // SPA-14148: the run lock gates on live run state, so the fixture pins the
+    // checkout field path: a non-null checkoutRunId resolving to a live
+    // (running) heartbeat run for the issue.
+    mockIssueService.getById.mockResolvedValue(makeIssue({ checkoutRunId: liveCheckoutRunId }));
+    mockHeartbeatService.getRun.mockResolvedValue({ id: liveCheckoutRunId, status: "running" });
+
     const app = await createApp(peerActor());
 
     const res = await request(app)

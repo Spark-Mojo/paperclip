@@ -698,6 +698,11 @@ const ISSUE_WORKSPACE_AUDIT_FIELDS = new Set([
   "executionWorkspaceSettings",
 ]);
 
+// SPA-14148: the execution-path status set. A heartbeat run is LIVE while it
+// is queued, running, or awaiting a scheduled retry; every other status
+// (succeeded, interrupted, failed, cancelled, timed_out) is terminal.
+const LIVE_HEARTBEAT_RUN_STATUSES = ["queued", "running", "scheduled_retry"] as const;
+
 function readNonEmptyString(value: unknown): string | null {
   return typeof value === "string" && value.trim().length > 0
     ? value.trim()
@@ -5337,6 +5342,58 @@ export function issueRoutes(
     return decision.allowed;
   }
 
+  /**
+   * SPA-14148: is there a LIVE execution run bound to this issue?
+   *
+   * LIVE means the execution-path status set (queued | running |
+   * scheduled_retry); a terminal status (succeeded | interrupted | failed |
+   * cancelled | timed_out) or a missing row counts as ABSENT for that field.
+   * The field path is tried first (checkoutRunId, then executionRunId); when
+   * neither yields a live run the fallback asks the heartbeat for the
+   * assignee's active run and only counts it when its contextSnapshot is
+   * bound to THIS issue.
+   *
+   * The fallback binding rule: the assignee's ACTIVE run counts only when its
+   * status is exactly "running" AND contextSnapshot.issueId === issue.id; a
+   * terminal pointer on the issue is ABSENT and does NOT suppress that
+   * issue-bound fallback.
+   *
+   * This is advisory-lock semantics at the mutation boundary, not race-free:
+   * the lookup and the write are not atomic, so a run that starts between the
+   * two can still slip past the lock. A failed lookup is NOT mapped to ABSENT
+   * — the error propagates so the write fails closed instead of unlocking.
+   */
+  async function isIssueRunLockLive(issue: {
+    id: string;
+    assigneeAgentId: string | null;
+    checkoutRunId: string | null;
+    executionRunId: string | null;
+  }) {
+    const isLiveRun = (run: { status?: string | null } | null | undefined) =>
+      !!run &&
+      (LIVE_HEARTBEAT_RUN_STATUSES as readonly string[]).includes(run.status ?? "");
+    for (const runId of [issue.checkoutRunId, issue.executionRunId]) {
+      if (!runId) continue;
+      const run = await heartbeat.getRun(runId);
+      if (isLiveRun(run)) return true;
+    }
+    if (issue.assigneeAgentId) {
+      const activeRun = await heartbeat.getActiveRunForAgent(issue.assigneeAgentId);
+      // The fallback demands exactly "running" (the ACTIVE RUNNING run bound
+      // to this issue), NOT the execution-path set the field path uses.
+      if (!activeRun || activeRun.status !== "running") return false;
+      const snapshot = activeRun.contextSnapshot;
+      const boundIssueId =
+        snapshot &&
+        typeof snapshot === "object" &&
+        typeof (snapshot as Record<string, unknown>).issueId === "string"
+          ? ((snapshot as Record<string, unknown>).issueId as string)
+          : null;
+      return boundIssueId === issue.id;
+    }
+    return false;
+  }
+
   async function assertAgentIssueMutationAllowed(
     req: Request,
     res: Response,
@@ -5348,6 +5405,8 @@ export function issueRoutes(
       status: string;
       assigneeAgentId: string | null;
       assigneeUserId: string | null;
+      checkoutRunId: string | null;
+      executionRunId: string | null;
       reviewPolicy?: IssueReviewPolicy | null;
       /** Used only to name the task in denial copy (plan §6). */
       identifier?: string | null;
@@ -5433,7 +5492,7 @@ export function issueRoutes(
       ) {
         return true;
       }
-      if (issue.status === "in_progress") {
+      if (issue.status === "in_progress" && (await isIssueRunLockLive(issue))) {
         // Run/checkout ownership stays assignee-scoped even though writes are
         // open, so this lock clears on its own — the copy routes to comments.
         return denyIssueWrite(
