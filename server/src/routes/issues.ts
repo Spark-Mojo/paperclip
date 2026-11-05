@@ -9740,21 +9740,6 @@ export function issueRoutes(
         }
         let issue = lockedIssue;
         const sourceStatusChanged = sourceIssueStatus !== lockedIssue.status;
-        await assertRecoveryResolutionEvidenceGates(
-          tx as unknown as Db,
-          {
-            companyId: lockedIssue.companyId,
-            issueId: lockedIssue.id,
-            identifier: lockedIssue.identifier,
-            recoveryActionId: activeRecoveryAction.id,
-            sourceIssueStatus,
-            sourceStatusChanged,
-            title: lockedIssue.title,
-            description: lockedIssue.description,
-            monitorNotes: lockedIssue.monitorNotes,
-          },
-          resolutionNote,
-        );
         if (outcome === "blocked" && sourceStatusChanged) {
           const unresolvedBlockers = await tx
             .select({ id: issueRows.id })
@@ -9805,6 +9790,22 @@ export function issueRoutes(
               actor: { type: actor.actorType, id: actor.actorId },
             });
           }
+
+          await assertRecoveryResolutionEvidenceGates(
+            tx as unknown as Db,
+            {
+              companyId: lockedIssue.companyId,
+              issueId: lockedIssue.id,
+              identifier: lockedIssue.identifier,
+              recoveryActionId: activeRecoveryAction.id,
+              sourceIssueStatus,
+              sourceStatusChanged,
+              title: lockedIssue.title,
+              description: lockedIssue.description,
+              monitorNotes: lockedIssue.monitorNotes,
+            },
+            resolutionNote,
+          );
 
           const updateFields: Record<string, unknown> = {
             status: sourceIssueStatus,
@@ -9887,6 +9888,24 @@ export function issueRoutes(
                 );
           if (!updatedIssue) throw notFound("Issue not found");
           issue = updatedIssue;
+        }
+
+        if (!sourceStatusChanged) {
+          await assertRecoveryResolutionEvidenceGates(
+            tx as unknown as Db,
+            {
+              companyId: lockedIssue.companyId,
+              issueId: lockedIssue.id,
+              identifier: lockedIssue.identifier,
+              recoveryActionId: activeRecoveryAction.id,
+              sourceIssueStatus,
+              sourceStatusChanged,
+              title: lockedIssue.title,
+              description: lockedIssue.description,
+              monitorNotes: lockedIssue.monitorNotes,
+            },
+            resolutionNote,
+          );
         }
 
         const recordedOutcome =
