@@ -2804,6 +2804,7 @@ const ISSUE_USER_PARTICIPATION_ACTIVITY_ACTIONS = [
   "issue.monitor_cleared",
   "issue.monitor_scheduled",
   "issue.recovery_action_resolved",
+  "issue.recovery_evidence_refused",
   "issue.relations.updated",
   "issue.released",
   "issue.reviewers_updated",
