@@ -23,7 +23,34 @@ import { projectWorkspaces } from "./project_workspaces.js";
 import { executionWorkspaces } from "./execution_workspaces.js";
 import type { IssueReviewPolicy, IssueUnblockDescriptor, SourceTrustMetadata } from "@paperclipai/shared";
 
-export const issues = pgTable(
+type MonitorPhaseColumnNames = "monitorPhaseHistory" | "monitorActivePhase";
+
+type VanillaCompatibleIssueTable<
+  T extends {
+    readonly _: { readonly columns: Record<string, unknown>; readonly inferSelect: Record<string, unknown> };
+    readonly $inferSelect: Record<string, unknown>;
+  },
+> = Omit<T, "_" | "$inferSelect"> & {
+  readonly _: Omit<T["_"], "columns" | "inferSelect"> & {
+    readonly columns: Omit<T["_"]["columns"], MonitorPhaseColumnNames>;
+    readonly inferSelect: Omit<T["_"]["inferSelect"], MonitorPhaseColumnNames>;
+  };
+  readonly $inferSelect: Omit<T["$inferSelect"], MonitorPhaseColumnNames>;
+};
+
+function preserveVanillaIssueProjection<
+  T extends {
+    readonly _: { readonly columns: Record<string, unknown>; readonly inferSelect: Record<string, unknown> };
+    readonly $inferSelect: Record<string, unknown>;
+  },
+>(table: T): VanillaCompatibleIssueTable<T> {
+  // Existing compact issue projections deliberately omit large JSON columns.
+  // Preserve their vanilla inferred shape while exposing the actual columns as
+  // direct table properties for phase-specific selects.
+  return table as unknown as VanillaCompatibleIssueTable<T>;
+}
+
+export const issues = preserveVanillaIssueProjection(pgTable(
   "issues",
   {
     id: uuid("id").primaryKey().defaultRandom(),
@@ -76,6 +103,13 @@ export const issues = pgTable(
     monitorAttemptCount: integer("monitor_attempt_count").notNull().default(0),
     monitorNotes: text("monitor_notes"),
     monitorScheduledBy: text("monitor_scheduled_by"),
+    // Append-only lifetime phase ledger. The final entry may be the active
+    // phase; completed entries are copied forward byte-for-byte.
+    monitorPhaseHistory: jsonb("monitor_phase_history")
+      .$type<Record<string, unknown>[]>()
+      .notNull()
+      .default(sql`'[]'::jsonb`),
+    monitorActivePhase: jsonb("monitor_active_phase").$type<Record<string, unknown> | null>(),
     executionWorkspaceId: uuid("execution_workspace_id")
       .references((): AnyPgColumn => executionWorkspaces.id, { onDelete: "set null" }),
     executionWorkspacePreference: text("execution_workspace_preference"),
@@ -202,4 +236,4 @@ export const issues = pgTable(
       .on(table.companyId)
       .where(sql`${table.originKind} = 'onboarding_first_task'`),
   }),
-);
+));

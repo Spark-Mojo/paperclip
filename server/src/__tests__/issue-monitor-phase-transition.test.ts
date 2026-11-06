@@ -4,12 +4,19 @@ import request from "supertest";
 import { eq } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import {
+  activityLog,
+  agentRuntimeState,
+  agentWakeupRequests,
   agents,
   companies,
   companyMemberships,
   createDb,
+  environmentLeases,
+  heartbeatRunEvents,
+  heartbeatRuns,
   issues,
   principalPermissionGrants,
+  workspaceRuntimeServices,
 } from "@paperclipai/db";
 import {
   getEmbeddedPostgresTestSupport,
@@ -17,6 +24,11 @@ import {
 } from "./helpers/embedded-postgres.js";
 import { errorHandler } from "../middleware/index.js";
 import { issueRoutes } from "../routes/issues.js";
+import { heartbeatService } from "../services/heartbeat.js";
+import {
+  normalizeIssueExecutionPolicy,
+  parseIssueExecutionState,
+} from "../services/issue-execution-policy.js";
 
 const support = await getEmbeddedPostgresTestSupport();
 const describeDatabase = support.supported ? describe : describe.skip;
@@ -24,6 +36,7 @@ const describeDatabase = support.supported ? describe : describe.skip;
 const AUTHORIZED_USER_ID = "monitor-operator";
 const UNAUTHORIZED_USER_ID = "monitor-observer";
 const GRANTED_BY_USER_ID = "monitor-grant-admin";
+const NEXT_CHECK_AT = "2026-11-06T10:05:00.000Z";
 const HISTORICAL_AUTHORIZED_USER_ID = "retired-monitor-operator";
 const HISTORICAL_GRANTED_BY_USER_ID = "retired-grant-admin";
 const PRIOR_PREDICATE = "queue_depth > 50 for 10m";
@@ -39,6 +52,15 @@ function boardActor(companyId: string, userId: string): Express.Request["actor"]
     memberships: [{ companyId, membershipRole: "operator", status: "active" }],
     isInstanceAdmin: false,
     source: "session",
+  };
+}
+
+function agentActor(companyId: string, agentId: string): Express.Request["actor"] {
+  return {
+    type: "agent",
+    agentId,
+    companyId,
+    source: "agent_jwt",
   };
 }
 
@@ -64,7 +86,23 @@ describeDatabase("issue monitor phase transition route", () => {
   }, 20_000);
 
   afterEach(async () => {
+    const heartbeat = heartbeatService(db);
+    await heartbeat.drainActiveRunExecutions();
+    const runs = await db.select({ id: heartbeatRuns.id }).from(heartbeatRuns);
+    for (const run of runs) {
+      await heartbeat.cancelRun(run.id, "Monitor phase fixture teardown", {
+        suppressImmediateRecovery: true,
+      });
+    }
+    await heartbeat.drainActiveRunExecutions();
+    await db.delete(heartbeatRunEvents);
+    await db.delete(activityLog);
+    await db.delete(environmentLeases);
+    await db.delete(workspaceRuntimeServices);
     await db.delete(issues);
+    await db.delete(heartbeatRuns);
+    await db.delete(agentWakeupRequests);
+    await db.delete(agentRuntimeState);
     await db.delete(principalPermissionGrants);
     await db.delete(companyMemberships);
     await db.delete(agents);
@@ -78,9 +116,11 @@ describeDatabase("issue monitor phase transition route", () => {
   async function seedExhaustedIssue() {
     const companyId = randomUUID();
     const assigneeAgentId = randomUUID();
+    const peerAgentId = randomUUID();
     const issueId = randomUUID();
     const phaseId = randomUUID();
     const grantId = randomUUID();
+    const peerGrantId = randomUUID();
     const historicalGrantId = randomUUID();
     const currentAuthorizationProvenance = {
       principalType: "user",
@@ -118,30 +158,58 @@ describeDatabase("issue monitor phase transition route", () => {
       name: "Monitor phase integration",
       issuePrefix: `MP${companyId.slice(0, 5).toUpperCase()}`,
     });
-    await db.insert(agents).values({
-      id: assigneeAgentId,
-      companyId,
-      name: "Monitor owner",
-      role: "engineer",
-      status: "active",
-      adapterType: "process",
-      adapterConfig: {},
-      runtimeConfig: {},
-      permissions: {},
-    });
+    await db.insert(agents).values([
+      {
+        id: assigneeAgentId,
+        companyId,
+        name: "Monitor owner",
+        role: "engineer",
+        status: "active",
+        adapterType: "process",
+        adapterConfig: {
+          command: process.execPath,
+          args: ["-e", ""],
+          cwd: process.cwd(),
+        },
+        runtimeConfig: { heartbeat: { enabled: false, wakeOnDemand: true } },
+        permissions: {},
+      },
+      {
+        id: peerAgentId,
+        companyId,
+        name: "Peer with default runtime grant",
+        role: "engineer",
+        status: "active",
+        adapterType: "process",
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+      },
+    ]);
     await db.insert(companyMemberships).values([
       { companyId, principalType: "user", principalId: AUTHORIZED_USER_ID, status: "active", membershipRole: "operator" },
       { companyId, principalType: "user", principalId: UNAUTHORIZED_USER_ID, status: "active", membershipRole: "operator" },
     ]);
-    await db.insert(principalPermissionGrants).values({
-      id: grantId,
-      companyId,
-      principalType: "user",
-      principalId: AUTHORIZED_USER_ID,
-      permissionKey: "tools:manage_runtime",
-      scope: null,
-      grantedByUserId: GRANTED_BY_USER_ID,
-    });
+    await db.insert(principalPermissionGrants).values([
+      {
+        id: grantId,
+        companyId,
+        principalType: "user",
+        principalId: AUTHORIZED_USER_ID,
+        permissionKey: "tools:manage_runtime",
+        scope: null,
+        grantedByUserId: GRANTED_BY_USER_ID,
+      },
+      {
+        id: peerGrantId,
+        companyId,
+        principalType: "agent",
+        principalId: peerAgentId,
+        permissionKey: "tools:manage_runtime",
+        scope: null,
+        grantedByUserId: GRANTED_BY_USER_ID,
+      },
+    ]);
     await db.insert(issues).values({
       id: issueId,
       companyId,
@@ -171,6 +239,8 @@ describeDatabase("issue monitor phase transition route", () => {
 
     return {
       companyId,
+      assigneeAgentId,
+      peerAgentId,
       issueId,
       phaseId,
       grantId,
@@ -226,6 +296,51 @@ describeDatabase("issue monitor phase transition route", () => {
       error: "Missing permission: tools:manage_runtime.",
       details: { reason: "deny_missing_grant" },
     });
+    const after = await db.select().from(issues).where(eq(issues.id, fixture.issueId)).then((rows) => rows[0]!);
+    expect(after).toEqual(before);
+  });
+
+  it("refuses a transition while the active monitor phase is not exhausted", async () => {
+    const fixture = await seedExhaustedIssue();
+    const activePhaseBefore = {
+      ...fixture.exhaustedPhaseBefore,
+      status: "active",
+      nextCheckAt: NEXT_CHECK_AT,
+      attemptCount: 1,
+      maxAttempts: 3,
+      clearReason: null,
+      clearedAt: null,
+    };
+    await db
+      .update(issues)
+      .set({
+        executionState: {
+          status: "idle",
+          currentStageId: null,
+          currentStageIndex: null,
+          currentStageType: null,
+          currentParticipant: null,
+          returnAssignee: null,
+          reviewRequest: null,
+          completedStageIds: [],
+          lastDecisionId: null,
+          lastDecisionOutcome: null,
+          monitor: activePhaseBefore,
+        },
+        monitorAttemptCount: 1,
+        monitorNotes: PRIOR_NOTES,
+        monitorScheduledBy: "board",
+        monitorNextCheckAt: null,
+      })
+      .where(eq(issues.id, fixture.issueId));
+    const before = await db.select().from(issues).where(eq(issues.id, fixture.issueId)).then((rows) => rows[0]!);
+
+    const response = await request(createApp(db, boardActor(fixture.companyId, AUTHORIZED_USER_ID)))
+      .post(`/api/issues/${fixture.issueId}/monitor/phase-transition`)
+      .send({ predicate: NEXT_PREDICATE, notes: NEXT_NOTES, maxAttempts: 3 });
+
+    expect(response.status, JSON.stringify(response.body)).toBe(422);
+    expect(response.body).toEqual({ error: "The current monitor phase is not exhausted" });
     const after = await db.select().from(issues).where(eq(issues.id, fixture.issueId)).then((rows) => rows[0]!);
     expect(after).toEqual(before);
   });

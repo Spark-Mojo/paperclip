@@ -308,6 +308,7 @@ import {
   redactIssueMonitorExternalRef,
   setIssueExecutionPolicyMonitorScheduledBy,
 } from "../services/issue-execution-policy.js";
+import { transitionIssueMonitorPhase } from "../services/issue-monitor-phases.js";
 import { parseIssueExecutionWorkspaceSettings } from "../services/execution-workspace-policy.js";
 import type { PluginWorkerManager } from "../services/plugin-worker-manager.js";
 import {
@@ -370,6 +371,13 @@ const queuedCommentSteeringTargetSchema =
 const queuedCommentInterruptTargetSchema = queuedCommentMutationTargetSchema.extend({
   targetRunId: z.string().min(1).nullable(),
 });
+const monitorPhaseTransitionSchema = z
+  .object({
+    predicate: z.string().min(1).max(2_000).refine((value) => value.trim().length > 0),
+    notes: z.string().min(1).max(500).refine((value) => value.trim().length > 0),
+    maxAttempts: z.number().int().positive().max(100),
+  })
+  .strict();
 const editQueuedCommentSchema = queuedCommentMutationTargetSchema.extend({
   body: z
     .string()
@@ -12577,6 +12585,36 @@ export function issueRoutes(
           (issue) => issue.id,
         ),
       });
+    },
+  );
+
+  router.post(
+    "/issues/:id/monitor/phase-transition",
+    validate(monitorPhaseTransitionSchema),
+    async (req, res) => {
+      const id = req.params.id as string;
+      const issue = await getAccessibleResource(
+        req,
+        res,
+        svc.getById(id),
+        "Issue not found",
+      );
+      if (!issue) return;
+      assertCompanyAccess(req, issue.companyId);
+
+      const result = await transitionIssueMonitorPhase({
+        db,
+        issueId: issue.id,
+        companyId: issue.companyId,
+        actor:
+          req.actor.type === "board"
+            ? { type: "board", userId: req.actor.userId }
+            : { type: "agent", agentId: req.actor.agentId },
+        predicate: req.body.predicate,
+        notes: req.body.notes,
+        maxAttempts: req.body.maxAttempts,
+      });
+      res.json(result);
     },
   );
 
