@@ -185,6 +185,16 @@ const RECOVERY_BLOCKER_TRANSACTION_RETRY_CODES = new Set([
   "40001",
   "55P03",
 ]);
+const RECOVERY_BLOCKER_CYCLE_GUARD_MESSAGE =
+  "Blocking relations cannot contain cycles";
+
+function isRecoveryBlockerCycleGuardError(error: unknown) {
+  return (
+    error instanceof HttpError &&
+    error.status === 422 &&
+    error.message === RECOVERY_BLOCKER_CYCLE_GUARD_MESSAGE
+  );
+}
 
 function isRetryableRecoveryBlockerTransactionError(error: unknown) {
   let current: unknown = error;
@@ -2903,7 +2913,7 @@ export function recoveryService(
     excludedIds: string[];
     cycleInvolvedExistingIds: string[];
     fingerprint: string;
-    refusalReason: "cycle" | "cycle_race" | null;
+    refusalReason: "cycle" | "cycle_race" | "cycle_guard_refused" | null;
   };
 
   function recoveryBlockerSelectionFingerprint(input: {
@@ -3258,6 +3268,53 @@ export function recoveryService(
           };
         });
       } catch (error) {
+        if (isRecoveryBlockerCycleGuardError(error)) {
+          const existingIds = await existingUnresolvedBlockerIssueIds(
+            input.companyId,
+            input.sourceIssueId,
+          );
+          const current = await selectCycleSafeRecoveryBlockers({
+            companyId: input.companyId,
+            sourceIssueId: input.sourceIssueId,
+            existingIds,
+            proposedIds: input.proposedIds,
+          });
+          const refusedIds = [
+            ...new Set([...current.existingIds, ...current.proposedIds]),
+          ];
+          const selection: RecoveryBlockerSelection = {
+            ...current,
+            blockerIds: current.existingIds,
+            excludedIds: refusedIds,
+            refusalReason: "cycle_guard_refused",
+            fingerprint: recoveryBlockerSelectionFingerprint({
+              existingIds: current.existingIds,
+              proposedIds: current.proposedIds,
+              excludedIds: refusedIds,
+              cycleInvolvedExistingIds: current.cycleInvolvedExistingIds,
+              refusalReason: "cycle_guard_refused",
+            }),
+          };
+          try {
+            const updated = await issuesSvc.update(input.sourceIssueId, {
+              status: "blocked",
+            });
+            return { updated, selection };
+          } catch (fallbackError) {
+            if (!isRecoveryBlockerCycleGuardError(fallbackError)) {
+              throw fallbackError;
+            }
+            logger.warn(
+              {
+                companyId: input.companyId,
+                issueId: input.sourceIssueId,
+                refusalReason: selection.refusalReason,
+              },
+              "recovery blocker cycle-guard status-only fallback was refused",
+            );
+            return { updated: null, selection };
+          }
+        }
         if (!isRetryableRecoveryBlockerTransactionError(error)) throw error;
         if (attempt < RECOVERY_BLOCKER_TRANSACTION_MAX_ATTEMPTS) {
           await new Promise((resolve) =>
@@ -3449,7 +3506,10 @@ export function recoveryService(
     selection: RecoveryBlockerSelection,
   ) {
     await appendRecoveryBlockerEvidence(actionId, selection);
-    if (selection.refusalReason !== "cycle_race") return false;
+    if (
+      selection.refusalReason !== "cycle_race" &&
+      selection.refusalReason !== "cycle_guard_refused"
+    ) return false;
     await deferRecoveryBlockerWrite(actionId, selection);
     return true;
   }
@@ -3528,7 +3588,10 @@ export function recoveryService(
       sourceIssueId: issue.id,
       proposedIds,
     });
-    if (selection.refusalReason === "cycle_race") {
+    if (
+      selection.refusalReason === "cycle_race" ||
+      selection.refusalReason === "cycle_guard_refused"
+    ) {
       const recoveryAction =
         activeRecoveryAction ??
         (await ensureSourceScopedStrandedRecoveryAction({
@@ -3539,7 +3602,12 @@ export function recoveryService(
         }));
       await persistRecoveryBlockerSelection(recoveryAction.id, selection);
     }
-    if (!updated) return null;
+    if (!updated) {
+      return selection.refusalReason === "cycle_race" ||
+        selection.refusalReason === "cycle_guard_refused"
+        ? ("deferred" as const)
+        : null;
+    }
     const blockedByIssueIds = selection.blockerIds;
     const excludedIds = selection.excludedIds;
     const cycleInvolvedExistingIds = selection.cycleInvolvedExistingIds;
@@ -3554,14 +3622,16 @@ export function recoveryService(
     );
     const cycleEvidence = [
       excludedIds.length > 0
-        ? `${refusalReason === "cycle_race" ? "Race-refused" : "Cycle-excluded"} proposed blocker ids: ${excludedIds.join(", ")}.`
+        ? `${refusalReason === "cycle_race" ? "Race-refused" : refusalReason === "cycle_guard_refused" ? "Write-time cycle-guard-refused" : "Cycle-excluded"} proposed blocker ids: ${excludedIds.join(", ")}.`
         : "",
       cycleInvolvedExistingIds.length > 0
         ? `Persisted cycle-involved blocker ids preserved without relation rewrite: ${cycleInvolvedExistingIds.join(", ")}.`
         : "",
       refusalReason === "cycle_race"
         ? "The blocker transaction exhausted its bounded concurrency retry budget."
-        : "",
+        : refusalReason === "cycle_guard_refused"
+          ? "The exact write-time cycle guard refused the advisory pre-filtered blocker set."
+          : "",
     ].filter(Boolean).join(" ");
     await issuesSvc.addComment(
       issue.id,
@@ -3606,7 +3676,9 @@ export function recoveryService(
                       label:
                         refusalReason === "cycle_race"
                           ? "Race-refused proposed issues"
-                          : "Cycle-excluded proposed issues",
+                          : refusalReason === "cycle_guard_refused"
+                            ? "Write-time cycle-guard-refused proposed issues"
+                            : "Cycle-excluded proposed issues",
                       value: excludedIds.join(", ").slice(0, 2000),
                     }]
                   : []),
@@ -3643,7 +3715,8 @@ export function recoveryService(
         cycleInvolvedExistingBlockerIssueIds: cycleInvolvedExistingIds,
       },
     });
-    return refusalReason === "cycle_race"
+    return refusalReason === "cycle_race" ||
+      refusalReason === "cycle_guard_refused"
       ? ("deferred_after_update" as const)
       : updated;
   }
