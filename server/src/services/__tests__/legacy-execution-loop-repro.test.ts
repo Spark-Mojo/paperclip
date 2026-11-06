@@ -22,11 +22,84 @@ const support = externalDatabaseUrl
   ? { supported: true }
   : await getEmbeddedPostgresTestSupport();
 
+type TestDb = ReturnType<typeof createDb>;
+
+async function insertLoopFixture(
+  db: TestDb,
+  label: string,
+  runOverrides: Record<string, unknown> = {},
+) {
+  const companyId = randomUUID();
+  const agentId = randomUUID();
+  const issueId = randomUUID();
+  const runId = randomUUID();
+  const expectedFingerprint = `legacy-execution:${runId}`;
+  await db.insert(companies).values({
+    id: companyId,
+    name: label,
+    issuePrefix: `LR${companyId.slice(0, 6)}`,
+  });
+  await db.insert(agents).values({
+    id: agentId,
+    companyId,
+    name: "Executor",
+    role: "engineer",
+    adapterType: "paperclip_runner",
+  });
+  await db.insert(issues).values({
+    id: issueId,
+    companyId,
+    title: "Loop fixture",
+    status: "in_progress",
+    assigneeAgentId: agentId,
+  });
+  await db.insert(heartbeatRuns).values({
+    id: runId,
+    companyId,
+    agentId,
+    nativeIssueId: issueId,
+    runtimeMode: "legacy",
+    status: "failed",
+    errorCode: "adapter_failed",
+    contextSnapshot: { issueId },
+    ...runOverrides,
+  });
+  return { companyId, agentId, issueId, runId, expectedFingerprint };
+}
+
+async function terminalizeAndSettle(db: TestDb, runId: string) {
+  const [run] = await db
+    .select()
+    .from(heartbeatRuns)
+    .where(eq(heartbeatRuns.id, runId));
+  await terminalizeLegacyExecution({ db, run: run!, status: "failed" });
+  await settleUnrecoverableExecutions(db);
+}
+
+async function readActions(db: TestDb, issueId: string) {
+  return db
+    .select()
+    .from(issueRecoveryActions)
+    .where(eq(issueRecoveryActions.sourceIssueId, issueId));
+}
+
+async function readSettledLogs(db: TestDb, issueId: string) {
+  return db
+    .select()
+    .from(activityLog)
+    .where(
+      and(
+        eq(activityLog.entityId, issueId),
+        eq(activityLog.action, "issue.execution_recovery_settled"),
+      ),
+    );
+}
+
 (support.supported ? describe : describe.skip)(
   "legacy-execution recovery-action create/settle loop repro",
   () => {
     let database: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>>;
-    let db: ReturnType<typeof createDb>;
+    let db: TestDb;
     beforeAll(async () => {
       if (externalDatabaseUrl) {
         db = createDb(externalDatabaseUrl);
@@ -45,41 +118,9 @@ const support = externalDatabaseUrl
       else await database?.cleanup();
     });
 
-    it("creates one fresh recovery action per terminalize/settle cycle (N=3)", async () => {
-      const companyId = randomUUID();
-      const agentId = randomUUID();
-      const issueId = randomUUID();
-      const runId = randomUUID();
-      const expectedFingerprint = `legacy-execution:${runId}`;
-      await db.insert(companies).values({
-        id: companyId,
-        name: "Loop Repro",
-        issuePrefix: `LR${companyId.slice(0, 6)}`,
-      });
-      await db.insert(agents).values({
-        id: agentId,
-        companyId,
-        name: "Executor",
-        role: "engineer",
-        adapterType: "paperclip_runner",
-      });
-      await db.insert(issues).values({
-        id: issueId,
-        companyId,
-        title: "Loop fixture",
-        status: "in_progress",
-        assigneeAgentId: agentId,
-      });
-      await db.insert(heartbeatRuns).values({
-        id: runId,
-        companyId,
-        agentId,
-        nativeIssueId: issueId,
-        runtimeMode: "legacy",
-        status: "failed",
-        errorCode: "adapter_failed",
-        contextSnapshot: { issueId },
-      });
+    it("N=3 cycles yield exactly one recovery action and one settled log", async () => {
+      const { issueId, runId, expectedFingerprint } =
+        await insertLoopFixture(db, "Loop Repro");
 
       for (let cycle = 1; cycle <= 3; cycle += 1) {
         const [run] = await db
@@ -88,10 +129,7 @@ const support = externalDatabaseUrl
           .where(eq(heartbeatRuns.id, runId));
         await terminalizeLegacyExecution({ db, run: run!, status: "failed" });
         await settleUnrecoverableExecutions(db);
-        const actions = await db
-          .select()
-          .from(issueRecoveryActions)
-          .where(eq(issueRecoveryActions.sourceIssueId, issueId));
+        const actions = await readActions(db, issueId);
         const ids = actions.map((action) => action.id).join(",");
         const fingerprints = actions
           .map((action) => String(action.fingerprint))
@@ -101,41 +139,106 @@ const support = externalDatabaseUrl
         );
       }
 
-      const actions = await db
-        .select()
-        .from(issueRecoveryActions)
-        .where(eq(issueRecoveryActions.sourceIssueId, issueId));
-      // One fresh row per cycle: the settler resolves each action with
-      // evidence.automaticRecovery.replay="blocked" but no
-      // evidence.executionReconciliation, so the terminalize skip-guard
-      // (legacy-execution-recovery.ts:133-147) misses and inserts again.
-      expect(actions).toHaveLength(3);
-      // Same identity re-created, fresh UUIDs each cycle.
+      // Idempotent per fingerprint: repeated terminalize/settle sweeps must
+      // not mint a fresh row per cycle.
+      const actions = await readActions(db, issueId);
+      expect(actions).toHaveLength(1);
+      // Fingerprint stable, single UUID retained.
       expect(actions.map((action) => action.fingerprint)).toEqual([
         expectedFingerprint,
-        expectedFingerprint,
-        expectedFingerprint,
       ]);
-      expect(new Set(actions.map((action) => action.id)).size).toBe(3);
-      for (const action of actions) {
-        expect(action.status).toBe("resolved");
-        expect(action.evidence?.automaticRecovery?.replay).toBe("blocked");
-        expect(action.evidence?.runId).toBe(runId);
-        // The guard's second disjunct needs workspaceRestoreFailure, which
-        // this fixture lacks; the first disjunct needs executionReconciliation.
-        expect(action.evidence).not.toHaveProperty("executionReconciliation");
-        expect(action.evidence).not.toHaveProperty("workspaceRestoreFailure");
-      }
-      const settledLogs = await db
+      expect(new Set(actions.map((action) => action.id)).size).toBe(1);
+      // The retained row is terminal, with replay blocked under the
+      // preserve-without-replay policy for this run — however the
+      // resolution was recorded (no executionReconciliation required, no
+      // workspaceRestoreFailure required).
+      const [retained] = actions;
+      expect(retained!.status).toBe("resolved");
+      expect(retained!.evidence?.runId).toBe(runId);
+      const automaticRecovery = (retained!.evidence as Record<string, any>)
+        ?.automaticRecovery as Record<string, any> | undefined;
+      expect(automaticRecovery).toMatchObject({
+        policy: "preserve_without_replay_v1",
+        replay: "blocked",
+        runId,
+      });
+      // Exactly one settled activity row: later cycles add zero new rows.
+      const settledLogs = await readSettledLogs(db, issueId);
+      expect(settledLogs).toHaveLength(1);
+    });
+
+    it("a genuinely new failure (different runId) still creates a new action row", async () => {
+      const { issueId, runId: firstRunId } = await insertLoopFixture(
+        db,
+        "Loop Oracle New",
+      );
+      await terminalizeAndSettle(db, firstRunId);
+      const secondRunId = randomUUID();
+      const [first] = await db
         .select()
-        .from(activityLog)
-        .where(
-          and(
-            eq(activityLog.entityId, issueId),
-            eq(activityLog.action, "issue.execution_recovery_settled"),
-          ),
-        );
-      expect(settledLogs).toHaveLength(3);
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.id, firstRunId));
+      await db.insert(heartbeatRuns).values({
+        id: secondRunId,
+        companyId: first!.companyId,
+        agentId: first!.agentId,
+        nativeIssueId: issueId,
+        runtimeMode: "legacy",
+        status: "failed",
+        errorCode: "adapter_failed",
+        contextSnapshot: { issueId },
+      });
+      await terminalizeAndSettle(db, secondRunId);
+
+      const actions = await readActions(db, issueId);
+      const fingerprints = actions.map((action) => String(action.fingerprint));
+      console.log(
+        `ORACLE new-run actions=${actions.length} fingerprints=${fingerprints.join(",")}`,
+      );
+      // No over-suppression: a distinct run identity mints its own row.
+      expect(actions).toHaveLength(2);
+      expect(new Set(fingerprints).size).toBe(2);
+      expect(fingerprints).toEqual(
+        expect.arrayContaining([
+          `legacy-execution:${firstRunId}`,
+          `legacy-execution:${secondRunId}`,
+        ]),
+      );
+      expect(new Set(actions.map((action) => action.id)).size).toBe(2);
+    });
+
+    it("a resolved row stays resolved across further settle sweeps", async () => {
+      const { issueId, runId } = await insertLoopFixture(
+        db,
+        "Loop Oracle Stable",
+      );
+      await terminalizeAndSettle(db, runId);
+      const [settled] = await readActions(db, issueId);
+      expect(settled!.status).toBe("resolved");
+      const settledId = settled!.id;
+      const logsBefore = await readSettledLogs(db, issueId);
+
+      // Further settle-only sweeps plus repeat terminalize/settle cycles must
+      // neither reopen the row nor leak extra rows or settled logs.
+      await settleUnrecoverableExecutions(db);
+      await terminalizeAndSettle(db, runId);
+      await settleUnrecoverableExecutions(db);
+      const [run] = await db
+        .select()
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.id, runId));
+      await terminalizeLegacyExecution({ db, run: run!, status: "failed" });
+      await settleUnrecoverableExecutions(db);
+      const actions = await readActions(db, issueId);
+      console.log(
+        `ORACLE stable actions=${actions.length} ids=${actions.map((a) => a.id).join(",")}`,
+      );
+      expect(actions).toHaveLength(1);
+      expect(actions[0]!.id).toBe(settledId);
+      expect(actions[0]!.status).toBe("resolved");
+      expect(["active", "escalated"]).not.toContain(actions[0]!.status);
+      const logsAfter = await readSettledLogs(db, issueId);
+      expect(logsAfter).toHaveLength(logsBefore.length);
     });
   },
 );
