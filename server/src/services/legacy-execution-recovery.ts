@@ -142,6 +142,15 @@ export async function terminalizeLegacyExecution(input: {
               sql`${issueRecoveryActions.evidence}->>'workspaceRestoreFailure' = 'restore_unsafe_archive'`,
               sql`${issueRecoveryActions.evidence}->'automaticRecovery'->>'replay' = 'blocked'`,
             ),
+            // Settler receipt: settleUnrecoverableExecutions never writes
+            // executionReconciliation and rows without an unsafe-workspace hold
+            // lack workspaceRestoreFailure. Treat its preserved-without-replay
+            // receipt as reconciled for the same run identity.
+            and(
+              sql`${issueRecoveryActions.evidence}->>'runId' = ${run.id}`,
+              sql`${issueRecoveryActions.evidence}->'automaticRecovery'->>'policy' = 'preserve_without_replay_v1'`,
+              sql`${issueRecoveryActions.evidence}->'automaticRecovery'->>'replay' = 'blocked'`,
+            ),
           ),
         )).limit(1);
       if (reconciled) return updated;

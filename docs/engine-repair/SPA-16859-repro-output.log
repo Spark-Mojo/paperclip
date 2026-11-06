@@ -1,0 +1,2140 @@
+(!) Your Vite config uses features that are unsupported by `configLoader: 'native'`, which is planned to become the default in a future major version of Vite:
+  - `__dirname` (vitest.config.ts:7:25). Use `import.meta.dirname` instead
+Set `VITE_CONFIG_NATIVE_IGNORE_WARNING=true` to suppress this warning.
+
+ RUN  v4.1.11 /srv/bulk/worktrees/engine-fork/SPA-16851
+
+stdout | src/services/__tests__/legacy-execution-loop-repro.test.ts > legacy-execution recovery-action create/settle loop repro > creates one fresh recovery action per terminalize/settle cycle (N=3)
+CYCLE 1 actions=1 ids=e0ebcbb2-f2c3-42bd-a260-2c0a73b0ff7e fingerprints=legacy-execution:38da2129-34b6-41fc-bc82-bcdd5a515ac5
+
+stdout | src/services/__tests__/legacy-execution-loop-repro.test.ts > legacy-execution recovery-action create/settle loop repro > creates one fresh recovery action per terminalize/settle cycle (N=3)
+CYCLE 2 actions=2 ids=e0ebcbb2-f2c3-42bd-a260-2c0a73b0ff7e,626e2f2f-0097-414d-b956-2f6c289ab311 fingerprints=legacy-execution:38da2129-34b6-41fc-bc82-bcdd5a515ac5,legacy-execution:38da2129-34b6-41fc-bc82-bcdd5a515ac5
+
+stdout | src/services/__tests__/legacy-execution-loop-repro.test.ts > legacy-execution recovery-action create/settle loop repro > creates one fresh recovery action per terminalize/settle cycle (N=3)
+CYCLE 3 actions=3 ids=e0ebcbb2-f2c3-42bd-a260-2c0a73b0ff7e,626e2f2f-0097-414d-b956-2f6c289ab311,18ca0d85-5578-4a21-8d96-6e159442359d fingerprints=legacy-execution:38da2129-34b6-41fc-bc82-bcdd5a515ac5,legacy-execution:38da2129-34b6-41fc-bc82-bcdd5a515ac5,legacy-execution:38da2129-34b6-41fc-bc82-bcdd5a515ac5
+
+stdout | src/services/__tests__/legacy-execution-loop-repro.test.ts > legacy-execution recovery-action create/settle loop repro > creates one fresh recovery action per terminalize/settle cycle (N=3)
+{
+  severity_local: 'NOTICE',
+  severity: 'NOTICE',
+  code: '00000',
+  message: 'truncate cascades to table "activity_log"',
+  file: 'tablecmds.c',
+  line: '2020',
+  routine: 'ExecuteTruncateGuts'
+}
+
+stdout | src/services/__tests__/legacy-execution-loop-repro.test.ts > legacy-execution recovery-action create/settle loop repro > creates one fresh recovery action per terminalize/settle cycle (N=3)
+{
+  severity_local: 'NOTICE',
+  severity: 'NOTICE',
+  code: '00000',
+  message: 'truncate cascades to table "agent_api_keys"',
+  file: 'tablecmds.c',
+  line: '2020',
+  routine: 'ExecuteTruncateGuts'
+}
+{
+  severity_local: 'NOTICE',
+  severity: 'NOTICE',
+  code: '00000',
+  message: 'truncate cascades to table "agents"',
+  file: 'tablecmds.c',
+  line: '2020',
+  routine: 'ExecuteTruncateGuts'
+}
+{
+  severity_local: 'NOTICE',
+  severity: 'NOTICE',
+  code: '00000',
+  message: 'truncate cascades to table "approvals"',
+  file: 'tablecmds.c',
+  line: '2020',
+  routine: 'ExecuteTruncateGuts'
+}
+{
+  severity_local: 'NOTICE',
+  severity: 'NOTICE',
+  code: '00000',
+  message: 'truncate cascades to table "cost_events"',
+  file: 'tablecmds.c',
+  line: '2020',
+  routine: 'ExecuteTruncateGuts'
+}
+{
+  severity_local: 'NOTICE',
+  severity: 'NOTICE',
+  code: '00000',
+  message: 'truncate cascades to table "goals"',
+  file: 'tablecmds.c',
+  line: '2020',
+  routine: 'ExecuteTruncateGuts'
+}
+{
+  severity_local: 'NOTICE',
+  severity: 'NOTICE',
+  code: '00000',
+  message: 'truncate cascades to table "heartbeat_runs"',
+  file: 'tablecmds.c',
+  line: '2020',
+  routine: 'ExecuteTruncateGuts'
+}
+{
+  severity_local: 'NOTICE',
+  severity: 'NOTICE',
+  code: '00000',
+  message: 'truncate cascades to table "issue_comments"',
+  file: 'tablecmds.c',
+  line: '2020',
+  routine: 'ExecuteTruncateGuts'
+}
+{
+  severity_local: 'NOTICE',
+  severity: 'NOTICE',
+  code: '00000',
+  message: 'truncate cascades to table "issues"',
+  file: 'tablecmds.c',
+  line: '2020',
+  routine: 'ExecuteTruncateGuts'
+}
+{
+  severity_local: 'NOTICE',
+  severity: 'NOTICE',
+  code: '00000',
+  message: 'truncate cascades to table "projects"',
+  file: 'tablecmds.c',
+  line: '2020',
+  routine: 'ExecuteTruncateGuts'
+}
+
+stdout | src/services/__tests__/legacy-execution-loop-repro.test.ts > legacy-execution recovery-action create/settle loop repro > creates one fresh recovery action per terminalize/settle cycle (N=3)
+{
+  severity_local: 'NOTICE',
+  severity: 'NOTICE',
+  code: '00000',
+  message: 'truncate cascades to table "agent_runtime_state"',
+  file: 'tablecmds.c',
+  line: '2020',
+  routine: 'ExecuteTruncateGuts'
+}
+{
+  severity_local: 'NOTICE',
+  severity: 'NOTICE',
+  code: '00000',
+  message: 'truncate cascades to table "agent_wakeup_requests"',
+  file: 'tablecmds.c',
+  line: '2020',
+  routine: 'ExecuteTruncateGuts'
+}
+{
+  severity_local: 'NOTICE',
+  severity: 'NOTICE',
+  code: '00000',
+  message: 'truncate cascades to table "heartbeat_run_events"',
+  file: 'tablecmds.c',
+  line: '2020',
+  routine: 'ExecuteTruncateGuts'
+}
+{
+  severity_local: 'NOTICE',
+  severity: 'NOTICE',
+  code: '00000',
+  message: 'truncate cascades to table "approval_comments"',
+  file: 'tablecmds.c',
+  line: '2020',
+  routine: 'ExecuteTruncateGuts'
+}
+{
+  severity_local: 'NOTICE',
+  severity: 'NOTICE',
+  code: '00000',
+  message: 'truncate cascades to table "agent_config_revisions"',
+  file: 'tablecmds.c',
+  line: '2020',
+  routine: 'ExecuteTruncateGuts'
+}
+{
+  severity_local: 'NOTICE',
+  severity: 'NOTICE',
+  code: '00000',
+  message: 'truncate cascades to table "issue_approvals"',
+  file: 'tablecmds.c',
+  line: '2020',
+  routine: 'ExecuteTruncateGuts'
+}
+{
+  severity_local: 'NOTICE',
+  severity: 'NOTICE',
+  code: '00000',
+  message: 'truncate cascades to table "agent_task_sessions"',
+  file: 'tablecmds.c',
+  line: '2020',
+  routine: 'ExecuteTruncateGuts'
+}
+{
+  severity_local: 'NOTICE',
+  severity: 'NOTICE',
+  code: '00000',
+  message: 'truncate cascades to table "company_secrets"',
+  file: 'tablecmds.c',
+  line: '2020',
+  routine: 'ExecuteTruncateGuts'
+}
+{
+  severity_local: 'NOTICE',
+  severity: 'NOTICE',
+  code: '00000',
+  message: 'truncate cascades to table "assets"',
+  file: 'tablecmds.c',
+  line: '2020',
+  routine: 'ExecuteTruncateGuts'
+}
+{
+  severity_local: 'NOTICE',
+  severity: 'NOTICE',
+  code: '00000',
+  message: 'truncate cascades to table "issue_attachments"',
+  file: 'tablecmds.c',
+  line: '2020',
+  routine: 'ExecuteTruncateGuts'
+}
+{
+  severity_local: 'NOTICE',
+  severity: 'NOTICE',
+  code: '00000',
+  message: 'truncate cascades to table "project_goals"',
+  file: 'tablecmds.c',
+  line: '2020',
+  routine: 'ExecuteTruncateGuts'
+}
+{
+  severity_local: 'NOTICE',
+  severity: 'NOTICE',
+  code: '00000',
+  message: 'truncate cascades to table "company_memberships"',
+  file: 'tablecmds.c',
+  line: '2020',
+  routine: 'ExecuteTruncateGuts'
+}
+{
+  severity_local: 'NOTICE',
+  severity: 'NOTICE',
+  code: '00000',
+  message: 'truncate cascades to table "invites"',
+  file: 'tablecmds.c',
+  line: '2020',
+  routine: 'ExecuteTruncateGuts'
+}
+{
+  severity_local: 'NOTICE',
+  severity: 'NOTICE',
+  code: '00000',
+  message: 'truncate cascades to table "join_requests"',
+  file: 'tablecmds.c',
+  line: '2020',
+  routine: 'ExecuteTruncateGuts'
+}
+{
+  severity_local: 'NOTICE',
+  severity: 'NOTICE',
+  code: '00000',
+  message: 'truncate cascades to table "principal_permission_grants"',
+  file: 'tablecmds.c',
+  line: '2020',
+  routine: 'ExecuteTruncateGuts'
+}
+{
+  severity_local: 'NOTICE',
+  severity: 'NOTICE',
+  code: '00000',
+  message: 'truncate cascades to table "issue_labels"',
+  file: 'tablecmds.c',
+  line: '2020',
+  routine: 'ExecuteTruncateGuts'
+}
+
+stdout | src/services/__tests__/legacy-execution-loop-repro.test.ts > legacy-execution recovery-action create/settle loop repro > creates one fresh recovery action per terminalize/settle cycle (N=3)
+{
+  severity_local: 'NOTICE',
+  severity: 'NOTICE',
+  code: '00000',
+  message: 'truncate cascades to table "labels"',
+  file: 'tablecmds.c',
+  line: '2020',
+  routine: 'ExecuteTruncateGuts'
+}
+{
+  severity_local: 'NOTICE',
+  severity: 'NOTICE',
+  code: '00000',
+  message: 'truncate cascades to table "project_workspaces"',
+  file: 'tablecmds.c',
+  line: '2020',
+  routine: 'ExecuteTruncateGuts'
+}
+{
+  severity_local: 'NOTICE',
+  severity: 'NOTICE',
+  code: '00000',
+  message: 'truncate cascades to table "issue_read_states"',
+  file: 'tablecmds.c',
+  line: '2020',
+  routine: 'ExecuteTruncateGuts'
+}
+{
+  severity_local: 'NOTICE',
+  severity: 'NOTICE',
+  code: '00000',
+  message: 'truncate cascades to table "workspace_runtime_services"',
+  file: 'tablecmds.c',
+  line: '2020',
+  routine: 'ExecuteTruncateGuts'
+}
+
+stdout | src/services/__tests__/legacy-execution-loop-repro.test.ts > legacy-execution recovery-action create/settle loop repro > creates one fresh recovery action per terminalize/settle cycle (N=3)
+{
+  severity_local: 'NOTICE',
+  severity: 'NOTICE',
+  code: '00000',
+  message: 'truncate cascades to table "document_revisions"',
+  file: 'tablecmds.c',
+  line: '2020',
+  routine: 'ExecuteTruncateGuts'
+}
+
+stdout | src/services/__tests__/legacy-execution-loop-repro.test.ts > legacy-execution recovery-action create/settle loop repro > creates one fresh recovery action per terminalize/settle cycle (N=3)
+{
+  severity_local: 'NOTICE',
+  severity: 'NOTICE',
+  code: '00000',
+  message: 'truncate cascades to table "documents"',
+  file: 'tablecmds.c',
+  line: '2020',
+  routine: 'ExecuteTruncateGuts'
+}
+
+stdout | src/services/__tests__/legacy-execution-loop-repro.test.ts > legacy-execution recovery-action create/settle loop repro > creates one fresh recovery action per terminalize/settle cycle (N=3)
+{
+  severity_local: 'NOTICE',
+  severity: 'NOTICE',
+  code: '00000',
+  message: 'truncate cascades to table "issue_documents"',
+  file: 'tablecmds.c',
+  line: '2020',
+  routine: 'ExecuteTruncateGuts'
+}
+{
+  severity_local: 'NOTICE',
+  severity: 'NOTICE',
+  code: '00000',
+  message: 'truncate cascades to table "plugin_config"',
+  file: 'tablecmds.c',
+  line: '2020',
+  routine: 'ExecuteTruncateGuts'
+}
+{
+  severity_local: 'NOTICE',
+  severity: 'NOTICE',
+  code: '00000',
+  message: 'truncate cascades to table "plugin_entities"',
+  file: 'tablecmds.c',
+  line: '2020',
+  routine: 'ExecuteTruncateGuts'
+}
+{
+  severity_local: 'NOTICE',
+  severity: 'NOTICE',
+  code: '00000',
+  message: 'truncate cascades to table "plugin_job_runs"',
+  file: 'tablecmds.c',
+  line: '2020',
+  routine: 'ExecuteTruncateGuts'
+}
+{
+  severity_local: 'NOTICE',
+  severity: 'NOTICE',
+  code: '00000',
+  message: 'truncate cascades to table "plugin_webhook_deliveries"',
+  file: 'tablecmds.c',
+  line: '2020',
+  routine: 'ExecuteTruncateGuts'
+}
+
+stdout | src/services/__tests__/legacy-execution-loop-repro.test.ts > legacy-execution recovery-action create/settle loop repro > creates one fresh recovery action per terminalize/settle cycle (N=3)
+{
+  severity_local: 'NOTICE',
+  severity: 'NOTICE',
+  code: '00000',
+  message: 'truncate cascades to table "plugin_company_settings"',
+  file: 'tablecmds.c',
+  line: '2020',
+  routine: 'ExecuteTruncateGuts'
+}
+{
+  severity_local: 'NOTICE',
+  severity: 'NOTICE',
+  code: '00000',
+  message: 'truncate cascades to table "plugin_logs"',
+  file: 'tablecmds.c',
+  line: '2020',
+  routine: 'ExecuteTruncateGuts'
+}
+{
+  severity_local: 'NOTICE',
+  severity: 'NOTICE',
+  code: '00000',
+  message: 'truncate cascades to table "company_logos"',
+  file: 'tablecmds.c',
+  line: '2020',
+  routine: 'ExecuteTruncateGuts'
+}
+{
+  severity_local: 'NOTICE',
+  severity: 'NOTICE',
+  code: '00000',
+  message: 'truncate cascades to table "finance_events"',
+  file: 'tablecmds.c',
+  line: '2020',
+  routine: 'ExecuteTruncateGuts'
+}
+
+stdout | src/services/__tests__/legacy-execution-loop-repro.test.ts > legacy-execution recovery-action create/settle loop repro > creates one fresh recovery action per terminalize/settle cycle (N=3)
+{
+  severity_local: 'NOTICE',
+  severity: 'NOTICE',
+  code: '00000',
+  message: 'truncate cascades to table "budget_incidents"',
+  file: 'tablecmds.c',
+  line: '2020',
+  routine: 'ExecuteTruncateGuts'
+}
+{
+  severity_local: 'NOTICE',
+  severity: 'NOTICE',
+  code: '00000',
+  message: 'truncate cascades to table "budget_policies"',
+  file: 'tablecmds.c',
+  line: '2020',
+  routine: 'ExecuteTruncateGuts'
+}
+{
+  severity_local: 'NOTICE',
+  severity: 'NOTICE',
+  code: '00000',
+  message: 'truncate cascades to table "execution_workspaces"',
+  file: 'tablecmds.c',
+  line: '2020',
+  routine: 'ExecuteTruncateGuts'
+}
+{
+  severity_local: 'NOTICE',
+  severity: 'NOTICE',
+  code: '00000',
+  message: 'truncate cascades to table "issue_work_products"',
+  file: 'tablecmds.c',
+  line: '2020',
+  routine: 'ExecuteTruncateGuts'
+}
+{
+  severity_local: 'NOTICE',
+  severity: 'NOTICE',
+  code: '00000',
+  message: 'truncate cascades to table "workspace_operations"',
+  file: 'tablecmds.c',
+  line: '2020',
+  routine: 'ExecuteTruncateGuts'
+}
+{
+  severity_local: 'NOTICE',
+  severity: 'NOTICE',
+  code: '00000',
+  message: 'truncate cascades to table "routine_runs"',
+  file: 'tablecmds.c',
+  line: '2020',
+  routine: 'ExecuteTruncateGuts'
+}
+
+stdout | src/services/__tests__/legacy-execution-loop-repro.test.ts > legacy-execution recovery-action create/settle loop repro > creates one fresh recovery action per terminalize/settle cycle (N=3)
+{
+  severity_local: 'NOTICE',
+  severity: 'NOTICE',
+  code: '00000',
+  message: 'truncate cascades to table "routine_triggers"',
+  file: 'tablecmds.c',
+  line: '2020',
+  routine: 'ExecuteTruncateGuts'
+}
+{
+  severity_local: 'NOTICE',
+  severity: 'NOTICE',
+  code: '00000',
+  message: 'truncate cascades to table "routines"',
+  file: 'tablecmds.c',
+  line: '2020',
+  routine: 'ExecuteTruncateGuts'
+}
+
+stdout | src/services/__tests__/legacy-execution-loop-repro.test.ts > legacy-execution recovery-action create/settle loop repro > creates one fresh recovery action per terminalize/settle cycle (N=3)
+{
+  severity_local: 'NOTICE',
+  severity: 'NOTICE',
+  code: '00000',
+  message: 'truncate cascades to table "company_skills"',
+  file: 'tablecmds.c',
+  line: '2020',
+  routine: 'ExecuteTruncateGuts'
+}
+{
+  severity_local: 'NOTICE',
+  severity: 'NOTICE',
+  code: '00000',
+  message: 'truncate cascades to table "cli_auth_challenges"',
+  file: 'tablecmds.c',
+  line: '2020',
+  routine: 'ExecuteTruncateGuts'
+}
+{
+  severity_local: 'NOTICE',
+  severity: 'NOTICE',
+  code: '00000',
+  message: 'truncate cascades to table "issue_inbox_archives"',
+  file: 'tablecmds.c',
+  line: '2020',
+  routine: 'ExecuteTruncateGuts'
+}
+
+stdout | src/services/__tests__/legacy-execution-loop-repro.test.ts > legacy-execution recovery-action create/settle loop repro > creates one fresh recovery action per terminalize/settle cycle (N=3)
+{
+  severity_local: 'NOTICE',
+  severity: 'NOTICE',
+  code: '00000',
+  message: 'truncate cascades to table "feedback_exports"',
+  file: 'tablecmds.c',
+  line: '2020',
+  routine: 'ExecuteTruncateGuts'
+}
+{
+  severity_local: 'NOTICE',
+  severity: 'NOTICE',
+  code: '00000',
+  message: 'truncate cascades to table "feedback_votes"',
+  file: 'tablecmds.c',
+  line: '2020',
+  routine: 'ExecuteTruncateGuts'
+}
+{
+  severity_local: 'NOTICE',
+  severity: 'NOTICE',
+  code: '00000',
+  message: 'truncate cascades to table "issue_relations"',
+  file: 'tablecmds.c',
+  line: '2020',
+  routine: 'ExecuteTruncateGuts'
+}
+
+stdout | src/services/__tests__/legacy-execution-loop-repro.test.ts > legacy-execution recovery-action create/settle loop repro > creates one fresh recovery action per terminalize/settle cycle (N=3)
+{
+  severity_local: 'NOTICE',
+  severity: 'NOTICE',
+  code: '00000',
+  message: 'truncate cascades to table "issue_execution_decisions"',
+  file: 'tablecmds.c',
+  line: '2020',
+  routine: 'ExecuteTruncateGuts'
+}
+{
+  severity_local: 'NOTICE',
+  severity: 'NOTICE',
+  code: '00000',
+  message: 'truncate cascades to table "inbox_dismissals"',
+  file: 'tablecmds.c',
+  line: '2020',
+  routine: 'ExecuteTruncateGuts'
+}
+{
+  severity_local: 'NOTICE',
+  severity: 'NOTICE',
+  code: '00000',
+  message: 'truncate cascades to table "company_user_sidebar_preferences"',
+  file: 'tablecmds.c',
+  line: '2020',
+  routine: 'ExecuteTruncateGuts'
+}
+
+stdout | src/services/__tests__/legacy-execution-loop-repro.test.ts > legacy-execution recovery-action create/settle loop repro > creates one fresh recovery action per terminalize/settle cycle (N=3)
+{
+  severity_local: 'NOTICE',
+  severity: 'NOTICE',
+  code: '00000',
+  message: 'truncate cascades to table "issue_reference_mentions"',
+  file: 'tablecmds.c',
+  line: '2020',
+  routine: 'ExecuteTruncateGuts'
+}
+
+stdout | src/services/__tests__/legacy-execution-loop-repro.test.ts > legacy-execution recovery-action create/settle loop repro > creates one fresh recovery action per terminalize/settle cycle (N=3)
+{
+  severity_local: 'NOTICE',
+  severity: 'NOTICE',
+  code: '00000',
+  message: 'truncate cascades to table "issue_thread_interactions"',
+  file: 'tablecmds.c',
+  line: '2020',
+  routine: 'ExecuteTruncateGuts'
+}
+{
+  severity_local: 'NOTICE',
+  severity: 'NOTICE',
+  code: '00000',
+  message: 'truncate cascades to table "environment_leases"',
+  file: 'tablecmds.c',
+  line: '2020',
+  routine: 'ExecuteTruncateGuts'
+}
+
+stdout | src/services/__tests__/legacy-execution-loop-repro.test.ts > legacy-execution recovery-action create/settle loop repro > creates one fresh recovery action per terminalize/settle cycle (N=3)
+{
+  severity_local: 'NOTICE',
+  severity: 'NOTICE',
+  code: '00000',
+  message: 'truncate cascades to table "issue_tree_holds"',
+  file: 'tablecmds.c',
+  line: '2020',
+  routine: 'ExecuteTruncateGuts'
+}
+{
+  severity_local: 'NOTICE',
+  severity: 'NOTICE',
+  code: '00000',
+  message: 'truncate cascades to table "issue_tree_hold_members"',
+  file: 'tablecmds.c',
+  line: '2020',
+  routine: 'ExecuteTruncateGuts'
+}
+
+stdout | src/services/__tests__/legacy-execution-loop-repro.test.ts > legacy-execution recovery-action create/settle loop repro > creates one fresh recovery action per terminalize/settle cycle (N=3)
+{
+  severity_local: 'NOTICE',
+  severity: 'NOTICE',
+  code: '00000',
+  message: 'truncate cascades to table "heartbeat_run_watchdog_decisions"',
+  file: 'tablecmds.c',
+  line: '2020',
+  routine: 'ExecuteTruncateGuts'
+}
+{
+  severity_local: 'NOTICE',
+  severity: 'NOTICE',
+  code: '00000',
+  message: 'truncate cascades to table "plugin_managed_resources"',
+  file: 'tablecmds.c',
+  line: '2020',
+  routine: 'ExecuteTruncateGuts'
+}
+{
+  severity_local: 'NOTICE',
+  severity: 'NOTICE',
+  code: '00000',
+  message: 'truncate cascades to table "routine_revisions"',
+  file: 'tablecmds.c',
+  line: '2020',
+  routine: 'ExecuteTruncateGuts'
+}
+
+stdout | src/services/__tests__/legacy-execution-loop-repro.test.ts > legacy-execution recovery-action create/settle loop repro > creates one fresh recovery action per terminalize/settle cycle (N=3)
+{
+  severity_local: 'NOTICE',
+  severity: 'NOTICE',
+  code: '00000',
+  message: 'truncate cascades to table "company_secret_bindings"',
+  file: 'tablecmds.c',
+  line: '2020',
+  routine: 'ExecuteTruncateGuts'
+}
+{
+  severity_local: 'NOTICE',
+  severity: 'NOTICE',
+  code: '00000',
+  message: 'truncate cascades to table "secret_access_events"',
+  file: 'tablecmds.c',
+  line: '2020',
+  routine: 'ExecuteTruncateGuts'
+}
+{
+  severity_local: 'NOTICE',
+  severity: 'NOTICE',
+  code: '00000',
+  message: 'truncate cascades to table "company_secret_provider_configs"',
+  file: 'tablecmds.c',
+  line: '2020',
+  routine: 'ExecuteTruncateGuts'
+}
+
+stdout | src/services/__tests__/legacy-execution-loop-repro.test.ts > legacy-execution recovery-action create/settle loop repro > creates one fresh recovery action per terminalize/settle cycle (N=3)
+{
+  severity_local: 'NOTICE',
+  severity: 'NOTICE',
+  code: '00000',
+  message: 'truncate cascades to table "issue_recovery_actions"',
+  file: 'tablecmds.c',
+  line: '2020',
+  routine: 'ExecuteTruncateGuts'
+}
+{
+  severity_local: 'NOTICE',
+  severity: 'NOTICE',
+  code: '00000',
+  message: 'truncate cascades to table "agent_memberships"',
+  file: 'tablecmds.c',
+  line: '2020',
+  routine: 'ExecuteTruncateGuts'
+}
+{
+  severity_local: 'NOTICE',
+  severity: 'NOTICE',
+  code: '00000',
+  message: 'truncate cascades to table "project_memberships"',
+  file: 'tablecmds.c',
+  line: '2020',
+  routine: 'ExecuteTruncateGuts'
+}
+{
+  severity_local: 'NOTICE',
+  severity: 'NOTICE',
+  code: '00000',
+  message: 'truncate cascades to table "document_annotation_threads"',
+  file: 'tablecmds.c',
+  line: '2020',
+  routine: 'ExecuteTruncateGuts'
+}
+
+stdout | src/services/__tests__/legacy-execution-loop-repro.test.ts > legacy-execution recovery-action create/settle loop repro > creates one fresh recovery action per terminalize/settle cycle (N=3)
+{
+  severity_local: 'NOTICE',
+  severity: 'NOTICE',
+  code: '00000',
+  message: 'truncate cascades to table "document_annotation_comments"',
+  file: 'tablecmds.c',
+  line: '2020',
+  routine: 'ExecuteTruncateGuts'
+}
+{
+  severity_local: 'NOTICE',
+  severity: 'NOTICE',
+  code: '00000',
+  message: 'truncate cascades to table "document_annotation_anchor_snapshots"',
+  file: 'tablecmds.c',
+  line: '2020',
+  routine: 'ExecuteTruncateGuts'
+}
+{
+  severity_local: 'NOTICE',
+  severity: 'NOTICE',
+  code: '00000',
+  message: 'truncate cascades to table "issue_plan_decompositions"',
+  file: 'tablecmds.c',
+  line: '2020',
+  routine: 'ExecuteTruncateGuts'
+}
+{
+  severity_local: 'NOTICE',
+  severity: 'NOTICE',
+  code: '00000',
+  message: 'truncate cascades to table "company_skill_versions"',
+  file: 'tablecmds.c',
+  line: '2020',
+  routine: 'ExecuteTruncateGuts'
+}
+{
+  severity_local: 'NOTICE',
+  severity: 'NOTICE',
+  code: '00000',
+  message: 'truncate cascades to table "company_skill_stars"',
+  file: 'tablecmds.c',
+  line: '2020',
+  routine: 'ExecuteTruncateGuts'
+}
+
+stdout | src/services/__tests__/legacy-execution-loop-repro.test.ts > legacy-execution recovery-action create/settle loop repro > creates one fresh recovery action per terminalize/settle cycle (N=3)
+{
+  severity_local: 'NOTICE',
+  severity: 'NOTICE',
+  code: '00000',
+  message: 'truncate cascades to table "company_skill_comments"',
+  file: 'tablecmds.c',
+  line: '2020',
+  routine: 'ExecuteTruncateGuts'
+}
+{
+  severity_local: 'NOTICE',
+  severity: 'NOTICE',
+  code: '00000',
+  message: 'truncate cascades to table "issue_watchdogs"',
+  file: 'tablecmds.c',
+  line: '2020',
+  routine: 'ExecuteTruncateGuts'
+}
+{
+  severity_local: 'NOTICE',
+  severity: 'NOTICE',
+  code: '00000',
+  message: 'truncate cascades to table "external_objects"',
+  file: 'tablecmds.c',
+  line: '2020',
+  routine: 'ExecuteTruncateGuts'
+}
+{
+  severity_local: 'NOTICE',
+  severity: 'NOTICE',
+  code: '00000',
+  message: 'truncate cascades to table "external_object_mentions"',
+  file: 'tablecmds.c',
+  line: '2020',
+  routine: 'ExecuteTruncateGuts'
+}
+{
+  severity_local: 'NOTICE',
+  severity: 'NOTICE',
+  code: '00000',
+  message: 'truncate cascades to table "routine_documents"',
+  file: 'tablecmds.c',
+  line: '2020',
+  routine: 'ExecuteTruncateGuts'
+}
+
+stdout | src/services/__tests__/legacy-execution-loop-repro.test.ts > legacy-execution recovery-action create/settle loop repro > creates one fresh recovery action per terminalize/settle cycle (N=3)
+{
+  severity_local: 'NOTICE',
+  severity: 'NOTICE',
+  code: '00000',
+  message: 'truncate cascades to table "pipeline_automation_executions"',
+  file: 'tablecmds.c',
+  line: '2020',
+  routine: 'ExecuteTruncateGuts'
+}
+{
+  severity_local: 'NOTICE',
+  severity: 'NOTICE',
+  code: '00000',
+  message: 'truncate cascades to table "pipeline_case_blockers"',
+  file: 'tablecmds.c',
+  line: '2020',
+  routine: 'ExecuteTruncateGuts'
+}
+{
+  severity_local: 'NOTICE',
+  severity: 'NOTICE',
+  code: '00000',
+  message: 'truncate cascades to table "pipeline_case_events"',
+  file: 'tablecmds.c',
+  line: '2020',
+  routine: 'ExecuteTruncateGuts'
+}
+{
+  severity_local: 'NOTICE',
+  severity: 'NOTICE',
+  code: '00000',
+  message: 'truncate cascades to table "pipeline_case_issue_links"',
+  file: 'tablecmds.c',
+  line: '2020',
+  routine: 'ExecuteTruncateGuts'
+}
+
+stdout | src/services/__tests__/legacy-execution-loop-repro.test.ts > legacy-execution recovery-action create/settle loop repro > creates one fresh recovery action per terminalize/settle cycle (N=3)
+{
+  severity_local: 'NOTICE',
+  severity: 'NOTICE',
+  code: '00000',
+  message: 'truncate cascades to table "pipeline_cases"',
+  file: 'tablecmds.c',
+  line: '2020',
+  routine: 'ExecuteTruncateGuts'
+}
+{
+  severity_local: 'NOTICE',
+  severity: 'NOTICE',
+  code: '00000',
+  message: 'truncate cascades to table "pipeline_documents"',
+  file: 'tablecmds.c',
+  line: '2020',
+  routine: 'ExecuteTruncateGuts'
+}
+{
+  severity_local: 'NOTICE',
+  severity: 'NOTICE',
+  code: '00000',
+  message: 'truncate cascades to table "pipelines"',
+  file: 'tablecmds.c',
+  line: '2020',
+  routine: 'ExecuteTruncateGuts'
+}
+{
+  severity_local: 'NOTICE',
+  severity: 'NOTICE',
+  code: '00000',
+  message: 'truncate cascades to table "pipeline_case_documents"',
+  file: 'tablecmds.c',
+  line: '2020',
+  routine: 'ExecuteTruncateGuts'
+}
+{
+  severity_local: 'NOTICE',
+  severity: 'NOTICE',
+  code: '00000',
+  message: 'truncate cascades to table "user_secret_definitions"',
+  file: 'tablecmds.c',
+  line: '2020',
+  routine: 'ExecuteTruncateGuts'
+}
+
+stdout | src/services/__tests__/legacy-execution-loop-repro.test.ts > legacy-execution recovery-action create/settle loop repro > creates one fresh recovery action per terminalize/settle cycle (N=3)
+{
+  severity_local: 'NOTICE',
+  severity: 'NOTICE',
+  code: '00000',
+  message: 'truncate cascades to table "user_secret_declarations"',
+  file: 'tablecmds.c',
+  line: '2020',
+  routine: 'ExecuteTruncateGuts'
+}
+{
+  severity_local: 'NOTICE',
+  severity: 'NOTICE',
+  code: '00000',
+  message: 'truncate cascades to table "company_skill_test_inputs"',
+  file: 'tablecmds.c',
+  line: '2020',
+  routine: 'ExecuteTruncateGuts'
+}
+{
+  severity_local: 'NOTICE',
+  severity: 'NOTICE',
+  code: '00000',
+  message: 'truncate cascades to table "company_skill_test_runs"',
+  file: 'tablecmds.c',
+  line: '2020',
+  routine: 'ExecuteTruncateGuts'
+}
+{
+  severity_local: 'NOTICE',
+  severity: 'NOTICE',
+  code: '00000',
+  message: 'truncate cascades to table "company_skill_test_run_templates"',
+  file: 'tablecmds.c',
+  line: '2020',
+  routine: 'ExecuteTruncateGuts'
+}
+
+stdout | src/services/__tests__/legacy-execution-loop-repro.test.ts > legacy-execution recovery-action create/settle loop repro > creates one fresh recovery action per terminalize/settle cycle (N=3)
+{
+  severity_local: 'NOTICE',
+  severity: 'NOTICE',
+  code: '00000',
+  message: 'truncate cascades to table "built_in_managed_resources"',
+  file: 'tablecmds.c',
+  line: '2020',
+  routine: 'ExecuteTruncateGuts'
+}
+{
+  severity_local: 'NOTICE',
+  severity: 'NOTICE',
+  code: '00000',
+  message: 'truncate cascades to table "cases"',
+  file: 'tablecmds.c',
+  line: '2020',
+  routine: 'ExecuteTruncateGuts'
+}
+{
+  severity_local: 'NOTICE',
+  severity: 'NOTICE',
+  code: '00000',
+  message: 'truncate cascades to table "case_issue_links"',
+  file: 'tablecmds.c',
+  line: '2020',
+  routine: 'ExecuteTruncateGuts'
+}
+{
+  severity_local: 'NOTICE',
+  severity: 'NOTICE',
+  code: '00000',
+  message: 'truncate cascades to table "case_events"',
+  file: 'tablecmds.c',
+  line: '2020',
+  routine: 'ExecuteTruncateGuts'
+}
+{
+  severity_local: 'NOTICE',
+  severity: 'NOTICE',
+  code: '00000',
+  message: 'truncate cascades to table "case_documents"',
+  file: 'tablecmds.c',
+  line: '2020',
+  routine: 'ExecuteTruncateGuts'
+}
+
+stdout | src/services/__tests__/legacy-execution-loop-repro.test.ts > legacy-execution recovery-action create/settle loop repro > creates one fresh recovery action per terminalize/settle cycle (N=3)
+{
+  severity_local: 'NOTICE',
+  severity: 'NOTICE',
+  code: '00000',
+  message: 'truncate cascades to table "case_labels"',
+  file: 'tablecmds.c',
+  line: '2020',
+  routine: 'ExecuteTruncateGuts'
+}
+{
+  severity_local: 'NOTICE',
+  severity: 'NOTICE',
+  code: '00000',
+  message: 'truncate cascades to table "case_attachments"',
+  file: 'tablecmds.c',
+  line: '2020',
+  routine: 'ExecuteTruncateGuts'
+}
+{
+  severity_local: 'NOTICE',
+  severity: 'NOTICE',
+  code: '00000',
+  message: 'truncate cascades to table "tool_applications"',
+  file: 'tablecmds.c',
+  line: '2020',
+  routine: 'ExecuteTruncateGuts'
+}
+
+stdout | src/services/__tests__/legacy-execution-loop-repro.test.ts > legacy-execution recovery-action create/settle loop repro > creates one fresh recovery action per terminalize/settle cycle (N=3)
+{
+  severity_local: 'NOTICE',
+  severity: 'NOTICE',
+  code: '00000',
+  message: 'truncate cascades to table "tool_connections"',
+  file: 'tablecmds.c',
+  line: '2020',
+  routine: 'ExecuteTruncateGuts'
+}
+{
+  severity_local: 'NOTICE',
+  severity: 'NOTICE',
+  code: '00000',
+  message: 'truncate cascades to table "tool_catalog_entries"',
+  file: 'tablecmds.c',
+  line: '2020',
+  routine: 'ExecuteTruncateGuts'
+}
+
+stdout | src/services/__tests__/legacy-execution-loop-repro.test.ts > legacy-execution recovery-action create/settle loop repro > creates one fresh recovery action per terminalize/settle cycle (N=3)
+{
+  severity_local: 'NOTICE',
+  severity: 'NOTICE',
+  code: '00000',
+  message: 'truncate cascades to table "tool_runtime_slots"',
+  file: 'tablecmds.c',
+  line: '2020',
+  routine: 'ExecuteTruncateGuts'
+}
+{
+  severity_local: 'NOTICE',
+  severity: 'NOTICE',
+  code: '00000',
+  message: 'truncate cascades to table "tool_access_audit_events"',
+  file: 'tablecmds.c',
+  line: '2020',
+  routine: 'ExecuteTruncateGuts'
+}
+{
+  severity_local: 'NOTICE',
+  severity: 'NOTICE',
+  code: '00000',
+  message: 'truncate cascades to table "tool_profiles"',
+  file: 'tablecmds.c',
+  line: '2020',
+  routine: 'ExecuteTruncateGuts'
+}
+
+stdout | src/services/__tests__/legacy-execution-loop-repro.test.ts > legacy-execution recovery-action create/settle loop repro > creates one fresh recovery action per terminalize/settle cycle (N=3)
+{
+  severity_local: 'NOTICE',
+  severity: 'NOTICE',
+  code: '00000',
+  message: 'truncate cascades to table "tool_profile_entries"',
+  file: 'tablecmds.c',
+  line: '2020',
+  routine: 'ExecuteTruncateGuts'
+}
+{
+  severity_local: 'NOTICE',
+  severity: 'NOTICE',
+  code: '00000',
+  message: 'truncate cascades to table "tool_profile_bindings"',
+  file: 'tablecmds.c',
+  line: '2020',
+  routine: 'ExecuteTruncateGuts'
+}
+{
+  severity_local: 'NOTICE',
+  severity: 'NOTICE',
+  code: '00000',
+  message: 'truncate cascades to table "tool_policies"',
+  file: 'tablecmds.c',
+  line: '2020',
+  routine: 'ExecuteTruncateGuts'
+}
+{
+  severity_local: 'NOTICE',
+  severity: 'NOTICE',
+  code: '00000',
+  message: 'truncate cascades to table "tool_invocations"',
+  file: 'tablecmds.c',
+  line: '2020',
+  routine: 'ExecuteTruncateGuts'
+}
+
+stdout | src/services/__tests__/legacy-execution-loop-repro.test.ts > legacy-execution recovery-action create/settle loop repro > creates one fresh recovery action per terminalize/settle cycle (N=3)
+{
+  severity_local: 'NOTICE',
+  severity: 'NOTICE',
+  code: '00000',
+  message: 'truncate cascades to table "tool_action_requests"',
+  file: 'tablecmds.c',
+  line: '2020',
+  routine: 'ExecuteTruncateGuts'
+}
+{
+  severity_local: 'NOTICE',
+  severity: 'NOTICE',
+  code: '00000',
+  message: 'truncate cascades to table "tool_call_events"',
+  file: 'tablecmds.c',
+  line: '2020',
+  routine: 'ExecuteTruncateGuts'
+}
+{
+  severity_local: 'NOTICE',
+  severity: 'NOTICE',
+  code: '00000',
+  message: 'truncate cascades to table "tool_rate_limit_counters"',
+  file: 'tablecmds.c',
+  line: '2020',
+  routine: 'ExecuteTruncateGuts'
+}
+
+stdout | src/services/__tests__/legacy-execution-loop-repro.test.ts > legacy-execution recovery-action create/settle loop repro > creates one fresh recovery action per terminalize/settle cycle (N=3)
+{
+  severity_local: 'NOTICE',
+  severity: 'NOTICE',
+  code: '00000',
+  message: 'truncate cascades to table "tool_gateway_sessions"',
+  file: 'tablecmds.c',
+  line: '2020',
+  routine: 'ExecuteTruncateGuts'
+}
+{
+  severity_local: 'NOTICE',
+  severity: 'NOTICE',
+  code: '00000',
+  message: 'truncate cascades to table "tool_stdio_command_templates"',
+  file: 'tablecmds.c',
+  line: '2020',
+  routine: 'ExecuteTruncateGuts'
+}
+{
+  severity_local: 'NOTICE',
+  severity: 'NOTICE',
+  code: '00000',
+  message: 'truncate cascades to table "tool_oauth_states"',
+  file: 'tablecmds.c',
+  line: '2020',
+  routine: 'ExecuteTruncateGuts'
+}
+
+stdout | src/services/__tests__/legacy-execution-loop-repro.test.ts > legacy-execution recovery-action create/settle loop repro > creates one fresh recovery action per terminalize/settle cycle (N=3)
+{
+  severity_local: 'NOTICE',
+  severity: 'NOTICE',
+  code: '00000',
+  message: 'truncate cascades to table "tool_mcp_gateways"',
+  file: 'tablecmds.c',
+  line: '2020',
+  routine: 'ExecuteTruncateGuts'
+}
+{
+  severity_local: 'NOTICE',
+  severity: 'NOTICE',
+  code: '00000',
+  message: 'truncate cascades to table "tool_mcp_gateway_tokens"',
+  file: 'tablecmds.c',
+  line: '2020',
+  routine: 'ExecuteTruncateGuts'
+}
+
+stdout | src/services/__tests__/legacy-execution-loop-repro.test.ts > legacy-execution recovery-action create/settle loop repro > creates one fresh recovery action per terminalize/settle cycle (N=3)
+{
+  severity_local: 'NOTICE',
+  severity: 'NOTICE',
+  code: '00000',
+  message: 'truncate cascades to table "tool_runtime_metric_counters"',
+  file: 'tablecmds.c',
+  line: '2020',
+  routine: 'ExecuteTruncateGuts'
+}
+{
+  severity_local: 'NOTICE',
+  severity: 'NOTICE',
+  code: '00000',
+  message: 'truncate cascades to table "connection_token_issuances"',
+  file: 'tablecmds.c',
+  line: '2020',
+  routine: 'ExecuteTruncateGuts'
+}
+
+stdout | src/services/__tests__/legacy-execution-loop-repro.test.ts > legacy-execution recovery-action create/settle loop repro > creates one fresh recovery action per terminalize/settle cycle (N=3)
+{
+  severity_local: 'NOTICE',
+  severity: 'NOTICE',
+  code: '00000',
+  message: 'truncate cascades to table "smoke_runs"',
+  file: 'tablecmds.c',
+  line: '2020',
+  routine: 'ExecuteTruncateGuts'
+}
+{
+  severity_local: 'NOTICE',
+  severity: 'NOTICE',
+  code: '00000',
+  message: 'truncate cascades to table "smoke_run_steps"',
+  file: 'tablecmds.c',
+  line: '2020',
+  routine: 'ExecuteTruncateGuts'
+}
+{
+  severity_local: 'NOTICE',
+  severity: 'NOTICE',
+  code: '00000',
+  message: 'truncate cascades to table "tool_connection_installs"',
+  file: 'tablecmds.c',
+  line: '2020',
+  routine: 'ExecuteTruncateGuts'
+}
+{
+  severity_local: 'NOTICE',
+  severity: 'NOTICE',
+  code: '00000',
+  message: 'truncate cascades to table "tool_gateway_rate_limit_counters"',
+  file: 'tablecmds.c',
+  line: '2020',
+  routine: 'ExecuteTruncateGuts'
+}
+
+stdout | src/services/__tests__/legacy-execution-loop-repro.test.ts > legacy-execution recovery-action create/settle loop repro > creates one fresh recovery action per terminalize/settle cycle (N=3)
+{
+  severity_local: 'NOTICE',
+  severity: 'NOTICE',
+  code: '00000',
+  message: 'truncate cascades to table "company_skill_policies"',
+  file: 'tablecmds.c',
+  line: '2020',
+  routine: 'ExecuteTruncateGuts'
+}
+{
+  severity_local: 'NOTICE',
+  severity: 'NOTICE',
+  code: '00000',
+  message: 'truncate cascades to table "issue_create_idempotency_keys"',
+  file: 'tablecmds.c',
+  line: '2020',
+  routine: 'ExecuteTruncateGuts'
+}
+{
+  severity_local: 'NOTICE',
+  severity: 'NOTICE',
+  code: '00000',
+  message: 'truncate cascades to table "user_inbox_agent_policies"',
+  file: 'tablecmds.c',
+  line: '2020',
+  routine: 'ExecuteTruncateGuts'
+}
+{
+  severity_local: 'NOTICE',
+  severity: 'NOTICE',
+  code: '00000',
+  message: 'truncate cascades to table "folders"',
+  file: 'tablecmds.c',
+  line: '2020',
+  routine: 'ExecuteTruncateGuts'
+}
+{
+  severity_local: 'NOTICE',
+  severity: 'NOTICE',
+  code: '00000',
+  message: 'truncate cascades to table "summary_slots"',
+  file: 'tablecmds.c',
+  line: '2020',
+  routine: 'ExecuteTruncateGuts'
+}
+
+stdout | src/services/__tests__/legacy-execution-loop-repro.test.ts > legacy-execution recovery-action create/settle loop repro > creates one fresh recovery action per terminalize/settle cycle (N=3)
+{
+  severity_local: 'NOTICE',
+  severity: 'NOTICE',
+  code: '00000',
+  message: 'truncate cascades to table "decision_training_examples"',
+  file: 'tablecmds.c',
+  line: '2020',
+  routine: 'ExecuteTruncateGuts'
+}
+{
+  severity_local: 'NOTICE',
+  severity: 'NOTICE',
+  code: '00000',
+  message: 'truncate cascades to table "connection_grants"',
+  file: 'tablecmds.c',
+  line: '2020',
+  routine: 'ExecuteTruncateGuts'
+}
+{
+  severity_local: 'NOTICE',
+  severity: 'NOTICE',
+  code: '00000',
+  message: 'truncate cascades to table "status_cards"',
+  file: 'tablecmds.c',
+  line: '2020',
+  routine: 'ExecuteTruncateGuts'
+}
+{
+  severity_local: 'NOTICE',
+  severity: 'NOTICE',
+  code: '00000',
+  message: 'truncate cascades to table "document_memberships"',
+  file: 'tablecmds.c',
+  line: '2020',
+  routine: 'ExecuteTruncateGuts'
+}
+
+stdout | src/services/__tests__/legacy-execution-loop-repro.test.ts > legacy-execution recovery-action create/settle loop repro > creates one fresh recovery action per terminalize/settle cycle (N=3)
+{
+  severity_local: 'NOTICE',
+  severity: 'NOTICE',
+  code: '00000',
+  message: 'truncate cascades to table "decision_bundles"',
+  file: 'tablecmds.c',
+  line: '2020',
+  routine: 'ExecuteTruncateGuts'
+}
+{
+  severity_local: 'NOTICE',
+  severity: 'NOTICE',
+  code: '00000',
+  message: 'truncate cascades to table "decisions"',
+  file: 'tablecmds.c',
+  line: '2020',
+  routine: 'ExecuteTruncateGuts'
+}
+{
+  severity_local: 'NOTICE',
+  severity: 'NOTICE',
+  code: '00000',
+  message: 'truncate cascades to table "decision_target_issues"',
+  file: 'tablecmds.c',
+  line: '2020',
+  routine: 'ExecuteTruncateGuts'
+}
+{
+  severity_local: 'NOTICE',
+  severity: 'NOTICE',
+  code: '00000',
+  message: 'truncate cascades to table "decision_queue_items"',
+  file: 'tablecmds.c',
+  line: '2020',
+  routine: 'ExecuteTruncateGuts'
+}
+{
+  severity_local: 'NOTICE',
+  severity: 'NOTICE',
+  code: '00000',
+  message: 'truncate cascades to table "decision_queues"',
+  file: 'tablecmds.c',
+  line: '2020',
+  routine: 'ExecuteTruncateGuts'
+}
+
+stdout | src/services/__tests__/legacy-execution-loop-repro.test.ts > legacy-execution recovery-action create/settle loop repro > creates one fresh recovery action per terminalize/settle cycle (N=3)
+{
+  severity_local: 'NOTICE',
+  severity: 'NOTICE',
+  code: '00000',
+  message: 'truncate cascades to table "decision_triage"',
+  file: 'tablecmds.c',
+  line: '2020',
+  routine: 'ExecuteTruncateGuts'
+}
+{
+  severity_local: 'NOTICE',
+  severity: 'NOTICE',
+  code: '00000',
+  message: 'truncate cascades to table "decision_triage_events"',
+  file: 'tablecmds.c',
+  line: '2020',
+  routine: 'ExecuteTruncateGuts'
+}
+{
+  severity_local: 'NOTICE',
+  severity: 'NOTICE',
+  code: '00000',
+  message: 'truncate cascades to table "decision_archive_notification_outbox"',
+  file: 'tablecmds.c',
+  line: '2020',
+  routine: 'ExecuteTruncateGuts'
+}
+{
+  severity_local: 'NOTICE',
+  severity: 'NOTICE',
+  code: '00000',
+  message: 'truncate cascades to table "decision_retention"',
+  file: 'tablecmds.c',
+  line: '2020',
+  routine: 'ExecuteTruncateGuts'
+}
+
+stdout | src/services/__tests__/legacy-execution-loop-repro.test.ts > legacy-execution recovery-action create/settle loop repro > creates one fresh recovery action per terminalize/settle cycle (N=3)
+{
+  severity_local: 'NOTICE',
+  severity: 'NOTICE',
+  code: '00000',
+  message: 'truncate cascades to table "company_secret_proposals"',
+  file: 'tablecmds.c',
+  line: '2020',
+  routine: 'ExecuteTruncateGuts'
+}
+{
+  severity_local: 'NOTICE',
+  severity: 'NOTICE',
+  code: '00000',
+  message: 'truncate cascades to table "company_transfer_runs"',
+  file: 'tablecmds.c',
+  line: '2020',
+  routine: 'ExecuteTruncateGuts'
+}
+{
+  severity_local: 'NOTICE',
+  severity: 'NOTICE',
+  code: '00000',
+  message: 'truncate cascades to table "adapter_auth_sessions"',
+  file: 'tablecmds.c',
+  line: '2020',
+  routine: 'ExecuteTruncateGuts'
+}
+{
+  severity_local: 'NOTICE',
+  severity: 'NOTICE',
+  code: '00000',
+  message: 'truncate cascades to table "company_onboarding_seeds"',
+  file: 'tablecmds.c',
+  line: '2020',
+  routine: 'ExecuteTruncateGuts'
+}
+{
+  severity_local: 'NOTICE',
+  severity: 'NOTICE',
+  code: '00000',
+  message: 'truncate cascades to table "execution_workspace_runtime_leases"',
+  file: 'tablecmds.c',
+  line: '2020',
+  routine: 'ExecuteTruncateGuts'
+}
+
+stdout | src/services/__tests__/legacy-execution-loop-repro.test.ts > legacy-execution recovery-action create/settle loop repro > creates one fresh recovery action per terminalize/settle cycle (N=3)
+{
+  severity_local: 'NOTICE',
+  severity: 'NOTICE',
+  code: '00000',
+  message: 'truncate cascades to table "completion_contracts"',
+  file: 'tablecmds.c',
+  line: '2020',
+  routine: 'ExecuteTruncateGuts'
+}
+{
+  severity_local: 'NOTICE',
+  severity: 'NOTICE',
+  code: '00000',
+  message: 'truncate cascades to table "native_run_finalizations"',
+  file: 'tablecmds.c',
+  line: '2020',
+  routine: 'ExecuteTruncateGuts'
+}
+{
+  severity_local: 'NOTICE',
+  severity: 'NOTICE',
+  code: '00000',
+  message: 'truncate cascades to table "native_run_results"',
+  file: 'tablecmds.c',
+  line: '2020',
+  routine: 'ExecuteTruncateGuts'
+}
+{
+  severity_local: 'NOTICE',
+  severity: 'NOTICE',
+  code: '00000',
+  message: 'truncate cascades to table "status_decision_effects"',
+  file: 'tablecmds.c',
+  line: '2020',
+  routine: 'ExecuteTruncateGuts'
+}
+{
+  severity_local: 'NOTICE',
+  severity: 'NOTICE',
+  code: '00000',
+  message: 'truncate cascades to table "status_decisions"',
+  file: 'tablecmds.c',
+  line: '2020',
+  routine: 'ExecuteTruncateGuts'
+}
+
+stdout | src/services/__tests__/legacy-execution-loop-repro.test.ts > legacy-execution recovery-action create/settle loop repro > creates one fresh recovery action per terminalize/settle cycle (N=3)
+{
+  severity_local: 'NOTICE',
+  severity: 'NOTICE',
+  code: '00000',
+  message: 'truncate cascades to table "work_assessments"',
+  file: 'tablecmds.c',
+  line: '2020',
+  routine: 'ExecuteTruncateGuts'
+}
+{
+  severity_local: 'NOTICE',
+  severity: 'NOTICE',
+  code: '00000',
+  message: 'truncate cascades to table "issue_question_response_deliveries"',
+  file: 'tablecmds.c',
+  line: '2020',
+  routine: 'ExecuteTruncateGuts'
+}
+{
+  severity_local: 'NOTICE',
+  severity: 'NOTICE',
+  code: '00000',
+  message: 'truncate cascades to table "connection_grant_members"',
+  file: 'tablecmds.c',
+  line: '2020',
+  routine: 'ExecuteTruncateGuts'
+}
+{
+  severity_local: 'NOTICE',
+  severity: 'NOTICE',
+  code: '00000',
+  message: 'truncate cascades to table "connection_grant_delegations"',
+  file: 'tablecmds.c',
+  line: '2020',
+  routine: 'ExecuteTruncateGuts'
+}
+{
+  severity_local: 'NOTICE',
+  severity: 'NOTICE',
+  code: '00000',
+  message: 'truncate cascades to table "provider_trace_records"',
+  file: 'tablecmds.c',
+  line: '2020',
+  routine: 'ExecuteTruncateGuts'
+}
+
+stdout | src/services/__tests__/legacy-execution-loop-repro.test.ts > legacy-execution recovery-action create/settle loop repro > creates one fresh recovery action per terminalize/settle cycle (N=3)
+{
+  severity_local: 'NOTICE',
+  severity: 'NOTICE',
+  code: '00000',
+  message: 'truncate cascades to table "managed_agent_profiles"',
+  file: 'tablecmds.c',
+  line: '2020',
+  routine: 'ExecuteTruncateGuts'
+}
+{
+  severity_local: 'NOTICE',
+  severity: 'NOTICE',
+  code: '00000',
+  message: 'truncate cascades to table "remote_agent_profiles"',
+  file: 'tablecmds.c',
+  line: '2020',
+  routine: 'ExecuteTruncateGuts'
+}
+{
+  severity_local: 'NOTICE',
+  severity: 'NOTICE',
+  code: '00000',
+  message: 'truncate cascades to table "connection_event_deliveries"',
+  file: 'tablecmds.c',
+  line: '2020',
+  routine: 'ExecuteTruncateGuts'
+}
+{
+  severity_local: 'NOTICE',
+  severity: 'NOTICE',
+  code: '00000',
+  message: 'truncate cascades to table "run_identity_contexts"',
+  file: 'tablecmds.c',
+  line: '2020',
+  routine: 'ExecuteTruncateGuts'
+}
+{
+  severity_local: 'NOTICE',
+  severity: 'NOTICE',
+  code: '00000',
+  message: 'truncate cascades to table "connection_intent_deliveries"',
+  file: 'tablecmds.c',
+  line: '2020',
+  routine: 'ExecuteTruncateGuts'
+}
+{
+  severity_local: 'NOTICE',
+  severity: 'NOTICE',
+  code: '00000',
+  message: 'truncate cascades to table "agent_session_goal_actions"',
+  file: 'tablecmds.c',
+  line: '2020',
+  routine: 'ExecuteTruncateGuts'
+}
+{
+  severity_local: 'NOTICE',
+  severity: 'NOTICE',
+  code: '00000',
+  message: 'truncate cascades to table "tool_action_deliveries"',
+  file: 'tablecmds.c',
+  line: '2020',
+  routine: 'ExecuteTruncateGuts'
+}
+
+stdout | src/services/__tests__/legacy-execution-loop-repro.test.ts > legacy-execution recovery-action create/settle loop repro > creates one fresh recovery action per terminalize/settle cycle (N=3)
+{
+  severity_local: 'NOTICE',
+  severity: 'NOTICE',
+  code: '00000',
+  message: 'truncate cascades to table "chat_actions"',
+  file: 'tablecmds.c',
+  line: '2020',
+  routine: 'ExecuteTruncateGuts'
+}
+{
+  severity_local: 'NOTICE',
+  severity: 'NOTICE',
+  code: '00000',
+  message: 'truncate cascades to table "chat_agent_routes"',
+  file: 'tablecmds.c',
+  line: '2020',
+  routine: 'ExecuteTruncateGuts'
+}
+{
+  severity_local: 'NOTICE',
+  severity: 'NOTICE',
+  code: '00000',
+  message: 'truncate cascades to table "chat_conversations"',
+  file: 'tablecmds.c',
+  line: '2020',
+  routine: 'ExecuteTruncateGuts'
+}
+{
+  severity_local: 'NOTICE',
+  severity: 'NOTICE',
+  code: '00000',
+  message: 'truncate cascades to table "chat_deliveries"',
+  file: 'tablecmds.c',
+  line: '2020',
+  routine: 'ExecuteTruncateGuts'
+}
+{
+  severity_local: 'NOTICE',
+  severity: 'NOTICE',
+  code: '00000',
+  message: 'truncate cascades to table "chat_endpoint_leases"',
+  file: 'tablecmds.c',
+  line: '2020',
+  routine: 'ExecuteTruncateGuts'
+}
+{
+  severity_local: 'NOTICE',
+  severity: 'NOTICE',
+  code: '00000',
+  message: 'truncate cascades to table "chat_endpoint_resources"',
+  file: 'tablecmds.c',
+  line: '2020',
+  routine: 'ExecuteTruncateGuts'
+}
+
+stdout | src/services/__tests__/legacy-execution-loop-repro.test.ts > legacy-execution recovery-action create/settle loop repro > creates one fresh recovery action per terminalize/settle cycle (N=3)
+{
+  severity_local: 'NOTICE',
+  severity: 'NOTICE',
+  code: '00000',
+  message: 'truncate cascades to table "chat_endpoints"',
+  file: 'tablecmds.c',
+  line: '2020',
+  routine: 'ExecuteTruncateGuts'
+}
+{
+  severity_local: 'NOTICE',
+  severity: 'NOTICE',
+  code: '00000',
+  message: 'truncate cascades to table "chat_external_principals"',
+  file: 'tablecmds.c',
+  line: '2020',
+  routine: 'ExecuteTruncateGuts'
+}
+{
+  severity_local: 'NOTICE',
+  severity: 'NOTICE',
+  code: '00000',
+  message: 'truncate cascades to table "chat_identity_links"',
+  file: 'tablecmds.c',
+  line: '2020',
+  routine: 'ExecuteTruncateGuts'
+}
+{
+  severity_local: 'NOTICE',
+  severity: 'NOTICE',
+  code: '00000',
+  message: 'truncate cascades to table "chat_message_links"',
+  file: 'tablecmds.c',
+  line: '2020',
+  routine: 'ExecuteTruncateGuts'
+}
+
+stdout | src/services/__tests__/legacy-execution-loop-repro.test.ts > legacy-execution recovery-action create/settle loop repro > creates one fresh recovery action per terminalize/settle cycle (N=3)
+{
+  severity_local: 'NOTICE',
+  severity: 'NOTICE',
+  code: '00000',
+  message: 'truncate cascades to table "chat_publications"',
+  file: 'tablecmds.c',
+  line: '2020',
+  routine: 'ExecuteTruncateGuts'
+}
+{
+  severity_local: 'NOTICE',
+  severity: 'NOTICE',
+  code: '00000',
+  message: 'truncate cascades to table "chat_sdk_state"',
+  file: 'tablecmds.c',
+  line: '2020',
+  routine: 'ExecuteTruncateGuts'
+}
+{
+  severity_local: 'NOTICE',
+  severity: 'NOTICE',
+  code: '00000',
+  message: 'truncate cascades to table "chat_teams_file_transfers"',
+  file: 'tablecmds.c',
+  line: '2020',
+  routine: 'ExecuteTruncateGuts'
+}
+{
+  severity_local: 'NOTICE',
+  severity: 'NOTICE',
+  code: '00000',
+  message: 'truncate cascades to table "ai_connection_defaults"',
+  file: 'tablecmds.c',
+  line: '2020',
+  routine: 'ExecuteTruncateGuts'
+}
+{
+  severity_local: 'NOTICE',
+  severity: 'NOTICE',
+  code: '00000',
+  message: 'truncate cascades to table "ai_provider_defaults"',
+  file: 'tablecmds.c',
+  line: '2020',
+  routine: 'ExecuteTruncateGuts'
+}
+
+stdout | src/services/__tests__/legacy-execution-loop-repro.test.ts > legacy-execution recovery-action create/settle loop repro > creates one fresh recovery action per terminalize/settle cycle (N=3)
+{
+  severity_local: 'NOTICE',
+  severity: 'NOTICE',
+  code: '00000',
+  message: 'truncate cascades to table "routine_webhook_test_receipts"',
+  file: 'tablecmds.c',
+  line: '2020',
+  routine: 'ExecuteTruncateGuts'
+}
+{
+  severity_local: 'NOTICE',
+  severity: 'NOTICE',
+  code: '00000',
+  message: 'truncate cascades to table "runner_api_response_reservations"',
+  file: 'tablecmds.c',
+  line: '2020',
+  routine: 'ExecuteTruncateGuts'
+}
+{
+  severity_local: 'NOTICE',
+  severity: 'NOTICE',
+  code: '00000',
+  message: 'truncate cascades to table "chat_completion_deliveries"',
+  file: 'tablecmds.c',
+  line: '2020',
+  routine: 'ExecuteTruncateGuts'
+}
+{
+  severity_local: 'NOTICE',
+  severity: 'NOTICE',
+  code: '00000',
+  message: 'truncate cascades to table "chat_task_handoffs"',
+  file: 'tablecmds.c',
+  line: '2020',
+  routine: 'ExecuteTruncateGuts'
+}
+{
+  severity_local: 'NOTICE',
+  severity: 'NOTICE',
+  code: '00000',
+  message: 'truncate cascades to table "browser_use_browsers"',
+  file: 'tablecmds.c',
+  line: '2020',
+  routine: 'ExecuteTruncateGuts'
+}
+{
+  severity_local: 'NOTICE',
+  severity: 'NOTICE',
+  code: '00000',
+  message: 'truncate cascades to table "browser_use_runs"',
+  file: 'tablecmds.c',
+  line: '2020',
+  routine: 'ExecuteTruncateGuts'
+}
+
+stdout | src/services/__tests__/legacy-execution-loop-repro.test.ts > legacy-execution recovery-action create/settle loop repro > creates one fresh recovery action per terminalize/settle cycle (N=3)
+{
+  severity_local: 'NOTICE',
+  severity: 'NOTICE',
+  code: '00000',
+  message: 'truncate cascades to table "browser_use_sessions"',
+  file: 'tablecmds.c',
+  line: '2020',
+  routine: 'ExecuteTruncateGuts'
+}
+{
+  severity_local: 'NOTICE',
+  severity: 'NOTICE',
+  code: '00000',
+  message: 'truncate cascades to table "browser_use_settings"',
+  file: 'tablecmds.c',
+  line: '2020',
+  routine: 'ExecuteTruncateGuts'
+}
+{
+  severity_local: 'NOTICE',
+  severity: 'NOTICE',
+  code: '00000',
+  message: 'truncate cascades to table "company_skill_source_entries"',
+  file: 'tablecmds.c',
+  line: '2020',
+  routine: 'ExecuteTruncateGuts'
+}
+{
+  severity_local: 'NOTICE',
+  severity: 'NOTICE',
+  code: '00000',
+  message: 'truncate cascades to table "company_skill_sources"',
+  file: 'tablecmds.c',
+  line: '2020',
+  routine: 'ExecuteTruncateGuts'
+}
+{
+  severity_local: 'NOTICE',
+  severity: 'NOTICE',
+  code: '00000',
+  message: 'truncate cascades to table "tool_connection_app_snapshots"',
+  file: 'tablecmds.c',
+  line: '2020',
+  routine: 'ExecuteTruncateGuts'
+}
+{
+  severity_local: 'NOTICE',
+  severity: 'NOTICE',
+  code: '00000',
+  message: 'truncate cascades to table "tool_connection_app_syncs"',
+  file: 'tablecmds.c',
+  line: '2020',
+  routine: 'ExecuteTruncateGuts'
+}
+{
+  severity_local: 'NOTICE',
+  severity: 'NOTICE',
+  code: '00000',
+  message: 'truncate cascades to table "resource_lifecycle_events"',
+  file: 'tablecmds.c',
+  line: '2020',
+  routine: 'ExecuteTruncateGuts'
+}
+
+stdout | src/services/__tests__/legacy-execution-loop-repro.test.ts > legacy-execution recovery-action create/settle loop repro > creates one fresh recovery action per terminalize/settle cycle (N=3)
+{
+  severity_local: 'NOTICE',
+  severity: 'NOTICE',
+  code: '00000',
+  message: 'truncate cascades to table "ai_connection_pools"',
+  file: 'tablecmds.c',
+  line: '2020',
+  routine: 'ExecuteTruncateGuts'
+}
+{
+  severity_local: 'NOTICE',
+  severity: 'NOTICE',
+  code: '00000',
+  message: 'truncate cascades to table "ai_connection_router_cursors"',
+  file: 'tablecmds.c',
+  line: '2020',
+  routine: 'ExecuteTruncateGuts'
+}
+{
+  severity_local: 'NOTICE',
+  severity: 'NOTICE',
+  code: '00000',
+  message: 'truncate cascades to table "ai_connection_task_pins"',
+  file: 'tablecmds.c',
+  line: '2020',
+  routine: 'ExecuteTruncateGuts'
+}
+{
+  severity_local: 'NOTICE',
+  severity: 'NOTICE',
+  code: '00000',
+  message: 'truncate cascades to table "mcp_mutation_receipts"',
+  file: 'tablecmds.c',
+  line: '2020',
+  routine: 'ExecuteTruncateGuts'
+}
+{
+  severity_local: 'NOTICE',
+  severity: 'NOTICE',
+  code: '00000',
+  message: 'truncate cascades to table "mcp_oauth_grants"',
+  file: 'tablecmds.c',
+  line: '2020',
+  routine: 'ExecuteTruncateGuts'
+}
+{
+  severity_local: 'NOTICE',
+  severity: 'NOTICE',
+  code: '00000',
+  message: 'truncate cascades to table "mcp_event_subscriptions"',
+  file: 'tablecmds.c',
+  line: '2020',
+  routine: 'ExecuteTruncateGuts'
+}
+{
+  severity_local: 'NOTICE',
+  severity: 'NOTICE',
+  code: '00000',
+  message: 'truncate cascades to table "mcp_event_admissions"',
+  file: 'tablecmds.c',
+  line: '2020',
+  routine: 'ExecuteTruncateGuts'
+}
+
+stdout | src/services/__tests__/legacy-execution-loop-repro.test.ts > legacy-execution recovery-action create/settle loop repro > creates one fresh recovery action per terminalize/settle cycle (N=3)
+{
+  severity_local: 'NOTICE',
+  severity: 'NOTICE',
+  code: '00000',
+  message: 'truncate cascades to table "company_secret_versions"',
+  file: 'tablecmds.c',
+  line: '2020',
+  routine: 'ExecuteTruncateGuts'
+}
+
+stdout | src/services/__tests__/legacy-execution-loop-repro.test.ts > legacy-execution recovery-action create/settle loop repro > creates one fresh recovery action per terminalize/settle cycle (N=3)
+{
+  severity_local: 'NOTICE',
+  severity: 'NOTICE',
+  code: '00000',
+  message: 'truncate cascades to table "pipeline_stages"',
+  file: 'tablecmds.c',
+  line: '2020',
+  routine: 'ExecuteTruncateGuts'
+}
+
+stdout | src/services/__tests__/legacy-execution-loop-repro.test.ts > legacy-execution recovery-action create/settle loop repro > creates one fresh recovery action per terminalize/settle cycle (N=3)
+{
+  severity_local: 'NOTICE',
+  severity: 'NOTICE',
+  code: '00000',
+  message: 'truncate cascades to table "pipeline_transitions"',
+  file: 'tablecmds.c',
+  line: '2020',
+  routine: 'ExecuteTruncateGuts'
+}
+
+stdout | src/services/__tests__/legacy-execution-loop-repro.test.ts > legacy-execution recovery-action create/settle loop repro > creates one fresh recovery action per terminalize/settle cycle (N=3)
+{
+  severity_local: 'NOTICE',
+  severity: 'NOTICE',
+  code: '00000',
+  message: 'truncate cascades to table "environment_custom_image_templates"',
+  file: 'tablecmds.c',
+  line: '2020',
+  routine: 'ExecuteTruncateGuts'
+}
+{
+  severity_local: 'NOTICE',
+  severity: 'NOTICE',
+  code: '00000',
+  message: 'truncate cascades to table "environment_custom_image_setup_sessions"',
+  file: 'tablecmds.c',
+  line: '2020',
+  routine: 'ExecuteTruncateGuts'
+}
+
+stdout | src/services/__tests__/legacy-execution-loop-repro.test.ts > legacy-execution recovery-action create/settle loop repro > creates one fresh recovery action per terminalize/settle cycle (N=3)
+{
+  severity_local: 'NOTICE',
+  severity: 'NOTICE',
+  code: '00000',
+  message: 'truncate cascades to table "status_card_updates"',
+  file: 'tablecmds.c',
+  line: '2020',
+  routine: 'ExecuteTruncateGuts'
+}
+
+stdout | src/services/__tests__/legacy-execution-loop-repro.test.ts > legacy-execution recovery-action create/settle loop repro > creates one fresh recovery action per terminalize/settle cycle (N=3)
+{
+  severity_local: 'NOTICE',
+  severity: 'NOTICE',
+  code: '00000',
+  message: 'truncate cascades to table "decision_effect_executions"',
+  file: 'tablecmds.c',
+  line: '2020',
+  routine: 'ExecuteTruncateGuts'
+}
+{
+  severity_local: 'NOTICE',
+  severity: 'NOTICE',
+  code: '00000',
+  message: 'truncate cascades to table "email_endpoints"',
+  file: 'tablecmds.c',
+  line: '2020',
+  routine: 'ExecuteTruncateGuts'
+}
+
+stdout | src/services/__tests__/legacy-execution-loop-repro.test.ts > legacy-execution recovery-action create/settle loop repro > creates one fresh recovery action per terminalize/settle cycle (N=3)
+{
+  severity_local: 'NOTICE',
+  severity: 'NOTICE',
+  code: '00000',
+  message: 'truncate cascades to table "email_messages"',
+  file: 'tablecmds.c',
+  line: '2020',
+  routine: 'ExecuteTruncateGuts'
+}
+{
+  severity_local: 'NOTICE',
+  severity: 'NOTICE',
+  code: '00000',
+  message: 'truncate cascades to table "email_sends"',
+  file: 'tablecmds.c',
+  line: '2020',
+  routine: 'ExecuteTruncateGuts'
+}
+
+stdout | src/services/__tests__/legacy-execution-loop-repro.test.ts > legacy-execution recovery-action create/settle loop repro > creates one fresh recovery action per terminalize/settle cycle (N=3)
+{
+  severity_local: 'NOTICE',
+  severity: 'NOTICE',
+  code: '00000',
+  message: 'truncate cascades to table "chat_github_configurations"',
+  file: 'tablecmds.c',
+  line: '2020',
+  routine: 'ExecuteTruncateGuts'
+}
+{
+  severity_local: 'NOTICE',
+  severity: 'NOTICE',
+  code: '00000',
+  message: 'truncate cascades to table "chat_github_registrations"',
+  file: 'tablecmds.c',
+  line: '2020',
+  routine: 'ExecuteTruncateGuts'
+}
+
+stdout | src/services/__tests__/legacy-execution-loop-repro.test.ts > legacy-execution recovery-action create/settle loop repro > creates one fresh recovery action per terminalize/settle cycle (N=3)
+{
+  severity_local: 'NOTICE',
+  severity: 'NOTICE',
+  code: '00000',
+  message: 'truncate cascades to table "chat_github_reviews"',
+  file: 'tablecmds.c',
+  line: '2020',
+  routine: 'ExecuteTruncateGuts'
+}
+{
+  severity_local: 'NOTICE',
+  severity: 'NOTICE',
+  code: '00000',
+  message: 'truncate cascades to table "agent_instruction_revisions"',
+  file: 'tablecmds.c',
+  line: '2020',
+  routine: 'ExecuteTruncateGuts'
+}
+
+stdout | src/services/__tests__/legacy-execution-loop-repro.test.ts > legacy-execution recovery-action create/settle loop repro > creates one fresh recovery action per terminalize/settle cycle (N=3)
+{
+  severity_local: 'NOTICE',
+  severity: 'NOTICE',
+  code: '00000',
+  message: 'truncate cascades to table "agent_instruction_working_copies"',
+  file: 'tablecmds.c',
+  line: '2020',
+  routine: 'ExecuteTruncateGuts'
+}
+{
+  severity_local: 'NOTICE',
+  severity: 'NOTICE',
+  code: '00000',
+  message: 'truncate cascades to table "mcp_oauth_requests"',
+  file: 'tablecmds.c',
+  line: '2020',
+  routine: 'ExecuteTruncateGuts'
+}
+
+stdout | src/services/__tests__/legacy-execution-loop-repro.test.ts > legacy-execution recovery-action create/settle loop repro > creates one fresh recovery action per terminalize/settle cycle (N=3)
+{
+  severity_local: 'NOTICE',
+  severity: 'NOTICE',
+  code: '00000',
+  message: 'truncate cascades to table "mcp_oauth_tokens"',
+  file: 'tablecmds.c',
+  line: '2020',
+  routine: 'ExecuteTruncateGuts'
+}
+{
+  severity_local: 'NOTICE',
+  severity: 'NOTICE',
+  code: '00000',
+  message: 'truncate cascades to table "mcp_event_deliveries"',
+  file: 'tablecmds.c',
+  line: '2020',
+  routine: 'ExecuteTruncateGuts'
+}
+{
+  severity_local: 'NOTICE',
+  severity: 'NOTICE',
+  code: '00000',
+  message: 'truncate cascades to table "mcp_oauth_device_requests"',
+  file: 'tablecmds.c',
+  line: '2020',
+  routine: 'ExecuteTruncateGuts'
+}
+
+stdout | src/services/__tests__/legacy-execution-loop-repro.test.ts > legacy-execution recovery-action create/settle loop repro > creates one fresh recovery action per terminalize/settle cycle (N=3)
+{
+  severity_local: 'NOTICE',
+  severity: 'NOTICE',
+  code: '00000',
+  message: 'truncate cascades to table "agent_instruction_heads"',
+  file: 'tablecmds.c',
+  line: '2020',
+  routine: 'ExecuteTruncateGuts'
+}
+
+ ✓ |@paperclipai/server| src/services/__tests__/legacy-execution-loop-repro.test.ts > legacy-execution recovery-action create/settle loop repro > creates one fresh recovery action per terminalize/settle cycle (N=3) 1863ms
+
+ Test Files  1 passed (1)
+      Tests  1 passed (1)
+   Start at  02:26:52
+   Duration  42.97s (transform 22.14s, setup 253ms, import 31.69s, tests 10.58s, environment 1ms)
+
