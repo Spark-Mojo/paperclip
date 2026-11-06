@@ -71,7 +71,7 @@ import {
   nativeRunnerOwnershipNotHeldCondition,
 } from "../native-runtime/native-runner-ownership.js";
 import { visibleIssueCondition } from "../issue-visibility.js";
-import { forbidden, notFound } from "../../errors.js";
+import { forbidden, HttpError, notFound } from "../../errors.js";
 import { logger } from "../../middleware/logger.js";
 import {
   isPidAlive,
@@ -176,6 +176,33 @@ const STRANDED_BOARD_ESCALATION_POLICY = "board_escalation_no_takeover_v1";
 const DISPOSITION_REPAIR_IDEMPOTENCY_INDEX =
   "agent_wakeup_requests_disposition_repair_idempotency_uq";
 const RESOLVED_DEPENDENCY_WAKE_BACKSTOP_CANDIDATE_LIMIT = 500;
+const RECOVERY_BLOCKER_GRAPH_QUERY_BATCH_SIZE = 500;
+const RECOVERY_BLOCKER_TRANSACTION_MAX_ATTEMPTS = 3;
+const RECOVERY_BLOCKER_TRANSACTION_RETRY_BASE_DELAY_MS = 10;
+const RECOVERY_BLOCKER_WRITE_BACKOFF_MS = 30_000;
+const RECOVERY_BLOCKER_TRANSACTION_RETRY_CODES = new Set([
+  "40P01",
+  "40001",
+  "55P03",
+]);
+
+function isRetryableRecoveryBlockerTransactionError(error: unknown) {
+  let current: unknown = error;
+  const seen = new Set<object>();
+  for (let depth = 0; depth < 5 && current && typeof current === "object"; depth += 1) {
+    if (seen.has(current)) break;
+    seen.add(current);
+    const candidate = current as { code?: unknown; cause?: unknown };
+    if (
+      typeof candidate.code === "string" &&
+      RECOVERY_BLOCKER_TRANSACTION_RETRY_CODES.has(candidate.code)
+    ) {
+      return true;
+    }
+    current = candidate.cause;
+  }
+  return false;
+}
 
 // GGU-809: when a stranded `in_progress` issue would otherwise hit the
 // `isRepeatedProductiveContinuationRecovery` escalation path, exempt the
@@ -2837,8 +2864,9 @@ export function recoveryService(
   async function existingUnresolvedBlockerIssues(
     companyId: string,
     issueId: string,
+    dbOrTx: Db = db,
   ) {
-    return db
+    return dbOrTx
       .select({ id: issueRelations.issueId, identifier: issues.identifier })
       .from(issueRelations)
       .innerJoin(
@@ -2861,10 +2889,569 @@ export function recoveryService(
   async function existingUnresolvedBlockerIssueIds(
     companyId: string,
     issueId: string,
+    dbOrTx: Db = db,
   ) {
-    return existingUnresolvedBlockerIssues(companyId, issueId).then((rows) =>
-      rows.map((row) => row.id),
+    return existingUnresolvedBlockerIssues(companyId, issueId, dbOrTx).then(
+      (rows) => rows.map((row) => row.id),
     );
+  }
+
+  type RecoveryBlockerSelection = {
+    blockerIds: string[];
+    existingIds: string[];
+    proposedIds: string[];
+    excludedIds: string[];
+    cycleInvolvedExistingIds: string[];
+    fingerprint: string;
+    refusalReason: "cycle" | "cycle_race" | null;
+  };
+
+  function recoveryBlockerSelectionFingerprint(input: {
+    existingIds: string[];
+    proposedIds: string[];
+    excludedIds: string[];
+    cycleInvolvedExistingIds: string[];
+    refusalReason: RecoveryBlockerSelection["refusalReason"];
+  }) {
+    return JSON.stringify({
+      existing: [...input.existingIds].sort(),
+      proposed: [...input.proposedIds].sort(),
+      excluded: [...input.excludedIds].sort(),
+      cycleInvolvedExisting: [...input.cycleInvolvedExistingIds].sort(),
+      reason: input.refusalReason,
+    });
+  }
+
+  async function selectCycleSafeRecoveryBlockers(input: {
+    companyId: string;
+    sourceIssueId: string;
+    existingIds: string[];
+    proposedIds: string[];
+    dbOrTx?: Db;
+  }): Promise<RecoveryBlockerSelection> {
+    const candidateExistingIds = [...new Set(input.existingIds)];
+    const proposedCandidates = [...new Set(input.proposedIds)].filter(
+      (id) => !candidateExistingIds.includes(id),
+    );
+
+    // Mirror issues.assertNoBlockingCycles without its company-wide load. There
+    // is no traversal cap: every frontier is fully read in bounded query batches,
+    // and the visited set makes corrupt pre-existing cycles terminate safely.
+    const downstream = new Set<string>([input.sourceIssueId]);
+    let frontier = [input.sourceIssueId];
+    while (frontier.length > 0) {
+      const next: string[] = [];
+      for (
+        let offset = 0;
+        offset < frontier.length;
+        offset += RECOVERY_BLOCKER_GRAPH_QUERY_BATCH_SIZE
+      ) {
+        const batch = frontier.slice(
+          offset,
+          offset + RECOVERY_BLOCKER_GRAPH_QUERY_BATCH_SIZE,
+        );
+        const rows = await (input.dbOrTx ?? db)
+          .select({ id: issueRelations.relatedIssueId })
+          .from(issueRelations)
+          .where(
+            and(
+              eq(issueRelations.companyId, input.companyId),
+              eq(issueRelations.type, "blocks"),
+              inArray(issueRelations.issueId, batch),
+            ),
+          );
+        for (const row of rows) {
+          if (downstream.has(row.id)) continue;
+          downstream.add(row.id);
+          next.push(row.id);
+        }
+      }
+      frontier = next;
+    }
+
+    const existingIds = candidateExistingIds;
+    const cycleInvolvedExistingIds = existingIds.filter((id) =>
+      downstream.has(id),
+    );
+    const proposedIds = proposedCandidates;
+    const excludedIds = proposedIds.filter((id) => downstream.has(id));
+    const excluded = new Set(excludedIds);
+    const blockerIds = [
+      ...existingIds,
+      ...(cycleInvolvedExistingIds.length > 0
+        ? []
+        : proposedIds.filter((id) => !excluded.has(id))),
+    ];
+    const refusalReason =
+      cycleInvolvedExistingIds.length > 0 || excludedIds.length > 0
+        ? "cycle"
+        : null;
+    return {
+      blockerIds,
+      existingIds,
+      proposedIds,
+      excludedIds,
+      cycleInvolvedExistingIds,
+      refusalReason,
+      fingerprint: recoveryBlockerSelectionFingerprint({
+        existingIds,
+        proposedIds,
+        excludedIds,
+        cycleInvolvedExistingIds,
+        refusalReason,
+      }),
+    };
+  }
+
+  async function updateWithCycleSafeRecoveryBlockers(input: {
+    companyId: string;
+    sourceIssueId: string;
+    proposedIds: string[];
+  }): Promise<{
+    updated: typeof issues.$inferSelect | null;
+    selection: RecoveryBlockerSelection;
+  }> {
+    if (input.proposedIds.includes(input.sourceIssueId)) {
+      throw new HttpError(422, "Issue cannot be blocked by itself");
+    }
+    for (
+      let attempt = 1;
+      attempt <= RECOVERY_BLOCKER_TRANSACTION_MAX_ATTEMPTS;
+      attempt += 1
+    ) {
+      // These queues belong to one transaction attempt. An aborted attempt must
+      // not publish its rolled-back activity or execute its post-commit work.
+      const publications: ActivityPublication[] = [];
+      const postCommitActions: IssuePostCommitAction[] = [];
+      let result: {
+        updated: typeof issues.$inferSelect | null;
+        selection: RecoveryBlockerSelection;
+      };
+      try {
+        result = await db.transaction(async (tx) => {
+          // Canonical blocker replacement locks its source before this ordered
+          // endpoint set. A concurrent reverse update can therefore still make
+          // PostgreSQL choose one transaction as a deadlock victim; the bounded
+          // outer retry re-runs every read and graph decision from scratch.
+          const endpointIds = [
+            ...new Set([input.sourceIssueId, ...input.proposedIds]),
+          ];
+          const [sourceEndpoint] = await tx
+            .select({ id: issues.id, identifier: issues.identifier })
+            .from(issues)
+            .where(
+              and(
+                eq(issues.companyId, input.companyId),
+                eq(issues.id, input.sourceIssueId),
+              ),
+            )
+            .for("update")
+            .limit(1);
+          if (!sourceEndpoint) {
+            const selection = await selectCycleSafeRecoveryBlockers({
+              companyId: input.companyId,
+              sourceIssueId: input.sourceIssueId,
+              existingIds: [],
+              proposedIds: input.proposedIds,
+              dbOrTx: tx as unknown as Db,
+            });
+            return { updated: null, selection };
+          }
+          const remainingEndpointIds = endpointIds
+            .filter((id) => id !== input.sourceIssueId)
+            .sort();
+          if (remainingEndpointIds.length > 0) {
+            const lockedEndpoints = await tx
+              .select({ id: issues.id })
+              .from(issues)
+              .where(
+                and(
+                  eq(issues.companyId, input.companyId),
+                  inArray(issues.id, remainingEndpointIds),
+                ),
+              )
+              .orderBy(asc(issues.id))
+              .for("update");
+            if (lockedEndpoints.length !== remainingEndpointIds.length) {
+              throw new HttpError(
+                422,
+                "Blocked-by issues must belong to the same company",
+              );
+            }
+          }
+          const existingIds = await existingUnresolvedBlockerIssueIds(
+            input.companyId,
+            input.sourceIssueId,
+            tx as unknown as Db,
+          );
+          let selection = await selectCycleSafeRecoveryBlockers({
+            companyId: input.companyId,
+            sourceIssueId: input.sourceIssueId,
+            existingIds,
+            proposedIds: input.proposedIds,
+            dbOrTx: tx as unknown as Db,
+          });
+
+          if (selection.cycleInvolvedExistingIds.length === 0) {
+            return {
+              updated: await issuesSvc.update(
+                input.sourceIssueId,
+                { status: "blocked", blockedByIssueIds: selection.blockerIds },
+                tx,
+                publications,
+                postCommitActions,
+              ),
+              selection,
+            };
+          }
+
+          const safeProposedIdsBeforeLock = selection.proposedIds.filter(
+            (id) => !selection.excludedIds.includes(id),
+          );
+          if (safeProposedIdsBeforeLock.length === 0) {
+            return {
+              updated: await issuesSvc.update(
+                input.sourceIssueId,
+                { status: "blocked" },
+                tx,
+                publications,
+                postCommitActions,
+              ),
+              selection: {
+                ...selection,
+                blockerIds: selection.existingIds,
+              },
+            };
+          }
+
+          // A replacement write cannot include a corrupt persisted edge: the issue
+          // service correctly rejects the whole set as cyclic. Keep that edge and
+          // use the exceptional append path. First serialize against every
+          // canonical relation writer, then re-read the graph under that table
+          // lock: the pre-lock scan avoids taking the heavyweight lock for normal
+          // and unchanged refused shapes, while this second scan closes phantom
+          // bridge races before any safe candidate is inserted.
+          await tx.execute(sql`set local lock_timeout = '2s'`);
+          await tx.execute(
+            sql`lock table issue_relations in share row exclusive mode`,
+          );
+          const lockedExistingIds = await existingUnresolvedBlockerIssueIds(
+            input.companyId,
+            input.sourceIssueId,
+            tx as unknown as Db,
+          );
+          selection = await selectCycleSafeRecoveryBlockers({
+            companyId: input.companyId,
+            sourceIssueId: input.sourceIssueId,
+            existingIds: lockedExistingIds,
+            proposedIds: input.proposedIds,
+            dbOrTx: tx as unknown as Db,
+          });
+          const safeProposedIds = selection.proposedIds.filter(
+            (id) => !selection.excludedIds.includes(id),
+          );
+          if (selection.cycleInvolvedExistingIds.length === 0) {
+            return {
+              updated: await issuesSvc.update(
+                input.sourceIssueId,
+                { status: "blocked", blockedByIssueIds: selection.blockerIds },
+                tx,
+                publications,
+                postCommitActions,
+              ),
+              selection,
+            };
+          }
+          const updated = await issuesSvc.update(
+            input.sourceIssueId,
+            { status: "blocked" },
+            tx,
+            publications,
+            postCommitActions,
+          );
+          let insertedProposedIds: string[] = [];
+          if (safeProposedIds.length > 0) {
+            insertedProposedIds = await tx
+              .insert(issueRelations)
+              .values(
+                safeProposedIds.map((blockerIssueId) => ({
+                  companyId: input.companyId,
+                  issueId: blockerIssueId,
+                  relatedIssueId: input.sourceIssueId,
+                  type: "blocks" as const,
+                })),
+              )
+              .onConflictDoNothing()
+              .returning({ id: issueRelations.issueId })
+              .then((rows) => rows.map((row) => row.id));
+            if (insertedProposedIds.length > 0) {
+              // This append path deliberately preserves every persisted relation,
+              // including blockers whose issues are already resolved. Report the
+              // complete post-write relation state rather than the unresolved set
+              // used by cycle selection.
+              const finalBlockerIds = await tx
+                .select({ id: issueRelations.issueId })
+                .from(issueRelations)
+                .where(
+                  and(
+                    eq(issueRelations.companyId, input.companyId),
+                    eq(issueRelations.relatedIssueId, input.sourceIssueId),
+                    eq(issueRelations.type, "blocks"),
+                  ),
+                )
+                .orderBy(asc(issueRelations.createdAt), asc(issueRelations.id))
+                .then((rows) => rows.map((row) => row.id));
+              const blockerSummaries = await tx
+                .select({
+                  id: issues.id,
+                  identifier: issues.identifier,
+                  title: issues.title,
+                })
+                .from(issues)
+                .where(
+                  and(
+                    eq(issues.companyId, input.companyId),
+                    inArray(issues.id, finalBlockerIds),
+                  ),
+                );
+              const summariesById = new Map(
+                blockerSummaries.map((summary) => [summary.id, summary]),
+              );
+              const persistedBlockerSummaries = finalBlockerIds
+                .map((id) => summariesById.get(id))
+                .filter((summary): summary is (typeof blockerSummaries)[number] =>
+                  Boolean(summary),
+                );
+              const inserted = new Set(insertedProposedIds);
+              await logActivity(
+                tx as unknown as Db,
+                {
+                  companyId: input.companyId,
+                  actorType: "system",
+                  actorId: "recovery",
+                  action: "issue.blockers_updated",
+                  entityType: "issue",
+                  entityId: input.sourceIssueId,
+                  details: {
+                    identifier: sourceEndpoint.identifier,
+                    source: "recovery.cycle_safe_blocker_append",
+                    blockedByIssueIds: finalBlockerIds,
+                    addedBlockedByIssueIds: insertedProposedIds,
+                    removedBlockedByIssueIds: [],
+                    blockedByIssues: persistedBlockerSummaries,
+                    addedBlockedByIssues: persistedBlockerSummaries.filter((row) =>
+                      inserted.has(row.id),
+                    ),
+                    removedBlockedByIssues: [],
+                  },
+                },
+                publications,
+              );
+            }
+          }
+          return {
+            updated,
+            selection: {
+              ...selection,
+              blockerIds: [...selection.existingIds, ...insertedProposedIds],
+            },
+          };
+        });
+      } catch (error) {
+        if (!isRetryableRecoveryBlockerTransactionError(error)) throw error;
+        if (attempt < RECOVERY_BLOCKER_TRANSACTION_MAX_ATTEMPTS) {
+          await new Promise((resolve) =>
+            setTimeout(
+              resolve,
+              RECOVERY_BLOCKER_TRANSACTION_RETRY_BASE_DELAY_MS * attempt,
+            ),
+          );
+          continue;
+        }
+        break;
+      }
+      // Transaction commit succeeded. Publication and post-commit failures are
+      // not transaction aborts and must never replay the already-committed write.
+      for (const publication of publications) publishActivity(publication);
+      await executeIssuePostCommitActions(db, postCommitActions);
+      return result;
+    }
+
+    // The contended transaction exhausted its bounded retry budget. Re-read the
+    // current graph instead of reusing an aborted attempt's selection, refuse
+    // every still-proposed append as a cycle race, and take the source-only
+    // blocked path so the sweeper backs off rather than failing every heartbeat.
+    const existingIds = await existingUnresolvedBlockerIssueIds(
+      input.companyId,
+      input.sourceIssueId,
+    );
+    const current = await selectCycleSafeRecoveryBlockers({
+      companyId: input.companyId,
+      sourceIssueId: input.sourceIssueId,
+      existingIds,
+      proposedIds: input.proposedIds,
+    });
+    const selection: RecoveryBlockerSelection = {
+      ...current,
+      blockerIds: current.existingIds,
+      excludedIds: current.proposedIds,
+      refusalReason: "cycle_race",
+      fingerprint: recoveryBlockerSelectionFingerprint({
+        existingIds: current.existingIds,
+        proposedIds: current.proposedIds,
+        excludedIds: current.proposedIds,
+        cycleInvolvedExistingIds: current.cycleInvolvedExistingIds,
+        refusalReason: "cycle_race",
+      }),
+    };
+    for (
+      let fallbackAttempt = 1;
+      fallbackAttempt <= RECOVERY_BLOCKER_TRANSACTION_MAX_ATTEMPTS;
+      fallbackAttempt += 1
+    ) {
+      const fallbackPublications: ActivityPublication[] = [];
+      const fallbackPostCommitActions: IssuePostCommitAction[] = [];
+      let updated: typeof issues.$inferSelect | null;
+      try {
+        updated = await issuesSvc.update(
+          input.sourceIssueId,
+          { status: "blocked" },
+          db,
+          fallbackPublications,
+          fallbackPostCommitActions,
+        );
+      } catch (error) {
+        if (!isRetryableRecoveryBlockerTransactionError(error)) throw error;
+        if (fallbackAttempt < RECOVERY_BLOCKER_TRANSACTION_MAX_ATTEMPTS) {
+          await new Promise((resolve) =>
+            setTimeout(
+              resolve,
+              RECOVERY_BLOCKER_TRANSACTION_RETRY_BASE_DELAY_MS * fallbackAttempt,
+            ),
+          );
+          continue;
+        }
+        logger.warn(
+          {
+            companyId: input.companyId,
+            issueId: input.sourceIssueId,
+            retryAttempts: fallbackAttempt,
+            refusalReason: selection.refusalReason,
+          },
+          "recovery blocker cycle-race status-only fallback remained contended",
+        );
+        return { updated: null, selection };
+      }
+      for (const publication of fallbackPublications)
+        publishActivity(publication);
+      await executeIssuePostCommitActions(db, fallbackPostCommitActions);
+      return { updated, selection };
+    }
+    return { updated: null, selection };
+  }
+
+  async function deferRecoveryBlockerWrite(
+    actionId: string,
+    selection: RecoveryBlockerSelection,
+  ) {
+    const now = new Date();
+    const retryNotBefore = new Date(
+      now.getTime() + RECOVERY_BLOCKER_WRITE_BACKOFF_MS,
+    ).toISOString();
+    await db.transaction(async (tx) => {
+      const action = await tx
+        .select({
+          evidence: issueRecoveryActions.evidence,
+          wakePolicy: issueRecoveryActions.wakePolicy,
+        })
+        .from(issueRecoveryActions)
+        .where(eq(issueRecoveryActions.id, actionId))
+        .for("update")
+        .limit(1)
+        .then((rows) => rows[0] ?? null);
+      if (!action) return;
+      const evidence = parseObject(action.evidence);
+      await tx
+        .update(issueRecoveryActions)
+        .set({
+          evidence: {
+            ...evidence,
+            recoveryBlockerWriteDeferred: {
+              fingerprint: selection.fingerprint,
+              reason: selection.refusalReason,
+              retryNotBefore,
+              recordedAt: now.toISOString(),
+            },
+          },
+          wakePolicy: {
+            ...parseObject(action.wakePolicy),
+            retryNotBefore,
+          },
+          updatedAt: now,
+        })
+        .where(eq(issueRecoveryActions.id, actionId));
+    });
+  }
+
+  async function appendRecoveryBlockerEvidence(
+    actionId: string,
+    selection: RecoveryBlockerSelection,
+  ) {
+    if (
+      selection.refusalReason === null &&
+      selection.excludedIds.length === 0 &&
+      selection.cycleInvolvedExistingIds.length === 0
+    ) return;
+    await db.transaction(async (tx) => {
+      const action = await tx
+        .select({ evidence: issueRecoveryActions.evidence })
+        .from(issueRecoveryActions)
+        .where(eq(issueRecoveryActions.id, actionId))
+        .for("update")
+        .limit(1)
+        .then((rows) => rows[0] ?? null);
+      if (!action) return;
+      const evidence = parseObject(action.evidence);
+      const prior = Array.isArray(evidence.recoveryBlockerRefusals)
+        ? evidence.recoveryBlockerRefusals.filter(
+            (entry): entry is Record<string, unknown> =>
+              Boolean(entry) && typeof entry === "object" && !Array.isArray(entry),
+          )
+        : [];
+      if (prior.some((entry) => entry.fingerprint === selection.fingerprint)) {
+        return;
+      }
+      await tx
+        .update(issueRecoveryActions)
+        .set({
+          evidence: {
+            ...evidence,
+            recoveryBlockerRefusals: [
+              ...prior,
+              {
+                fingerprint: selection.fingerprint,
+                excludedIds: selection.excludedIds,
+                cycleInvolvedExistingIds:
+                  selection.cycleInvolvedExistingIds,
+                reason: selection.refusalReason,
+                recordedAt: new Date().toISOString(),
+              },
+            ],
+          },
+          updatedAt: new Date(),
+        })
+        .where(eq(issueRecoveryActions.id, actionId));
+    });
+  }
+
+  async function persistRecoveryBlockerSelection(
+    actionId: string,
+    selection: RecoveryBlockerSelection,
+  ) {
+    await appendRecoveryBlockerEvidence(actionId, selection);
+    if (selection.refusalReason !== "cycle_race") return false;
+    await deferRecoveryBlockerWrite(actionId, selection);
+    return true;
   }
 
   async function openChildIssues(issue: typeof issues.$inferSelect) {
@@ -2913,34 +3500,78 @@ export function recoveryService(
   async function resolveContinuationWaitingOnReview(
     issue: typeof issues.$inferSelect,
   ) {
+    const activeRecoveryAction = await recoveryActionsSvc.getActiveForIssue(
+      issue.companyId,
+      issue.id,
+    );
+    const blockerWriteDeferred = parseObject(
+      parseObject(activeRecoveryAction?.evidence).recoveryBlockerWriteDeferred,
+    );
+    const blockerWriteRetryNotBefore = readNonEmptyString(
+      blockerWriteDeferred.retryNotBefore,
+    );
+    if (
+      blockerWriteRetryNotBefore &&
+      new Date(blockerWriteRetryNotBefore).getTime() > Date.now()
+    ) {
+      return "deferred" as const;
+    }
+
     const [existingBlockers, openChildren] = await Promise.all([
       existingUnresolvedBlockerIssues(issue.companyId, issue.id),
       openChildIssues(issue),
     ]);
-    const blockedByIssueIds = [
-      ...new Set([
-        ...existingBlockers.map((row) => row.id),
-        ...openChildren.map((row) => row.id),
-      ]),
-    ];
-    if (blockedByIssueIds.length === 0) return null;
-
-    const updated = await issuesSvc.update(issue.id, {
-      status: "blocked",
-      blockedByIssueIds,
+    const proposedIds = openChildren.map((row) => row.id);
+    if (existingBlockers.length === 0 && proposedIds.length === 0) return null;
+    const { updated, selection } = await updateWithCycleSafeRecoveryBlockers({
+      companyId: issue.companyId,
+      sourceIssueId: issue.id,
+      proposedIds,
     });
+    if (selection.refusalReason === "cycle_race") {
+      const recoveryAction =
+        activeRecoveryAction ??
+        (await ensureSourceScopedStrandedRecoveryAction({
+          issue,
+          previousStatus: issue.status as StrandedPreviousStatus,
+          latestRun: await getLatestIssueRun(issue.companyId, issue.id),
+          recoveryCause: "deliberate_wait_without_target",
+        }));
+      await persistRecoveryBlockerSelection(recoveryAction.id, selection);
+    }
     if (!updated) return null;
+    const blockedByIssueIds = selection.blockerIds;
+    const excludedIds = selection.excludedIds;
+    const cycleInvolvedExistingIds = selection.cycleInvolvedExistingIds;
+    const refusalReason: RecoveryBlockerSelection["refusalReason"] =
+      selection.refusalReason;
 
-    const waitingOn = formatIssueLinksForComment([
-      ...openChildren,
-      ...existingBlockers,
-    ]);
+    const blockerIdSet = new Set(blockedByIssueIds);
+    const waitingOn = formatIssueLinksForComment(
+      [...openChildren, ...existingBlockers].filter((row) =>
+        blockerIdSet.has(row.id),
+      ),
+    );
+    const cycleEvidence = [
+      excludedIds.length > 0
+        ? `${refusalReason === "cycle_race" ? "Race-refused" : "Cycle-excluded"} proposed blocker ids: ${excludedIds.join(", ")}.`
+        : "",
+      cycleInvolvedExistingIds.length > 0
+        ? `Persisted cycle-involved blocker ids preserved without relation rewrite: ${cycleInvolvedExistingIds.join(", ")}.`
+        : "",
+      refusalReason === "cycle_race"
+        ? "The blocker transaction exhausted its bounded concurrency retry budget."
+        : "",
+    ].filter(Boolean).join(" ");
     await issuesSvc.addComment(
       issue.id,
-      `This task is waiting on ${waitingOn} to finish. ` +
-        "It will continue automatically when that work is done — there's nothing you need to do. " +
+      (blockedByIssueIds.length > 0
+        ? `This task is waiting on ${waitingOn} to finish. ` +
+          "It will continue automatically when that work is done — there's nothing you need to do. "
+        : "This task remains blocked, but no proposed dependency could be attached safely. ") +
         "(It was paused because the latest run reported it was waiting for review/approval; " +
-        "Paperclip turned that into a normal dependency wait instead of flagging it as stuck.)",
+        "Paperclip turned that into a normal dependency wait instead of flagging it as stuck.)" +
+        (cycleEvidence ? ` ${cycleEvidence}` : ""),
       {},
       {
         authorType: "system",
@@ -2966,8 +3597,26 @@ export function recoveryService(
                 {
                   type: "key_value",
                   label: "Blocking issues",
-                  value: blockedByIssueIds.join(", ").slice(0, 2000),
+                  value:
+                    blockedByIssueIds.join(", ").slice(0, 2000) || "(none)",
                 },
+                ...(excludedIds.length > 0
+                  ? [{
+                      type: "key_value" as const,
+                      label:
+                        refusalReason === "cycle_race"
+                          ? "Race-refused proposed issues"
+                          : "Cycle-excluded proposed issues",
+                      value: excludedIds.join(", ").slice(0, 2000),
+                    }]
+                  : []),
+                ...(cycleInvolvedExistingIds.length > 0
+                  ? [{
+                      type: "key_value" as const,
+                      label: "Preserved cycle-involved blockers",
+                      value: cycleInvolvedExistingIds.join(", ").slice(0, 2000),
+                    }]
+                  : []),
               ],
             },
           ],
@@ -2989,9 +3638,14 @@ export function recoveryService(
         previousStatus: issue.status,
         source: "recovery.reconcile_continuation_waiting_on_review",
         blockedByIssueIds,
+        recoveryBlockerRefusalReason: refusalReason,
+        cycleExcludedBlockerIssueIds: excludedIds,
+        cycleInvolvedExistingBlockerIssueIds: cycleInvolvedExistingIds,
       },
     });
-    return updated;
+    return refusalReason === "cycle_race"
+      ? ("deferred_after_update" as const)
+      : updated;
   }
 
   function readDispositionRepairAttempt(latestRun: LatestIssueRun) {
@@ -3453,33 +4107,105 @@ export function recoveryService(
         continue;
       }
 
+      const blockerWriteDeferred = parseObject(
+        parseObject(action.evidence).recoveryBlockerWriteDeferred,
+      );
+      const blockerWriteRetryNotBefore = readNonEmptyString(
+        blockerWriteDeferred.retryNotBefore,
+      );
+      if (
+        blockerWriteRetryNotBefore &&
+        new Date(blockerWriteRetryNotBefore).getTime() > Date.now()
+      ) {
+        result.skipped += 1;
+        continue;
+      }
+
       const [sourceState, healthyChildren, hasNewSourcePath] =
         await Promise.all([
           collectDispositionRepairSourceState(db, { issue }),
           healthyOpenChildIssues(issue),
           sourceHasNewPathOutsideRecoveryAction(action),
         ]);
+      const healthyChildSelection = await selectCycleSafeRecoveryBlockers({
+        companyId: issue.companyId,
+        sourceIssueId: issue.id,
+        existingIds: [],
+        proposedIds: healthyChildren.map((child) => child.id),
+      });
+      await persistRecoveryBlockerSelection(action.id, healthyChildSelection);
+      const healthyChildIds = new Set(healthyChildSelection.blockerIds);
+      const safeHealthyChildren = healthyChildren.filter((child) =>
+        healthyChildIds.has(child.id),
+      );
       const durablePathRestored =
         action.ownerType !== "board" && sourceState.hasDurableWaitingPath;
+      const allHealthyChildrenCycleExcluded =
+        healthyChildren.length > 0 && safeHealthyChildren.length === 0;
+      if (
+        allHealthyChildrenCycleExcluded &&
+        !durablePathRestored &&
+        !hasNewSourcePath
+      ) {
+        const blockerUpdate = await updateWithCycleSafeRecoveryBlockers({
+          companyId: issue.companyId,
+          sourceIssueId: issue.id,
+          proposedIds: healthyChildren.map((child) => child.id),
+        });
+        const blockerWriteDeferred = await persistRecoveryBlockerSelection(
+          action.id,
+          blockerUpdate.selection,
+        );
+        if (blockerWriteDeferred || !blockerUpdate.updated) {
+          if (!blockerWriteDeferred) {
+            await deferRecoveryBlockerWrite(action.id, blockerUpdate.selection);
+          }
+          result.skipped += 1;
+          continue;
+        }
+        const resolved = await recoveryActionsSvc.resolveActiveForIssue({
+          companyId: action.companyId,
+          sourceIssueId: action.sourceIssueId,
+          actionId: action.id,
+          status: "resolved",
+          outcome: "blocked",
+          resolutionNote: "healthy_children_cycle_excluded",
+        });
+        if (resolved) {
+          result.resolved += 1;
+          result.issueIds.push(issue.id);
+        } else {
+          result.skipped += 1;
+        }
+        continue;
+      }
       if (
         durablePathRestored ||
-        healthyChildren.length > 0 ||
+        safeHealthyChildren.length > 0 ||
         hasNewSourcePath
       ) {
-        if (healthyChildren.length > 0 && !sourceState.hasDurableWaitingPath) {
-          const blockerIds = await existingUnresolvedBlockerIssueIds(
-            issue.companyId,
-            issue.id,
-          );
-          await issuesSvc.update(issue.id, {
-            status: "blocked",
-            blockedByIssueIds: [
-              ...new Set([
-                ...blockerIds,
-                ...healthyChildren.map((child) => child.id),
-              ]),
-            ],
+        if (safeHealthyChildren.length > 0 && !sourceState.hasDurableWaitingPath) {
+          const blockerUpdate = await updateWithCycleSafeRecoveryBlockers({
+            companyId: issue.companyId,
+            sourceIssueId: issue.id,
+            proposedIds: safeHealthyChildren.map((child) => child.id),
           });
+          const blockerWriteDeferred = await persistRecoveryBlockerSelection(
+            action.id,
+            blockerUpdate.selection,
+          );
+          if (
+            blockerWriteDeferred ||
+            !blockerUpdate.updated ||
+            blockerUpdate.selection.excludedIds.length > 0 ||
+            blockerUpdate.selection.cycleInvolvedExistingIds.length > 0
+          ) {
+            if (!blockerWriteDeferred && !blockerUpdate.updated) {
+              await deferRecoveryBlockerWrite(action.id, blockerUpdate.selection);
+            }
+            result.skipped += 1;
+            continue;
+          }
         }
         const resolved = await recoveryActionsSvc.resolveActiveForIssue({
           companyId: action.companyId,
@@ -3489,7 +4215,7 @@ export function recoveryService(
           outcome: "restored",
           resolutionNote: durablePathRestored
             ? `durable_path_restored:${sourceState.durablePathReason ?? "unknown"}`
-            : healthyChildren.length > 0
+            : safeHealthyChildren.length > 0
               ? "durable_path_restored:healthy_child"
               : "new_source_execution_path",
         });
@@ -3790,6 +4516,10 @@ export function recoveryService(
     );
     const maxAttempts = episode?.maxAttempts ?? DISPOSITION_REPAIR_MAX_ATTEMPTS;
     const dependencyWait = episode ? null : await resolveContinuationWaitingOnReview(current);
+    if (
+      dependencyWait === "deferred" ||
+      dependencyWait === "deferred_after_update"
+    ) return "skipped";
     if (dependencyWait) {
       await resolveDispositionRepairActionAsCovered(
         current,
@@ -3937,6 +4667,19 @@ export function recoveryService(
       recoveryCause,
       successfulRunHandoffEvidence: input.successfulRunHandoffEvidence,
     });
+    const persistedBlockerWriteDeferred = parseObject(
+      parseObject(recoveryAction.evidence).recoveryBlockerWriteDeferred,
+    );
+    const blockerWriteRetryNotBefore = readNonEmptyString(
+      persistedBlockerWriteDeferred.retryNotBefore,
+    );
+    if (
+      blockerWriteRetryNotBefore &&
+      new Date(blockerWriteRetryNotBefore).getTime() > Date.now()
+    ) {
+      return null;
+    }
+
     const isProviderQuotaWait =
       recoveryCause === "provider_quota" &&
       !recoveryAction.ownerAgentId &&
@@ -3949,15 +4692,23 @@ export function recoveryService(
         agentId: recoveryAction.returnOwnerAgentId,
       });
     }
-    const blockerIds = await existingUnresolvedBlockerIssueIds(
-      input.issue.companyId,
-      input.issue.id,
-    );
-    const updated = await issuesSvc.update(input.issue.id, {
-      status: "blocked",
-      blockedByIssueIds: blockerIds,
+    const blockerUpdate = await updateWithCycleSafeRecoveryBlockers({
+      companyId: input.issue.companyId,
+      sourceIssueId: input.issue.id,
+      proposedIds: [],
     });
-    if (!updated) return null;
+    const blockerSelection = blockerUpdate.selection;
+    const blockerWriteDeferred = await persistRecoveryBlockerSelection(
+      recoveryAction.id,
+      blockerSelection,
+    );
+    const updated = blockerUpdate.updated;
+    if (blockerWriteDeferred || !updated) {
+      if (!blockerWriteDeferred && !updated) {
+        await deferRecoveryBlockerWrite(recoveryAction.id, blockerSelection);
+      }
+      return null;
+    }
     if (isProviderQuotaWait) return updated;
     const sourceAssigneePreserved =
       updated.assigneeAgentId === input.issue.assigneeAgentId &&
@@ -4141,7 +4892,10 @@ export function recoveryService(
           userId: updated.assigneeUserId,
         },
         sourceAssigneePreserved,
-        blockerIssueIds: blockerIds,
+        blockerIssueIds: blockerSelection.blockerIds,
+        cycleExcludedBlockerIssueIds: blockerSelection.excludedIds,
+        cycleInvolvedExistingBlockerIssueIds:
+          blockerSelection.cycleInvolvedExistingIds,
       },
     });
 
@@ -4828,6 +5582,15 @@ export function recoveryService(
             "deliberate_wait_without_target"
           ) {
             const resolved = await resolveContinuationWaitingOnReview(issue);
+            if (resolved === "deferred") {
+              result.skipped += 1;
+              continue;
+            }
+            if (resolved === "deferred_after_update") {
+              result.waitingOnReviewResolved += 1;
+              result.issueIds.push(issue.id);
+              continue;
+            }
             if (resolved) {
               result.waitingOnReviewResolved += 1;
               result.issueIds.push(issue.id);
@@ -4858,6 +5621,15 @@ export function recoveryService(
             latestPostResolutionRun
           ) {
             const resolved = await resolveContinuationWaitingOnReview(issue);
+            if (resolved === "deferred") {
+              result.skipped += 1;
+              continue;
+            }
+            if (resolved === "deferred_after_update") {
+              result.waitingOnReviewResolved += 1;
+              result.issueIds.push(issue.id);
+              continue;
+            }
             if (resolved) {
               result.waitingOnReviewResolved += 1;
               result.issueIds.push(issue.id);
@@ -5378,6 +6150,15 @@ export function recoveryService(
           classification.errorCode === CONTINUATION_WAITING_ON_REVIEW_ERROR_CODE
         ) {
           const resolved = await resolveContinuationWaitingOnReview(issue);
+          if (resolved === "deferred") {
+            result.skipped += 1;
+            continue;
+          }
+          if (resolved === "deferred_after_update") {
+            result.waitingOnReviewResolved += 1;
+            result.issueIds.push(issue.id);
+            continue;
+          }
           if (resolved) {
             result.waitingOnReviewResolved += 1;
             result.issueIds.push(issue.id);
