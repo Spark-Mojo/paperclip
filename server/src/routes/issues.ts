@@ -13477,7 +13477,6 @@ export function issueRoutes(
         } else if (
           !assigneeWillChange &&
           parentChangedForDelegationCheck &&
-          nextParentIdForDelegationCheck &&
           existing.assigneeAgentId
         ) {
           await assertNoAgentDelegationCycle({
