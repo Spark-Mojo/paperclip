@@ -42,6 +42,7 @@ import {
 } from "./legacy-execution-recovery.js";
 import { settleUnrecoverableExecutions } from "./execution-recovery-resolution.js";
 import { issueService } from "./issues.js";
+import { attentionService } from "./attention.js";
 
 const externalDatabaseUrl = process.env.PAPERCLIP_TEST_DATABASE_URL;
 const support = externalDatabaseUrl
@@ -292,6 +293,246 @@ async function readSettledLogs(db: TestDb, issueId: string) {
     );
 }
 
+/** Provenance snapshot: issue ids that pre-date settlement. Any blocker id
+ * minted by settlement itself (placeholder) fails the post-settlement check. */
+async function snapshotIssueIds(db: TestDb, companyId: string): Promise<Set<string>> {
+  const rows = await db
+    .select({ id: issues.id })
+    .from(issues)
+    .where(eq(issues.companyId, companyId));
+  return new Set(rows.map((row) => row.id));
+}
+
+function normalizeObligationLabel(value: unknown): string {
+  return typeof value === "string" ? value.toLowerCase().replace(/\s+/g, " ").trim() : "";
+}
+
+function obligationOwnerKey(owner: unknown): string | null {
+  if (owner === "board") return "board";
+  if (owner && typeof owner === "object") {
+    if ("agentId" in owner && typeof (owner as { agentId: unknown }).agentId === "string") {
+      return `agent:${(owner as { agentId: string }).agentId}`;
+    }
+    if ("userId" in owner && typeof (owner as { userId: unknown }).userId === "string") {
+      return `user:${(owner as { userId: string }).userId}`;
+    }
+  }
+  return null;
+}
+
+function ownerKeyFromRecoveryRow(row: {
+  ownerType: string | null;
+  ownerAgentId: string | null;
+  ownerUserId: string | null;
+}): string | null {
+  if (row.ownerType === "board") return "board";
+  if (row.ownerAgentId) return `agent:${row.ownerAgentId}`;
+  if (row.ownerUserId) return `user:${row.ownerUserId}`;
+  return null;
+}
+
+/** Two obligation representations are the SAME obligation only when they name
+ * the SAME owner (structural key) AND the SAME semantic action label. Blank
+ * labels and raw-UUID labels never count as a match. */
+function sameObligation(
+  left: { ownerKey: string | null; actionLabel: string },
+  right: { ownerKey: string | null; actionLabel: string },
+): boolean {
+  if (!left.ownerKey || !right.ownerKey) return false;
+  if (left.ownerKey !== right.ownerKey) return false;
+  const leftLabel = normalizeObligationLabel(left.actionLabel);
+  const rightLabel = normalizeObligationLabel(right.actionLabel);
+  if (!leftLabel || !rightLabel) return false;
+  const bareUuid =
+    /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+  if (bareUuid.test(leftLabel) || bareUuid.test(rightLabel)) return false;
+  return leftLabel === rightLabel;
+}
+
+type ObligationVehicle = {
+  kind: "blocker" | "interaction" | "approval" | "descriptor" | "recoveryAction";
+  ownerKey: string | null;
+  actionLabel: string;
+};
+
+async function readActiveRecoveryObligation(
+  db: TestDb,
+  companyId: string,
+  sourceIssueId: string,
+  excludeActionId?: string,
+) {
+  const rows = await db
+    .select({
+      id: issueRecoveryActions.id,
+      ownerType: issueRecoveryActions.ownerType,
+      ownerAgentId: issueRecoveryActions.ownerAgentId,
+      ownerUserId: issueRecoveryActions.ownerUserId,
+      nextAction: issueRecoveryActions.nextAction,
+      status: issueRecoveryActions.status,
+    })
+    .from(issueRecoveryActions)
+    .where(
+      and(
+        eq(issueRecoveryActions.companyId, companyId),
+        eq(issueRecoveryActions.sourceIssueId, sourceIssueId),
+        inArray(issueRecoveryActions.status, ["active", "escalated"]),
+      ),
+    );
+  return excludeActionId ? rows.filter((row) => row.id !== excludeActionId) : rows;
+}
+
+/** Logical-obligation vehicles across ALL routable-wait surfaces. Count is the
+ * number of vehicles present; same-obligation sharing is checked separately. */
+async function readObligationVehicles(
+  db: TestDb,
+  contract: Awaited<ReturnType<typeof readBlockedEntryContract>>,
+  opts: { companyId: string; issueId: string; excludeRecoveryActionId?: string },
+): Promise<ObligationVehicle[]> {
+  const vehicles: ObligationVehicle[] = [];
+  if (contract.hasUnresolvedBlocker) {
+    // One vehicle PER unresolved blocker id (never collapsed to one): a
+    // blocker with no wait surface still counts as its own vehicle with
+    // owner null/action "" so it fails same-obligation rather than vanishing.
+    const surfaces = await readBlockerWaitSurfaces(
+      db,
+      opts.companyId,
+      contract.unresolvedBlockerIssueIds,
+    );
+    for (const surface of surfaces) {
+      vehicles.push({
+        kind: "blocker",
+        ownerKey: surface.via !== null ? obligationOwnerKey(surface.owner) : null,
+        actionLabel: surface.via !== null ? (surface.actionLabel ?? "") : "",
+      });
+    }
+  }
+  // Boolean vehicles: at most one pending interaction / one pending approval
+  // can route a single issue, so existence counts as 1 each — limit(1) only
+  // fetches the representative row for owner/action naming, not the count.
+  if (contract.pendingInteraction) {
+    const [interaction] = await db
+      .select({
+        kind: issueThreadInteractions.kind,
+        title: issueThreadInteractions.title,
+        addresseeAgentId: issueThreadInteractions.addresseeAgentId,
+        addresseeUserId: issueThreadInteractions.addresseeUserId,
+      })
+      .from(issueThreadInteractions)
+      .where(
+        and(
+          eq(issueThreadInteractions.companyId, opts.companyId),
+          eq(issueThreadInteractions.issueId, opts.issueId),
+          eq(issueThreadInteractions.status, "pending"),
+        ),
+      )
+      .limit(1);
+    vehicles.push({
+      kind: "interaction",
+      ownerKey: interaction?.addresseeAgentId
+        ? `agent:${interaction.addresseeAgentId}`
+        : interaction?.addresseeUserId
+          ? `user:${interaction.addresseeUserId}`
+          : null,
+      actionLabel: interaction?.title ?? interaction?.kind ?? "",
+    });
+  }
+  if (contract.pendingApproval) {
+    const [approval] = await db
+      .select({
+          type: approvals.type,
+          payload: approvals.payload,
+          requestedByAgentId: approvals.requestedByAgentId,
+          requestedByUserId: approvals.requestedByUserId,
+        })
+      .from(issueApprovals)
+      .innerJoin(approvals, eq(issueApprovals.approvalId, approvals.id))
+      .where(
+        and(
+          eq(issueApprovals.companyId, opts.companyId),
+          eq(issueApprovals.issueId, opts.issueId),
+          eq(approvals.status, "pending"),
+        ),
+      )
+      .limit(1);
+    const payload = (approval?.payload ?? {}) as Record<string, unknown>;
+    const title =
+      typeof payload.title === "string" && payload.title.trim()
+        ? payload.title
+        : typeof payload.summary === "string" && payload.summary.trim()
+          ? payload.summary
+          : (approval?.type ?? "");
+    vehicles.push({
+      kind: "approval",
+      // Obligation owner: the requester who must act (requestedByAgentId /
+      // requestedByUserId, approvals.ts:11-12). linkedBy fields on
+      // issue_approvals (issue_approvals.ts:13-14) are linkage provenance
+      // (who attached the approval to the issue), not the obligation owner.
+      ownerKey: approval?.requestedByAgentId
+        ? `agent:${approval.requestedByAgentId}`
+        : approval?.requestedByUserId
+          ? `user:${approval.requestedByUserId}`
+          : null,
+      actionLabel: title,
+    });
+  }
+  if (contract.descriptorNamesOwnerAndAction) {
+    const descriptor = contract.descriptor as {
+      owner: unknown;
+      action: unknown;
+    };
+    vehicles.push({
+      kind: "descriptor",
+      ownerKey: obligationOwnerKey(descriptor.owner),
+      actionLabel: typeof descriptor.action === "string" ? descriptor.action : "",
+    });
+  }
+  const activeRecovery = await readActiveRecoveryObligation(
+    db,
+    opts.companyId,
+    opts.issueId,
+    opts.excludeRecoveryActionId,
+  );
+  // One vehicle PER active/escalated recovery row (never collapsed to the
+  // first): 2+ active actions count as 2+ vehicles so the same-obligation
+  // check sees every obligation.
+  if (activeRecovery.length > 0) {
+    for (const row of activeRecovery) {
+      vehicles.push({
+        kind: "recoveryAction",
+        ownerKey: ownerKeyFromRecoveryRow(row),
+        actionLabel: row.nextAction ?? "",
+      });
+    }
+  }
+  return vehicles;
+}
+
+/** Service-level engine projection: the blocked row as the engine serves it
+ * (issueService list with includeBlockedBy), plus the full attention feed
+ * fetched through the attention service. The feed is asserted by linkage +
+ * owner/action naming when it projects this issue, never by an exactly-once
+ * count and never by raw-UUID prose. By engine design only human-routed waits
+ * (user/board descriptor, stalled terminal blockers) page the feed — an
+ * agent-owned GREEN wait surfaces via the engine row, not the feed — so the
+ * feed assertion falls back to the engine-row structural check when the feed
+ * carries no row for this issue. */
+async function readBlockedEngineProjection(
+  db: TestDb,
+  companyId: string,
+  issueId: string,
+) {
+  const engineRows = await issueService(db).list(companyId, {
+    status: "blocked",
+    includeBlockedBy: true,
+  });
+  const engineRow = engineRows.find((row) => row.id === issueId) ?? null;
+  const feed = await attentionService(db).list(companyId, {
+    all: true,
+    allowUnscopedAll: true,
+  });
+  return { engineRow, feed };
+}
+
 (support.supported ? describe : describe.skip)(
   "failed-execution settlement blocked-entry contract",
   () => {
@@ -322,6 +563,10 @@ async function readSettledLogs(db: TestDb, issueId: string) {
         "Failed Settlement",
       );
       const watchdog = await terminalizeAndGuardWatchdog(db, runId, issueId);
+      // Provenance/legitimacy: snapshot every issue id that pre-dates
+      // settlement. A GREEN repair may only reference these ids — settlement
+      // must never mint a placeholder blocker to fake a wait.
+      const preExistingIssueIds = await snapshotIssueIds(db, companyId);
 
       await settleUnrecoverableExecutions(db);
 
@@ -333,7 +578,7 @@ async function readSettledLogs(db: TestDb, issueId: string) {
       expect(action!.status).toBe("resolved");
       expect(action!.evidence?.runId).toBe(runId);
       const automaticRecovery = (action!.evidence as Record<string, any>)
-        ?.automaticRecovery as Record<string, any> | undefined;
+        ?.automaticRecovery as Record<string, unknown> | undefined;
       expect(automaticRecovery).toMatchObject({
         policy: "preserve_without_replay_v1",
         replay: "blocked",
@@ -341,6 +586,10 @@ async function readSettledLogs(db: TestDb, issueId: string) {
       });
       const settledLogs = await readSettledLogs(db, issueId);
       expect(settledLogs).toHaveLength(1);
+
+      // Current settlement resolves the watchdog, so a wait must NOT be read
+      // off this resolved recovery action — the engine projection below
+      // asserts the blocked-issue attention path instead.
 
       // The settlement must stop the issue (precondition of the contract below).
       const [issue] = await db.select().from(issues).where(eq(issues.id, issueId));
@@ -394,6 +643,9 @@ async function readSettledLogs(db: TestDb, issueId: string) {
       const { blockerIds, realIds } = await readRealBlockerRelations(db, companyId, issueId);
       expect(new Set(realIds)).toEqual(new Set(blockerIds));
       expect(blockerIds.every((id) => id !== issueId)).toBe(true);
+      // Authorized shapes only: descriptor, or a pre-existing blocker with a
+      // wait surface. Settlement-minted placeholders fail here.
+      expect(blockerIds.every((id) => preExistingIssueIds.has(id))).toBe(true);
       expect(action!.evidence?.runId).toBe(runId);
 
       // O1(d): preserved assignee; execution/checkout locks fully released.
@@ -405,6 +657,211 @@ async function readSettledLogs(db: TestDb, issueId: string) {
       expect(issue!.checkoutRunId).toBeNull();
       expect(issue!.executionLockedAt).toBeNull();
       expect(issue!.executionAgentNameKey).toBeNull();
+
+      // Engine projection (O2): when a wait remains, the blocked row must
+      // surface in the engine list AND the attention feed must name the SAME
+      // owner/action as the wait vehicle (structural owner match + semantic
+      // action-label containment, never raw-UUID prose, never exactly-once).
+      // On the RED path this stays unreachable — the wait-must-remain failure
+      // above fires first, so RED still reports missing wait behavior.
+      expect(contract.hasAllowedActionableWait).toBe(true);
+      const { engineRow, feed } = await readBlockedEngineProjection(db, companyId, issueId);
+      expect(engineRow).not.toBeNull();
+      // Engine-row structural check (always applicable): the engine must
+      // serve the blocked row with the SAME wait vehicle — descriptor fields
+      // or at least one live blocker in blockedBy.
+      if (contract.descriptorNamesOwnerAndAction) {
+        expect(engineRow!.unblockDescriptor).not.toBeNull();
+      } else {
+        const blockedBy = (engineRow as { blockedBy?: Array<{ id: string }> }).blockedBy ?? [];
+        expect(blockedBy.length).toBeGreaterThan(0);
+        expect(
+          blockedBy.every((row) => preExistingIssueIds.has(row.id) && row.id !== issueId),
+        ).toBe(true);
+      }
+      // Feed linkage (conditional, never exactly-once): only human-routed
+      // waits page the attention feed by engine design (user/board descriptor
+      // at attention.ts:1488-1517, stalled terminal blockers at :1519-1571).
+      // An agent-owned GREEN wait surfaces via the engine row above, not the
+      // feed — so when the feed carries no row for this issue, the engine-row
+      // structural check above carries the assertion and this branch must not
+      // fail GREEN vacuously nor pass RED vacuously (RED never reaches here).
+      const blockedAttentionItems =
+        feed.items?.filter(
+          (item) =>
+            item.sourceKind === "blocker_attention" &&
+            (item.subject.id === issueId || item.relatedIssue?.id === issueId),
+        ) ?? [];
+      if (contract.descriptorNamesOwnerAndAction) {
+        // Human-owned descriptor waits page the feed by engine design — assert
+        // feed linkage ONLY here (T2 pattern): SAME owner/action as the wait
+        // vehicle (structural owner match + semantic action-label containment,
+        // never raw-UUID prose, never exactly-once).
+        const waitOwnerKey = obligationOwnerKey(
+          (contract.descriptor as { owner: unknown }).owner,
+        );
+        const waitActionLabel = String((contract.descriptor as { action: unknown }).action ?? "");
+        if (blockedAttentionItems.length > 0) {
+          const attentionLinked = blockedAttentionItems.some((item) => {
+            // Structural owner equality only: the wait owner's key must equal
+            // an owner key carried by the feed item's own owner fields
+            // (subject or relatedIssue assignee ids). Subject-id linkage alone
+            // never counts — every item in this filtered list already
+            // references the issue, so it proves nothing about the owner.
+            const feedOwnerKeys = new Set<string>();
+            for (const scope of [item.subject, item.relatedIssue]) {
+              const agentId = scope?.metadata?.assigneeAgentId;
+              const userId = scope?.metadata?.assigneeUserId;
+              if (typeof agentId === "string" && agentId) feedOwnerKeys.add(`agent:${agentId}`);
+              if (typeof userId === "string" && userId) feedOwnerKeys.add(`user:${userId}`);
+            }
+            const ownerMatches =
+              waitOwnerKey != null &&
+              (waitOwnerKey === "board"
+                ? item.entryRule.includes("human-owned unblockDescriptor")
+                : feedOwnerKeys.has(waitOwnerKey));
+            const normalizedWait = normalizeObligationLabel(waitActionLabel);
+            const actionMatches =
+              normalizedWait.length > 0
+                ? `${item.whyNow} ${item.detail && "blockingIssue" in item.detail ? (item.detail.blockingIssue?.title ?? "") : ""}`
+                    .toLowerCase()
+                    .includes(normalizedWait) ||
+                  item.decisionVerbs.some((verb) =>
+                    (verb.description ?? "").toLowerCase().includes(normalizedWait),
+                  )
+                : true;
+            return ownerMatches && actionMatches;
+          });
+          expect(
+            attentionLinked,
+            `attention feed must project the SAME owner/action as the wait vehicle for blocked issue ${issueId}`,
+          ).toBe(true);
+          // Non-vacuity: the projection must name a semantic label, never a
+          // raw UUID and never a blank whyNow.
+          for (const item of blockedAttentionItems) {
+            expect(item.whyNow.trim().length).toBeGreaterThan(0);
+          }
+        } else {
+          // No feed row for this issue: document that agent-owned waits are
+          // engine-row-only by design (GREEN expectation), and pin it — the
+          // wait vehicle must be agent-owned or blocker-carried, never a
+          // human-owned descriptor that SHOULD have paged the feed.
+          const descriptorOwner = obligationOwnerKey(
+            (contract.descriptor as { owner: unknown }).owner,
+          );
+          expect(
+            descriptorOwner === null || descriptorOwner.startsWith("agent:"),
+            `human-owned descriptor wait for blocked issue ${issueId} must page the attention feed (engine design attention.ts:1488-1517) — feed absence with a board/user descriptor is a missing projection`,
+          ).toBe(true);
+        }
+      } else {
+        // Blocker-carried wait: NEVER fail solely because the feed exists, and
+        // never require attentionLinked via the descriptor waitOwnerKey (null
+        // for blocker-only waits, which made feed-present+blocker fail
+        // spuriously while feed-absent+blocker passed vacuously). The
+        // engine-row structural check above (blockedBy pre-existing issues)
+        // already carries the assertion; here, when feed items ARE present, at
+        // least one item's owner must structurally match SOME blocking
+        // issue's wait-surface owner (readBlockerWaitSurfaces, one level) AND
+        // its action label containment.
+        if (blockedAttentionItems.length > 0) {
+          const surfaces = await readBlockerWaitSurfaces(
+            db,
+            companyId,
+            contract.unresolvedBlockerIssueIds,
+          );
+          const withWait = surfaces.filter((surface) => surface.via !== null);
+          const blockerLinked = blockedAttentionItems.some((item) => {
+            const feedOwnerKeys = new Set<string>();
+            for (const scope of [item.subject, item.relatedIssue]) {
+              const agentId = scope?.metadata?.assigneeAgentId;
+              const userId = scope?.metadata?.assigneeUserId;
+              if (typeof agentId === "string" && agentId) feedOwnerKeys.add(`agent:${agentId}`);
+              if (typeof userId === "string" && userId) feedOwnerKeys.add(`user:${userId}`);
+            }
+            return withWait.some((surface) => {
+              const surfaceOwnerKey = obligationOwnerKey(surface.owner);
+              const ownerMatches =
+                surfaceOwnerKey != null &&
+                (surfaceOwnerKey === "board"
+                  ? item.entryRule.includes("human-owned unblockDescriptor")
+                  : feedOwnerKeys.has(surfaceOwnerKey));
+              if (!ownerMatches) return false;
+              const normalizedSurface = normalizeObligationLabel(surface.actionLabel ?? "");
+              if (normalizedSurface.length === 0) return false;
+              return (
+                `${item.whyNow} ${item.detail && "blockingIssue" in item.detail ? (item.detail.blockingIssue?.title ?? "") : ""}`
+                  .toLowerCase()
+                  .includes(normalizedSurface) ||
+                item.decisionVerbs.some((verb) =>
+                  (verb.description ?? "").toLowerCase().includes(normalizedSurface),
+                )
+              );
+            });
+          });
+          expect(
+            blockerLinked,
+            `attention feed items for blocked issue ${issueId} must project SOME blocking issue's owner/action (structural owner match + action-label containment) — never fail a blocker-wait solely because the feed exists`,
+          ).toBe(true);
+          for (const item of blockedAttentionItems) {
+            expect(item.whyNow.trim().length).toBeGreaterThan(0);
+          }
+        }
+        // Feed absent on a blocker-carried wait passes vacuously BY DESIGN:
+        // the stalled-terminal path (attention.ts:1519-1571, entryRule
+        // `terminal blocker has a non-live blockerAttention.state`) carries no
+        // owner condition, so the feed may legitimately be absent on the RED
+        // path — RED still fails first at hasAllowedActionableWait above.
+      }
+      // One-obligation bound: at most one logical obligation across ALL
+      // vehicles; multiple representations pass ONLY when demonstrably the
+      // same obligation (same owner AND same action label).
+      const vehicles = await readObligationVehicles(db, contract, {
+        companyId,
+        issueId,
+        excludeRecoveryActionId: watchdog.id,
+      });
+      // Single-null-vehicle non-vacuity: when a wait is claimed, even one
+      // vehicle must name an obligation — a lone vehicle with null owner or
+      // a blank label names nothing. Skipped when no wait is claimed (RED
+      // has zero vehicles, and RED fails earlier at hasAllowedActionableWait).
+      if (contract.hasAllowedActionableWait) {
+        expect(
+          vehicles.length,
+          `blocked issue ${issueId} claims an allowed actionable wait but no obligation vehicle remains — a claimed wait with zero vehicles must fail instead of passing via length<=1`,
+        ).toBeGreaterThan(0);
+        for (const vehicle of vehicles) {
+          expect(
+            vehicle.ownerKey != null && normalizeObligationLabel(vehicle.actionLabel).length > 0,
+            `obligation vehicle names no obligation for blocked issue ${issueId}: ${JSON.stringify(vehicle)} — a wait vehicle must name a concrete owner and a non-blank action label`,
+          ).toBe(true);
+        }
+      }
+      const allSameObligation =
+        vehicles.length > 0 &&
+        vehicles.every((vehicle) => sameObligation(vehicles[0]!, vehicle));
+      expect(
+        vehicles.length <= 1 || allSameObligation,
+        `more than one logical obligation remains for blocked issue ${issueId}: ${JSON.stringify(vehicles)} — multiple representations must name the SAME owner AND action`,
+      ).toBe(true);
+      // No second owner-routing effect beyond the single obligation:
+      // blockedOwnerNotifiedAt null-or-timestamp consistent with the vehicle
+      // (agent-owned descriptor wait may set it post-GREEN via
+      // routable-blocked.ts:23-54 + routes/issues.ts:13822-13839; a
+      // blocker-only wait carries no descriptor so nothing may notify).
+      // RED path never reaches here (no wait exists there); GREEN with a
+      // descriptor permits either state until the notify path lands.
+      if (contract.descriptorNamesOwnerAndAction) {
+        expect(
+          issue!.blockedOwnerNotifiedAt == null || issue!.blockedOwnerNotifiedAt instanceof Date,
+        ).toBe(true);
+      } else {
+        expect(issue!.blockedOwnerNotifiedAt).toBeNull();
+      }
+      // No second active recovery action beyond the resolved watchdog —
+      // settlement must not mint one to fake a wait.
+      const extraRecovery = await readActiveRecoveryObligation(db, companyId, issueId, watchdog.id);
+      expect(extraRecovery).toEqual([]);
     }, 60_000);
 
     // O2: service-level idempotency + exactly-once durable effects.
@@ -414,6 +871,9 @@ async function readSettledLogs(db: TestDb, issueId: string) {
         "Idempotent Settlement",
       );
       const watchdog = await terminalizeAndGuardWatchdog(db, runId, issueId);
+      // Provenance snapshot: GREEN may only reference pre-existing issues.
+      const idempotentCompanyId = watchdog.companyId;
+      const preExistingIssueIds = await snapshotIssueIds(db, idempotentCompanyId);
 
       // Concurrent settlement: the attempt row's active-fingerprint uniqueness
       // plus the transactional re-check must let exactly one logical resolve win.
@@ -445,6 +905,105 @@ async function readSettledLogs(db: TestDb, issueId: string) {
       const { blockerIds, realIds } = await readRealBlockerRelations(db, actions[0]!.companyId, issueId);
       expect(blockerIds.length).toBeLessThanOrEqual(1);
       expect(new Set(realIds)).toEqual(new Set(blockerIds));
+      expect(blockerIds.every((id) => preExistingIssueIds.has(id))).toBe(true);
+
+      // One-obligation bound across ALL vehicles (replaces the blocker-only
+      // bound): count the blocker vehicle + pending interaction + pending
+      // approval + descriptor + any active/escalated recovery action beyond
+      // the resolved watchdog; assert <= 1 when a wait remains. Multiple
+      // representations pass ONLY when demonstrably the same obligation
+      // (same owner AND same action label via sameObligation). Lifecycle
+      // receipt stays exactly one (settled log + lifecycle run event below),
+      // AND no second owner-routing effect may exist (blockedOwnerNotifiedAt
+      // single timestamp at most, no second active recovery action). The
+      // current settlement resolves the watchdog, so a wait must NOT be read
+      // off it — the new active-recovery vehicle below excludes it.
+      const postContract = await readBlockedEntryContract(db, issueId);
+      const obligationVehicles = await readObligationVehicles(db, postContract, {
+        companyId: actions[0]!.companyId,
+        issueId,
+        excludeRecoveryActionId: watchdog.id,
+      });
+      const allSameObligation =
+        obligationVehicles.length > 0 &&
+        obligationVehicles.every((vehicle) => sameObligation(obligationVehicles[0]!, vehicle));
+      // Single-null-vehicle non-vacuity (copied from the first test): when a
+      // wait is claimed, even one vehicle must name an obligation. Skipped on
+      // RED (postContract.hasAllowedActionableWait=false there, so RED still
+      // fails at the wait-must-remain asserts below).
+      if (postContract.hasAllowedActionableWait) {
+        expect(
+          obligationVehicles.length,
+          `blocked issue ${issueId} claims an allowed actionable wait but no obligation vehicle remains — a claimed wait with zero vehicles must fail instead of passing via length<=1`,
+        ).toBeGreaterThan(0);
+        for (const vehicle of obligationVehicles) {
+          expect(
+            vehicle.ownerKey != null && normalizeObligationLabel(vehicle.actionLabel).length > 0,
+            `obligation vehicle names no obligation for blocked issue ${issueId}: ${JSON.stringify(vehicle)} — a wait vehicle must name a concrete owner and a non-blank action label`,
+          ).toBe(true);
+        }
+      }
+      expect(
+        obligationVehicles.length <= 1 || allSameObligation,
+        `more than one logical obligation remains for blocked issue ${issueId}: ${JSON.stringify(obligationVehicles)} — multiple representations must name the SAME owner AND action`,
+      ).toBe(true);
+      const [issueAfterIdempotent] = await db.select().from(issues).where(eq(issues.id, issueId));
+      if (postContract.descriptorNamesOwnerAndAction) {
+        // GREEN expectation (documented, not yet reachable): descriptor wait
+        // may carry a notifiedAt timestamp after the blocked-owner notify
+        // path (routable-blocked.ts:23-54) delivers the agent wakeup.
+        expect(
+          issueAfterIdempotent!.blockedOwnerNotifiedAt == null ||
+            issueAfterIdempotent!.blockedOwnerNotifiedAt instanceof Date,
+        ).toBe(true);
+      } else {
+        // No invented notification may mask a missing wait: blocker-only or
+        // interaction/approval waits carry no descriptor, so notifiedAt stays null.
+        expect(issueAfterIdempotent!.blockedOwnerNotifiedAt).toBeNull();
+      }
+      const extraRecovery = await readActiveRecoveryObligation(
+        db,
+        actions[0]!.companyId,
+        issueId,
+        watchdog.id,
+      );
+      expect(extraRecovery).toEqual([]);
+      // Engine projection (O2 service-level): when a wait remains the blocked
+      // row must surface via the engine (issueService list with
+      // includeBlockedBy) with the SAME wait vehicle, and the attention feed
+      // must project the SAME owner/action when it carries the row (never
+      // exactly-once, never raw-UUID prose). Guarded on the wait so the RED
+      // path (no wait) skips this and fails at the wait-must-remain assert
+      // below with its original message — this block can never turn RED green.
+      if (postContract.hasAllowedActionableWait) {
+      const { engineRow, feed } = await readBlockedEngineProjection(
+        db,
+        actions[0]!.companyId,
+        issueId,
+      );
+      expect(engineRow).not.toBeNull();
+      const blockedFeedItems =
+        feed.items?.filter(
+          (item) =>
+            item.sourceKind === "blocker_attention" &&
+            (item.subject.id === issueId || item.relatedIssue?.id === issueId),
+        ) ?? [];
+      if (postContract.descriptorNamesOwnerAndAction) {
+        expect(engineRow!.unblockDescriptor).not.toBeNull();
+        const humanOwner = obligationOwnerKey(
+          (postContract.descriptor as { owner: unknown }).owner,
+        );
+        if (humanOwner === "board" || humanOwner?.startsWith("user:")) {
+          expect(
+            blockedFeedItems.length,
+            `human-owned descriptor wait for blocked issue ${issueId} must page the attention feed (attention.ts:1488-1517)`,
+          ).toBeGreaterThan(0);
+        }
+      } else if (postContract.hasUnresolvedBlocker) {
+        const blockedBy = (engineRow as { blockedBy?: Array<{ id: string }> }).blockedBy ?? [];
+        expect(blockedBy.length).toBeGreaterThan(0);
+      }
+      } // end guarded engine projection — RED (no wait) skips to the wait-must-remain failure below
 
       // No duplicate replay notification: one settled log row, one lifecycle
       // run event, across both sweeps and the replay cycle.
@@ -667,9 +1226,19 @@ async function readSettledLogs(db: TestDb, issueId: string) {
       const [issue] = await db.select().from(issues).where(eq(issues.id, issueId));
       expect(issue!.status).toBe("in_progress");
       expect(issue!.unblockDescriptor).toBeNull();
+      // Terminal control extended to ALL vehicles: null descriptor is not
+      // enough — notifiedAt, relations, interaction, approval, and recovery
+      // actions must all show zero obligation.
       expect(issue!.blockedOwnerNotifiedAt).toBeNull();
       const { blockerIds } = await readRealBlockerRelations(db, companyId, issueId);
       expect(blockerIds).toEqual([]);
+      const terminalContract = await readBlockedEntryContract(db, issueId);
+      expect(terminalContract.pendingInteraction).toBe(false);
+      expect(terminalContract.pendingApproval).toBe(false);
+      expect(terminalContract.hasUnresolvedBlocker).toBe(false);
+      expect(terminalContract.descriptorNamesOwnerAndAction).toBe(false);
+      const terminalRecovery = await readActiveRecoveryObligation(db, companyId, issueId);
+      expect(terminalRecovery).toEqual([]);
       const actions = await db
         .select()
         .from(issueRecoveryActions)
