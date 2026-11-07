@@ -15819,17 +15819,6 @@ export function issueRoutes(
       })();
 
       await queueTaskWatchdogEvaluation(issue, actor.runId);
-      // Lost-update echo: the service dropped the stale status change against a
-      // concurrently-landed terminal row and reports the kept terminal status
-      // via `statusSupersededByTerminal`; echo the requested status in the
-      // response without misrepresenting the persisted row.
-      if (
-        issue.statusSupersededByTerminal &&
-        typeof updateFields.status === "string" &&
-        updateFields.status !== issue.status
-      ) {
-        issueResponse = { ...issueResponse, status: updateFields.status };
-      }
       const changes = issueResponse.changes ?? {};
       if (prefersMinimalIssueUpdateResponse(req)) {
         res.setHeader("Preference-Applied", "return=minimal");

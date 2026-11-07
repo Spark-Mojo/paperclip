@@ -57,6 +57,11 @@ type Writer = {
   run: (fixture: Fixture) => Promise<Response>;
   assertSuccess: (response: Response, fixture: Fixture) => void;
   assertEffect: (before: Snapshot, after: Snapshot, fixture: Fixture) => void;
+  /** Persisted-effect oracle for the mutation-first schedule: the guarded
+   * mutation committed status=done first, then this writer ran normally on
+   * top of it. Per-writer on purpose — each writer's own effect decides what
+   * the surviving issue.status must be, so no blanket status claim exists. */
+  assertEffectAfterGuardedMutation: (before: Snapshot, after: Snapshot, fixture: Fixture) => void;
 };
 type AuditRow = {
   backendPid: number;
@@ -77,6 +82,7 @@ const COMPETING_USER_ID = "competing-user";
 const ORIGINAL_COMMENT_BODY = "original comment body must never enter refusal evidence";
 const TIE_COMMENT_BODY = "equal-time ID tie-break comment";
 const COMPETING_COMMENT_BODY = "competing comment body must never enter refusal evidence";
+const COMPETING_TITLE = "competing title written after the guard read its evidence";
 const BODY_SHAPED_ARBITRARY = `body:${"x".repeat(96)}`;
 const REFUSAL_ACTION = "issue.evidence_guarded_mutation_refused";
 const REFUSAL_SCHEMA = "issue_evidence_v1";
@@ -310,6 +316,7 @@ function expectRefusalAudit(
     ORIGINAL_COMMENT_BODY.slice(0, 18),
     TIE_COMMENT_BODY,
     COMPETING_COMMENT_BODY,
+    COMPETING_TITLE,
     BODY_SHAPED_ARBITRARY,
     BODY_SHAPED_ARBITRARY.slice(0, 24),
   ]) expect(serialized).not.toContain(forbidden);
@@ -332,6 +339,17 @@ function expectOnlyIssueColumnsChanged(before: Snapshot, after: Snapshot, allowe
 function expectUnrelatedStateUnchanged(before: Snapshot, after: Snapshot) {
   expect(after.runs).toEqual(before.runs);
   expect(after.related).toEqual(before.related);
+}
+
+/** In the mutation-first schedule the guarded mutation commits before the
+ * competing writer runs, so its own success audit is the FIRST new activity
+ * row and the writer's publications trail it: the competing write is visibly
+ * later, never suppressed. */
+function expectGuardAuditThenWriterActions(before: Snapshot, after: Snapshot, writerActions: string[]) {
+  const newRows = after.activities.slice(before.activities.length);
+  expect(newRows.map((row) => row.action)).toEqual(["issue.updated", ...writerActions]);
+  expect(newRows[0]?.details, "the guarded mutation's own audit must be visibly first")
+    .toMatchObject({ source: "evidence_guarded_mutation" });
 }
 
 async function waitUntil<T>(probe: () => Promise<T | null>, description: string, timeoutMs = 5_000): Promise<T> {
@@ -616,8 +634,24 @@ describePostgres("issue evidence-guarded mutation PostgreSQL boundary", () => {
       assertEffect: (before, after) => {
         expect(after.comments).toHaveLength(before.comments.length + 1);
         expect(after.comments.filter((row) => row.body === COMPETING_COMMENT_BODY)).toHaveLength(1);
+        // This writer never touches issue.status, so the exact surviving value
+        // is pinned: todo proves the refused guarded mutation's done landed
+        // nowhere (competing-write-first) and was left untouched (writer alone).
+        expect(after.issue[0]).toMatchObject({ status: "todo" });
         expectOnlyIssueColumnsChanged(before, after, ["updated_at"]);
         expect(after.activities.slice(before.activities.length).map((row) => row.action)).toEqual(["issue.comment_added"]);
+        expectUnrelatedStateUnchanged(before, after);
+      },
+      assertEffectAfterGuardedMutation: (before, after) => {
+        // The comment row lands visibly on top of the guard's committed done.
+        // The overlap helper proves the writer queued on the guard's row lock
+        // before the gate released, so the route decided its semantics from the
+        // pre-commit todo row: no implicit reopen, the guard's done survives.
+        expect(after.comments).toHaveLength(before.comments.length + 1);
+        expect(after.comments.filter((row) => row.body === COMPETING_COMMENT_BODY)).toHaveLength(1);
+        expect(after.issue[0]).toMatchObject({ status: "done" });
+        expectOnlyIssueColumnsChanged(before, after, ["status", "status_version", "completed_at", "updated_at"]);
+        expectGuardAuditThenWriterActions(before, after, ["issue.comment_added"]);
         expectUnrelatedStateUnchanged(before, after);
       },
     },
@@ -634,8 +668,20 @@ describePostgres("issue evidence-guarded mutation PostgreSQL boundary", () => {
       assertEffect: (before, after, fixture) => {
         expect(after.comments).toHaveLength(before.comments.length);
         expect(rowById(after.comments, fixture.deletedCommentId)).toMatchObject({ body: "", deleted_by_type: "user", deleted_by_user_id: BOARD_USER_ID });
+        expect(after.issue[0]).toMatchObject({ status: "todo" });
         expectOnlyIssueColumnsChanged(before, after, ["updated_at"]);
         expect(after.activities.slice(before.activities.length).map((row) => row.action)).toEqual(["issue.comment_deleted"]);
+        expect(after.wakes).toEqual(before.wakes);
+        expectUnrelatedStateUnchanged(before, after);
+      },
+      assertEffectAfterGuardedMutation: (before, after, fixture) => {
+        // The tombstone lands visibly on top of the guard's committed done;
+        // deletion never touches status, so the guard's done survives exactly.
+        expect(after.comments).toHaveLength(before.comments.length);
+        expect(rowById(after.comments, fixture.deletedCommentId)).toMatchObject({ body: "", deleted_by_type: "user", deleted_by_user_id: BOARD_USER_ID });
+        expect(after.issue[0]).toMatchObject({ status: "done" });
+        expectOnlyIssueColumnsChanged(before, after, ["status", "status_version", "completed_at", "updated_at"]);
+        expectGuardAuditThenWriterActions(before, after, ["issue.comment_deleted"]);
         expect(after.wakes).toEqual(before.wakes);
         expectUnrelatedStateUnchanged(before, after);
       },
@@ -657,6 +703,16 @@ describePostgres("issue evidence-guarded mutation PostgreSQL boundary", () => {
         expect(after.activities.slice(before.activities.length).map((row) => row.action)).toEqual(["issue.updated"]);
         expectUnrelatedStateUnchanged(before, after);
       },
+      assertEffectAfterGuardedMutation: (before, after) => {
+        // The visibly-later competing write: the guard's done landed first and
+        // this writer's reopen supersedes it in the persisted row — in_progress
+        // wins, and the writer's own non-done semantics reset done's completed_at.
+        expect(after.issue[0]).toMatchObject({ status: "in_progress", completed_at: null, started_at: expect.any(String) });
+        expectOnlyIssueColumnsChanged(before, after, ["status", "status_version", "started_at", "updated_at"]);
+        expect(after.comments).toEqual(before.comments);
+        expectGuardAuditThenWriterActions(before, after, ["issue.updated"]);
+        expectUnrelatedStateUnchanged(before, after);
+      },
     },
     {
       name: "agent assignment update",
@@ -669,10 +725,19 @@ describePostgres("issue evidence-guarded mutation PostgreSQL boundary", () => {
         expect(response.body).toMatchObject({ assigneeAgentId: fixture.otherAgentId, assigneeUserId: null });
       },
       assertEffect: (before, after, fixture) => {
-        expect(after.issue[0]).toMatchObject({ assignee_agent_id: fixture.otherAgentId, assignee_user_id: null });
+        expect(after.issue[0]).toMatchObject({ assignee_agent_id: fixture.otherAgentId, assignee_user_id: null, status: "todo" });
         expectOnlyIssueColumnsChanged(before, after, ["assignee_agent_id", "status_version", "updated_at"]);
         expect(after.comments).toEqual(before.comments);
         expect(after.activities.slice(before.activities.length).map((row) => row.action)).toEqual(["issue.updated"]);
+        expectUnrelatedStateUnchanged(before, after);
+      },
+      assertEffectAfterGuardedMutation: (before, after, fixture) => {
+        // The persisted assignee change lands on top of the guard's done, which
+        // this writer never touches — the exact done survives it.
+        expect(after.issue[0]).toMatchObject({ assignee_agent_id: fixture.otherAgentId, assignee_user_id: null, status: "done" });
+        expectOnlyIssueColumnsChanged(before, after, ["assignee_agent_id", "status", "status_version", "completed_at", "updated_at"]);
+        expect(after.comments).toEqual(before.comments);
+        expectGuardAuditThenWriterActions(before, after, ["issue.updated"]);
         expectUnrelatedStateUnchanged(before, after);
       },
     },
@@ -687,10 +752,50 @@ describePostgres("issue evidence-guarded mutation PostgreSQL boundary", () => {
         expect(response.body).toMatchObject({ assigneeAgentId: null, assigneeUserId: COMPETING_USER_ID });
       },
       assertEffect: (before, after) => {
-        expect(after.issue[0]).toMatchObject({ assignee_agent_id: null, assignee_user_id: COMPETING_USER_ID });
+        expect(after.issue[0]).toMatchObject({ assignee_agent_id: null, assignee_user_id: COMPETING_USER_ID, status: "todo" });
         expectOnlyIssueColumnsChanged(before, after, ["assignee_agent_id", "assignee_user_id", "status_version", "updated_at"]);
         expect(after.comments).toEqual(before.comments);
         expect(after.activities.slice(before.activities.length).map((row) => row.action)).toEqual(["issue.updated"]);
+        expectUnrelatedStateUnchanged(before, after);
+      },
+      assertEffectAfterGuardedMutation: (before, after) => {
+        expect(after.issue[0]).toMatchObject({ assignee_agent_id: null, assignee_user_id: COMPETING_USER_ID, status: "done" });
+        expectOnlyIssueColumnsChanged(before, after, ["assignee_agent_id", "assignee_user_id", "status", "status_version", "completed_at", "updated_at"]);
+        expect(after.comments).toEqual(before.comments);
+        expectGuardAuditThenWriterActions(before, after, ["issue.updated"]);
+        expectUnrelatedStateUnchanged(before, after);
+      },
+    },
+    {
+      // Sixth writer class (source craft recommendation): a title-only PATCH
+      // routes through the unified in-transaction else-branch (updateIssue →
+      // issue.updated activity), yet the title itself is invisible to the
+      // evidence precondition — only its activity trail betrays it, so the
+      // guard must refuse on the activity mismatch and never accept a stale
+      // precondition while hiding the earlier title write.
+      name: "title update (activity-producing)",
+      firstTable: "issues",
+      expectedMismatchIds: ["activity.latest.createdAt", "activity.latest.id", "activity.count"],
+      run: (fixture) => request(appFor(writerDb, boardActor(fixture.companyId)))
+        .patch(`/api/issues/${fixture.issueId}`).send({ title: COMPETING_TITLE }),
+      assertSuccess: (response) => {
+        expect(response.status, JSON.stringify(response.body)).toBe(200);
+        expect(response.body).toMatchObject({ title: COMPETING_TITLE });
+      },
+      assertEffect: (before, after) => {
+        expect(after.issue[0]).toMatchObject({ title: COMPETING_TITLE, status: "todo" });
+        expectOnlyIssueColumnsChanged(before, after, ["title", "updated_at"]);
+        expect(after.comments).toEqual(before.comments);
+        expect(after.activities.slice(before.activities.length).map((row) => row.action)).toEqual(["issue.updated"]);
+        expectUnrelatedStateUnchanged(before, after);
+      },
+      assertEffectAfterGuardedMutation: (before, after) => {
+        // The title lands visibly on top of the guard's done, which this
+        // writer never touches — the exact done survives it.
+        expect(after.issue[0]).toMatchObject({ title: COMPETING_TITLE, status: "done" });
+        expectOnlyIssueColumnsChanged(before, after, ["title", "status", "status_version", "completed_at", "updated_at"]);
+        expect(after.comments).toEqual(before.comments);
+        expectGuardAuditThenWriterActions(before, after, ["issue.updated"]);
         expectUnrelatedStateUnchanged(before, after);
       },
     },
@@ -980,19 +1085,24 @@ describePostgres("issue evidence-guarded mutation PostgreSQL boundary", () => {
     const result = await overlap(fixture, writer, "competing-write-first");
     writer.assertSuccess(result.writerResponse, fixture);
     expect(result.guardResponse.status, JSON.stringify(result.guardResponse.body)).toBe(409);
+    expect(result.guardResponse.body).toMatchObject({ error: { code: "issue_evidence_conflict" } });
     // The 409 flushes at the probe while the refusal-audit transaction commits
     // afterwards by design: the audit row deliberately observes post-writer-commit
     // state, so the response can never trail its own audit commit. waitUntil closes
     // ONLY that commit-arrival race — the refusal row stays REQUIRED below (exact
     // length, exact digests, bounded body-free audit), and the wait does not depend
-    // on writer speed: all five writer classes share this single assertion site.
+    // on writer speed: all six writer classes share this single assertion site.
     const after = await waitUntil(async () => {
       const snap = await snapshot(db, fixture);
       return refusalRows(snap).length ? snap : null;
     }, "guard refusal audit commit");
     const afterWriter = withoutRefusal(after);
+    // Persisted-state oracle: each writer's assertEffect pins its exact surviving
+    // issue.status (in_progress for the status writer, todo for every other
+    // class), so the refused guarded mutation's status=done is proven ABSENT in
+    // committed state — no schedule accepts a stale precondition while hiding an
+    // earlier relevant write.
     writer.assertEffect(result.before, afterWriter, fixture);
-    expect(afterWriter.issue[0]?.status).not.toBe("done");
     const observed = await readPrecondition(db, fixture);
     expectRefusalAudit(after, writer.expectedMismatchIds, result.requested, observed);
     await expectTransactionScope(fixture, writer.firstTable, WRITER_APP_NAME);
@@ -1002,9 +1112,14 @@ describePostgres("issue evidence-guarded mutation PostgreSQL boundary", () => {
     const fixture = await seed();
     const result = await overlap(fixture, writer, "mutation-first");
     expect(result.guardResponse.status, JSON.stringify(result.guardResponse.body)).toBe(200);
+    expect(result.guardResponse.body).toMatchObject({ operation: OPERATION_ID, issue: { id: fixture.issueId, status: "done" } });
     writer.assertSuccess(result.writerResponse, fixture);
     const after = await snapshot(db, fixture);
-    expect(after.issue[0]?.status).toBe("done");
+    // Per-writer persisted effects, never a blanket status claim: the guarded
+    // mutation landed done first and each writer's own semantics decide what
+    // the surviving row must be (its reopen wins for the status writer; done
+    // survives untouched for every writer that leaves status alone).
+    writer.assertEffectAfterGuardedMutation(result.before, after, fixture);
     expect(refusalRows(after)).toHaveLength(0);
     await expectTransactionScope(fixture, "issues", GUARD_APP_NAME);
     await expectTransactionScope(fixture, writer.firstTable, WRITER_APP_NAME);
