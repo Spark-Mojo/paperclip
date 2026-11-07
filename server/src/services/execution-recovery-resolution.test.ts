@@ -116,6 +116,82 @@ async function terminalizeAndGuardWatchdog(db: TestDb, runId: string, issueId: s
   return watchdog!;
 }
 
+/** Structural shape of a valid unblockDescriptor: a concrete owner (board, an
+ * agent id, or a user id) AND a non-empty action. Deliberately stricter than
+ * the route's gate at issues.ts:13361, which accepts ANY truthy descriptor. */
+type UnblockDescriptorShape = {
+  owner?: { agentId?: unknown; userId?: unknown } | "board" | null;
+  action?: unknown;
+} | null | undefined;
+
+function namesOwnerAndAction(descriptor: UnblockDescriptorShape) {
+  return Boolean(
+    descriptor &&
+      typeof descriptor.action === "string" &&
+      descriptor.action.trim().length > 0 &&
+      (descriptor.owner === "board" ||
+        (typeof descriptor.owner === "object" &&
+          descriptor.owner !== null &&
+          (("agentId" in descriptor.owner && typeof descriptor.owner.agentId === "string") ||
+            ("userId" in descriptor.owner && typeof descriptor.owner.userId === "string")))),
+  );
+}
+
+type IssueUnblockOwnerLike = { agentId: string } | { userId: string } | "board";
+
+/** The wait surface of a blocking issue ITSELF — one level of recursion only:
+ * either its own `unblockDescriptor` naming a concrete owner + action, or its
+ * populated owner fields (`assigneeAgentId`/`assigneeUserId`) with the issue
+ * title as the action being worked. Representation-agnostic on purpose. The
+ * blocker's own blockers are never read, and nothing below one level. */
+type BlockerWaitSurface =
+  | { issueId: string; via: "descriptor"; owner: IssueUnblockOwnerLike; actionLabel: string }
+  | { issueId: string; via: "ownerFields"; owner: IssueUnblockOwnerLike; actionLabel: string }
+  | { issueId: string; via: null; owner: null; actionLabel: null };
+
+async function readBlockerWaitSurfaces(
+  db: TestDb,
+  companyId: string,
+  blockerIssueIds: string[],
+): Promise<BlockerWaitSurface[]> {
+  if (blockerIssueIds.length === 0) return [];
+  const rows = await db
+    .select({
+      id: issues.id,
+      title: issues.title,
+      unblockDescriptor: issues.unblockDescriptor,
+      assigneeAgentId: issues.assigneeAgentId,
+      assigneeUserId: issues.assigneeUserId,
+    })
+    .from(issues)
+    .where(and(eq(issues.companyId, companyId), inArray(issues.id, blockerIssueIds)));
+  const byId = new Map(rows.map((row) => [row.id, row]));
+  return blockerIssueIds.map((issueId) => {
+    const row = byId.get(issueId);
+    if (!row) return { issueId, via: null, owner: null, actionLabel: null };
+    if (namesOwnerAndAction(row.unblockDescriptor)) {
+      const descriptor = row.unblockDescriptor!;
+      return {
+        issueId,
+        via: "descriptor" as const,
+        owner: descriptor.owner,
+        actionLabel: descriptor.action,
+      };
+    }
+    if (row.assigneeAgentId || row.assigneeUserId) {
+      return {
+        issueId,
+        via: "ownerFields" as const,
+        owner: row.assigneeAgentId
+          ? ({ agentId: row.assigneeAgentId } as const)
+          : ({ userId: row.assigneeUserId! } as const),
+        actionLabel: row.title,
+      };
+    }
+    return { issueId, via: null, owner: null, actionLabel: null };
+  });
+}
+
 /**
  * The SAME predicate the public route enforces when an issue transitions to
  * blocked (server/src/routes/issues.ts, enteringBlocked around 13304-13362):
@@ -156,17 +232,7 @@ async function readBlockedEntryContract(db: TestDb, issueId: string) {
   // Deliberately stricter than the route's gate at issues.ts:13361, which
   // accepts ANY truthy unblockDescriptor — this shape check demands a real
   // owner+action pair so a drift back to the looser gate stays visible here.
-  const descriptorNamesOwnerAndAction = Boolean(
-    descriptor &&
-      typeof descriptor === "object" &&
-      typeof descriptor.action === "string" &&
-      descriptor.action.trim().length > 0 &&
-      (descriptor.owner === "board" ||
-        (typeof descriptor.owner === "object" &&
-          descriptor.owner !== null &&
-          (("agentId" in descriptor.owner && typeof descriptor.owner.agentId === "string") ||
-            ("userId" in descriptor.owner && typeof descriptor.owner.userId === "string")))),
-  );
+  const descriptorNamesOwnerAndAction = namesOwnerAndAction(descriptor);
   const hasUnresolvedBlocker = readiness.unresolvedBlockerCount > 0;
   const hasAllowedActionableWait =
     hasUnresolvedBlocker ||
@@ -303,6 +369,23 @@ async function readSettledLogs(db: TestDb, issueId: string) {
         if (typeof owner === "object" && "agentId" in owner) {
           expect(owner.agentId).toBe(ownerAgentId);
         }
+      } else {
+        // Blocker-carried wait: ANY blocked result needs a real owner/action
+        // wait — so the blocking issue itself must name a CONCRETE owner and
+        // action via its own unblockDescriptor or its populated owner fields
+        // (representation-agnostic). ONE level of recursion: this surface is
+        // asserted; the blocker's own blockers never are.
+        const surfaces = await readBlockerWaitSurfaces(
+          db,
+          companyId,
+          contract.unresolvedBlockerIssueIds,
+        );
+        for (const surface of surfaces) {
+          expect(
+            surface.via,
+            `blocker-carried wait: blocking issue ${surface.issueId} carries no concrete owner/action wait of its own (no unblockDescriptor with owner+action, no populated assignee owner fields) — the blocked result would name no owner and no action anywhere`,
+          ).not.toBeNull();
+        }
       }
 
       // O1(c): no fabricated blocker — every blocker relation references a
@@ -414,9 +497,13 @@ async function readSettledLogs(db: TestDb, issueId: string) {
       // follows the wait vehicle and never demands a raw owner UUID as prose
       // (critic round 1): a descriptor wait matches by its semantic action
       // label in every projection plus the projection surface's structured
-      // owner fields; a blocker wait matches by surfacing the blocking state
-      // (blocking issue id, blocker issue title, or an explicit readiness/
-      // blocking reference). Non-vacuity: the unpatched settler's settlement
+      // owner fields; a blocker wait matches the SAME way, but the expected
+      // owner/action is sourced from the blocking issue's own wait surface
+      // read from the DB row (never invented constants): structural owner
+      // match on the projection surface's owner fields plus the blocker's
+      // semantic action label (its descriptor action, or its title when it
+      // carries owner fields instead) contained in every projection.
+      // Non-vacuity: the unpatched settler's settlement
       // notes ("Automatic recovery stopped. Recorded work is preserved; …")
       // contain no action label and none of these blocking references, and
       // bare "blocked" is deliberately excluded as a keyword — the status
@@ -474,35 +561,72 @@ async function readSettledLogs(db: TestDb, issueId: string) {
           ).toBe(true);
         }
       } else {
-        // Blocker-carried wait: every attention projection must surface the
-        // blocking state — the blocking issue id, the blocker issue's own
-        // title, or an explicit readiness/blocking reference — instead of
-        // arbitrary prose (the readiness structured checks are already pinned
-        // above; realness of every blocker row via readRealBlockerRelations).
-        const blockingIssueIds = contract.unresolvedBlockerIssueIds;
-        const blockerTitles = blockingIssueIds.length
-          ? (
-              await db
-                .select({ title: issues.title })
-                .from(issues)
-                .where(
-                  and(
-                    eq(issues.companyId, actions[0]!.companyId),
-                    inArray(issues.id, blockingIssueIds),
-                  ),
-                )
-            ).map((row) => normalize(row.title))
-          : [];
-        for (const { surface, text } of projections) {
-          const normalized = normalize(text);
-          const surfacesBlockingState =
-            blockingIssueIds.some((id) => normalized.includes(id)) ||
-            blockerTitles.some((title) => title.length > 0 && normalized.includes(title)) ||
-            /readiness|unresolved|blocker|blocking|blocked by/i.test(normalized);
+        // Blocker-carried wait: the projection must MATCH the blocking
+        // issue's owner/action under the SAME rules as the descriptor
+        // branch — structural owner match on the projection surface's
+        // owner fields (ownerType/ownerAgentId/ownerUserId on the recovery
+        // action row) plus normalized action-label containment in every
+        // attention projection. Expected owner/action sourced from the
+        // blocking issue's own wait surface (read from the DB row), never
+        // from invented constants. ONE level of recursion: the blocker's
+        // own wait surface is read; nothing below it is asserted.
+        const surfaces = await readBlockerWaitSurfaces(
+          db,
+          actions[0]!.companyId,
+          contract.unresolvedBlockerIssueIds,
+        );
+        const withWait = surfaces.filter((surface) => surface.via !== null);
+        expect(
+          withWait.length,
+          `blocker-carried wait: no blocking issue (${contract.unresolvedBlockerIssueIds.join(", ")}) carries a concrete owner/action wait of its own (unblockDescriptor with owner+action or populated assignee owner fields), so the attention projection has no owner/action to match — verify round 2: a GREEN repair with no concrete owner/action anywhere must not pass vacuously`,
+        ).toBeGreaterThan(0);
+        const matched = withWait.find((surface) => {
+          const owner = surface.owner;
+          const ownerMatches =
+            owner === "board"
+              ? actions[0]!.ownerType === "board" ||
+                (actions[0]!.ownerAgentId == null && actions[0]!.ownerUserId == null)
+              : "agentId" in owner
+                ? actions[0]!.ownerAgentId === owner.agentId
+                : actions[0]!.ownerUserId === owner.userId;
+          if (!ownerMatches) return false;
+          // Critic round 2, advisory 1: a blank title must NOT reduce the
+          // projection check to owner-only via a vacuous includes("") — a
+          // blank action label is never a matchable wait.
+          if (surface.actionLabel.trim().length === 0) return false;
+          // Critic round 2, advisory 2 (anti-raw-UUID guard extended to the
+          // ownerFields branch): a UUID-shaped title is an id, not a
+          // semantic action label — do NOT demand that UUID as a prose
+          // substring; its projection check is carried by the structural
+          // owner match above plus the non-empty-projection asserts already
+          // run above. Only non-UUID-shaped labels demand prose
+          // containment. Descriptor branch unchanged: it always demands
+          // prose containment of a semantic action label.
+          if (surface.via === "ownerFields" && bareUuid.test(surface.actionLabel.trim())) {
+            return true;
+          }
+          return projections.every(({ text }) =>
+            normalize(text).includes(normalize(surface.actionLabel)),
+          );
+        });
+        expect(
+          matched,
+          `no blocking issue's owner/action matches the attention projection: expected a blocking issue whose owner structurally matches (ownerType=${actions[0]!.ownerType}, ownerAgentId=${actions[0]!.ownerAgentId}, ownerUserId=${actions[0]!.ownerUserId}) and whose semantic action label is contained in every projection ${JSON.stringify(projections)}`,
+        ).toBeDefined();
+        // The matched action label must be a semantic label, never a raw
+        // UUID — containment in prose is a semantic match, not an id
+        // substring (critic round 1). Extended (critic round 2): the
+        // ownerFields branch never demands a UUID-shaped title as prose at
+        // all (waived in the matched predicate) — its check rides on the
+        // structural owner match plus the non-empty-projection asserts
+        // above; only non-UUID-shaped labels demand containment. The
+        // descriptor branch is unchanged: its action must always be
+        // semantic, so a raw-UUID action there is forbidden outright.
+        if (matched!.via === "descriptor") {
           expect(
-            surfacesBlockingState,
-            `${surface} projection must surface the blocking wait (blocking issue id, blocker title, or readiness/blocking reference), got: ${JSON.stringify(text)}`,
-          ).toBe(true);
+            bareUuid.test(matched!.actionLabel.trim()),
+            `the blocking issue's descriptor action must be a semantic label, not a raw UUID: ${JSON.stringify(matched!.actionLabel)}`,
+          ).toBe(false);
         }
       }
     }, 60_000);
