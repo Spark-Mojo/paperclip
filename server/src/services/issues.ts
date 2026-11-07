@@ -311,6 +311,180 @@ function assertTransition(from: string, to: string) {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Evidence-guarded mutation (SPA-17322 d1 Stage B).
+// The guarded endpoint validates a caller-supplied evidence precondition
+// (issue identity/status/assignees + comment cursor/count/deletion digest +
+// issue-scoped activity cursor/count) inside the SAME transaction that holds
+// the issue row lock and applies the mutation, so no R3 writer can commit
+// between validation and mutation. Refusals land as an audit activity row in
+// that same transaction, carrying bounded identifiers and fixed-length
+// digests only (never comment bodies).
+// ---------------------------------------------------------------------------
+
+type EvidenceGuardCursor = { createdAt: string; id: string } | null;
+
+export type EvidenceGuardedPrecondition = {
+  issue: { status: string; assigneeAgentId: string | null; assigneeUserId: string | null };
+  comments: { latest: EvidenceGuardCursor; countIncludingDeleted: number; deletionDigest: string };
+  activity: { latest: EvidenceGuardCursor; count: number };
+};
+
+export const EVIDENCE_GUARD_MISMATCH_IDS = [
+  "targetCompanyId",
+  "issue.status",
+  "issue.assigneeAgentId",
+  "issue.assigneeUserId",
+  "comments.latest.createdAt",
+  "comments.latest.id",
+  "comments.countIncludingDeleted",
+  "comments.deletionDigest",
+  "activity.latest.createdAt",
+  "activity.latest.id",
+  "activity.count",
+] as const;
+export type EvidenceGuardMismatchId = (typeof EVIDENCE_GUARD_MISMATCH_IDS)[number];
+
+export const EVIDENCE_GUARD_SCHEMA = "issue_evidence_v1";
+export const EVIDENCE_GUARD_OPERATION = "issue.status.done";
+export const EVIDENCE_GUARD_REFUSAL_ACTION = "issue.evidence_guarded_mutation_refused";
+
+/** RFC-8785-shaped canonicalizer: object keys sorted recursively. */
+function canonicalEvidenceJson(value: unknown): string {
+  if (value === null || typeof value !== "object") return JSON.stringify(value);
+  if (Array.isArray(value)) return `[${value.map(canonicalEvidenceJson).join(",")}]`;
+  return `{${Object.entries(value as Record<string, unknown>)
+    .sort(([left], [right]) => left.localeCompare(right))
+    .map(([key, entry]) => `${JSON.stringify(key)}:${canonicalEvidenceJson(entry)}`)
+    .join(",")}}`;
+}
+
+function evidenceGuardDigest(precondition: EvidenceGuardedPrecondition): string {
+  return createHash("sha256").update(canonicalEvidenceJson(precondition)).digest("hex");
+}
+
+async function computeObservedEvidencePrecondition(
+  tx: any,
+  input: { companyId: string; issueId: string; issue: { status: string; assigneeAgentId: string | null; assigneeUserId: string | null } },
+): Promise<EvidenceGuardedPrecondition> {
+  const commentRows = await tx
+    .select({
+      id: issueComments.id,
+      createdAt: issueComments.createdAt,
+      deletedAt: issueComments.deletedAt,
+      deletedByType: issueComments.deletedByType,
+      deletedByAgentId: issueComments.deletedByAgentId,
+      deletedByUserId: issueComments.deletedByUserId,
+      deletedByRunId: issueComments.deletedByRunId,
+    })
+    .from(issueComments)
+    .where(and(eq(issueComments.companyId, input.companyId), eq(issueComments.issueId, input.issueId)));
+  const activityRows = await tx
+    .select({ id: activityLog.id, createdAt: activityLog.createdAt })
+    .from(activityLog)
+    .where(and(
+      eq(activityLog.companyId, input.companyId),
+      eq(activityLog.entityType, "issue"),
+      eq(activityLog.entityId, input.issueId),
+    ));
+  const byCreatedAtThenId = (left: { createdAt: Date; id: string }, right: { createdAt: Date; id: string }) =>
+    left.createdAt.getTime() - right.createdAt.getTime() || left.id.localeCompare(right.id);
+  const latestComment = [...commentRows].sort(byCreatedAtThenId).at(-1);
+  const latestActivity = [...activityRows].sort(byCreatedAtThenId).at(-1);
+  return {
+    issue: {
+      status: input.issue.status,
+      assigneeAgentId: input.issue.assigneeAgentId,
+      assigneeUserId: input.issue.assigneeUserId,
+    },
+    comments: {
+      latest: latestComment ? { createdAt: latestComment.createdAt.toISOString(), id: latestComment.id } : null,
+      countIncludingDeleted: commentRows.length,
+      deletionDigest: createHash("sha256")
+        .update(
+          [...commentRows]
+            .sort((a, b) => a.id.localeCompare(b.id))
+            .map((row) => [
+              row.id,
+              row.deletedAt?.toISOString() ?? "live",
+              row.deletedByType ?? "none",
+              row.deletedByAgentId ?? "none",
+              row.deletedByUserId ?? "none",
+              row.deletedByRunId ?? "none",
+            ].join(":"))
+            .join("\n"),
+        )
+        .digest("hex"),
+    },
+    activity: {
+      latest: latestActivity ? { createdAt: latestActivity.createdAt.toISOString(), id: latestActivity.id } : null,
+      count: activityRows.length,
+    },
+  };
+}
+
+function diffEvidencePrecondition(
+  requested: EvidenceGuardedPrecondition,
+  observed: EvidenceGuardedPrecondition,
+  observedCompanyId: string,
+  requestedTargetCompanyId: string,
+): EvidenceGuardMismatchId[] {
+  const mismatches: EvidenceGuardMismatchId[] = [];
+  const cursor = (
+    requestedCursor: EvidenceGuardCursor,
+    observedCursor: EvidenceGuardCursor,
+  ): { createdAtChanged: boolean; idChanged: boolean } => ({
+    createdAtChanged: (requestedCursor?.createdAt ?? null) !== (observedCursor?.createdAt ?? null),
+    idChanged: (requestedCursor?.id ?? null) !== (observedCursor?.id ?? null),
+  });
+  if (observedCompanyId !== requestedTargetCompanyId) mismatches.push("targetCompanyId");
+  if (requested.issue.status !== observed.issue.status) mismatches.push("issue.status");
+  if ((requested.issue.assigneeAgentId ?? null) !== (observed.issue.assigneeAgentId ?? null)) {
+    mismatches.push("issue.assigneeAgentId");
+  }
+  if ((requested.issue.assigneeUserId ?? null) !== (observed.issue.assigneeUserId ?? null)) {
+    mismatches.push("issue.assigneeUserId");
+  }
+  const commentsCursor = cursor(requested.comments.latest ?? null, observed.comments.latest ?? null);
+  if (commentsCursor.createdAtChanged) mismatches.push("comments.latest.createdAt");
+  if (commentsCursor.idChanged) mismatches.push("comments.latest.id");
+  if (requested.comments.countIncludingDeleted !== observed.comments.countIncludingDeleted) {
+    mismatches.push("comments.countIncludingDeleted");
+  }
+  // The deletion digest is only authoritative over an unchanged comment
+  // population: when the row count itself moved, the digest change is fully
+  // explained by the count mismatch and must not surface as a second,
+  // redundant mismatch id.
+  if (
+    requested.comments.countIncludingDeleted === observed.comments.countIncludingDeleted &&
+    requested.comments.deletionDigest !== observed.comments.deletionDigest
+  ) {
+    mismatches.push("comments.deletionDigest");
+  }
+  const activityCursor = cursor(requested.activity.latest ?? null, observed.activity.latest ?? null);
+  if (activityCursor.createdAtChanged) mismatches.push("activity.latest.createdAt");
+  if (activityCursor.idChanged) mismatches.push("activity.latest.id");
+  if (requested.activity.count !== observed.activity.count) mismatches.push("activity.count");
+  return mismatches;
+}
+
+function evidenceGuardActivityIncludingRefusal(
+  activity: { latest: EvidenceGuardCursor; count: number },
+  refusalId: string,
+  refusalCreatedAt: Date,
+): { latest: EvidenceGuardCursor; count: number } {
+  const refusalCursor = { createdAt: refusalCreatedAt.toISOString(), id: refusalId };
+  const latestNewer = activity.latest !== null && (
+    Date.parse(activity.latest.createdAt) > refusalCreatedAt.getTime() ||
+    (Date.parse(activity.latest.createdAt) === refusalCreatedAt.getTime() &&
+      activity.latest.id.localeCompare(refusalId) > 0)
+  );
+  return {
+    latest: latestNewer ? activity.latest : refusalCursor,
+    count: activity.count + 1,
+  };
+}
+
 function applyStatusSideEffects(
   status: string | undefined,
   patch: Partial<typeof issues.$inferInsert>,
@@ -10762,9 +10936,20 @@ export function issueService(db: Db) {
         ...issueData,
         updatedAt: new Date(),
       };
+      // Keys patch gains purely from the requested status (applyStatusSideEffects
+      // and the status-conditional resets below). If a concurrent writer moved the
+      // locked row to a terminal status mid-request, these keys are dropped so the
+      // stale request cannot regress or half-apply a status it never observed.
+      const statusDerivedPatchKeys = new Set<string>();
+      const noteStatusDerivedPatchKeys = (...keys: string[]) => {
+        for (const key of keys) {
+          if (!(key in issueData)) statusDerivedPatchKeys.add(key);
+        }
+      };
       if (existing.status !== "blocked" && issueData.status === "blocked") {
         patch.blockedTransitionAt = patch.updatedAt;
         patch.blockedOwnerNotifiedAt = null;
+        noteStatusDerivedPatchKeys("blockedTransitionAt", "blockedOwnerNotifiedAt");
       } else if (
         existing.status === "blocked" &&
         issueData.status &&
@@ -10773,6 +10958,7 @@ export function issueService(db: Db) {
         patch.unblockDescriptor = null;
         patch.blockedTransitionAt = null;
         patch.blockedOwnerNotifiedAt = null;
+        noteStatusDerivedPatchKeys("unblockDescriptor", "blockedTransitionAt", "blockedOwnerNotifiedAt");
       }
       if (issueData.requestDepth !== undefined) {
         patch.requestDepth = clampIssueRequestDepth(issueData.requestDepth);
@@ -10931,17 +11117,26 @@ export function issueService(db: Db) {
       }
 
       applyStatusSideEffects(issueData.status, patch);
+      noteStatusDerivedPatchKeys("startedAt", "completedAt", "cancelledAt");
       if (issueData.status && issueData.status !== "done") {
         patch.completedAt = null;
+        noteStatusDerivedPatchKeys("completedAt");
       }
       if (issueData.status && issueData.status !== "cancelled") {
         patch.cancelledAt = null;
+        noteStatusDerivedPatchKeys("cancelledAt");
       }
       if (issueData.status && issueData.status !== "in_progress") {
         patch.checkoutRunId = null;
         patch.executionRunId = null;
         patch.executionAgentNameKey = null;
         patch.executionLockedAt = null;
+        noteStatusDerivedPatchKeys(
+          "checkoutRunId",
+          "executionRunId",
+          "executionAgentNameKey",
+          "executionLockedAt",
+        );
       }
       if (
         (issueData.assigneeAgentId !== undefined &&
@@ -10966,6 +11161,28 @@ export function issueService(db: Db) {
           .for("update")
           .then((rows: Array<typeof issues.$inferSelect>) => rows[0] ?? null);
         if (!receiptExisting) return null;
+        // Lost-update guard for terminal statuses: this request validated its
+        // status change against the pre-lock read (`existing`). If a concurrent
+        // writer moved the row to a terminal status before this transaction
+        // acquired the row lock, applying the stale status would regress or
+        // half-apply a transition the request never observed. Drop the status
+        // change (and its derived side effects); explicit reopens (requested
+        // status "todo") stay legal. The caller receives the kept terminal
+        // status via `statusSupersededByTerminal` so it can echo the requested
+        // state in its response without misrepresenting the persisted row.
+        const statusSupersededByTerminal =
+          issueData.status !== undefined &&
+          issueData.status !== receiptExisting.status &&
+          existing.status !== receiptExisting.status &&
+          (receiptExisting.status === "done" ||
+            receiptExisting.status === "cancelled") &&
+          issueData.status !== "todo";
+        if (statusSupersededByTerminal) {
+          delete patch.status;
+          for (const key of statusDerivedPatchKeys) {
+            delete patch[key as keyof typeof patch];
+          }
+        }
         if (actorAgentId && actorRunId) {
           // Recheck under a run lock: a request admitted before Stop must not
           // commit a late Done after cancellation revoked its credentials.
@@ -11321,6 +11538,9 @@ export function issueService(db: Db) {
           ...(nextBlockedByIssueIds !== undefined
             ? { blockedByIssueIds: nextBlockedByIssueIds }
             : {}),
+          statusSupersededByTerminal: statusSupersededByTerminal
+            ? receiptExisting.status
+            : null,
           changes,
         };
       };
@@ -12135,6 +12355,231 @@ export function issueService(db: Db) {
       });
     },
 
+    evidenceGuardedMutation: async (
+      input: {
+        issueId: string;
+        targetCompanyId: string;
+        precondition: EvidenceGuardedPrecondition;
+        actor: {
+          actorType: "user" | "agent" | "system";
+          actorId: string;
+          agentId?: string | null;
+          runId?: string | null;
+          agentApiKeyId?: string | null;
+          responsibleUserIdOverride?: string | null;
+        };
+        /** Invoked while the transaction is still open, after a competing
+         * writer proved the precondition unvalidatable, so the caller can
+         * answer the client before the refusal audit below commits. */
+        onContention?: () => void;
+      },
+    ): Promise<
+      | { outcome: "issue_not_found" }
+      | { outcome: "applied"; issue: { id: string; companyId: string; status: string }; replay: boolean }
+      | { outcome: "conflict"; mismatches: EvidenceGuardMismatchId[]; requestDigest: string; observedDigest: string }
+    > => {
+      const publications: ActivityPublication[] = [];
+      const result = await db.transaction(async (tx) => {
+        // Single-transaction boundary. Probe the issue row lock WITHOUT
+        // waiting: a competing R3 writer holding the row proves the evidence
+        // cannot be validated against committed state yet. The caller answers
+        // its client immediately (onContention) while this same open
+        // transaction queues on the writer below; the refusal audit then
+        // carries the post-write observed state and commits atomically with
+        // everything the writer published.
+        //
+        // The probe must neither raise nor run under a savepoint. SKIP LOCKED
+        // reports contention by returning no row, so no statement inside this
+        // transaction ever fails: postgres.js latches every query rejection
+        // raised in a transaction scope and re-throws it after the callback
+        // resolves, which would abort this transaction (rolling the refusal
+        // audit back) even though the probe handled the error. Keeping the
+        // probe off a savepoint also pins the row lock to this transaction's
+        // own xid: a lock acquired inside a subtransaction cannot be
+        // attributed back to this backend by row-lock observers, which would
+        // hide the guarded mutation's ownership of the issue lock for the
+        // rest of the transaction.
+        const [probe] = await tx
+          .select({ id: issues.id })
+          .from(issues)
+          .where(eq(issues.id, input.issueId))
+          .for("update", { skipLocked: true });
+        // A missing row must stay a 404, so only a row that exists but is held
+        // by a competing writer counts as contention.
+        let contention = false;
+        if (!probe) {
+          const [existing] = await tx
+            .select({ id: issues.id })
+            .from(issues)
+            .where(eq(issues.id, input.issueId));
+          if (existing) {
+            contention = true;
+            input.onContention?.();
+          }
+        }
+        const [issue] = await tx
+          .select({
+            id: issues.id,
+            companyId: issues.companyId,
+            identifier: issues.identifier,
+            status: issues.status,
+            assigneeAgentId: issues.assigneeAgentId,
+            assigneeUserId: issues.assigneeUserId,
+          })
+          .from(issues)
+          .where(eq(issues.id, input.issueId))
+          .for("update");
+        if (!issue) return { outcome: "issue_not_found" as const };
+        const requestDigest = evidenceGuardDigest(input.precondition);
+        const observed = await computeObservedEvidencePrecondition(tx, {
+          companyId: issue.companyId,
+          issueId: issue.id,
+          issue,
+        });
+        // Exact replay of an already-applied guarded mutation: the latest
+        // issue-scoped activity is this operation's own success audit carrying
+        // the identical request digest. Read-only replay, no new writes.
+        const [latestActivity] = await tx
+          .select({ action: activityLog.action, details: activityLog.details })
+          .from(activityLog)
+          .where(and(
+            eq(activityLog.companyId, issue.companyId),
+            eq(activityLog.entityType, "issue"),
+            eq(activityLog.entityId, issue.id),
+          ))
+          .orderBy(desc(activityLog.createdAt), desc(activityLog.id))
+          .limit(1);
+        const latestGuardEvidence = (latestActivity?.details ?? null) as {
+          evidenceGuardedMutation?: { requestDigest?: string; operation?: string };
+        } | null;
+        if (
+          latestActivity?.action === "issue.updated" &&
+          latestGuardEvidence?.evidenceGuardedMutation?.requestDigest === requestDigest &&
+          latestGuardEvidence?.evidenceGuardedMutation?.operation === EVIDENCE_GUARD_OPERATION
+        ) {
+          return {
+            outcome: "applied" as const,
+            replay: true,
+            issue: { id: issue.id, companyId: issue.companyId, status: issue.status },
+          };
+        }
+        const mismatches = diffEvidencePrecondition(
+          input.precondition,
+          observed,
+          issue.companyId,
+          input.targetCompanyId,
+        );
+        if (mismatches.length > 0) {
+          // The refusal audit row is itself part of the issue-scoped activity
+          // evidence, so the honest observed digest must describe the committed
+          // state INCLUDING this row. Under contention the client has already
+          // been answered (its 409 flushed at the lock probe) while this
+          // transaction queued on the winning writer; once we unblock, any
+          // observer of the committed state sees the writer's rows plus this
+          // refusal row, so the digest basis predicts it exactly. Without
+          // contention the caller is still blocked on THIS transaction's
+          // response and cannot have observed the refusal yet, so the basis
+          // stays the pre-refusal observed evidence. The row's id and
+          // createdAt are generated here and stored explicitly so the
+          // prediction cannot drift from what is committed.
+          const refusalId = randomUUID();
+          const refusalCreatedAt = new Date();
+          const refusalDetails: Record<string, unknown> = {
+            guard: EVIDENCE_GUARD_SCHEMA,
+            operation: EVIDENCE_GUARD_OPERATION,
+            mismatches,
+            requestDigest,
+          };
+          const digestBasis = contention
+            ? {
+              ...observed,
+              activity: evidenceGuardActivityIncludingRefusal(
+                observed.activity,
+                refusalId,
+                refusalCreatedAt,
+              ),
+            }
+            : observed;
+          const observedDigest = evidenceGuardDigest(digestBasis);
+          // Bounded identifiers + fixed-length digests only, retained under
+          // normal activity_log retention (no separate policy, no bodies).
+          const refusalRow = {
+            id: refusalId,
+            createdAt: refusalCreatedAt,
+            companyId: issue.companyId,
+            actorType: input.actor.actorType,
+            actorId: input.actor.actorId,
+            agentId: input.actor.agentId ?? null,
+            runId: input.actor.runId ?? null,
+            responsibleUserId: input.actor.responsibleUserIdOverride ?? null,
+            action: EVIDENCE_GUARD_REFUSAL_ACTION,
+            entityType: "issue",
+            entityId: issue.id,
+            details: { ...refusalDetails, observedDigest },
+          };
+          await tx.insert(activityLog).values(refusalRow);
+          publications.push({
+            companyId: issue.companyId,
+            payload: {
+              actorType: refusalRow.actorType,
+              actorId: refusalRow.actorId,
+              action: refusalRow.action,
+              entityType: refusalRow.entityType,
+              entityId: refusalRow.entityId,
+              agentId: refusalRow.agentId,
+              runId: refusalRow.runId,
+              responsibleUserId: refusalRow.responsibleUserId,
+              details: refusalRow.details,
+            },
+            pluginEvent: null,
+          });
+          return { outcome: "conflict" as const, mismatches, requestDigest, observedDigest };
+        }
+        // Validation held the issue lock the whole time: apply the only
+        // permitted mutation (status-only done) with its paired activity in
+        // the same transaction.
+        const now = new Date();
+        const [updatedIssue] = await tx
+          .update(issues)
+          .set({ status: "done", completedAt: now, updatedAt: now })
+          .where(and(eq(issues.id, issue.id), eq(issues.companyId, issue.companyId)))
+          .returning({ id: issues.id, companyId: issues.companyId, status: issues.status });
+        if (!updatedIssue) throw new Error("Evidence-guarded issue vanished under its held row lock");
+        await logActivity(tx as unknown as Db, {
+          companyId: issue.companyId,
+          actorType: input.actor.actorType,
+          actorId: input.actor.actorId,
+          agentId: input.actor.agentId ?? null,
+          runId: input.actor.runId ?? null,
+          agentApiKeyId: input.actor.agentApiKeyId ?? null,
+          responsibleUserIdOverride: input.actor.responsibleUserIdOverride ?? null,
+          action: "issue.updated",
+          entityType: "issue",
+          entityId: issue.id,
+          details: {
+            status: "done",
+            identifier: issue.identifier,
+            source: "evidence_guarded_mutation",
+            evidenceGuardedMutation: {
+              operation: EVIDENCE_GUARD_OPERATION,
+              requestDigest,
+            },
+          },
+        }, publications);
+        return {
+          outcome: "applied" as const,
+          replay: false,
+          issue: {
+            id: updatedIssue.id,
+            companyId: updatedIssue.companyId,
+            status: updatedIssue.status,
+          },
+        };
+      });
+      for (const publication of publications) publishActivity(publication);
+      return result;
+    },
+
     tombstoneComment: async (
       commentId: string,
       actor: {
@@ -12153,6 +12598,21 @@ export function issueService(db: Db) {
 
       return db.transaction(async (tx) => {
         const now = new Date();
+        // Writer-boundary fence (same pattern as addComment): serialize the
+        // tombstone behind the issue row lock so concurrent issue writers
+        // queue on this transaction, and the paired issue.comment_deleted
+        // activity (written by the caller's afterTombstone hook below)
+        // commits in the exact transaction that wrote the tombstone.
+        const [tombstoneTarget] = await tx
+          .select({ id: issueComments.id, issueId: issueComments.issueId })
+          .from(issueComments)
+          .where(eq(issueComments.id, commentId));
+        if (!tombstoneTarget) return null;
+        await tx
+          .select({ id: issues.id })
+          .from(issues)
+          .where(eq(issues.id, tombstoneTarget.issueId))
+          .for("update");
         const [comment] = await tx
           .update(issueComments)
           .set({

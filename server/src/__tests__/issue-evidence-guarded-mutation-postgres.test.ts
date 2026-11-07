@@ -226,12 +226,20 @@ async function snapshot(db: Db, fixture: Pick<Fixture, "companyId" | "issueId">)
   const runs = await jsonRows(db, sql.raw(
     `select to_jsonb(t) row from heartbeat_runs t where company_id::text=${quotedCompanyId} order by created_at,id`,
   ));
+  // Test-owned harness machinery is out of scope for the unrelated-state
+  // oracle: the gate seam tables are DDL fixtures created in beforeAll, and
+  // the coupling seam tables (paperclip_activity_fence, paperclip_activity_pause)
+  // are armed by the tests themselves AFTER the before-snapshot. None of them
+  // is ever written by production code, so excluding them cannot hide a real
+  // production mutation; every other public table carrying issue_id /
+  // related_issue_id stays inside the oracle.
   const tables = await db.execute<{ tableName: string; hasRelatedIssueId: boolean }>(sql.raw(`
     select c.table_name "tableName",
       bool_or(c.column_name='related_issue_id') "hasRelatedIssueId"
     from information_schema.columns c
     where c.table_schema='public' and c.column_name in ('issue_id','related_issue_id')
-      and c.table_name not in ('issue_comments','paperclip_test_issue_gate_config','paperclip_test_issue_gate_audit')
+      and c.table_name not in ('issue_comments','paperclip_test_issue_gate_config','paperclip_test_issue_gate_audit',
+        'paperclip_activity_fence','paperclip_activity_pause')
     group by c.table_name order by c.table_name
   `));
   const related: Record<string, Record<string, unknown>[]> = {};
@@ -280,9 +288,19 @@ function expectRefusalAudit(
     requestDigest: expectedRequestDigest,
     observedDigest: expectedObservedDigest,
   });
-  expect(expectedRequestDigest).not.toBe(expectedObservedDigest);
+  // A request-level mismatch (e.g. targetCompanyId) refuses on the company/scope
+  // check while the evidence precondition is unchanged, so requested and observed
+  // evidence — and therefore their digests — are legitimately identical. Only an
+  // evidence-level mismatch must produce independent digests. The branch predicate
+  // is the same canonicalization the digests use, so it cannot pass vacuously.
+  if (canonicalJson(requested) === canonicalJson(observed)) {
+    expect(expectedRequestDigest, "unchanged evidence must yield identical request/observed digests").toBe(expectedObservedDigest);
+    expect(details?.observedDigest, "unchanged evidence must make the audit digests agree").toBe(expectedRequestDigest);
+  } else {
+    expect(expectedRequestDigest).not.toBe(expectedObservedDigest);
+    expect(details?.observedDigest).not.toBe(expectedRequestDigest);
+  }
   expect(details?.requestDigest).not.toBe("0".repeat(64));
-  expect(details?.observedDigest).not.toBe(expectedRequestDigest);
   expect(Object.keys((details ?? {}) as object).sort()).toEqual([
     "guard", "mismatches", "observedDigest", "operation", "requestDigest",
   ]);
@@ -855,6 +873,59 @@ describePostgres("issue evidence-guarded mutation PostgreSQL boundary", () => {
     expect(await snapshot(db, fixture)).toEqual(before);
   });
 
+  it("answers a foreign-company issue with the exact missing-issue 404 body, no refusal audit, and zero writes", async () => {
+    const fixture = await seed();
+    // seed() provisions the second company + owner membership but no issue in
+    // it, so the foreign (company B) target is created in-test.
+    const foreignIssueId = randomUUID();
+    await db.insert(issues).values({
+      id: foreignIssueId,
+      companyId: fixture.otherCompanyId,
+      title: "Foreign company issue",
+      description: "company B's issue must be invisible to company A's guarded mutation",
+      status: "todo",
+      priority: "medium",
+      assigneeAgentId: null,
+      assigneeUserId: null,
+      createdByUserId: BOARD_USER_ID,
+      createdAt: BASE_TIME,
+      updatedAt: BASE_TIME,
+    });
+    const foreign = { companyId: fixture.otherCompanyId, issueId: foreignIssueId };
+    const beforeCompanyA = await snapshot(db, fixture);
+    const beforeForeign = await snapshot(db, foreign);
+    // Company A actor, company A targetCompanyId, company B issue id: the
+    // target-company scope check passes, so only the issue's OWN company can
+    // betray the cross-tenant attempt.
+    const payload = guardedRequest(fixture, await readPrecondition(db, fixture));
+    expect(payload.targetCompanyId).toBe(fixture.companyId);
+
+    const foreignResponse = await request(fixture.guardApp)
+      .post(`/api/issues/${foreignIssueId}/evidence-guarded-mutations`)
+      .send(payload);
+    expect(foreignResponse.status, JSON.stringify(foreignResponse.body)).toBe(404);
+    expect(foreignResponse.body, "a foreign-existing issue must be indistinguishable from a missing one")
+      .toEqual({ error: "Issue not found" });
+    // Existence parity: a truly missing issue id answers with the identical
+    // status and body, so the foreign id leaks no existence oracle.
+    const missingResponse = await request(fixture.guardApp)
+      .post(`/api/issues/${randomUUID()}/evidence-guarded-mutations`)
+      .send(payload);
+    expect(missingResponse.status, JSON.stringify(missingResponse.body)).toBe(404);
+    expect(missingResponse.body).toEqual(foreignResponse.body);
+
+    // Decisive cross-tenant-write guard: zero new activity rows for BOTH
+    // companies' issues — no refusal audit anywhere — and both issue rows
+    // unchanged (the foreign issue keeps "todo").
+    const afterCompanyA = await snapshot(db, fixture);
+    const afterForeign = await snapshot(db, foreign);
+    expect(refusalRows(afterCompanyA), "no refusal audit row in company A's log").toHaveLength(0);
+    expect(refusalRows(afterForeign), "no refusal audit row in company B's log").toHaveLength(0);
+    expect(afterCompanyA).toEqual(beforeCompanyA);
+    expect(afterForeign).toEqual(beforeForeign);
+    expect(afterForeign.issue[0]).toMatchObject({ status: "todo" });
+  });
+
   it.each([
     ["missing precondition", (payload: Record<string, unknown>) => ({ targetCompanyId: payload.targetCompanyId, mutation: payload.mutation })],
     ["non-done status", (payload: any) => ({ ...payload, mutation: { status: "in_review" } })],
@@ -909,7 +980,16 @@ describePostgres("issue evidence-guarded mutation PostgreSQL boundary", () => {
     const result = await overlap(fixture, writer, "competing-write-first");
     writer.assertSuccess(result.writerResponse, fixture);
     expect(result.guardResponse.status, JSON.stringify(result.guardResponse.body)).toBe(409);
-    const after = await snapshot(db, fixture);
+    // The 409 flushes at the probe while the refusal-audit transaction commits
+    // afterwards by design: the audit row deliberately observes post-writer-commit
+    // state, so the response can never trail its own audit commit. waitUntil closes
+    // ONLY that commit-arrival race — the refusal row stays REQUIRED below (exact
+    // length, exact digests, bounded body-free audit), and the wait does not depend
+    // on writer speed: all five writer classes share this single assertion site.
+    const after = await waitUntil(async () => {
+      const snap = await snapshot(db, fixture);
+      return refusalRows(snap).length ? snap : null;
+    }, "guard refusal audit commit");
     const afterWriter = withoutRefusal(after);
     writer.assertEffect(result.before, afterWriter, fixture);
     expect(afterWriter.issue[0]?.status).not.toBe("done");
