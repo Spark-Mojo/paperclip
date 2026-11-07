@@ -13453,6 +13453,41 @@ export function issueRoutes(
           });
         }
       }
+      if (actor.actorType === "agent") {
+        const nextParentIdForDelegationCheck =
+          updateFields.parentId === undefined
+            ? existing.parentId
+            : (updateFields.parentId as string | null);
+        const parentChangedForDelegationCheck =
+          updateFields.parentId !== undefined &&
+          updateFields.parentId !== existing.parentId;
+        if (
+          assigneeWillChange &&
+          nextAssigneeAgentId &&
+          nextAssigneeAgentId !== existing.assigneeAgentId
+        ) {
+          await assertNoAgentDelegationCycle({
+            actorType: actor.actorType,
+            actorAgentId: actor.agentId,
+            parentIssueId: parentChangedForDelegationCheck
+              ? nextParentIdForDelegationCheck
+              : existing.parentId,
+            assigneeAgentId: nextAssigneeAgentId,
+          });
+        } else if (
+          !assigneeWillChange &&
+          parentChangedForDelegationCheck &&
+          nextParentIdForDelegationCheck &&
+          existing.assigneeAgentId
+        ) {
+          await assertNoAgentDelegationCycle({
+            actorType: actor.actorType,
+            actorAgentId: actor.agentId,
+            parentIssueId: nextParentIdForDelegationCheck,
+            assigneeAgentId: existing.assigneeAgentId,
+          });
+        }
+      }
 
       // Only this request may finish a mutation that intentionally stops its
       // own run (for example handing work to a signoff reviewer).

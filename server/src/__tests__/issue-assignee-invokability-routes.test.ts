@@ -349,3 +349,127 @@ describe("agent delegation cycle guard", () => {
     expect(mockIssueService.findOpenAncestorCreatedByAgent).not.toHaveBeenCalled();
   });
 });
+
+describe("agent delegation cycle guard on PATCH reassignment", () => {
+  beforeEach(() => {
+    mockIssueService.getById.mockReset();
+    mockIssueService.findOpenAncestorCreatedByAgent.mockReset();
+    mockIssueService.findOpenAncestorCreatedByAgent.mockResolvedValue(null);
+    mockIssueService.update.mockReset();
+  });
+
+  it("refuses a PATCH reassignment to the creator of an open ancestor", async () => {
+    const existing = makeIssue({
+      assigneeAgentId: null,
+      parentId: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+    });
+    // Pin the fixture: id and parentId must differ so the guard-scope
+    // assertion below distinguishes (existing.parentId, assignee).
+    expect(existing.parentId).not.toBe(existing.id);
+    mockIssueService.getById.mockResolvedValue(existing);
+    mockIssueService.findOpenAncestorCreatedByAgent.mockResolvedValue({
+      id: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+      identifier: "PAP-100",
+      parentId: null,
+      createdByAgentId: IDLE_AGENT_ID,
+      status: "in_progress",
+    });
+
+    const res = await request(createApp(agentActor()))
+      .patch(`/api/issues/${existing.id}`)
+      .send({ assigneeAgentId: IDLE_AGENT_ID });
+
+    expect(res.status).toBe(409);
+    expect(res.body.error).toContain("Delegation cycle");
+    expect(res.body.details).toMatchObject({ code: "delegation_cycle" });
+    expect(mockIssueService.update).not.toHaveBeenCalled();
+    expect(mockIssueService.findOpenAncestorCreatedByAgent).toHaveBeenCalledWith(existing.parentId, IDLE_AGENT_ID);
+  });
+
+  it("allows a PATCH reassignment when no open ancestor was created by the assignee", async () => {
+    const existing = makeIssue({
+      assigneeAgentId: null,
+      parentId: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+    });
+    const updated = makeIssue({
+      assigneeAgentId: IDLE_AGENT_ID,
+      parentId: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+    });
+    mockIssueService.getById.mockResolvedValue(existing);
+    mockIssueService.update.mockResolvedValue(updated);
+
+    const res = await request(createApp(agentActor()))
+      .patch(`/api/issues/${existing.id}`)
+      .send({ assigneeAgentId: IDLE_AGENT_ID });
+
+    expect(res.status).toBe(200);
+    expect(mockIssueService.update).toHaveBeenCalled();
+  });
+
+  it("refuses a PATCH reparent-only move onto a chain created by the current assignee", async () => {
+    const currentParent = "99999999-9999-4999-8999-999999999999";
+    const nextParent = "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee";
+    const existing = makeIssue({
+      assigneeAgentId: IDLE_AGENT_ID,
+      parentId: currentParent,
+    });
+    // Pin the fixture: distinct id/parent ids so the guard-scope call
+    // (nextParentId, currentAssignee) cannot be confused with (existing.id, *).
+    expect(existing.id).not.toBe(existing.parentId);
+    expect(nextParent).not.toBe(existing.id);
+    expect(nextParent).not.toBe(existing.parentId);
+    mockIssueService.getById.mockResolvedValue(existing);
+    mockIssueService.findOpenAncestorCreatedByAgent.mockResolvedValue({
+      id: nextParent,
+      identifier: "PAP-200",
+      parentId: null,
+      createdByAgentId: IDLE_AGENT_ID,
+      status: "in_progress",
+    });
+
+    const res = await request(createApp(agentActor()))
+      .patch(`/api/issues/${existing.id}`)
+      .send({ parentId: nextParent });
+
+    expect(res.status).toBe(409);
+    expect(res.body.error).toContain("Delegation cycle");
+    expect(res.body.details).toMatchObject({ code: "delegation_cycle" });
+    expect(mockIssueService.update).not.toHaveBeenCalled();
+    expect(mockIssueService.findOpenAncestorCreatedByAgent).toHaveBeenCalledWith(
+      nextParent,
+      IDLE_AGENT_ID,
+    );
+  });
+
+  it("refuses a PATCH reassign+reparent when the new parent chain was created by the new assignee", async () => {
+    const nextParent = "ffffffff-ffff-4fff-8fff-ffffffffffff";
+    const existing = makeIssue({
+      assigneeAgentId: null,
+      parentId: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+    });
+    expect(existing.parentId).not.toBe(existing.id);
+    expect(nextParent).not.toBe(existing.id);
+    expect(nextParent).not.toBe(existing.parentId);
+    mockIssueService.getById.mockResolvedValue(existing);
+    mockIssueService.findOpenAncestorCreatedByAgent.mockResolvedValue({
+      id: nextParent,
+      identifier: "PAP-300",
+      parentId: null,
+      createdByAgentId: IDLE_AGENT_ID,
+      status: "in_progress",
+    });
+
+    const res = await request(createApp(agentActor()))
+      .patch(`/api/issues/${existing.id}`)
+      .send({ assigneeAgentId: IDLE_AGENT_ID, parentId: nextParent });
+
+    expect(res.status).toBe(409);
+    expect(res.body.error).toContain("Delegation cycle");
+    expect(res.body.details).toMatchObject({ code: "delegation_cycle" });
+    expect(mockIssueService.update).not.toHaveBeenCalled();
+    expect(mockIssueService.findOpenAncestorCreatedByAgent).toHaveBeenCalledWith(
+      nextParent,
+      IDLE_AGENT_ID,
+    );
+  });
+});
