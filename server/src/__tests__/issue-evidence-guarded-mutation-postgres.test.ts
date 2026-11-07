@@ -50,6 +50,14 @@ type Fixture = {
   otherCompanyApp: express.Express;
 };
 type Snapshot = Awaited<ReturnType<typeof snapshot>>;
+type IssueIdentityCase = {
+  name: string;
+  app: (fixture: Fixture) => express.Express;
+  pathIssueId: (fixture: Fixture) => string;
+  targetCompanyId: (fixture: Fixture) => string;
+  expectedStatus: 403 | 404;
+  expectedBody?: Record<string, unknown>;
+};
 type Writer = {
   name: string;
   firstTable: "issues" | "issue_comments";
@@ -94,6 +102,8 @@ const GATE_APP_NAME = "guarded-evidence-gate-holder";
 const GATE_LOCK_KEY = 173120031;
 const PAUSE_LOCK_KEY = 173120032;
 
+// The URL :id is authoritative and therefore deliberately absent: foreign or
+// missing path identities are 404s below, never invented body-evidence fields.
 const MISMATCH_IDS = [
   "targetCompanyId",
   "issue.status",
@@ -306,7 +316,18 @@ function expectRefusalAudit(
     expect(expectedRequestDigest).not.toBe(expectedObservedDigest);
     expect(details?.observedDigest).not.toBe(expectedRequestDigest);
   }
+  expect(details?.requestDigest).toMatch(/^[0-9a-f]{64}$/);
+  expect(details?.observedDigest).toMatch(/^[0-9a-f]{64}$/);
   expect(details?.requestDigest).not.toBe("0".repeat(64));
+  expect(details?.observedDigest).not.toBe("0".repeat(64));
+  // This is the normal retained issue-activity row, not a side channel with a
+  // separate lifecycle: R4 refusal evidence follows activity_log retention.
+  expect(rows[0]).toMatchObject({
+    action: REFUSAL_ACTION,
+    entity_type: "issue",
+    entity_id: after.issue[0]?.id,
+    company_id: after.issue[0]?.company_id,
+  });
   expect(Object.keys((details ?? {}) as object).sort()).toEqual([
     "guard", "mismatches", "observedDigest", "operation", "requestDigest",
   ]);
@@ -946,6 +967,7 @@ describePostgres("issue evidence-guarded mutation PostgreSQL boundary", () => {
     const precondition = await readPrecondition(db, fixture);
     expect(precondition.comments.latest).toEqual({ createdAt: BASE_TIME.toISOString(), id: COMMENT_HIGH_ID });
     expect(precondition.activity.latest).toEqual({ createdAt: BASE_TIME.toISOString(), id: ACTIVITY_HIGH_ID });
+    const before = await snapshot(db, fixture);
     const payload = guardedRequest(fixture, precondition);
     expect(payload).toEqual({ targetCompanyId: fixture.companyId, precondition, mutation: { status: "done" } });
     expect(JSON.stringify(payload)).not.toContain("commentBody");
@@ -956,7 +978,7 @@ describePostgres("issue evidence-guarded mutation PostgreSQL boundary", () => {
     expect(first.body).toMatchObject({ operation: OPERATION_ID, issue: { id: fixture.issueId, companyId: fixture.companyId, status: "done" } });
     const afterFirst = await snapshot(db, fixture);
     expect(afterFirst.issue[0]).toMatchObject({ status: "done" });
-    expect(afterFirst.comments).toHaveLength(2);
+    expect(afterFirst.comments).toEqual(before.comments);
     expect(afterFirst.activities.slice(2).map((row) => row.action)).toEqual(["issue.updated"]);
 
     const retry = await request(fixture.guardApp).post(endpoint(fixture)).send(payload);
@@ -965,17 +987,52 @@ describePostgres("issue evidence-guarded mutation PostgreSQL boundary", () => {
     expect(await snapshot(db, fixture)).toEqual(afterFirst);
   });
 
-  it("requires authentication and target-company scope before reading evidence", async () => {
+  it("requires authentication before reading evidence", async () => {
     const fixture = await seed();
     const before = await snapshot(db, fixture);
     const payload = guardedRequest(fixture, await readPrecondition(db, fixture));
     const anonymous = await request(fixture.anonymousApp).post(endpoint(fixture)).send(payload);
     expect(anonymous.status).toBe(401);
-    const wrongScope = await request(fixture.otherCompanyApp).post(endpoint(fixture)).send(payload);
-    expect(wrongScope.status).toBe(403);
-    const mismatchedTarget = await request(fixture.guardApp).post(endpoint(fixture)).send({ ...payload, targetCompanyId: fixture.otherCompanyId });
-    expect(mismatchedTarget.status).toBe(403);
     expect(await snapshot(db, fixture)).toEqual(before);
+  });
+
+  const issueIdentityCases: IssueIdentityCase[] = [
+    {
+      name: "actor lacks target-company scope",
+      app: (fixture) => fixture.otherCompanyApp,
+      pathIssueId: (fixture) => fixture.issueId,
+      targetCompanyId: (fixture) => fixture.companyId,
+      expectedStatus: 403,
+    },
+    {
+      name: "targetCompanyId names a different existing company",
+      app: (fixture) => fixture.guardApp,
+      pathIssueId: (fixture) => fixture.issueId,
+      targetCompanyId: (fixture) => fixture.otherCompanyId,
+      expectedStatus: 403,
+    },
+    {
+      name: "authoritative URL issue id is missing",
+      app: (fixture) => fixture.guardApp,
+      pathIssueId: () => randomUUID(),
+      targetCompanyId: (fixture) => fixture.companyId,
+      expectedStatus: 404,
+      expectedBody: { error: "Issue not found" },
+    },
+  ];
+
+  it.each(issueIdentityCases)("refuses independent company/issue identity path: $name", async (identityCase) => {
+    const fixture = await seed();
+    const before = await snapshot(db, fixture);
+    const payload = guardedRequest(fixture, await readPrecondition(db, fixture));
+    const response = await request(identityCase.app(fixture))
+      .post(`/api/issues/${identityCase.pathIssueId(fixture)}/evidence-guarded-mutations`)
+      .send({ ...payload, targetCompanyId: identityCase.targetCompanyId(fixture) });
+    expect(response.status, JSON.stringify(response.body)).toBe(identityCase.expectedStatus);
+    if (identityCase.expectedBody) expect(response.body).toEqual(identityCase.expectedBody);
+    const after = await snapshot(db, fixture);
+    expect(refusalRows(after)).toHaveLength(0);
+    expect(after).toEqual(before);
   });
 
   it("answers a foreign-company issue with the exact missing-issue 404 body, no refusal audit, and zero writes", async () => {
@@ -1046,6 +1103,10 @@ describePostgres("issue evidence-guarded mutation PostgreSQL boundary", () => {
     expect(await snapshot(db, fixture)).toEqual(before);
   });
 
+  // R4 independent mismatch matrix: request company identity; issue status and
+  // both assignees; both halves of each latest-row cursor; comment count plus
+  // deletion state; and activity count. Path issue identity is the 403/404
+  // matrix above because URL :id is authoritative, not a body evidence field.
   const mismatchCases: Array<[MismatchId, (precondition: Precondition, fixture: Fixture) => { targetCompanyId?: string; precondition: Precondition }]> = [
     ["targetCompanyId", (precondition) => ({ targetCompanyId: randomUUID(), precondition })],
     ["issue.status", (precondition) => ({ precondition: { ...precondition, issue: { ...precondition.issue, status: "in_progress" } } })],
@@ -1059,6 +1120,10 @@ describePostgres("issue evidence-guarded mutation PostgreSQL boundary", () => {
     ["activity.latest.id", (precondition) => ({ precondition: { ...precondition, activity: { ...precondition.activity, latest: { ...precondition.activity.latest!, id: ACTIVITY_LOW_ID } } } })],
     ["activity.count", (precondition) => ({ precondition: { ...precondition, activity: { ...precondition.activity, count: precondition.activity.count + 1 } } })],
   ];
+
+  it("enumerates every R4 evidence mismatch exactly once", () => {
+    expect(mismatchCases.map(([mismatch]) => mismatch)).toEqual([...MISMATCH_IDS]);
+  });
 
   it.each(mismatchCases)("returns a typed 409 for only %s, exact independent digests, and one bounded body-free audit", async (mismatch, mutate) => {
     const fixture = await seed();
@@ -1076,6 +1141,8 @@ describePostgres("issue evidence-guarded mutation PostgreSQL boundary", () => {
       error: { code: "issue_evidence_conflict", message: "Issue evidence changed", mismatches: [mismatch] },
     });
     const after = await snapshot(db, fixture);
+    expect(after.issue[0]?.status, "a refusal must leave the target status unchanged").toBe(before.issue[0]?.status);
+    expect(after.comments, "a refusal must leave target comments unchanged").toEqual(before.comments);
     expect(withoutRefusal(after)).toEqual(before);
     expectRefusalAudit(after, [mismatch], requested, observed);
   });
