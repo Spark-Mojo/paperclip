@@ -10935,20 +10935,9 @@ export function issueService(db: Db) {
         ...issueData,
         updatedAt: new Date(),
       };
-      // Keys patch gains purely from the requested status (applyStatusSideEffects
-      // and the status-conditional resets below). If a concurrent writer moved the
-      // locked row to a terminal status mid-request, these keys are dropped so the
-      // stale request cannot regress or half-apply a status it never observed.
-      const statusDerivedPatchKeys = new Set<string>();
-      const noteStatusDerivedPatchKeys = (...keys: string[]) => {
-        for (const key of keys) {
-          if (!(key in issueData)) statusDerivedPatchKeys.add(key);
-        }
-      };
       if (existing.status !== "blocked" && issueData.status === "blocked") {
         patch.blockedTransitionAt = patch.updatedAt;
         patch.blockedOwnerNotifiedAt = null;
-        noteStatusDerivedPatchKeys("blockedTransitionAt", "blockedOwnerNotifiedAt");
       } else if (
         existing.status === "blocked" &&
         issueData.status &&
@@ -10957,7 +10946,6 @@ export function issueService(db: Db) {
         patch.unblockDescriptor = null;
         patch.blockedTransitionAt = null;
         patch.blockedOwnerNotifiedAt = null;
-        noteStatusDerivedPatchKeys("unblockDescriptor", "blockedTransitionAt", "blockedOwnerNotifiedAt");
       }
       if (issueData.requestDepth !== undefined) {
         patch.requestDepth = clampIssueRequestDepth(issueData.requestDepth);
@@ -11116,26 +11104,17 @@ export function issueService(db: Db) {
       }
 
       applyStatusSideEffects(issueData.status, patch);
-      noteStatusDerivedPatchKeys("startedAt", "completedAt", "cancelledAt");
       if (issueData.status && issueData.status !== "done") {
         patch.completedAt = null;
-        noteStatusDerivedPatchKeys("completedAt");
       }
       if (issueData.status && issueData.status !== "cancelled") {
         patch.cancelledAt = null;
-        noteStatusDerivedPatchKeys("cancelledAt");
       }
       if (issueData.status && issueData.status !== "in_progress") {
         patch.checkoutRunId = null;
         patch.executionRunId = null;
         patch.executionAgentNameKey = null;
         patch.executionLockedAt = null;
-        noteStatusDerivedPatchKeys(
-          "checkoutRunId",
-          "executionRunId",
-          "executionAgentNameKey",
-          "executionLockedAt",
-        );
       }
       if (
         (issueData.assigneeAgentId !== undefined &&
@@ -11160,28 +11139,6 @@ export function issueService(db: Db) {
           .for("update")
           .then((rows: Array<typeof issues.$inferSelect>) => rows[0] ?? null);
         if (!receiptExisting) return null;
-        // Lost-update guard for terminal statuses: this request validated its
-        // status change against the pre-lock read (`existing`). If a concurrent
-        // writer moved the row to a terminal status before this transaction
-        // acquired the row lock, applying the stale status would regress or
-        // half-apply a transition the request never observed. Drop the status
-        // change (and its derived side effects); explicit reopens (requested
-        // status "todo") stay legal. The caller receives the kept terminal
-        // status via `statusSupersededByTerminal` so it can echo the requested
-        // state in its response without misrepresenting the persisted row.
-        const statusSupersededByTerminal =
-          issueData.status !== undefined &&
-          issueData.status !== receiptExisting.status &&
-          existing.status !== receiptExisting.status &&
-          (receiptExisting.status === "done" ||
-            receiptExisting.status === "cancelled") &&
-          issueData.status !== "todo";
-        if (statusSupersededByTerminal) {
-          delete patch.status;
-          for (const key of statusDerivedPatchKeys) {
-            delete patch[key as keyof typeof patch];
-          }
-        }
         if (actorAgentId && actorRunId) {
           // Recheck under a run lock: a request admitted before Stop must not
           // commit a late Done after cancellation revoked its credentials.
@@ -11537,9 +11494,6 @@ export function issueService(db: Db) {
           ...(nextBlockedByIssueIds !== undefined
             ? { blockedByIssueIds: nextBlockedByIssueIds }
             : {}),
-          statusSupersededByTerminal: statusSupersededByTerminal
-            ? receiptExisting.status
-            : null,
           changes,
         };
       };
