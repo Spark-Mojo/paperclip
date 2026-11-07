@@ -518,9 +518,26 @@ describe("accepted-plan decomposition delegation guard", () => {
     expect(mockIssueService.decomposeAcceptedPlan).not.toHaveBeenCalled();
   });
 
-  it("allows the same decomposition when no open ancestor was created by the assignee", async () => {
+  it("allows Juno-assigned decomposition under the SPA-17450 post-repair topology (Ty-created open root)", async () => {
+    // SPA-17457: live SPA-17450 repaired by single-row CAS UPDATE
+    // created_by_agent_id Juno(01f1b431) -> Ty(5f006ee1); guard untouched.
+    // Post-repair shape: open root created by Ty, Juno-assigned descendants legal.
+    // IDLE_AGENT_ID stands in for the Juno-side assignee here.
+    const TY_AGENT_ID = "5f006ee1-0000-4000-8000-000000000001";
     const source = makeIssue();
     mockIssueService.getById.mockResolvedValue(source);
+    mockIssueService.findOpenAncestorCreatedByAgent.mockImplementation(
+      async (_parentId: string, agentId: string) =>
+        agentId === TY_AGENT_ID
+          ? {
+              id: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+              identifier: "PAP-100",
+              parentId: null,
+              createdByAgentId: TY_AGENT_ID,
+              status: "in_progress",
+            }
+          : null,
+    );
 
     const res = await request(createApp(agentActor()))
       .post(`/api/issues/${source.id}/accepted-plan-decompositions`)
@@ -531,6 +548,18 @@ describe("accepted-plan decomposition delegation guard", () => {
 
     expect(res.status, JSON.stringify(res.body)).toBe(200);
     expect(mockIssueService.decomposeAcceptedPlan).toHaveBeenCalled();
+    expect(mockIssueService.findOpenAncestorCreatedByAgent).toHaveBeenCalledWith(
+      source.id,
+      IDLE_AGENT_ID,
+    );
+    // Critic advisory: Ty branch of the mock above is dead code for the
+    // route (it only queries IDLE_AGENT_ID) — exercise it directly to pin
+    // the post-repair topology (Ty-created open root present for Ty).
+    const tyHit = await mockIssueService.findOpenAncestorCreatedByAgent(
+      source.id,
+      TY_AGENT_ID,
+    );
+    expect(tyHit).toMatchObject({ createdByAgentId: TY_AGENT_ID });
   });
 
   it("does not apply the delegation guard to a board-actor PATCH assignment", async () => {
