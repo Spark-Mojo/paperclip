@@ -12375,6 +12375,12 @@ export function issueRoutes(
           req,
           collectIssueWorkspaceCommandPaths(childBody),
         );
+        await assertNoAgentDelegationCycle({
+          actorType: req.actor.type,
+          actorAgentId: req.actor.agentId,
+          parentIssueId: sourceIssue.id,
+          assigneeAgentId: normalizedAssigneeAgentId ?? null,
+        });
         if (childBody.assigneeAgentId || childBody.assigneeUserId) {
           await assertCanAssignTasks(req, sourceIssue.companyId, {
             projectId: childBody.projectId ?? sourceIssue.projectId ?? null,

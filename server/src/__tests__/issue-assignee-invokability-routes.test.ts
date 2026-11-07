@@ -19,6 +19,7 @@ const mockIssueService = vi.hoisted(() => ({
   update: vi.fn(),
   create: vi.fn(),
   createChild: vi.fn(),
+  decomposeAcceptedPlan: vi.fn(),
   addComment: vi.fn(),
   findMentionedAgents: vi.fn(async () => []),
   getRelationSummaries: vi.fn(async () => ({ blockedBy: [], blocks: [] })),
@@ -471,5 +472,127 @@ describe("agent delegation cycle guard on PATCH reassignment", () => {
       nextParent,
       IDLE_AGENT_ID,
     );
+  });
+});
+
+describe("accepted-plan decomposition delegation guard", () => {
+  const REVISION_ID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+
+  beforeEach(() => {
+    mockIssueService.getById.mockReset();
+    mockIssueService.findOpenAncestorCreatedByAgent.mockReset();
+    mockIssueService.findOpenAncestorCreatedByAgent.mockResolvedValue(null);
+    mockIssueService.decomposeAcceptedPlan.mockReset();
+    mockIssueService.decomposeAcceptedPlan.mockResolvedValue({
+      decomposition: { id: "decomposition-1", status: "completed" },
+      childIssueIds: [],
+      newlyCreatedIssues: [],
+    });
+    mockIssueService.update.mockReset();
+  });
+
+  it("refuses an agent decomposition delegating back to the creator of an open ancestor", async () => {
+    const source = makeIssue();
+    mockIssueService.getById.mockResolvedValue(source);
+    mockIssueService.findOpenAncestorCreatedByAgent.mockResolvedValue({
+      id: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+      identifier: "PAP-100",
+      parentId: null,
+      createdByAgentId: IDLE_AGENT_ID,
+      status: "in_progress",
+    });
+
+    const res = await request(createApp(agentActor()))
+      .post(`/api/issues/${source.id}/accepted-plan-decompositions`)
+      .send({
+        acceptedPlanRevisionId: REVISION_ID,
+        children: [{ title: "Hand it back", assigneeAgentId: IDLE_AGENT_ID }],
+      });
+
+    expect(res.status).toBe(409);
+    expect(res.body.details).toMatchObject({ code: "delegation_cycle" });
+    expect(mockIssueService.findOpenAncestorCreatedByAgent).toHaveBeenCalledWith(
+      source.id,
+      IDLE_AGENT_ID,
+    );
+    expect(mockIssueService.decomposeAcceptedPlan).not.toHaveBeenCalled();
+  });
+
+  it("allows the same decomposition when no open ancestor was created by the assignee", async () => {
+    const source = makeIssue();
+    mockIssueService.getById.mockResolvedValue(source);
+
+    const res = await request(createApp(agentActor()))
+      .post(`/api/issues/${source.id}/accepted-plan-decompositions`)
+      .send({
+        acceptedPlanRevisionId: REVISION_ID,
+        children: [{ title: "Legit subtask", assigneeAgentId: IDLE_AGENT_ID }],
+      });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(mockIssueService.decomposeAcceptedPlan).toHaveBeenCalled();
+  });
+
+  it("does not apply the delegation guard to a board-actor PATCH assignment", async () => {
+    const existing = makeIssue({ assigneeAgentId: null });
+    const updated = makeIssue({ assigneeAgentId: IDLE_AGENT_ID });
+    mockIssueService.getById.mockResolvedValue(existing);
+    mockIssueService.update.mockResolvedValue(updated);
+    mockIssueService.findOpenAncestorCreatedByAgent.mockResolvedValue({
+      id: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+      identifier: "PAP-100",
+      parentId: null,
+      createdByAgentId: IDLE_AGENT_ID,
+      status: "in_progress",
+    });
+
+    const res = await request(createApp(boardActor()))
+      .patch(`/api/issues/${existing.id}`)
+      .send({ assigneeAgentId: IDLE_AGENT_ID });
+
+    expect(res.status).not.toBe(409);
+    expect(mockIssueService.update).toHaveBeenCalled();
+  });
+
+  it("allows an agent PATCH that clears the assignee without a delegation refusal", async () => {
+    const existing = makeIssue();
+    const updated = makeIssue({ assigneeAgentId: null });
+    mockIssueService.getById.mockResolvedValue(existing);
+    mockIssueService.update.mockResolvedValue(updated);
+    mockIssueService.findOpenAncestorCreatedByAgent.mockResolvedValue({
+      id: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+      identifier: "PAP-100",
+      parentId: null,
+      createdByAgentId: IDLE_AGENT_ID,
+      status: "in_progress",
+    });
+
+    const res = await request(createApp(agentActor()))
+      .patch(`/api/issues/${existing.id}`)
+      .send({ assigneeAgentId: null });
+
+    expect(res.status).not.toBe(409);
+    expect(mockIssueService.update).toHaveBeenCalled();
+  });
+
+  it("allows an agent PATCH self-assignment without a delegation refusal", async () => {
+    const existing = makeIssue({ assigneeAgentId: null });
+    const updated = makeIssue({ assigneeAgentId: AGENT_ACTOR_ID });
+    mockIssueService.getById.mockResolvedValue(existing);
+    mockIssueService.update.mockResolvedValue(updated);
+    mockIssueService.findOpenAncestorCreatedByAgent.mockResolvedValue({
+      id: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+      identifier: "PAP-100",
+      parentId: null,
+      createdByAgentId: AGENT_ACTOR_ID,
+      status: "in_progress",
+    });
+
+    const res = await request(createApp(agentActor()))
+      .patch(`/api/issues/${existing.id}`)
+      .send({ assigneeAgentId: AGENT_ACTOR_ID });
+
+    expect(res.status).not.toBe(409);
+    expect(mockIssueService.update).toHaveBeenCalled();
   });
 });
