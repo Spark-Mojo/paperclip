@@ -41,6 +41,7 @@ import {
   applyIssueExecutionPolicyTransition,
   normalizeIssueExecutionPolicy,
   parseIssueExecutionState,
+  validatedCompanyDefaultResponsibleUserId,
 } from "./issue-execution-policy.js";
 import { parseProjectExecutionWorkspacePolicy } from "./execution-workspace-policy.js";
 import { issueRecoveryActionService } from "./issue-recovery-actions.js";
@@ -733,7 +734,7 @@ function assertLockedBranchReconcileWorkspaceStillMatchesInspection(input: {
 
 async function quarantineRestoreDirtyWorkspaceBranch(input: {
   db: Db;
-  workspace: Pick<ExecutionWorkspace, "id" | "sourceIssueId">;
+  workspace: Pick<ExecutionWorkspace, "id" | "companyId" | "sourceIssueId">;
   inspection: ExecutionWorkspaceBranchReconcileInspection;
   actor: ExecutionWorkspaceBranchReconcileActor;
 }): Promise<NonNullable<ExecutionWorkspaceBranchReconcileResult["rescueRef"]>> {
@@ -745,7 +746,12 @@ async function quarantineRestoreDirtyWorkspaceBranch(input: {
       workMode: issues.workMode,
     })
     .from(issues)
-    .where(eq(issues.id, input.workspace.sourceIssueId!))
+    .where(
+      and(
+        eq(issues.id, input.workspace.sourceIssueId!),
+        eq(issues.companyId, input.workspace.companyId),
+      ),
+    )
     .then((rows) => rows[0] ?? null);
   if (!sourceIssue) throw notFound("Source issue not found");
 
@@ -3520,6 +3526,20 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
         if (!lockedWorkspace.sourceIssueId) {
           throw unprocessable("Execution workspace needs a source issue before Paperclip can audit branch reconciliation");
         }
+        if (input.mode === "quarantine_restore") {
+          const lockedSourceIssue = await tx
+            .select({ id: issues.id })
+            .from(issues)
+            .where(
+              and(
+                eq(issues.id, lockedWorkspace.sourceIssueId),
+                eq(issues.companyId, lockedWorkspace.companyId),
+              ),
+            )
+            .for("update")
+            .then((rows) => rows[0] ?? null);
+          if (!lockedSourceIssue) throw notFound("Source issue not found");
+        }
 
         let updatedRow: ExecutionWorkspaceRow = lockedRow;
         if (input.mode !== "quarantine_restore") {
@@ -3625,6 +3645,8 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
               status: issues.status,
               assigneeAgentId: issues.assigneeAgentId,
               assigneeUserId: issues.assigneeUserId,
+              responsibleUserId: issues.responsibleUserId,
+              createdByUserId: issues.createdByUserId,
               executionPolicy: issues.executionPolicy,
               executionState: issues.executionState,
               monitorNextCheckAt: issues.monitorNextCheckAt,
@@ -3635,16 +3657,24 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
               monitorScheduledBy: issues.monitorScheduledBy,
             })
             .from(issues)
-            .where(eq(issues.id, lockedWorkspace.sourceIssueId))
+            .where(
+              and(
+                eq(issues.id, lockedWorkspace.sourceIssueId),
+                eq(issues.companyId, lockedWorkspace.companyId),
+              ),
+            )
             .for("update");
           if (!sourceBefore) throw notFound("Source issue not found");
 
           const requestedStatus = quarantineRestoreRequestedSourceStatus(sourceBefore);
           const policy = normalizeIssueExecutionPolicy(sourceBefore.executionPolicy ?? null);
+          const companyDefaultResponsibleUserId =
+            await validatedCompanyDefaultResponsibleUserId(txDb, lockedWorkspace.companyId);
           const transition = applyIssueExecutionPolicyTransition({
             issue: sourceBefore,
             policy,
             previousPolicy: policy,
+            companyDefaultResponsibleUserId,
             requestedStatus,
             requestedAssigneePatch: {},
             actor: {
