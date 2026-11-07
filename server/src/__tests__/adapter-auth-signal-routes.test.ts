@@ -1,6 +1,6 @@
 import express from "express";
 import request from "supertest";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 
 // The cheap host-local authentication-signal route. It reads no sandbox and
 // runs no shell command or model process, so every test drives it through a
@@ -144,6 +144,15 @@ const authSignalPath = (companyId: string, type: string, environmentId?: string)
   `/api/companies/${companyId}/adapters/${type}/auth-signal${environmentId ? `?environmentId=${environmentId}` : ""}`;
 
 describe("adapter auth-signal route", () => {
+  // One-time warm-up: the first createApp() pays the factory-init/transform
+  // cost for the route + middleware modules. Hoisting it here under a
+  // generous hook timeout keeps that cost off the first test's per-test
+  // budget. The built app is discarded (no listen socket, no state leaks);
+  // each test still builds its own isolated app via createApp().
+  beforeAll(async () => {
+    await createApp();
+  }, 120_000);
+
   beforeEach(() => {
     vi.resetModules();
     vi.clearAllMocks();
