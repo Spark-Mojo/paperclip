@@ -409,18 +409,101 @@ async function readSettledLogs(db: TestDb, issueId: string) {
         expect(contract.unresolvedBlockerIssueIds.length).toBeGreaterThan(0);
         expect(contract.unresolvedBlockerIssueIds.every((id) => id !== issueId)).toBe(true);
       }
-      // The attention projections surface the wait but are human-readable:
-      // assert they exist and are non-empty — never raw-id substrings.
+      // DoD4: the attention projections must MATCH the wait's owner/action —
+      // non-empty alone is not enough (verify round 1 gap). The matching form
+      // follows the wait vehicle and never demands a raw owner UUID as prose
+      // (critic round 1): a descriptor wait matches by its semantic action
+      // label in every projection plus the projection surface's structured
+      // owner fields; a blocker wait matches by surfacing the blocking state
+      // (blocking issue id, blocker issue title, or an explicit readiness/
+      // blocking reference). Non-vacuity: the unpatched settler's settlement
+      // notes ("Automatic recovery stopped. Recorded work is preserved; …")
+      // contain no action label and none of these blocking references, and
+      // bare "blocked" is deliberately excluded as a keyword — the status
+      // word alone would make this oracle accept arbitrary prose.
+      const normalize = (value: string) => value.toLowerCase().replace(/\s+/g, " ").trim();
+      const bareUuid =
+        /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
       const projections = [
-        actions[0]!.nextAction ?? "",
-        actions[0]!.resolutionNote ?? "",
-        lifecycleEvents[0]!.message ?? "",
+        { surface: "nextAction", text: actions[0]!.nextAction ?? "" },
+        { surface: "resolutionNote", text: actions[0]!.resolutionNote ?? "" },
+        { surface: "lifecycle run event", text: lifecycleEvents[0]!.message ?? "" },
       ];
-      for (const projection of projections) {
+      for (const { surface, text } of projections) {
         expect(
-          projection.trim().length,
-          `attention projection must surface the wait non-empty, got: ${JSON.stringify(projection)}`,
+          text.trim().length,
+          `${surface} attention projection must be non-empty`,
         ).toBeGreaterThan(0);
+      }
+      if (contract.descriptorNamesOwnerAndAction) {
+        // Descriptor-carried wait: the action is a semantic label, never an
+        // id — so prose containment is a semantic match, not an id substring.
+        const descriptor = contract.descriptor!;
+        const actionLabel = normalize(descriptor.action);
+        expect(
+          bareUuid.test(descriptor.action.trim()),
+          `the descriptor action must be a semantic label, not a raw UUID: ${JSON.stringify(descriptor.action)}`,
+        ).toBe(false);
+        // Owner match through the projection surface's structured owner
+        // fields (ownerType/ownerAgentId/ownerUserId on the recovery action
+        // row): the routed attention must name the SAME owner the descriptor
+        // names, never an invented one.
+        if (descriptor.owner === "board") {
+          expect(
+            actions[0]!.ownerType === "board" ||
+              (actions[0]!.ownerAgentId == null && actions[0]!.ownerUserId == null),
+            `board-owned wait projected a non-board owner (ownerType=${actions[0]!.ownerType}, ownerAgentId=${actions[0]!.ownerAgentId}, ownerUserId=${actions[0]!.ownerUserId})`,
+          ).toBe(true);
+        } else if ("agentId" in descriptor.owner) {
+          expect(
+            actions[0]!.ownerAgentId,
+            `agent-owned wait projected ownerAgentId=${actions[0]!.ownerAgentId}, but the descriptor names ${descriptor.owner.agentId}`,
+          ).toBe(descriptor.owner.agentId);
+        } else {
+          expect(
+            actions[0]!.ownerUserId,
+            `user-owned wait projected ownerUserId=${actions[0]!.ownerUserId}, but the descriptor names ${descriptor.owner.userId}`,
+          ).toBe(descriptor.owner.userId);
+        }
+        // Action match: every attention projection must name THAT action — a
+        // projection that says nothing about it fails.
+        for (const { surface, text } of projections) {
+          expect(
+            normalize(text).includes(actionLabel),
+            `${surface} projection must name the descriptor's action ${JSON.stringify(descriptor.action)}, got: ${JSON.stringify(text)}`,
+          ).toBe(true);
+        }
+      } else {
+        // Blocker-carried wait: every attention projection must surface the
+        // blocking state — the blocking issue id, the blocker issue's own
+        // title, or an explicit readiness/blocking reference — instead of
+        // arbitrary prose (the readiness structured checks are already pinned
+        // above; realness of every blocker row via readRealBlockerRelations).
+        const blockingIssueIds = contract.unresolvedBlockerIssueIds;
+        const blockerTitles = blockingIssueIds.length
+          ? (
+              await db
+                .select({ title: issues.title })
+                .from(issues)
+                .where(
+                  and(
+                    eq(issues.companyId, actions[0]!.companyId),
+                    inArray(issues.id, blockingIssueIds),
+                  ),
+                )
+            ).map((row) => normalize(row.title))
+          : [];
+        for (const { surface, text } of projections) {
+          const normalized = normalize(text);
+          const surfacesBlockingState =
+            blockingIssueIds.some((id) => normalized.includes(id)) ||
+            blockerTitles.some((title) => title.length > 0 && normalized.includes(title)) ||
+            /readiness|unresolved|blocker|blocking|blocked by/i.test(normalized);
+          expect(
+            surfacesBlockingState,
+            `${surface} projection must surface the blocking wait (blocking issue id, blocker title, or readiness/blocking reference), got: ${JSON.stringify(text)}`,
+          ).toBe(true);
+        }
       }
     }, 60_000);
 
