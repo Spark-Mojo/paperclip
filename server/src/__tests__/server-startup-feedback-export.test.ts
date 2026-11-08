@@ -1,7 +1,11 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { randomUUID } from "node:crypto";
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { createConnection, createServer as createNetServer, type Socket } from "node:net";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import { spawn, type ChildProcess } from "node:child_process";
+import { fileURLToPath } from "node:url";
 
 const ORIGINAL_PAPERCLIP_API_URL = process.env.PAPERCLIP_API_URL;
 const ORIGINAL_PAPERCLIP_RUNTIME_API_URL = process.env.PAPERCLIP_RUNTIME_API_URL;
@@ -891,4 +895,716 @@ describe("startServer PAPERCLIP_API_URL handling", () => {
     expect(started.apiUrl).toBe("https://paperclip.example");
     expect(process.env.PAPERCLIP_RUNTIME_API_URL).toBe("https://paperclip.example");
   });
+});
+
+async function allocateLoopbackPort(): Promise<number> {
+  return await new Promise((resolve, reject) => {
+    const probe = createNetServer();
+    probe.unref();
+    probe.once("error", reject);
+    probe.listen(0, "127.0.0.1", () => {
+      const address = probe.address();
+      if (!address || typeof address === "string") {
+        probe.close(() => reject(new Error("failed to allocate startup integration port")));
+        return;
+      }
+      probe.close((error) => error ? reject(error) : resolve(address.port));
+    });
+  });
+}
+
+type StartupReadiness = {
+  type: "startup-integration-ready";
+  token: string;
+  listenPort: number;
+};
+
+async function createStartupReadinessListener(token: string): Promise<{
+  port: number;
+  readiness: Promise<StartupReadiness>;
+  close: () => Promise<void>;
+}> {
+  const sockets = new Set<Socket>();
+  let closePromise: Promise<void> | null = null;
+  let resolveReadiness!: (value: StartupReadiness) => void;
+  let rejectReadiness!: (error: Error) => void;
+  const readiness = new Promise<StartupReadiness>((resolve, reject) => {
+    resolveReadiness = resolve;
+    rejectReadiness = reject;
+  });
+  const listener = createNetServer((socket) => {
+    sockets.add(socket);
+    let message = "";
+    let ignoreConnection = false;
+    socket.setEncoding("utf8");
+    socket.setTimeout(1_000, () => {
+      ignoreConnection = true;
+      socket.destroy(new Error("startup readiness socket timed out"));
+    });
+    socket.once("close", () => sockets.delete(socket));
+    socket.on("data", (chunk) => {
+      message += chunk;
+      if (message.length > 4_096) {
+        ignoreConnection = true;
+        socket.destroy(new Error("startup readiness message exceeded 4096 bytes"));
+      }
+    });
+    // This listener is loopback-only, but unrelated local traffic must not be
+    // able to fail the fixture before the token-bearing child reports ready.
+    socket.once("error", () => socket.destroy());
+    socket.once("end", () => {
+      if (ignoreConnection) return;
+      let parsed: Partial<StartupReadiness>;
+      try {
+        parsed = JSON.parse(message.trim()) as Partial<StartupReadiness>;
+      } catch {
+        socket.destroy();
+        return;
+      }
+      if (parsed.token !== token) {
+        socket.destroy();
+        return;
+      }
+      if (
+        parsed.type !== "startup-integration-ready" ||
+        !Number.isInteger(parsed.listenPort) ||
+        Number(parsed.listenPort) <= 0
+      ) {
+        rejectReadiness(new Error(`invalid authenticated startup readiness message: ${message}`));
+        socket.destroy();
+        return;
+      }
+      resolveReadiness(parsed as StartupReadiness);
+      socket.destroy();
+    });
+  });
+  listener.once("error", rejectReadiness);
+  await new Promise<void>((resolve, reject) => {
+    listener.once("error", reject);
+    listener.listen(0, "127.0.0.1", resolve);
+  });
+  const address = listener.address();
+  if (!address || typeof address === "string") {
+    throw new Error("failed to bind startup readiness listener");
+  }
+  return {
+    port: address.port,
+    readiness,
+    close: async () => {
+      if (closePromise) return await closePromise;
+      closePromise = new Promise<void>((resolve, reject) => {
+        for (const socket of sockets) socket.destroy();
+        if (!listener.listening) {
+          resolve();
+          return;
+        }
+        let settled = false;
+        let timeout: ReturnType<typeof setTimeout> | undefined;
+        const finish = (error?: Error) => {
+          if (settled) return;
+          settled = true;
+          if (timeout) clearTimeout(timeout);
+          error ? reject(error) : resolve();
+        };
+        timeout = setTimeout(
+          () => finish(new Error("startup readiness listener close timed out")),
+          READINESS_LISTENER_CLOSE_TIMEOUT_MS,
+        );
+        try {
+          listener.close((error) => finish(error ?? undefined));
+        } catch (error) {
+          finish(error instanceof Error ? error : new Error(String(error)));
+        }
+      });
+      return await closePromise;
+    },
+  };
+}
+
+async function sendStartupReadinessMessage(port: number, message: string): Promise<void> {
+  await new Promise<void>((resolve, reject) => {
+    const socket = createConnection({ host: "127.0.0.1", port }, () => socket.end(message));
+    socket.once("close", () => resolve());
+    socket.once("error", reject);
+  });
+}
+
+function captureChildOutput(child: ChildProcess) {
+  let stdout = "";
+  let stderr = "";
+  child.stdout?.on("data", (chunk) => { stdout += String(chunk); });
+  child.stderr?.on("data", (chunk) => { stderr += String(chunk); });
+  return {
+    snapshot: () => ({ stdout, stderr }),
+    format: () => `child stdout:\n${stdout}\nchild stderr:\n${stderr}`,
+  };
+}
+
+type ChildTermination =
+  | { kind: "exit"; code: number | null; signal: NodeJS.Signals | null }
+  | { kind: "error"; error: Error };
+
+function observeChildTermination(child: ChildProcess): Promise<ChildTermination> {
+  return new Promise((resolve) => {
+    child.once("error", (error) => resolve({ kind: "error", error }));
+    child.once("exit", (code, signal) => resolve({ kind: "exit", code, signal }));
+  });
+}
+
+// Worst-case fixture budget: embedded support/startup 180s, readiness 60s,
+// health 10s, listener close 2s, child teardown 14s, and DB cleanup 15s.
+// The 360s outer timeout leaves 79s for setup, assertions, home cleanup, and
+// reporting. Embedded startup is deliberately awaited rather than timeout-raced:
+// it has no cancellation API, so abandoning its promise could leak PostgreSQL.
+const STARTUP_INTEGRATION_TEST_TIMEOUT_MS = 360_000;
+const STARTUP_READINESS_TIMEOUT_MS = 60_000;
+const HEALTH_REQUEST_TIMEOUT_MS = 10_000;
+const READINESS_LISTENER_CLOSE_TIMEOUT_MS = 2_000;
+const CHILD_TEARDOWN_TIMEOUT_MS = 14_000;
+const DATABASE_CLEANUP_TIMEOUT_MS = 15_000;
+
+async function waitForStartupReadiness(
+  termination: Promise<ChildTermination>,
+  readiness: Promise<StartupReadiness>,
+  output: ReturnType<typeof captureChildOutput>,
+  timeoutMs = STARTUP_READINESS_TIMEOUT_MS,
+): Promise<StartupReadiness> {
+  let timeout: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      readiness.catch((error) => {
+        throw new Error(`startup readiness failed: ${String(error)}\n${output.format()}`);
+      }),
+      termination.then((result) => {
+        if (result.kind === "error") {
+          throw new Error(`startup integration child spawn failed: ${result.error.message}\n${output.format()}`);
+        }
+        throw new Error(`startup integration child exited before readiness (code=${result.code}, signal=${result.signal}):\n${output.format()}`);
+      }),
+      new Promise<never>((_, reject) => {
+        timeout = setTimeout(() => reject(new Error(`timed out waiting for startup readiness:\n${output.format()}`)), timeoutMs);
+      }),
+    ]);
+  } finally {
+    if (timeout) clearTimeout(timeout);
+  }
+}
+
+type LinuxProcessSnapshot = {
+  pid: number;
+  parentPid: number;
+  command: string;
+  state: string;
+  startTime: string;
+};
+
+function listLinuxDescendants(rootPid: number): LinuxProcessSnapshot[] {
+  if (process.platform !== "linux") {
+    throw new Error(`startup fixture requires Linux descendant detection, received ${process.platform}`);
+  }
+  const processes: LinuxProcessSnapshot[] = [];
+  for (const entry of readdirSync("/proc", { withFileTypes: true })) {
+    if (!entry.isDirectory() || !/^\d+$/.test(entry.name)) continue;
+    const pid = Number(entry.name);
+    try {
+      const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
+      const commandEnd = stat.lastIndexOf(")");
+      if (commandEnd < 0) continue;
+      const commandStart = stat.indexOf("(");
+      const fieldsAfterCommand = stat.slice(commandEnd + 2).trim().split(/\s+/);
+      const state = fieldsAfterCommand[0] ?? "";
+      const parentPid = Number(fieldsAfterCommand[1]);
+      const startTime = fieldsAfterCommand[19] ?? "";
+      if (state && Number.isInteger(parentPid) && /^\d+$/.test(startTime)) {
+        processes.push({ pid, parentPid, command: stat.slice(commandStart + 1, commandEnd), state, startTime });
+      }
+    } catch (error) {
+      if (!["ENOENT", "ESRCH", "EACCES"].includes((error as NodeJS.ErrnoException).code ?? "")) throw error;
+    }
+  }
+
+  const descendants: LinuxProcessSnapshot[] = [];
+  const ancestorPids = new Set([rootPid]);
+  let foundAnotherGeneration = true;
+  while (foundAnotherGeneration) {
+    foundAnotherGeneration = false;
+    for (const candidate of processes) {
+      if (ancestorPids.has(candidate.pid) || !ancestorPids.has(candidate.parentPid)) continue;
+      ancestorPids.add(candidate.pid);
+      descendants.push(candidate);
+      foundAnotherGeneration = true;
+    }
+  }
+  return descendants;
+}
+
+function childIsAlive(child: ChildProcess): boolean {
+  return child.exitCode === null && child.signalCode === null;
+}
+
+function readLinuxProcessSnapshot(pid: number): LinuxProcessSnapshot | null {
+  try {
+    const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
+    const commandStart = stat.indexOf("(");
+    const commandEnd = stat.lastIndexOf(")");
+    if (commandStart < 0 || commandEnd < 0) throw new Error(`could not parse /proc/${pid}/stat`);
+    const fieldsAfterCommand = stat.slice(commandEnd + 2).trim().split(/\s+/);
+    const state = fieldsAfterCommand[0] ?? "";
+    const parentPid = Number(fieldsAfterCommand[1]);
+    const startTime = fieldsAfterCommand[19] ?? "";
+    if (!state || !Number.isInteger(parentPid) || !/^\d+$/.test(startTime)) {
+      throw new Error(`could not parse stable identity from /proc/${pid}/stat`);
+    }
+    return { pid, parentPid, command: stat.slice(commandStart + 1, commandEnd), state, startTime };
+  } catch (error) {
+    if (["ENOENT", "ESRCH"].includes((error as NodeJS.ErrnoException).code ?? "")) return null;
+    throw error;
+  }
+}
+
+function sameLinuxProcess(left: LinuxProcessSnapshot, right: LinuxProcessSnapshot): boolean {
+  return left.pid === right.pid && left.startTime === right.startTime;
+}
+
+type ChildDescendantObserver = {
+  stop: () => LinuxProcessSnapshot[];
+};
+
+function observeChildDescendants(child: ChildProcess): ChildDescendantObserver {
+  if (child.pid === undefined || child.pid <= 1) {
+    throw new Error("startup child has no valid pid for descendant observation");
+  }
+  const rootPid = child.pid;
+  const observed = new Map<string, LinuxProcessSnapshot>();
+  const sample = () => {
+    // Never reconstruct ancestry after the direct child has exited: descendants
+    // may have been reparented by then. Preserve every stable identity observed
+    // while the ChildProcess handle still represented a live direct child.
+    if (!childIsAlive(child)) return;
+    for (const processSnapshot of listLinuxDescendants(rootPid)) {
+      observed.set(`${processSnapshot.pid}:${processSnapshot.startTime}`, processSnapshot);
+    }
+  };
+  sample();
+  const interval = setInterval(sample, 25);
+  interval.unref?.();
+  let stopped = false;
+  return {
+    stop: () => {
+      if (!stopped) {
+        clearInterval(interval);
+        sample();
+        stopped = true;
+      }
+      return [...observed.values()];
+    },
+  };
+}
+
+function survivingObservedProcesses(observed: LinuxProcessSnapshot[]): LinuxProcessSnapshot[] {
+  return observed.flatMap((before) => {
+    const after = readLinuxProcessSnapshot(before.pid);
+    // A zombie has exited and awaits only parent reaping; it is not a live helper
+    // and must not be diagnosed as an executing-process leak.
+    return after !== null && after.state !== "Z" && sameLinuxProcess(before, after) ? [after] : [];
+  });
+}
+
+async function waitForObservedProcessesToExit(
+  observed: LinuxProcessSnapshot[],
+  deadline: number,
+): Promise<LinuxProcessSnapshot[]> {
+  let survivors = survivingObservedProcesses(observed);
+  while (survivors.length > 0 && Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, Math.min(50, Math.max(1, deadline - Date.now()))));
+    survivors = survivingObservedProcesses(observed);
+  }
+  // This final stable-identity read is diagnostic only. Raw PIDs are never used
+  // as signal targets, because a reused PID may belong to an unrelated process.
+  return survivingObservedProcesses(observed);
+}
+
+async function waitForChildTermination(
+  termination: Promise<ChildTermination>,
+  timeoutMs: number,
+): Promise<ChildTermination | null> {
+  let timeout: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      termination,
+      new Promise<null>((resolve) => { timeout = setTimeout(() => resolve(null), timeoutMs); }),
+    ]);
+  } finally {
+    if (timeout) clearTimeout(timeout);
+  }
+}
+
+async function terminateChildHandle(
+  child: ChildProcess,
+  termination: Promise<ChildTermination>,
+  output: ReturnType<typeof captureChildOutput>,
+  descendantObserver: ChildDescendantObserver | null,
+  timeoutMs = CHILD_TEARDOWN_TIMEOUT_MS,
+): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  const errors: Error[] = [];
+  const descendantsBeforeTermination = descendantObserver?.stop() ?? (
+    childIsAlive(child) && child.pid !== undefined && child.pid > 1
+      ? listLinuxDescendants(child.pid)
+      : []
+  );
+  let result: ChildTermination | null = null;
+
+  // Even if the direct child exited before cleanup began, never return early:
+  // the runtime observer is the only reliable record after descendants reparent.
+  if (childIsAlive(child)) {
+    if (child.pid === undefined || child.pid <= 1) {
+      errors.push(new Error("live startup child has no valid ChildProcess pid"));
+    } else {
+      // Signal only through the retained ChildProcess handle. Never signal a raw
+      // PID or PGID; stable PID reads below are diagnostics only.
+      child.kill("SIGTERM");
+      result = await waitForChildTermination(
+        termination,
+        Math.min(10_000, Math.max(0, deadline - Date.now())),
+      );
+      if (result === null && childIsAlive(child)) {
+        child.kill("SIGKILL");
+        result = await waitForChildTermination(termination, Math.max(0, deadline - Date.now()));
+      }
+    }
+  } else {
+    result = await waitForChildTermination(termination, Math.max(0, deadline - Date.now()));
+  }
+
+  if (result === null && childIsAlive(child)) {
+    errors.push(new Error(`startup child did not exit within ${timeoutMs}ms\n${output.format()}`));
+  } else if (result?.kind === "error") {
+    errors.push(new Error(`startup child termination failed: ${result.error.message}\n${output.format()}`));
+  }
+
+  // Known helpers receive no fixture signal. Give them the entire remaining
+  // child-teardown budget to exit naturally after the direct child is gone.
+  const survivors = await waitForObservedProcessesToExit(descendantsBeforeTermination, deadline);
+  if (survivors.length > 0) {
+    errors.push(new Error(
+      `startup child descendants survived the ${timeoutMs}ms teardown deadline; they were not signalled: ${JSON.stringify(survivors)}\n${output.format()}`,
+    ));
+  }
+  if (errors.length > 0) throw new AggregateError(errors, "startup child cleanup failed");
+}
+
+type CleanupStage = { name: string; run: () => void | Promise<void> };
+
+async function runCleanupStages(stages: CleanupStage[]): Promise<Error[]> {
+  const errors: Error[] = [];
+  for (const stage of stages) {
+    try {
+      await stage.run();
+    } catch (error) {
+      errors.push(new Error(`cleanup stage ${stage.name} failed`, { cause: error }));
+    }
+  }
+  return errors;
+}
+
+function throwTestAndCleanupErrors(testError: unknown, cleanupErrors: Error[]): void {
+  if (testError === undefined && cleanupErrors.length === 0) return;
+  if (testError !== undefined && cleanupErrors.length === 0) throw testError;
+  const errors = testError === undefined ? cleanupErrors : [testError, ...cleanupErrors];
+  throw new AggregateError(errors, testError === undefined ? "startup integration cleanup failed" : "startup integration test and cleanup failed");
+}
+
+async function fetchWithTimeout(url: string, timeoutMs: number): Promise<Response> {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(url, { signal: controller.signal });
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+async function runCleanupWithTimeout(
+  cleanup: Promise<void>,
+  timeoutMs: number,
+  description: string,
+): Promise<void> {
+  let timeout: ReturnType<typeof setTimeout> | undefined;
+  try {
+    await Promise.race([
+      cleanup,
+      new Promise<never>((_, reject) => {
+        timeout = setTimeout(() => reject(new Error(`${description} timed out after ${timeoutMs}ms`)), timeoutMs);
+      }),
+    ]);
+  } finally {
+    if (timeout) clearTimeout(timeout);
+  }
+}
+
+/**
+ * Process-isolated because this file deliberately mocks node:http, createApp,
+ * createDb, and heartbeatService for the unit-level startup tests above. The
+ * child imports the actual modules and seeds the production schema before it
+ * invokes the exported startup entry point.
+ */
+describe("startServer poisoned blocker graph integration", () => {
+  it("destroys an idle readiness socket so listener cleanup stays bounded", async () => {
+    const listener = await createStartupReadinessListener(randomUUID());
+    const idleSocket = createConnection({ host: "127.0.0.1", port: listener.port });
+    await new Promise<void>((resolve, reject) => {
+      idleSocket.once("connect", resolve);
+      idleSocket.once("error", reject);
+    });
+    const idleClosed = new Promise<void>((resolve) => idleSocket.once("close", () => resolve()));
+    const startedAt = Date.now();
+    await listener.close();
+    await idleClosed;
+    expect(Date.now() - startedAt).toBeLessThan(2_000);
+    expect(idleSocket.destroyed).toBe(true);
+  });
+
+  it("attempts every cleanup stage after an earlier cleanup failure", async () => {
+    const attempted: string[] = [];
+    const cleanupErrors = await runCleanupStages([
+      { name: "readiness", run: () => { attempted.push("readiness"); throw new Error("forced readiness cleanup failure"); } },
+      { name: "child-process", run: () => { attempted.push("child-process"); } },
+      { name: "database", run: async () => { attempted.push("database"); throw new Error("forced database cleanup failure"); } },
+      { name: "home", run: () => { attempted.push("home"); } },
+    ]);
+
+    expect(attempted).toEqual(["readiness", "child-process", "database", "home"]);
+    expect(cleanupErrors.map((error) => error.message)).toEqual([
+      "cleanup stage readiness failed",
+      "cleanup stage database failed",
+    ]);
+    try {
+      throwTestAndCleanupErrors(new Error("original test failure"), cleanupErrors);
+      expect.unreachable("combined failure should throw");
+    } catch (error) {
+      expect(error).toBeInstanceOf(AggregateError);
+      expect((error as AggregateError).errors.map((entry) => (entry as Error).message)).toEqual([
+        "original test failure",
+        "cleanup stage readiness failed",
+        "cleanup stage database failed",
+      ]);
+    }
+  });
+
+  it("skips the cycle-forming recovery write and keeps the bound health listener at HTTP 200", async () => {
+    let tempDb: Awaited<ReturnType<typeof import("../../../packages/db/src/test-embedded-postgres.ts")["startEmbeddedPostgresTestDatabase"]>> | null = null;
+    let home: string | null = null;
+    let child: ChildProcess | null = null;
+    let childTermination: Promise<ChildTermination> | null = null;
+    let childOutput: ReturnType<typeof captureChildOutput> | null = null;
+    let childDescendantObserver: ChildDescendantObserver | null = null;
+    let readinessListener: Awaited<ReturnType<typeof createStartupReadinessListener>> | null = null;
+    let testError: unknown;
+    try {
+      const { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } = await vi.importActual<
+        typeof import("../../../packages/db/src/test-embedded-postgres.ts")
+      >("../../../packages/db/src/test-embedded-postgres.ts");
+      const support = await getEmbeddedPostgresTestSupport();
+      if (!support.supported) {
+        throw new Error(`startup integration requires embedded PostgreSQL: ${support.reason ?? "unsupported environment"}`);
+      }
+      // Assign inside the cleanup boundary as part of awaiting the
+      // non-cancellable startup, before any later await can fail.
+      tempDb = await startEmbeddedPostgresTestDatabase("paperclip-startup-poisoned-graph-");
+      const databaseUrl = tempDb.connectionString;
+      home = mkdtempSync(path.join(tmpdir(), "paperclip-startup-poisoned-home-"));
+      const requestedPort = await allocateLoopbackPort();
+      const readinessToken = randomUUID();
+      // Bind this before spawn so a very fast child cannot emit readiness before
+      // the parent has attached a consumer.
+      readinessListener = await createStartupReadinessListener(readinessToken);
+      await sendStartupReadinessMessage(readinessListener.port, "not-json");
+      await sendStartupReadinessMessage(readinessListener.port, JSON.stringify({
+        type: "startup-integration-ready",
+        token: randomUUID(),
+        listenPort: requestedPort,
+      }));
+      // The script lives outside this package's `type: module` boundary, so use
+      // .mts to make tsx/esbuild preserve ESM and its top-level awaits.
+      const childScript = path.join(home, "startup-poisoned-graph.mts");
+      const dbModuleUrl = new URL("../../../packages/db/src/index.ts", import.meta.url).href;
+      const drizzleModuleUrl = new URL("../../node_modules/drizzle-orm/index.js", import.meta.url).href;
+      const indexModuleUrl = new URL("../index.ts", import.meta.url).href;
+      const script = `
+import { randomUUID } from "node:crypto";
+import { createConnection } from "node:net";
+import { and, eq } from ${JSON.stringify(drizzleModuleUrl)};
+import { activityLog, createDb, agents, agentWakeupRequests, authUsers, companies, heartbeatRuns, issueRelations, issues } from ${JSON.stringify(dbModuleUrl)};
+import { startServer } from ${JSON.stringify(indexModuleUrl)};
+const db = createDb(process.env.DATABASE_URL);
+const companyId = randomUUID();
+const agentId = randomUUID();
+const runId = randomUUID();
+const wakeupId = randomUUID();
+const sourceId = randomUUID();
+const childId = randomUUID();
+const now = new Date("2026-03-19T00:00:00.000Z");
+try {
+  await db.insert(authUsers).values({ id: "startup-responsible-user", name: "Startup Responsible User", email: "startup-responsible@example.test", emailVerified: true, createdAt: now, updatedAt: now }).onConflictDoNothing();
+  await db.insert(companies).values({ id: companyId, name: "Startup poisoned graph", issuePrefix: "STARTUPPOISON", defaultResponsibleUserId: "startup-responsible-user", requireBoardApprovalForNewAgents: false });
+  await db.insert(agents).values({ id: agentId, companyId, name: "StartupRecoveryAgent", role: "engineer", status: "idle", adapterType: "codex_local", adapterConfig: {}, runtimeConfig: {}, permissions: {} });
+  await db.insert(agentWakeupRequests).values({ id: wakeupId, companyId, agentId, source: "assignment", triggerDetail: "system", reason: "issue_assigned", payload: { issueId: sourceId }, status: "cancelled", runId, claimedAt: now, finishedAt: now, error: "Continuation parked: issue is waiting on review/approval" });
+  await db.insert(heartbeatRuns).values({ id: runId, companyId, agentId, invocationSource: "assignment", triggerDetail: "system", status: "cancelled", wakeupRequestId: wakeupId, contextSnapshot: { issueId: sourceId, taskId: sourceId, wakeReason: "issue_continuation_needed", retryReason: "issue_continuation_needed" }, startedAt: now, finishedAt: now, updatedAt: now, errorCode: "issue_continuation_waiting_on_review", error: "Continuation parked: issue is waiting on review/approval", resultJson: { stopReason: "issue_continuation_waiting_on_review", timeoutSource: "stale_queued_run_gate", executionRecovery: { kind: "bootstrap", providerWorkStarted: false } } });
+  await db.insert(issues).values([
+    { id: sourceId, companyId, title: "SPA-15845 startup source", status: "in_progress", priority: "medium", assigneeAgentId: agentId, checkoutRunId: runId, responsibleUserId: "startup-responsible-user", issueNumber: 1, identifier: "STARTUPPOISON-1", startedAt: now },
+    { id: childId, companyId, parentId: sourceId, title: "Open child already downstream of source", status: "todo", priority: "medium", responsibleUserId: "startup-responsible-user", issueNumber: 2, identifier: "STARTUPPOISON-2" },
+  ]);
+  await db.insert(issueRelations).values({ companyId, issueId: sourceId, relatedIssueId: childId, type: "blocks" });
+  const started = await startServer();
+  const source = await db.select().from(issues).where(eq(issues.id, sourceId)).then((rows) => rows[0]);
+  const blockers = await db.select({ blockerId: issueRelations.issueId }).from(issueRelations).where(and(eq(issueRelations.companyId, companyId), eq(issueRelations.relatedIssueId, sourceId), eq(issueRelations.type, "blocks")));
+  const downstream = await db.select({ childId: issueRelations.relatedIssueId }).from(issueRelations).where(and(eq(issueRelations.companyId, companyId), eq(issueRelations.issueId, sourceId), eq(issueRelations.type, "blocks")));
+  const recoveryRecords = await db.select({ details: activityLog.details }).from(activityLog).where(and(eq(activityLog.companyId, companyId), eq(activityLog.entityId, sourceId), eq(activityLog.action, "issue.updated")));
+  const fixtureRecovery = recoveryRecords.filter(({ details }) => details?.source === "recovery.reconcile_continuation_waiting_on_review");
+  if (source?.status !== "blocked") throw new Error(\`source was not recovered visibly: \${source?.status}\`);
+  if (fixtureRecovery.length !== 1) throw new Error(\`expected one fixture-scoped startup recovery record: \${JSON.stringify(recoveryRecords)}\`);
+  const recovery = fixtureRecovery[0]?.details;
+  const writeTimeFallbacks = fixtureRecovery.filter(({ details }) => details?.recoveryBlockerRefusalReason === "cycle_guard_refused");
+  if (recovery?.recoveryBlockerRefusalReason !== "cycle") throw new Error(\`startup recovery did not use cycle preflight exclusion: \${JSON.stringify(recovery)}\`);
+  if (writeTimeFallbacks.length !== 0) throw new Error(\`startup recovery fell through to the write-time cycle guard: \${JSON.stringify(writeTimeFallbacks)}\`);
+  if (!Array.isArray(recovery?.cycleExcludedBlockerIssueIds) || recovery.cycleExcludedBlockerIssueIds.length !== 1 || recovery.cycleExcludedBlockerIssueIds[0] !== childId) throw new Error(\`startup recovery did not durably identify the poisoned child: \${JSON.stringify(recovery)}\`);
+  if (blockers.length !== 0) throw new Error(\`cycle-forming inverse edge was written: \${JSON.stringify(blockers)}\`);
+  if (downstream.length !== 1 || downstream[0]?.childId !== childId) throw new Error(\`poison source-to-child relation was mutated: \${JSON.stringify(downstream)}\`);
+  const ready = { type: "startup-integration-ready", token: process.env.STARTUP_READINESS_TOKEN, listenPort: started.listenPort };
+  await new Promise((resolve, reject) => {
+    const socket = createConnection({ host: "127.0.0.1", port: Number(process.env.STARTUP_READINESS_PORT) }, () => socket.end(JSON.stringify(ready)));
+    socket.once("close", resolve);
+    socket.once("error", reject);
+  });
+} catch (error) {
+  console.error("STARTUP_INTEGRATION_ERROR", error);
+  process.exit(1);
+}
+`;
+      writeFileSync(childScript, script);
+      const nodeExecutable = path.resolve(process.execPath);
+      const tsxLoader = path.resolve(fileURLToPath(new URL("../../node_modules/tsx/dist/loader.mjs", import.meta.url)));
+      const childEnv: NodeJS.ProcessEnv = {
+        HOME: home,
+        LANG: "C.UTF-8",
+        LC_ALL: "C.UTF-8",
+        DATABASE_URL: databaseUrl,
+        DATABASE_MIGRATION_URL: databaseUrl,
+        PAPERCLIP_HOME: home,
+        PAPERCLIP_INSTANCE_ID: "startup-poisoned-graph",
+        PAPERCLIP_DISABLE_CWD_ENV_FILE: "true",
+        PAPERCLIP_CONFIG: path.join(home, "config.json"),
+        PAPERCLIP_DEPLOYMENT_MODE: "local_trusted",
+        PAPERCLIP_DEPLOYMENT_EXPOSURE: "private",
+        PAPERCLIP_BIND: "loopback",
+        PAPERCLIP_DECISION_SIGNING_SECRET: "startup-test-decision-secret-000000000000",
+        PAPERCLIP_AGENT_JWT_SECRET: "startup-test-agent-jwt-secret-000000000000",
+        PAPERCLIP_MIGRATION_AUTO_APPLY: "true",
+        PAPERCLIP_MIGRATION_PROMPT: "never",
+        HEARTBEAT_SCHEDULER_ENABLED: "true",
+        HEARTBEAT_SCHEDULER_INTERVAL_MS: "30000",
+        // Exact neutral values keep startup recovery enabled while excluding
+        // worktree/restore suppression and cloud/managed/plugin/external control planes.
+        PAPERCLIP_IN_WORKTREE: "false",
+        PAPERCLIP_DATABASE_RESTORE_IN_PROGRESS: "false",
+        PAPERCLIP_RESTORE_IN_PROGRESS: "false",
+        PAPERCLIP_CLOUD_WARM_STANDBY: "0",
+        PAPERCLIP_OPEN_ON_LISTEN: "false",
+        PAPERCLIP_ANNOUNCEMENTS_ENABLED: "false",
+        PAPERCLIP_TELEMETRY_DISABLED: "1",
+        PAPERCLIP_DISABLE_PLUGIN_AUTOBUILD: "1",
+        DO_NOT_TRACK: "1",
+        // Empty exact env values keep inherited observability/export settings
+        // from enabling Sentry, OTLP, or feedback-export network clients.
+        SENTRY_DSN: "",
+        SENTRY_DSN_BACKEND: "",
+        SENTRY_DSN_FRONTEND: "",
+        OTEL_EXPORTER_OTLP_ENDPOINT: "",
+        PAPERCLIP_FEEDBACK_EXPORT_BACKEND_URL: "",
+        PAPERCLIP_TELEMETRY_BACKEND_URL: "",
+        PAPERCLIP_SECRETS_PROVIDER: "local_encrypted",
+        PAPERCLIP_STORAGE_PROVIDER: "local_disk",
+        PAPERCLIP_STORAGE_LOCAL_DIR: path.join(home, "storage"),
+        STARTUP_READINESS_PORT: String(readinessListener.port),
+        STARTUP_READINESS_TOKEN: readinessToken,
+        SERVE_UI: "false",
+        HOST: "127.0.0.1",
+        PORT: String(requestedPort),
+      };
+      child = spawn(nodeExecutable, ["--import", tsxLoader, childScript], {
+        cwd: fileURLToPath(new URL("../..", import.meta.url)),
+        env: childEnv,
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+      childTermination = observeChildTermination(child);
+      childOutput = captureChildOutput(child);
+      if (child.pid === undefined || child.pid <= 1) {
+        const failedSpawn = await childTermination;
+        throw new Error(`startup integration child has no safe pid: ${failedSpawn.kind === "error" ? failedSpawn.error.message : JSON.stringify(failedSpawn)}\n${childOutput.format()}`);
+      }
+      childDescendantObserver = observeChildDescendants(child);
+      const readiness = await waitForStartupReadiness(
+        childTermination,
+        readinessListener.readiness,
+        childOutput,
+        STARTUP_READINESS_TIMEOUT_MS,
+      );
+      await readinessListener.close();
+      readinessListener = null;
+
+      const response = await fetchWithTimeout(
+        `http://127.0.0.1:${readiness.listenPort}/api/health`,
+        HEALTH_REQUEST_TIMEOUT_MS,
+      ).catch((error) => {
+        throw new Error(`health request failed: ${String(error)}\n${childOutput?.format()}`);
+      });
+      expect(response.status, childOutput.format()).toBe(200);
+      await expect(response.json()).resolves.toMatchObject({ status: "ok" });
+      const capturedOutput = childOutput.snapshot();
+      const relevantStartupErrors = `${capturedOutput.stdout}\n${capturedOutput.stderr}`
+        .split("\n")
+        .filter((line) => /startup heartbeat recovery failed|cycle.guard|cycle-guard|STARTUP_INTEGRATION_ERROR/i.test(line));
+      expect(relevantStartupErrors, childOutput.format()).toEqual([]);
+    } catch (error) {
+      testError = error;
+    } finally {
+      const cleanupErrors = await runCleanupStages([
+        {
+          name: "readiness",
+          run: async () => {
+            if (readinessListener) await readinessListener.close();
+            readinessListener = null;
+          },
+        },
+        {
+          name: "child-process",
+          run: async () => {
+            if (child && childTermination && childOutput) {
+              const observer = childDescendantObserver;
+              childDescendantObserver = null;
+              await terminateChildHandle(
+                child,
+                childTermination,
+                childOutput,
+                observer,
+                CHILD_TEARDOWN_TIMEOUT_MS,
+              );
+            } else {
+              childDescendantObserver?.stop();
+              childDescendantObserver = null;
+            }
+          },
+        },
+        {
+          name: "database",
+          run: async () => {
+            if (tempDb) await runCleanupWithTimeout(tempDb.cleanup(), DATABASE_CLEANUP_TIMEOUT_MS, "embedded PostgreSQL cleanup");
+          },
+        },
+        { name: "home", run: () => { if (home) rmSync(home, { recursive: true, force: true }); } },
+      ]);
+      throwTestAndCleanupErrors(testError, cleanupErrors);
+    }
+  }, STARTUP_INTEGRATION_TEST_TIMEOUT_MS);
 });
