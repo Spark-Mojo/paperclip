@@ -3,6 +3,7 @@ import { createHash } from "node:crypto";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import { afterEach, describe, expect, it } from "vitest";
 import {
@@ -15,7 +16,10 @@ async function makeTempDir(prefix: string): Promise<string> {
 }
 
 const execFileAsync = promisify(execFile);
-const artifactHelperPath = path.resolve(
+const here = path.dirname(fileURLToPath(import.meta.url));
+const repoRoot = path.resolve(here, "../../..");
+const artifactHelperPath = path.join(
+  repoRoot,
   "skills/paperclip/scripts/paperclip-upload-artifact.sh",
 );
 
@@ -265,9 +269,9 @@ describe("paperclip skill utils", () => {
   });
 
   it("documents artifact uploads in the installed Paperclip skill", async () => {
-    const skillBody = await fs.readFile(path.resolve("skills/paperclip/SKILL.md"), "utf8");
-    const referenceBody = await fs.readFile(path.resolve("skills/paperclip/references/artifacts.md"), "utf8");
-    const helperBody = await fs.readFile(path.resolve("skills/paperclip/scripts/paperclip-upload-artifact.sh"), "utf8");
+    const skillBody = await fs.readFile(path.join(repoRoot, "skills/paperclip/SKILL.md"), "utf8");
+    const referenceBody = await fs.readFile(path.join(repoRoot, "skills/paperclip/references/artifacts.md"), "utf8");
+    const helperBody = await fs.readFile(path.join(repoRoot, "skills/paperclip/scripts/paperclip-upload-artifact.sh"), "utf8");
     const normalizedReferenceBody = referenceBody.replace(/\s+/g, " ");
 
     expect(skillBody).toContain("Generated Artifacts and Work Products");
@@ -289,13 +293,13 @@ describe("paperclip skill utils", () => {
     expect(helperBody).toContain('"$api_base/issues/$issue_id/comments"');
     expect(helperBody).toContain("attachmentIds: [$attachmentId]");
     await expect(
-      fs.access(path.resolve("skills/paperclip/scripts/paperclip-upload-artifact.sh")),
+      fs.access(path.join(repoRoot, "skills/paperclip/scripts/paperclip-upload-artifact.sh")),
     ).resolves.toBeUndefined();
-    await expect(fs.access(path.resolve("scripts/paperclip-upload-artifact.sh"))).rejects.toThrow();
+    await expect(fs.access(path.join(repoRoot, "scripts/paperclip-upload-artifact.sh"))).rejects.toThrow();
   });
 
   it("keeps the external-chat shortcut behind the server-verified harness boundary", async () => {
-    const skillBody = await fs.readFile(path.resolve("skills/paperclip/SKILL.md"), "utf8");
+    const skillBody = await fs.readFile(path.join(repoRoot, "skills/paperclip/SKILL.md"), "utf8");
     const shortcut = skillBody.match(
       /## Server-Verified External Chat Turns(?<body>[\s\S]*?)\n## The Heartbeat Procedure/,
     )?.groups?.body;
@@ -503,8 +507,8 @@ describe("paperclip skill utils", () => {
   });
 
   it("documents governed agent interaction resolution invariants", async () => {
-    const apiReference = await fs.readFile(path.resolve("skills/paperclip/references/api-reference.md"), "utf8");
-    const issueDocs = await fs.readFile(path.resolve("docs/api/issues.md"), "utf8");
+    const apiReference = await fs.readFile(path.join(repoRoot, "skills/paperclip/references/api-reference.md"), "utf8");
+    const issueDocs = await fs.readFile(path.join(repoRoot, "docs/api/issues.md"), "utf8");
     for (const body of [apiReference, issueDocs]) {
       expect(body).toContain('resolverPolicy: "anyone" | "not_creator" | "human_only"');
       expect(body).toContain("requestedResolverPolicy");
@@ -519,7 +523,7 @@ describe("paperclip skill utils", () => {
   });
 
   it("uses the authoritative PATCH response to confirm monitor scheduling", async () => {
-    const skillBody = await fs.readFile(path.resolve("skills/paperclip/SKILL.md"), "utf8");
+    const skillBody = await fs.readFile(path.join(repoRoot, "skills/paperclip/SKILL.md"), "utf8");
 
     expect(skillBody).toContain("Use that request's default full response");
     expect(skillBody).toContain("do not issue a confirming GET");
@@ -529,7 +533,7 @@ describe("paperclip skill utils", () => {
   });
 
   it("requires issue-update writes to be verified, not inferred", async () => {
-    const skillBody = await fs.readFile(path.resolve("skills/paperclip/SKILL.md"), "utf8");
+    const skillBody = await fs.readFile(path.join(repoRoot, "skills/paperclip/SKILL.md"), "utf8");
 
     expect(skillBody).toContain("Verify writes — never infer them");
     expect(skillBody).toContain("An empty response body means the write FAILED");
@@ -540,7 +544,7 @@ describe("paperclip skill utils", () => {
   });
 
   it("keeps the create-issue-interaction-ui guide as a maintainer-only skill", async () => {
-    const skillPath = path.resolve(".agents/skills/create-issue-interaction-ui/SKILL.md");
+    const skillPath = path.join(repoRoot, ".agents/skills/create-issue-interaction-ui/SKILL.md");
     const skillBody = await fs.readFile(skillPath, "utf8");
     const normalizedSkillBody = skillBody.replace(/\s+/g, " ");
     const normalizedLowerSkillBody = normalizedSkillBody.toLowerCase();
@@ -554,7 +558,7 @@ describe("paperclip skill utils", () => {
     expect(skillBody).toContain("server/src/services/issue-thread-interactions.ts");
     expect(skillBody).toContain("ui/src/components/IssueThreadInteractionCard.tsx");
     expect(skillBody).toContain("packages/plugins/sdk/src/testing.ts");
-    await expect(fs.access(path.resolve("skills/create-issue-interaction-ui/SKILL.md"))).rejects.toThrow();
+    await expect(fs.access(path.join(repoRoot, "skills/create-issue-interaction-ui/SKILL.md"))).rejects.toThrow();
   });
 
   it("removes stale maintainer-only symlinks from a shared skills home", async () => {
