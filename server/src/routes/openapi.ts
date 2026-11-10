@@ -4342,6 +4342,32 @@ registry.registerPath({
 
 registry.registerPath({
   method: "post",
+  path: "/api/issues/{id}/evidence-guarded-mutations",
+  tags: ["issues"],
+  summary: "Apply an evidence-guarded mutation to an issue",
+  request: {
+    params: z.object({ id: z.string() }),
+    body: jsonBody(
+      z
+        .object({})
+        .passthrough()
+        .describe(
+          "Evidence guard envelope: targetCompanyId plus an exact-key evidence precondition and a status-only done mutation; exact-key validation lives in the handler",
+        ),
+    ),
+  },
+  responses: {
+    200: r.ok(),
+    400: r.badRequest,
+    401: r.unauthorized,
+    403: r.forbidden,
+    404: r.notFound,
+    409: r.conflict,
+  },
+});
+
+registry.registerPath({
+  method: "post",
   path: "/api/issues/{id}/inbox-archive",
   tags: ["issues"],
   summary: "Archive issue from inbox",
