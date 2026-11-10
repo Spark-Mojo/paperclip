@@ -1605,6 +1605,7 @@ describe("agent issue mutation checkout ownership", () => {
     expect(mockIssueService.update).toHaveBeenCalledWith(
       issueId,
       expect.objectContaining({ title: "Updated after commit" }),
+      expect.any(Object),
     );
     expect(mockIssueService.addComment).toHaveBeenCalledWith(
       issueId,
@@ -1755,6 +1756,7 @@ describe("agent issue mutation checkout ownership", () => {
         status: "blocked",
         unblockDescriptor: { owner: "board", action: "Review the blocker" },
       }),
+      expect.any(Object),
     );
   });
 
@@ -2732,7 +2734,11 @@ describe("agent issue mutation checkout ownership", () => {
       const res = await request(app).patch(`/api/issues/${issueId}`).send({ status });
 
       expect(res.status, JSON.stringify(res.body)).toBe(200);
-      expect(mockIssueService.update).toHaveBeenCalledWith(issueId, expect.objectContaining({ status }));
+      expect(mockIssueService.update).toHaveBeenCalledWith(
+        issueId,
+        expect.objectContaining({ status }),
+        expect.anything(),
+      );
     });
 
     it("lets a watchdog run transition a watched issue to in_review with a live review path", async () => {
@@ -2917,6 +2923,7 @@ describe("agent issue mutation checkout ownership", () => {
       expect(mockIssueService.update).toHaveBeenCalledWith(
         issueId,
         expect.objectContaining({ assigneeAgentId: peerAgentId }),
+        expect.anything(),
       );
     });
 
