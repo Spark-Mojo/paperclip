@@ -83,6 +83,7 @@ import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
+import { registeredSourceConfig } from "./fixtures/registered-source-config.ts";
 
 const RUNTIME_OWNED_GIT_BRANCH_METADATA = {
   createdByRuntime: true,
@@ -155,7 +156,11 @@ async function runPnpm(cwd: string, args: string[]) {
 async function writeRegisteredSourceConfig(baseCwd: string, instanceId = "source-instance") {
   const configDir = path.join(baseCwd, ".paperclip");
   await fs.mkdir(configDir, { recursive: true });
-  await fs.writeFile(path.join(configDir, "config.json"), "{}\n", "utf8");
+  await fs.writeFile(
+    path.join(configDir, "config.json"),
+    `${JSON.stringify(registeredSourceConfig, null, 2)}\n`,
+    "utf8",
+  );
   await fs.writeFile(
     path.join(configDir, ".env"),
     `PAPERCLIP_INSTANCE_ID=${instanceId}\n`,
