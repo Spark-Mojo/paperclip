@@ -164,7 +164,14 @@ function stubDb(): any {
     query[method] = () => query;
   }
   query.then = (resolve: (rows: unknown[]) => unknown) => Promise.resolve(resolve([]));
-  return { select: () => query };
+  // PATCH writer boundary: the route commits the update plus its paired
+  // issue.updated activity inside db.transaction (routes/issues.ts writer-boundary
+  // repair, else branch). Run the callback against this same chainable stub as tx
+  // (convention: issue-agent-mutation-ownership-routes.test.ts dbStub transaction).
+  return {
+    select: () => query,
+    transaction: async (fn: (tx: unknown) => unknown) => fn(query),
+  };
 }
 
 function createApp(actor: Actor) {
