@@ -2982,4 +2982,116 @@ describe("agent issue mutation checkout ownership", () => {
       expect(mockIssueService.update).not.toHaveBeenCalled();
     });
   });
+  describe("[R3: R2] recovery resolution PR-close gate", () => {
+    function seedPrCloseCard(overrides: Record<string, unknown> = {}) {
+      const issue = makeIssue(overrides);
+      mockIssueService.getById.mockResolvedValue(issue);
+      mockIssueRecoveryActionService.getActiveForIssue.mockResolvedValue({
+        id: recoveryActionId,
+        status: "active",
+        kind: "deliberate_wait_without_target",
+        ownerType: "board",
+        ownerAgentId: null,
+        returnOwnerAgentId: ownerAgentId,
+        wakePolicy: { type: "board_escalation" },
+      });
+      return issue;
+    }
+
+    it("refuses moving a PR-classified card to done through recovery resolution", async () => {
+      seedPrCloseCard({
+        title: "PR: deploy-drift version-gap check",
+        monitorNotes: "Tracking Spark-Mojo/sparkmojo-internal#2297 for the drift rerun.",
+      });
+      const res = await request(await createApp(boardActor()))
+        .post(`/api/issues/${issueId}/recovery-actions/resolve`)
+        .send({
+          actionId: recoveryActionId,
+          outcome: "restored",
+          sourceIssueStatus: "done",
+          resolutionNote: "Owner confirms the drift fix landed.",
+        });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(422);
+      expect(res.body).toMatchObject({
+        code: "recovery_pr_close_refused",
+        details: {
+          code: "recovery_pr_close_refused",
+          cause: "pr_close_unverified",
+          citedArtifact: null,
+          recoveryActionId,
+        },
+      });
+      expect(typeof res.body.error).toBe("string");
+      expect(mockIssueService.update).not.toHaveBeenCalled();
+      expect(
+        mockIssueRecoveryActionService.resolveActiveForIssue,
+      ).not.toHaveBeenCalled();
+      expect(mockLogActivity).toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({
+          action: "issue.recovery_evidence_refused",
+          details: expect.objectContaining({
+            code: "recovery_pr_close_refused",
+            cause: "pr_close_unverified",
+            gate: "R2",
+            recoveryActionId,
+          }),
+        }),
+      );
+    });
+
+    // Base-green proceed control: with no PR signal anywhere on the card the
+    // resolution proceeds on the unpatched base AND on the gated head.
+    it("resolves a card with no PR signal to done through recovery resolution", async () => {
+      const issue = seedPrCloseCard();
+      mockIssueService.update.mockImplementation(
+        async (_id: string, patch: Record<string, unknown>) => ({
+          ...issue,
+          ...patch,
+        }),
+      );
+      const res = await request(await createApp(boardActor()))
+        .post(`/api/issues/${issueId}/recovery-actions/resolve`)
+        .send({
+          actionId: recoveryActionId,
+          outcome: "restored",
+          sourceIssueStatus: "done",
+          resolutionNote: "Owner completed the remaining follow-up by hand.",
+        });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      expect(mockIssueService.update).toHaveBeenCalledTimes(1);
+      expect(mockIssueService.update.mock.calls[0]?.[1]).toMatchObject({
+        status: "done",
+      });
+      expect(
+        mockIssueRecoveryActionService.resolveActiveForIssue,
+      ).toHaveBeenCalledTimes(1);
+    });
+
+    // Base-green proceed control: already-terminal cards skip the PR-close
+    // gate when the resolution requests no status change.
+    it("keeps an already-terminal PR card closable when no status change is requested", async () => {
+      seedPrCloseCard({
+        status: "done",
+        title: "PR: deploy-drift version-gap check",
+        monitorNotes: "Tracking Spark-Mojo/sparkmojo-internal#2297 for the drift rerun.",
+      });
+      const res = await request(await createApp(boardActor()))
+        .post(`/api/issues/${issueId}/recovery-actions/resolve`)
+        .send({
+          actionId: recoveryActionId,
+          outcome: "restored",
+          sourceIssueStatus: "done",
+          resolutionNote: "Owner completed the remaining follow-up by hand.",
+        });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      expect(mockIssueService.update).not.toHaveBeenCalled();
+      expect(
+        mockIssueRecoveryActionService.resolveActiveForIssue,
+      ).toHaveBeenCalledTimes(1);
+    });
+  });
 });

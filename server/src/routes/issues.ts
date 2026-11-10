@@ -7,6 +7,7 @@ import { retryNativeWorkspaceExport } from "../services/native-runtime/native-wo
 import { queuedInteractionId, readQueuedInteractionResponse, hasQueuedInteractionResponse } from "../services/queued-interaction-response.js";
 import { deliverConversationComments, isConversation } from "../services/agent-conversations.js";
 import { issueRecoveryActionReadModel } from "../services/issue-recovery-actions.js";
+import { ghFetch, gitHubApiBase, isGitHubDotCom } from "../services/github-fetch.js";
 import { getExecutionBlocker } from "../services/execution-blocker.js";
 import { requiresExecutionReconciliation } from "@paperclipai/shared";
 import {
@@ -3462,6 +3463,363 @@ function logIssueListRequest(input: {
       "safe authenticated GET observed",
     );
   });
+}
+
+// --- Recovery-resolution evidence gates (R1/R2) — SPA-16691 ---
+// Fail-closed gates on POST /issues/:id/recovery-actions/resolve when the
+// source issue is being moved to a terminal status. R1 verifies the citations
+// in the resolution note (CI run or card-bridge receipt marker); R2 refuses
+// unevidenced closes of PR-classified cards. Refusals are thrown as a typed
+// error from inside the resolution transaction so it rolls back, then the
+// handler writes a refusal activity row and answers 422 exactly once.
+
+type RecoveryEvidenceRepoSignal = { owner: string; repo: string };
+
+type RecoveryEvidenceGateSubject = {
+  companyId: string;
+  issueId: string;
+  identifier: string | null;
+  recoveryActionId: string;
+  sourceIssueStatus: string;
+  sourceStatusChanged: boolean;
+  title: string | null;
+  description: string | null;
+  monitorNotes: string | null;
+};
+
+type RecoveryEvidenceCitation =
+  | {
+      kind: "run";
+      runId: string;
+      citationRepo: RecoveryEvidenceRepoSignal | null;
+      citationHost: string | null;
+      citedArtifact: string;
+    }
+  | { kind: "receipt"; citedArtifact: string };
+
+class RecoveryEvidenceGateRefusal extends Error {
+  readonly gate: "R1" | "R2";
+  readonly code: string;
+  readonly cause: string;
+  readonly citedArtifact: string | null;
+  readonly companyId: string;
+  readonly issueId: string;
+  readonly identifier: string | null;
+  readonly recoveryActionId: string;
+
+  constructor(input: {
+    gate: "R1" | "R2";
+    code: string;
+    cause: string;
+    citedArtifact: string | null;
+    companyId: string;
+    issueId: string;
+    identifier: string | null;
+    recoveryActionId: string;
+    message: string;
+  }) {
+    super(input.message);
+    this.name = "RecoveryEvidenceGateRefusal";
+    this.gate = input.gate;
+    this.code = input.code;
+    this.cause = input.cause;
+    this.citedArtifact = input.citedArtifact;
+    this.companyId = input.companyId;
+    this.issueId = input.issueId;
+    this.identifier = input.identifier;
+    this.recoveryActionId = input.recoveryActionId;
+  }
+}
+
+// Fetch gate for citation hosts (B1/B3): fetch ONLY github.com /
+// www.github.com (isGitHubDotCom semantics). Detection stays host-agnostic;
+// anything else is unresolvable and refused WITHOUT a fetch (no configured
+// GHE allowlist exists in this path).
+function isResolvableGitHubCitationHost(host: string): boolean {
+  return isGitHubDotCom(host);
+}
+
+function detectRecoveryEvidenceCitations(
+  resolutionNote: string | null | undefined,
+): RecoveryEvidenceCitation[] {
+  const citations: RecoveryEvidenceCitation[] = [];
+  const text = typeof resolutionNote === "string" ? resolutionNote : "";
+  if (!text) return citations;
+  const seenRunIds = new Set<string>();
+  // Host-agnostic detection: any `<host>/<owner>/<repo>/actions/runs/<id>`
+  // shape is a citation. Only github.com hosts are fetch-resolvable (see
+  // isResolvableGitHubCitationHost); anything else is unverified without a
+  // fetch. `(?!\w)` is the right boundary on the run id.
+  for (const match of text.matchAll(
+    /([a-z0-9.-]+)\/([\w.-]+)\/([\w.-]+)\/actions\/runs\/(\d{10,})(?!\w)/gi,
+  )) {
+    const [, host, owner, repo, runId] = match;
+    seenRunIds.add(runId);
+    citations.push({
+      kind: "run",
+      runId,
+      citationRepo: { owner, repo },
+      citationHost: host,
+      citedArtifact: match[0],
+    });
+  }
+  for (const match of text.matchAll(/\brun\s*`?(\d{10,})(?!\w)`?/gi)) {
+    const runId = match[1];
+    if (seenRunIds.has(runId)) continue;
+    seenRunIds.add(runId);
+    citations.push({
+      kind: "run",
+      runId,
+      citationRepo: null,
+      citationHost: null,
+      citedArtifact: match[0],
+    });
+  }
+  const receiptMatch =
+    /\bposted\s+the\s+(?:activation\s+)?receipt\b|\bbridge\s+posted\s+the\s+receipt\b/i.exec(
+      text,
+    );
+  if (receiptMatch) {
+    citations.push({ kind: "receipt", citedArtifact: receiptMatch[0] });
+  }
+  return citations;
+}
+
+function recoveryEvidenceRepoSignalFromPullUrl(
+  text: string,
+): RecoveryEvidenceRepoSignal[] {
+  const signals: RecoveryEvidenceRepoSignal[] = [];
+  for (const match of text.matchAll(
+    /github\.[a-z0-9.-]+\/([\w.-]+)\/([\w.-]+)\/pull\/\d+/gi,
+  )) {
+    signals.push({ owner: match[1], repo: match[2] });
+  }
+  return signals;
+}
+
+function recoveryEvidenceRepoSignalFromShortRef(
+  text: string,
+): RecoveryEvidenceRepoSignal[] {
+  const signals: RecoveryEvidenceRepoSignal[] = [];
+  for (const match of text.matchAll(/\b([\w.-]+)\/([\w.-]+)#\d+\b/g)) {
+    signals.push({ owner: match[1], repo: match[2] });
+  }
+  return signals;
+}
+
+async function loadRecoveryEvidenceCardSignals(
+  tx: Db,
+  subject: RecoveryEvidenceGateSubject,
+): Promise<{
+  distinctRepos: RecoveryEvidenceRepoSignal[];
+  prReferenceSeen: boolean;
+  pullRequestWorkProductCount: number;
+}> {
+  const workProductRows = await tx
+    .select({
+      url: issueWorkProducts.url,
+      externalId: issueWorkProducts.externalId,
+    })
+    .from(issueWorkProducts)
+    .where(
+      and(
+        eq(issueWorkProducts.companyId, subject.companyId),
+        eq(issueWorkProducts.issueId, subject.issueId),
+        eq(issueWorkProducts.type, "pull_request"),
+      ),
+    );
+  const reposByKey = new Map<string, RecoveryEvidenceRepoSignal>();
+  const noteSignal = (signal: RecoveryEvidenceRepoSignal | null) => {
+    if (!signal) return;
+    const key = `${signal.owner}/${signal.repo}`.toLowerCase();
+    if (!reposByKey.has(key)) reposByKey.set(key, signal);
+  };
+  for (const row of workProductRows) {
+    if (row.url) {
+      for (const signal of recoveryEvidenceRepoSignalFromPullUrl(row.url)) {
+        noteSignal(signal);
+      }
+    }
+    if (row.externalId) {
+      for (const signal of recoveryEvidenceRepoSignalFromShortRef(
+        row.externalId,
+      )) {
+        noteSignal(signal);
+      }
+    }
+  }
+  const cardText = [subject.title, subject.description, subject.monitorNotes]
+    .filter((value): value is string => typeof value === "string")
+    .join("\n");
+  const pullUrlSignals = recoveryEvidenceRepoSignalFromPullUrl(cardText);
+  const shortRefSignals = recoveryEvidenceRepoSignalFromShortRef(cardText);
+  for (const signal of [...pullUrlSignals, ...shortRefSignals]) {
+    noteSignal(signal);
+  }
+  return {
+    distinctRepos: [...reposByKey.values()],
+    prReferenceSeen:
+      pullUrlSignals.length > 0 || shortRefSignals.length > 0,
+    pullRequestWorkProductCount: workProductRows.filter(
+      (row) => "url" in row || "externalId" in row,
+    ).length,
+  };
+}
+
+async function recoveryReceiptMarkerPresent(
+  tx: Db,
+  subject: RecoveryEvidenceGateSubject,
+): Promise<boolean> {
+  const commentRows = await tx
+    .select({ body: issueComments.body })
+    .from(issueComments)
+    .where(
+      and(
+        eq(issueComments.companyId, subject.companyId),
+        eq(issueComments.issueId, subject.issueId),
+      ),
+    );
+  return commentRows.some(
+    (row) =>
+      typeof row.body === "string" &&
+      row.body.includes("<!-- card-bridge:v1 "),
+  );
+}
+
+async function verifyRecoveryEvidenceRun(
+  owner: string,
+  repo: string,
+  runId: string,
+  citationHost: string | null,
+): Promise<{ ok: true } | { ok: false; cause: string }> {
+  // B3: never fetch unless the host passes the allowlist; anything else is
+  // unresolvable and fails closed without a fetch.
+  if (
+    citationHost != null &&
+    !isResolvableGitHubCitationHost(citationHost)
+  ) {
+    return { ok: false, cause: "run_repo_unresolvable" };
+  }
+  const url = `${gitHubApiBase(citationHost ?? "github.com")}/repos/${owner}/${repo}/actions/runs/${runId}`;
+  try {
+    const response = await ghFetch(url, { signal: AbortSignal.timeout(5000) });
+    if (response.status === 404) return { ok: false, cause: "run_not_found" };
+    if (!response.ok) return { ok: false, cause: "run_lookup_error" };
+    let payload: { conclusion?: unknown };
+    try {
+      payload = (await response.json()) as { conclusion?: unknown };
+    } catch {
+      return { ok: false, cause: "run_lookup_error" };
+    }
+    return payload.conclusion === "success"
+      ? { ok: true }
+      : { ok: false, cause: "run_not_success" };
+  } catch {
+    return { ok: false, cause: "run_lookup_error" };
+  }
+}
+
+async function assertRecoveryResolutionEvidenceGates(
+  tx: Db,
+  subject: RecoveryEvidenceGateSubject,
+  resolutionNote: string | null | undefined,
+): Promise<void> {
+  const targetIsTerminal =
+    subject.sourceIssueStatus === "done" ||
+    subject.sourceIssueStatus === "cancelled";
+  if (!targetIsTerminal) return;
+
+  const citations = detectRecoveryEvidenceCitations(resolutionNote);
+
+  let cardSignals: Awaited<
+    ReturnType<typeof loadRecoveryEvidenceCardSignals>
+  > | null = null;
+  const loadSignals = async () => {
+    if (!cardSignals) {
+      cardSignals = await loadRecoveryEvidenceCardSignals(tx, subject);
+    }
+    return cardSignals;
+  };
+
+  // R1: EVERY detected citation must verify — a single unverified
+  // in-contract citation refuses (fail-closed), even when another citation
+  // verified. (R2 below is unconditional over evidence.)
+  if (citations.length > 0) {
+    let firstFailure: { cause: string; citedArtifact: string } | null = null;
+    for (const citation of citations) {
+      if (citation.kind === "receipt") {
+        if (await recoveryReceiptMarkerPresent(tx, subject)) {
+          continue;
+        }
+        firstFailure ??= {
+          cause: "receipt_absent",
+          citedArtifact: citation.citedArtifact,
+        };
+        continue;
+      }
+      let repo = citation.citationRepo;
+      if (!repo) {
+        const signals = await loadSignals();
+        if (signals.distinctRepos.length === 1) {
+          repo = signals.distinctRepos[0];
+        }
+      }
+      if (!repo) {
+        firstFailure ??= {
+          cause: "ambiguous_target_repo",
+          citedArtifact: citation.citedArtifact,
+        };
+        continue;
+      }
+      const verdict = await verifyRecoveryEvidenceRun(
+        repo.owner,
+        repo.repo,
+        citation.runId,
+        citation.citationHost,
+      );
+      if (verdict.ok) {
+        continue;
+      }
+      firstFailure ??= { cause: verdict.cause, citedArtifact: citation.citedArtifact };
+    }
+    if (firstFailure) {
+      throw new RecoveryEvidenceGateRefusal({
+        gate: "R1",
+        code: "recovery_evidence_unverified",
+        cause: firstFailure.cause,
+        citedArtifact: firstFailure.citedArtifact,
+        companyId: subject.companyId,
+        issueId: subject.issueId,
+        identifier: subject.identifier,
+        recoveryActionId: subject.recoveryActionId,
+        message: `Recovery resolution refused: the cited evidence is unverified (${firstFailure.cause}). Verify the cited CI run or attach the card-bridge receipt marker before moving this card to ${subject.sourceIssueStatus}.`,
+      });
+    }
+  }
+
+  // R2: moving a PR-classified card to a terminal status is refused
+  // UNCONDITIONALLY over evidence — a verifying citation or receipt marker does
+  // not exempt the close; recovery must never be the closer of a PR card.
+  // (Already-terminal cards with no status change skip.)
+  if (subject.sourceStatusChanged) {
+    const signals = await loadSignals();
+    if (
+      signals.pullRequestWorkProductCount > 0 ||
+      signals.prReferenceSeen
+    ) {
+      throw new RecoveryEvidenceGateRefusal({
+        gate: "R2",
+        code: "recovery_pr_close_refused",
+        cause: "pr_close_unverified",
+        citedArtifact: null,
+        companyId: subject.companyId,
+        issueId: subject.issueId,
+        identifier: subject.identifier,
+        recoveryActionId: subject.recoveryActionId,
+        message: `Recovery resolution refused: recovery cannot close a PR card; only the card bridge closes PR cards. This card was not closed.`,
+      });
+    }
+  }
 }
 
 export function issueRoutes(
@@ -9149,7 +9507,8 @@ export function issueRoutes(
       const actionStatus = outcome === "cancelled" ? "cancelled" : "resolved";
       const postCommitActivityPublications: ActivityPublication[] = [];
       const postCommitIssueActions: IssuePostCommitAction[] = [];
-      const result = await db.transaction(async (tx) => {
+      const runRecoveryResolutionTransaction = () =>
+        db.transaction(async (tx) => {
         const lockedIssue = await tx
           .select()
           .from(issueRows)
@@ -9432,6 +9791,22 @@ export function issueRoutes(
             });
           }
 
+          await assertRecoveryResolutionEvidenceGates(
+            tx as unknown as Db,
+            {
+              companyId: lockedIssue.companyId,
+              issueId: lockedIssue.id,
+              identifier: lockedIssue.identifier,
+              recoveryActionId: activeRecoveryAction.id,
+              sourceIssueStatus,
+              sourceStatusChanged,
+              title: lockedIssue.title,
+              description: lockedIssue.description,
+              monitorNotes: lockedIssue.monitorNotes,
+            },
+            resolutionNote,
+          );
+
           const updateFields: Record<string, unknown> = {
             status: sourceIssueStatus,
           };
@@ -9515,6 +9890,24 @@ export function issueRoutes(
           issue = updatedIssue;
         }
 
+        if (!sourceStatusChanged) {
+          await assertRecoveryResolutionEvidenceGates(
+            tx as unknown as Db,
+            {
+              companyId: lockedIssue.companyId,
+              issueId: lockedIssue.id,
+              identifier: lockedIssue.identifier,
+              recoveryActionId: activeRecoveryAction.id,
+              sourceIssueStatus,
+              sourceStatusChanged,
+              title: lockedIssue.title,
+              description: lockedIssue.description,
+              monitorNotes: lockedIssue.monitorNotes,
+            },
+            resolutionNote,
+          );
+        }
+
         const recordedOutcome =
           outcome === "restored" &&
           issue.status === "todo" &&
@@ -9540,6 +9933,57 @@ export function issueRoutes(
 
         return { issue, recoveryAction, chatRetry };
       });
+      let result: Awaited<ReturnType<typeof runRecoveryResolutionTransaction>>;
+      try {
+        result = await runRecoveryResolutionTransaction();
+      } catch (err) {
+        if (err instanceof RecoveryEvidenceGateRefusal) {
+          const refusal = err;
+          try {
+            await logActivity(db, {
+              companyId: refusal.companyId,
+              actorType: actor.actorType,
+              actorId: actor.actorId,
+              agentId: actor.agentId,
+              runId: actor.runId,
+              agentApiKeyId: actor.agentApiKeyId,
+              action: "issue.recovery_evidence_refused",
+              entityType: "issue",
+              entityId: refusal.issueId,
+              details: {
+                identifier: refusal.identifier,
+                code: refusal.code,
+                cause: refusal.cause,
+                citedArtifact: refusal.citedArtifact,
+                recoveryActionId: refusal.recoveryActionId,
+                gate: refusal.gate,
+                sourceIssueStatus: sourceIssueStatus ?? null,
+              },
+            });
+          } catch (activityError) {
+            logger.warn(
+              {
+                err: activityError,
+                issueId: refusal.issueId,
+                recoveryActionId: refusal.recoveryActionId,
+              },
+              "failed to persist recovery evidence refusal activity",
+            );
+          }
+          res.status(422).json({
+            error: refusal.message,
+            code: refusal.code,
+            details: {
+              code: refusal.code,
+              cause: refusal.cause,
+              citedArtifact: refusal.citedArtifact,
+              recoveryActionId: refusal.recoveryActionId,
+            },
+          });
+          return;
+        }
+        throw err;
+      }
       if (result.replayed) {
         res.json({
           issue: result.issue,
