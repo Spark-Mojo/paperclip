@@ -2640,6 +2640,23 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
           result.skippedNonTerminalTree += 1;
           continue;
         }
+        // A separate-root issue can inherit this workspace through
+        // issues.executionWorkspaceId. Read the live reference state and keep the
+        // workspace while any inheritor is non-terminal.
+        const nonTerminalInheritor = await db
+          .select({ id: issues.id })
+          .from(issues)
+          .where(and(
+            eq(issues.companyId, workspace.companyId),
+            eq(issues.executionWorkspaceId, workspace.id),
+            sql<boolean>`${issues.status} NOT IN ('done', 'cancelled')`,
+          ))
+          .limit(1)
+          .then((rows) => rows[0] ?? null);
+        if (nonTerminalInheritor) {
+          result.skippedNonTerminalTree += 1;
+          continue;
+        }
         if (assessment.workspaceDirty) {
           result.skippedUndelivered += 1;
           continue;
@@ -2778,6 +2795,15 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
                   )
                   AND live_run.company_id = ${workspace.companyId}
                   AND live_run.status IN ('queued', 'running')
+              )`,
+              // Re-check inheritors under the lifecycle lock: no issue that
+              // references this workspace may be non-terminal.
+              sql<boolean>`NOT EXISTS (
+                SELECT 1
+                FROM ${issues} inheritor
+                WHERE inheritor.company_id = ${workspace.companyId}
+                  AND inheritor.execution_workspace_id = ${workspace.id}
+                  AND inheritor.status NOT IN ('done', 'cancelled')
               )`,
               sql<boolean>`NOT EXISTS (
                 WITH RECURSIVE issue_tree(id, status) AS (
