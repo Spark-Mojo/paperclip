@@ -213,6 +213,10 @@ const MAX_ISSUE_COMMENT_PAGE_LIMIT = 500;
 const MAX_CHAT_PRESENTATION_ATTACHMENTS = 20;
 export const ISSUE_LIST_DEFAULT_LIMIT = 500;
 export const ISSUE_LIST_MAX_LIMIT = 1000;
+// Machine-readable marker for the done-transition compare-and-set refusal
+// (receipt-close contract §2). Carried in the thrown HttpError details; the
+// PATCH route turns it into the additive 409 body carrying `reason`.
+export const ISSUE_CLOSE_PRECONDITION_CODE = "issue_close_precondition_failed";
 export const ISSUE_BLOCKER_DIAGNOSTICS_MAX_BLOCKERS = 100;
 export const ISSUE_WAKE_DIAGNOSTICS_MAX_WAKE_REQUESTS = 50;
 export const ISSUE_WAKE_DIAGNOSTICS_MAX_ACTIVITY_RECORDS = 50;
@@ -10646,6 +10650,10 @@ export function issueService(db: Db) {
         actorRunStopId?: string | null;
         actorUserId?: string | null;
         companyGuard?: string;
+        expectedState?: {
+          status: "done";
+          blockers: Array<{ issueId: string; status: string }>;
+        };
       },
       dbOrTx: any = db,
       postCommitActivityPublications?: ActivityPublication[],
@@ -10693,6 +10701,7 @@ export function issueService(db: Db) {
         actorRunStopId,
         actorUserId,
         companyGuard,
+        expectedState,
         ...issueData
       } = data;
       // An explicit edit claims the title, even if it keeps the same text.
@@ -10976,6 +10985,65 @@ export function issueService(db: Db) {
         if (actorAgentId && patch.status === "done") {
           const [review] = await tx.select({ id: toolActionRequests.id }).from(toolActionRequests).where(and(eq(toolActionRequests.companyId, existing.companyId), eq(toolActionRequests.issueId, id), inArray(toolActionRequests.status, ["pending", "approved", "executing"]))).limit(1);
           if (review) throw conflict("This task is waiting for a connection review. Finish unrelated work, then yield in_review without retrying the governed call.", { code: "tool_review_pending", actionRequestId: review.id });
+        }
+        // Compare-and-set on the caller-declared state (receipt-close
+        // contract §1). Keyed on expectedState presence only, never on the
+        // status value, so every caller that omits the field keeps the base
+        // path byte-identically. The declared check runs under the same row
+        // lock as the write (`receiptExisting` above plus the FOR UPDATE on
+        // the first-class blocker rows below), before any write, inside this
+        // transaction: a mismatch throws with zero writes and rolls back.
+        if (expectedState) {
+          if (receiptExisting.status === "done") {
+            throw conflict("Issue is already closed", {
+              code: ISSUE_CLOSE_PRECONDITION_CODE,
+              reason: "alreadyClosed",
+            });
+          }
+          const liveBlockers = await tx
+            .select({
+              issueId: issueRelations.issueId,
+              status: issues.status,
+            })
+            .from(issueRelations)
+            .innerJoin(issues, eq(issueRelations.issueId, issues.id))
+            .where(
+              and(
+                eq(issueRelations.companyId, receiptExisting.companyId),
+                eq(issueRelations.type, "blocks"),
+                eq(issueRelations.relatedIssueId, id),
+              ),
+            )
+            .for("update");
+          const declaredByIssueId = new Map(
+            expectedState.blockers.map((blocker) => [
+              blocker.issueId,
+              blocker.status,
+            ]),
+          );
+          const liveByIssueId = new Map(
+            liveBlockers.map(
+              (blocker: { issueId: string; status: string }) => [
+                blocker.issueId,
+                blocker.status,
+              ],
+            ),
+          );
+          const declaredMismatch =
+            declaredByIssueId.size !== liveByIssueId.size ||
+            [...declaredByIssueId].some(
+              ([blockerIssueId, blockerStatus]) =>
+                liveByIssueId.get(blockerIssueId) !== blockerStatus,
+            );
+          if (declaredMismatch) {
+            throw conflict(
+              "Declared issue state no longer matches the live issue state",
+              {
+                code: ISSUE_CLOSE_PRECONDITION_CODE,
+                reason: "blockerMismatch",
+              },
+            );
+          }
         }
 
         const [previousLabelsByIssueId, previousRelationSummaries] = await Promise.all([

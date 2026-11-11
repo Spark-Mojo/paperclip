@@ -895,6 +895,25 @@ export const updateIssueSchema = objectWithoutDefaults(
     /** Assignment-only handoff; the following structured goal action owns the wake. */
     deferWakeForGoal: z.boolean().optional(),
     hiddenAt: z.string().datetime().nullable().optional(),
+    // Compare-and-set declaration for the done transition (receipt-close
+    // contract §2): the caller declares the exact first-class blocker set it
+    // saw, each entry the blocker issue id paired with that blocker's own
+    // status. Declaration is exact — the live set must equal it
+    // element-for-element or the close is refused with 409 `blockerMismatch`
+    // / `alreadyClosed`. Optional: `.partial()` above runs before this
+    // `.extend()`, so the explicit `.optional()` is what keeps the field
+    // absent-by-default for every existing caller.
+    expectedState: z
+      .object({
+        status: z.literal('done'),
+        blockers: z.array(
+          z.object({
+            issueId: z.string(),
+            status: z.string(),
+          }),
+        ),
+      })
+      .optional(),
   });
 
 export type UpdateIssue = z.infer<typeof updateIssueSchema>;

@@ -287,6 +287,14 @@ import {
   readAcceptedPlanConfirmationTarget,
   type IssuePostCommitAction,
 } from "../services/issues.js";
+// Receipt-close compare-and-set marker (receipt-close contract §2): the
+// expectedState refusal code thrown by the service, matched here to shape the
+// additive 409 body. Declared as a local literal rather than imported from
+// services/issues.js on purpose: unit tests replace that module wholesale via
+// a vi.mock factory, which leaves any other named import undefined — and an
+// undefined marker would make the 409 guard below match every details-less
+// 409 (e.g. transactional attachment-binding refusals) and mis-route them.
+const ISSUE_CLOSE_PRECONDITION_CODE = "issue_close_precondition_failed";
 import { authorizationDeniedDetails } from "../services/authorization.js";
 import { stalledReviewDecisionService } from "../services/stalled-review-decisions.js";
 import { environmentService } from "../services/environments.js";
@@ -13320,6 +13328,29 @@ export function issueRoutes(
         onBehalfOfUserId: _requestedOnBehalfOfUserId,
         ...updateFields
       } = req.body;
+      // Receipt-close compare-and-set marker (receipt-close contract §2):
+      // presence of the validated expectedState field, never the status
+      // value, is what routes the close into the single-transaction path.
+      // Omitted (every existing caller) keeps the base path byte-identically.
+      const expectedStateClose = updateFields.expectedState !== undefined;
+      if (expectedStateClose && !commentBody) {
+        // Receipt-close precondition (receipt-close contract §2): the receipt
+        // comment IS the close record, so an expectedState close with no
+        // comment body would otherwise reach svc.addComment(undefined) inside
+        // the transaction, fail the NOT NULL write, roll back, and surface as
+        // a generic 500 on a client-error shape. Pure request-shape refusal,
+        // before any transaction opens. Keyed on a falsy comment body, which
+        // here can only mean the field is absent: updateIssueSchema rejects
+        // comment: "" with a 400 at the validation middleware (min(1)), so an
+        // empty string never reaches this handler — base semantics matched.
+        // Additive: reachable only when expectedState is present, so no
+        // existing caller's status or body changes.
+        res.status(422).json({
+          error: "Receipt-close requires a comment",
+          reason: "commentRequired",
+        });
+        return;
+      }
       if (existing.conversationAgentId && req.actor.type === "board" && commentBody) {
         throw unprocessable("Send conversation messages through the comments endpoint with a clientRequestId");
       }
@@ -14151,12 +14182,15 @@ export function issueRoutes(
       const commentWithAdapterOverrides = Boolean(
         commentBody && updateFields.assigneeAdapterOverrides !== undefined,
       );
-      const transactionalCommentSourceTrust = commentAttachmentIds?.length || commentWithAdapterOverrides
+      const transactionalCommentSourceTrust = commentAttachmentIds?.length ||
+        commentWithAdapterOverrides ||
+        expectedStateClose
         ? await sourceTrustForActorWrite(existing, actor)
         : undefined;
       const shouldUseTransactionalIssueUpdate =
         Boolean(commentAttachmentIds?.length) ||
         commentWithAdapterOverrides ||
+        expectedStateClose ||
         Boolean(decision) ||
         shouldRelayStop ||
         persistReviewActivityTransactionally ||
@@ -14171,9 +14205,16 @@ export function issueRoutes(
               return null;
             const updated = await updateIssue(tx);
             if (!updated) return null;
-            if (commentAttachmentIds?.length || commentWithAdapterOverrides) {
+            if (
+              commentAttachmentIds?.length ||
+              commentWithAdapterOverrides ||
+              expectedStateClose
+            ) {
               // Adapter settings, reassignment, comment and upload binding commit together.
               // A failed comment or invalid receipt rolls back the issue update.
+              // An expectedState close commits the same way: the receipt is the
+              // sole comment write and lives in the same transaction as the
+              // status write, so a comment failure rolls the status back.
               transactionalComment = await svc.addComment(
                 id,
                 commentBody,
@@ -14249,6 +14290,21 @@ export function issueRoutes(
             },
             "issue update rejected with 422",
           );
+        }
+        if (
+          err instanceof HttpError &&
+          err.status === 409 &&
+          (err.details as Record<string, unknown> | null | undefined)?.code ===
+            ISSUE_CLOSE_PRECONDITION_CODE
+        ) {
+          // Compare-and-set refusal (receipt-close contract §2). The throw
+          // happened before any write inside the update transaction, so the
+          // card is untouched; the body is additive and machine-readable.
+          res.status(409).json({
+            error: err.message,
+            reason: (err.details as Record<string, unknown>).reason,
+          });
+          return;
         }
         throw err;
       }
