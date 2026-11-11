@@ -19,6 +19,7 @@ import {
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
 import { executionWorkspaceService } from "../services/execution-workspaces.ts";
+import { ensurePersistedExecutionWorkspaceAvailable } from "../services/workspace-runtime.ts";
 
 const execFileAsync = promisify(execFile);
 
@@ -198,6 +199,8 @@ describeEmbeddedPostgres("execution workspace sweep inheritor", () => {
       name: "Archived setup",
       status: "in_progress",
     });
+    const activeCwd = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-active-setup-"));
+    tempDirs.add(activeCwd);
     await db.insert(executionWorkspaces).values({
       id: activeWorkspaceId,
       companyId,
@@ -207,8 +210,12 @@ describeEmbeddedPostgres("execution workspace sweep inheritor", () => {
       name: "active-workspace",
       status: "active",
       providerType: "local_fs",
-      cwd: "/tmp/paperclip-active-setup",
+      cwd: activeCwd,
     });
+    // The archived worktree path stays absent from disk: the reaper removes
+    // the archived worktree (see the rebuild comment in execution-workspaces
+    // setup), so a setup lookup against this row mirrors production.
+    const archivedCwd = path.join(os.tmpdir(), `paperclip-archived-setup-${randomUUID()}`);
     await db.insert(executionWorkspaces).values({
       id: archivedWorkspaceId,
       companyId,
@@ -220,17 +227,42 @@ describeEmbeddedPostgres("execution workspace sweep inheritor", () => {
       closedAt: archivedClosedAt,
       cleanupReason: "issue_terminal",
       providerType: "local_fs",
-      cwd: "/tmp/paperclip-archived-setup",
+      cwd: archivedCwd,
     });
 
-    // Negative control: an active row archives through this path, so the
-    // archived assertions below are not vacuous.
-    const activeSetup = await svc.archiveWorkspaceUnderLifecycleLock({
-      id: activeWorkspaceId,
-      patch: {},
-      closedAt: new Date("2026-05-24T20:00:00.000Z"),
-    });
-    expect(activeSetup?.outcome).toBe("archived");
+    // Negative control: an active row restores through the real setup
+    // lookup path, so restoring the archived row below exercises the same
+    // seam. A setup path that reuses/resolves this workspace must surface
+    // the archived id and its closed state — never a bare null with no id.
+    const activeRestore = await ensurePersistedExecutionWorkspaceAvailable({
+      db,
+      base: {
+        baseCwd: activeCwd,
+        source: "task_session",
+        projectId,
+        workspaceId: null,
+        repoUrl: null,
+        repoRef: null,
+      },
+      workspace: {
+        id: activeWorkspaceId,
+        mode: "isolated_workspace",
+        strategyType: "project_primary",
+        cwd: activeCwd,
+        providerRef: activeCwd,
+        projectId,
+        projectWorkspaceId: null,
+        repoUrl: "https://github.com/paperclipai/paperclip.git",
+        baseRef: "main",
+        branchName: null,
+        metadata: null,
+        config: null,
+      },
+      issue: { id: randomUUID(), identifier: null, title: "Active setup probe" },
+      agent: { id: null, name: "Agent", companyId },
+    }).catch((error: unknown) => (error instanceof Error ? error : new Error(String(error))));
+    expect(activeRestore).not.toBeNull();
+    expect(activeRestore).not.toBeInstanceOf(Error);
 
     // Non-terminal inheritor still linked to the archived row: a setup path
     // that reuses/resolves this workspace must surface the archived id and
@@ -245,14 +277,45 @@ describeEmbeddedPostgres("execution workspace sweep inheritor", () => {
       executionWorkspaceId: archivedWorkspaceId,
     });
 
-    // Automation setup against the archived row: capture the REAL return and
-    // assert it surfaces the workspace id plus its closed state.
-    const setup = await svc.archiveWorkspaceUnderLifecycleLock({
-      id: archivedWorkspaceId,
-      patch: {},
-      closedAt: new Date("2026-05-24T20:00:00.000Z"),
-    });
-    const surfaced = setup === null ? "null" : JSON.stringify(setup);
+    // Automation/heartbeat setup against the archived row: drive the REAL
+    // setup lookup path the setup calls (the same function heartbeat setup
+    // invokes via ensurePersistedExecutionWorkspaceAvailable), capture the
+    // REAL throw/return, and assert it surfaces the workspace id plus its
+    // closed state.
+    const archivedRow = await db
+      .select()
+      .from(executionWorkspaces)
+      .where(eq(executionWorkspaces.id, archivedWorkspaceId))
+      .then((rows) => rows[0] ?? null);
+    expect(archivedRow?.status).toBe("archived");
+    const setup = await ensurePersistedExecutionWorkspaceAvailable({
+      db,
+      base: {
+        baseCwd: archivedRow?.cwd ?? "",
+        source: "task_session",
+        projectId,
+        workspaceId: null,
+        repoUrl: null,
+        repoRef: null,
+      },
+      workspace: {
+        id: archivedWorkspaceId,
+        mode: archivedRow?.mode ?? "isolated_workspace",
+        strategyType: archivedRow?.strategyType ?? "project_primary",
+        cwd: archivedRow?.cwd ?? "/tmp/paperclip-archived-setup",
+        providerRef: archivedRow?.providerRef ?? "/tmp/paperclip-archived-setup",
+        projectId,
+        projectWorkspaceId: archivedRow?.projectWorkspaceId ?? null,
+        repoUrl: archivedRow?.repoUrl ?? null,
+        baseRef: archivedRow?.baseRef ?? null,
+        branchName: archivedRow?.branchName ?? null,
+        metadata: (archivedRow?.metadata as Record<string, unknown> | null) ?? null,
+        config: null,
+      },
+      issue: { id: randomUUID(), identifier: null, title: "Non-terminal inheritor run" },
+      agent: { id: null, name: "Agent", companyId },
+    }).catch((error: unknown) => (error instanceof Error ? error : new Error(String(error))));
+    const surfaced = setup === null ? "null" : setup instanceof Error ? setup.message : JSON.stringify(setup);
 
     expect(surfaced).toContain(archivedWorkspaceId);
     expect(surfaced).toMatch(/archived|closed/);

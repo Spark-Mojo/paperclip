@@ -1,6 +1,27 @@
-# SPA-17928 R3: upstream changelog check
+# R3 upstream-changelog check — intake comment for SPA-17926
 
-Scope: whether upstream paperclipai/paperclip fixed the SPA-17926 defect
+Upstream search result: ABSENT — no upstream fix found, proceed with local fix.
+
+Checked paperclipai/paperclip stable releases v2026.824.0, v2026.831.0,
+v2026.831.1, v2026.916.0, v2026.916.1, and latest v2026.1106.0
+(released 2026-11-06, 515 commits). Only reaper-adjacent hits: regenerable-dir
+compaction one hour after tree finish, pooled-connection fix touching
+workspace readiness/reaper, terminal-workspace cleanup off DB polling, and
+PAPERCLIP_WORKSPACE_REAPER_COOLDOWN_DAYS default 7 → 1. None changes the
+sweep archive predicate for a live separate-root inheritor sharing one
+workspace via executionWorkspaceId, nor the heartbeat setup error surface
+(workspace id + closed state vs bare setup_failed). In-tree releases/
+likewise has no such fix (newest note: releases/v2026.916.1.md).
+
+Recommendation: fix locally in this engine-repair tree; no upstream alignment
+needed. Regression scaffolding proving both defects is committed on branch
+engine-fork/SPA-17926 as
+server/src/__tests__/execution-workspace-sweep-inheritor.test.ts
+(commit 4b1d62348): test 1 leaves-shared-workspace-unarchived RED (sweep
+archives shared row despite live inheritor, expected 2 to be 1); test 2
+archived-workspace-setup RED (archived setup surfaces no id/closed state).
+Gate evidence: .unlazy/SPA-17928/gates.md (g1/g2/n1 PASS), full note in
+.unlazy/SPA-17928/upstream-check.md.
 (terminal sweep archives a workspace still inherited by a live separate-root
 tree via executionWorkspaceId; automation setup on the closed workspace fails
 with bare `setup_failed`).
