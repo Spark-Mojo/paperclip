@@ -308,6 +308,7 @@ import {
   parseIssueExecutionState,
   redactIssueMonitorExternalRef,
   setIssueExecutionPolicyMonitorScheduledBy,
+  validatedCompanyDefaultResponsibleUserId,
 } from "../services/issue-execution-policy.js";
 import { parseIssueExecutionWorkspaceSettings } from "../services/execution-workspace-policy.js";
 import type { PluginWorkerManager } from "../services/plugin-worker-manager.js";
@@ -9505,6 +9506,8 @@ export function issueRoutes(
 
       const actor = getActorInfo(req);
       const actionStatus = outcome === "cancelled" ? "cancelled" : "resolved";
+      const companyDefaultResponsibleUserId =
+        await validatedCompanyDefaultResponsibleUserId(db, existing.companyId);
       const postCommitActivityPublications: ActivityPublication[] = [];
       const postCommitIssueActions: IssuePostCommitAction[] = [];
       const runRecoveryResolutionTransaction = () =>
@@ -9826,6 +9829,7 @@ export function issueRoutes(
               issue: lockedIssue,
               policy: executionPolicy,
               previousPolicy: executionPolicy,
+              companyDefaultResponsibleUserId,
               requestedStatus: sourceIssueStatus,
               requestedAssigneePatch: {},
               actor: {
@@ -13293,6 +13297,8 @@ export function issueRoutes(
           : issueWriteAuthorizationReason(req, true);
 
       const actor = getActorInfo(req);
+      const companyDefaultResponsibleUserId =
+        await validatedCompanyDefaultResponsibleUserId(db, existing.companyId);
       const isClosed = isClosedIssueStatus(existing.status);
       const isBlocked = existing.status === "blocked";
       const normalizedAssigneeAgentId =
@@ -13651,6 +13657,7 @@ export function issueRoutes(
         issue: existing,
         policy: nextExecutionPolicy,
         previousPolicy: previousExecutionPolicy,
+        companyDefaultResponsibleUserId,
         requestedStatus:
           typeof updateFields.status === "string"
             ? updateFields.status
@@ -18100,6 +18107,8 @@ export function issueRoutes(
       const currentExecutionPolicy = normalizeIssueExecutionPolicy(
         currentIssue.executionPolicy ?? null,
       );
+      const companyDefaultResponsibleUserId =
+        await validatedCompanyDefaultResponsibleUserId(db, currentIssue.companyId);
       const shouldAutoApproveReviewComment =
         currentIssue.status === "in_review" &&
         currentExecutionState?.status === "pending" &&
@@ -18118,6 +18127,7 @@ export function issueRoutes(
         const transition = applyIssueExecutionPolicyTransition({
           issue: currentIssue,
           policy: currentExecutionPolicy,
+          companyDefaultResponsibleUserId,
           requestedStatus: "done",
           requestedAssigneePatch: {},
           actor: {
