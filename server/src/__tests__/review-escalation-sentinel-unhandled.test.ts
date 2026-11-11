@@ -1,4 +1,4 @@
-import { expect, it } from "vitest";
+import { describe, expect, it } from "vitest";
 import type { IssueExecutionState } from "@paperclipai/shared";
 import {
   applyIssueExecutionPolicyTransition,
@@ -16,8 +16,11 @@ type InputWithCompanyDefault = TransitionInput & {
   companyDefaultResponsibleUserId?: string | null;
 };
 
-it("negative fixture: leaves the local-board sentinel as the escalation target", () => {
-  expect(DEFAULT_MAX_REVIEW_ROUNDS).toBe(3);
+// Complements review-escalation-sentinel-fallback.test.ts (which drives the
+// full three-round loop): these are single-transition cases for an issue whose
+// historical responsible user is the board sentinel, with different
+// company-default inputs.
+function finalRoundResult(companyDefaultResponsibleUserId: string | null | undefined) {
   const policy = normalizeIssueExecutionPolicy({
     stages: [{ type: "review", participants: [{ type: "agent", agentId: reviewerAgentId }] }],
   })!;
@@ -49,16 +52,37 @@ it("negative fixture: leaves the local-board sentinel as the escalation target",
     requestedAssigneePatch: {},
     actor: { agentId: reviewerAgentId },
     commentBody: "Final agent review round",
-    companyDefaultResponsibleUserId: fallbackUserId,
+    companyDefaultResponsibleUserId,
   };
-
   const result = applyIssueExecutionPolicyTransition(input);
-  const participant = (result.patch.executionState as IssueExecutionState).currentParticipant;
+  return { result, participant: (result.patch.executionState as IssueExecutionState).currentParticipant };
+}
 
-  // This fixture is intentionally impossible to satisfy: before the fix the
-  // fallback assertion fails, while after the fix the old-behavior assertions
-  // fail. It therefore remains a reliable non-zero negative gate on both sides.
-  expect(result.patch.assigneeUserId).toBe(fallbackUserId);
-  expect(result.patch.assigneeUserId).toBe(sentinelUserId);
-  expect(participant).toMatchObject({ type: "user", userId: sentinelUserId });
+describe("final review round on an issue whose responsible user is the local-board sentinel", () => {
+  it("assigns the validated company fallback and never leaks local-board into the escalation", () => {
+    expect(DEFAULT_MAX_REVIEW_ROUNDS).toBe(3);
+    const { result, participant } = finalRoundResult(fallbackUserId);
+
+    expect(result.patch.assigneeAgentId).toBeNull();
+    expect(result.patch.assigneeUserId).toBe(fallbackUserId);
+    expect(participant).toMatchObject({ type: "user", userId: fallbackUserId });
+    expect(result.patch.assigneeUserId).not.toBe(sentinelUserId);
+    expect(participant?.userId).not.toBe(sentinelUserId);
+  });
+
+  it.each([
+    ["the sentinel itself", sentinelUserId],
+    ["a padded sentinel", ` ${sentinelUserId} `],
+    ["null", null],
+    ["undefined", undefined],
+  ])("never assigns the sentinel when the company default is %s", (_label, companyDefault) => {
+    const { result, participant } = finalRoundResult(companyDefault);
+
+    expect(result.patch.assigneeUserId).not.toBe(sentinelUserId);
+    expect(participant?.userId).not.toBe(sentinelUserId);
+    // No human target is available, so the stage hands back to the implementer
+    // (pre-existing behavior) instead of stalling on the sentinel.
+    expect(result.patch.assigneeAgentId).toBe(implementerAgentId);
+    expect(participant?.type).not.toBe("user");
+  });
 });

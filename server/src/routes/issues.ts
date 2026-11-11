@@ -9148,8 +9148,6 @@ export function issueRoutes(
 
       const actor = getActorInfo(req);
       const actionStatus = outcome === "cancelled" ? "cancelled" : "resolved";
-      const companyDefaultResponsibleUserId =
-        await validatedCompanyDefaultResponsibleUserId(db, existing.companyId);
       const postCommitActivityPublications: ActivityPublication[] = [];
       const postCommitIssueActions: IssuePostCommitAction[] = [];
       const result = await db.transaction(async (tx) => {
@@ -9165,6 +9163,11 @@ export function issueRoutes(
           .for("update")
           .then((rows) => rows[0] ?? null);
         if (!lockedIssue) throw notFound("Issue not found");
+        const companyDefaultResponsibleUserId =
+          await validatedCompanyDefaultResponsibleUserId(
+            tx as unknown as Db,
+            lockedIssue.companyId,
+          );
 
         let activeRecoveryAction = await recoveryActionsSvc.getActiveForIssue(
           lockedIssue.companyId,
@@ -17663,8 +17666,6 @@ export function issueRoutes(
       const currentExecutionPolicy = normalizeIssueExecutionPolicy(
         currentIssue.executionPolicy ?? null,
       );
-      const companyDefaultResponsibleUserId =
-        await validatedCompanyDefaultResponsibleUserId(db, currentIssue.companyId);
       const shouldAutoApproveReviewComment =
         currentIssue.status === "in_review" &&
         currentExecutionState?.status === "pending" &&
@@ -17680,42 +17681,7 @@ export function issueRoutes(
       let comment: Awaited<ReturnType<typeof svc.addComment>>;
       let goalCommentSteered = false;
       if (shouldAutoApproveReviewComment) {
-        const transition = applyIssueExecutionPolicyTransition({
-          issue: currentIssue,
-          policy: currentExecutionPolicy,
-          companyDefaultResponsibleUserId,
-          requestedStatus: "done",
-          requestedAssigneePatch: {},
-          actor: {
-            agentId: actor.agentId ?? null,
-            userId: actor.actorType === "user" ? actor.actorId : null,
-          },
-          commentBody: req.body.body,
-        });
-        const decisionId = transition.decision ? randomUUID() : null;
-        if (decisionId) {
-          const nextExecutionState = transition.patch.executionState;
-          if (!nextExecutionState || typeof nextExecutionState !== "object") {
-            throw new Error(
-              "Execution policy decision patch is missing executionState",
-            );
-          }
-          transition.patch.executionState = {
-            ...nextExecutionState,
-            lastDecisionId: decisionId,
-          };
-        }
-
         issueBeforeCommentDecision = currentIssue;
-        const updatePatch = {
-          ...transition.patch,
-          status:
-            typeof transition.patch.status === "string"
-              ? transition.patch.status
-              : "done",
-          actorAgentId: actor.agentId ?? null,
-          actorUserId: actor.actorType === "user" ? actor.actorId : null,
-        };
 
         const sourceTrust = await sourceTrustForActorWrite(currentIssue, actor);
         const commentOptions = {
@@ -17737,6 +17703,64 @@ export function issueRoutes(
         const postCommitIssueActions: IssuePostCommitAction[] = [];
         try {
           txResult = await db.transaction(async (tx) => {
+            // Lock the issue row first so the company default lookup and the
+            // policy transition see the same committed state as the update below.
+            const lockedIssue = await tx
+              .select()
+              .from(issueRows)
+              .where(
+                and(
+                  eq(issueRows.companyId, currentIssue.companyId),
+                  eq(issueRows.id, currentIssue.id),
+                ),
+              )
+              .for("update")
+              .then((rows) => rows[0] ?? null);
+            // Throw so drizzle rolls back; mapped to the same 404 as a concurrent delete.
+            if (!lockedIssue) throw new AutoApprovalIssueMissingError();
+            const companyDefaultResponsibleUserId =
+              await validatedCompanyDefaultResponsibleUserId(
+                tx as unknown as Db,
+                lockedIssue.companyId,
+              );
+            const transition = applyIssueExecutionPolicyTransition({
+              issue: lockedIssue,
+              policy: currentExecutionPolicy,
+              companyDefaultResponsibleUserId,
+              requestedStatus: "done",
+              requestedAssigneePatch: {},
+              actor: {
+                agentId: actor.agentId ?? null,
+                userId: actor.actorType === "user" ? actor.actorId : null,
+              },
+              commentBody: req.body.body,
+            });
+            const decisionId = transition.decision ? randomUUID() : null;
+            if (decisionId) {
+              const nextExecutionState = transition.patch.executionState;
+              if (
+                !nextExecutionState ||
+                typeof nextExecutionState !== "object"
+              ) {
+                throw new Error(
+                  "Execution policy decision patch is missing executionState",
+                );
+              }
+              transition.patch.executionState = {
+                ...nextExecutionState,
+                lastDecisionId: decisionId,
+              };
+            }
+            const updatePatch = {
+              ...transition.patch,
+              status:
+                typeof transition.patch.status === "string"
+                  ? transition.patch.status
+                  : "done",
+              actorAgentId: actor.agentId ?? null,
+              actorUserId: actor.actorType === "user" ? actor.actorId : null,
+            };
+
             const insertedComment = await svc.addComment(
               id,
               req.body.body,

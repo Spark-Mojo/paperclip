@@ -72,6 +72,13 @@ type TransitionResult = {
  */
 export const DEFAULT_MAX_REVIEW_ROUNDS = 3;
 
+const LEGACY_BOARD_USER_SENTINEL = "local-board";
+
+function humanUserId(value: string | null | undefined): string | null {
+  const trimmed = value?.trim();
+  return trimmed && trimmed !== LEGACY_BOARD_USER_SENTINEL ? trimmed : null;
+}
+
 export async function validatedCompanyDefaultResponsibleUserId(
   db: Db,
   companyId: string,
@@ -90,7 +97,10 @@ export async function validatedCompanyDefaultResponsibleUserId(
     )
     .where(eq(companies.id, companyId))
     .limit(1);
-  return membership?.principalId ?? null;
+  // A padded principal id can never equal a real membership principalId, so it
+  // fails closed instead of being silently trimmed into a different value.
+  if (membership?.principalId !== membership?.principalId?.trim()) return null;
+  return humanUserId(membership?.principalId);
 }
 
 const COMPLETED_STATUS: IssueExecutionState["status"] = "completed";
@@ -478,13 +488,6 @@ function resolveMaxReviewRounds(policy: IssueExecutionPolicy | null): number {
  * changes-requested rounds. Without one the loop keeps handing back to the
  * return assignee (pre-existing behavior) rather than stalling the stage.
  */
-const LEGACY_BOARD_USER_SENTINEL = "local-board";
-
-function humanUserId(value: string | null | undefined): string | null {
-  const trimmed = value?.trim();
-  return trimmed && trimmed !== LEGACY_BOARD_USER_SENTINEL ? trimmed : null;
-}
-
 function reviewEscalationUserId(input: {
   issue: IssueLike;
   companyDefaultResponsibleUserId?: string | null;
