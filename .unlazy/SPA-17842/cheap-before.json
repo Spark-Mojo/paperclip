@@ -1,0 +1,84 @@
+{
+  "table_row": {
+    "id": "7b7295a0-7880-41ad-8cec-953bbed211ac",
+    "name": "cheap",
+    "sort_order": 9,
+    "created_at": "2026-09-22T02:21:44.629Z",
+    "updated_at": "2026-10-30T04:36:22.452Z",
+    "context_cache_protection": 1
+  },
+  "data": {
+    "name": "cheap",
+    "models": [
+      {
+        "id": "cheap-model-1-antigravity-gpt-oss-120b-medium-1094d5f9-bca7-4030-8a9f-d6ad89f1458f",
+        "kind": "model",
+        "model": "antigravity/gpt-oss-120b-medium",
+        "providerId": "antigravity",
+        "connectionId": "1094d5f9-bca7-4030-8a9f-d6ad89f1458f",
+        "weight": 0,
+        "label": "jamesilsley@gmail.com"
+      },
+      {
+        "id": "cheap-model-2-openrouter-nvidia-nemotron-3-ultra-550b-a55b-free-be5f2c2a-9a02-439e-b230-2035ded48f54",
+        "kind": "model",
+        "model": "openrouter/nvidia/nemotron-3-ultra-550b-a55b:free",
+        "providerId": "openrouter",
+        "connectionId": "be5f2c2a-9a02-439e-b230-2035ded48f54",
+        "weight": 0
+      },
+      {
+        "id": "cheap-model-5-openrouter-inclusionai-ling-3-0-flash-be5f2c2a-9a02-439e-b230-2035ded48f54",
+        "kind": "model",
+        "model": "openrouter/inclusionai/ling-3.0-flash",
+        "providerId": "openrouter",
+        "connectionId": "be5f2c2a-9a02-439e-b230-2035ded48f54",
+        "weight": 0
+      },
+      {
+        "id": "cheap-model-1-zai-glm-4-7",
+        "kind": "model",
+        "model": "zai/glm-4.7",
+        "providerId": "zai",
+        "weight": 0
+      },
+      {
+        "id": "cheap-model-5-qoder-glm-5-2-874e96b6-4107-4c88-8c72-269aed112d35",
+        "kind": "model",
+        "model": "qoder/glm-5.2",
+        "providerId": "qoder",
+        "weight": 0,
+        "label": "main"
+      },
+      {
+        "id": "cheap-model-6-nous-research-meituan-longcat-2-5-preview-free-d3b15420-fc45-452e-87c9-7b6d693a4ba4",
+        "kind": "model",
+        "model": "nous-research/meituan/longcat-2.5-preview:free",
+        "providerId": "nous-research",
+        "connectionId": "d3b15420-fc45-452e-87c9-7b6d693a4ba4",
+        "weight": 0,
+        "label": "Nous Research james@sparkmojo.com"
+      }
+    ],
+    "strategy": "round-robin",
+    "config": {
+      "maxRetries": 1,
+      "retryDelayMs": 1000,
+      "failoverBeforeRetry": true,
+      "candidatePool": [
+        "openrouter",
+        "zai",
+        "qoder"
+      ]
+    },
+    "context_cache_protection": true,
+    "id": "7b7295a0-7880-41ad-8cec-953bbed211ac",
+    "isHidden": false,
+    "sortOrder": 9,
+    "createdAt": "2026-09-22T02:21:44.629Z",
+    "updatedAt": "2026-10-30T04:36:22.452Z",
+    "version": 2
+  },
+  "data_canonical_sha256": "b8433c659341ee3a089650a5d2e665a749f56f8cc09217a29aaf28e629be3399",
+  "data_raw_sha256": "99f9efa7859cf03cb2239988b81b41a226af807c77eefcaf611603b78934b3cd"
+}
