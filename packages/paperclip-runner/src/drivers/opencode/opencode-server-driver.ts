@@ -69,6 +69,7 @@ import {
   startOpenCodeMcpBridge,
   type OpenCodeMcpBridge,
 } from "./mcp-bridge.js";
+import { classifySessionError, terminalCauseFailure } from "./terminal-cause.js";
 import { nativeMcpLaunchBinding } from "../native-mcp.js";
 import { materializeNativeRuntimeSkills } from "../runtime-context-materializer.js";
 
@@ -435,6 +436,12 @@ class OpenCodeHarnessSession implements HarnessSession {
   #activeTurnId: string | null;
   #result: PrpStructuredRunResult | null;
   #resultFingerprint: string | null;
+  // Turns for which `interrupt()` was requested; an idle that follows is the
+  // provider acknowledging the abort, not an empty completion.
+  readonly #interruptedTurns = new Set<string>();
+  // Snapshot-recovered active turn whose assistant text may have been streamed
+  // before the snapshot (flag absent => unknown => conservatively "seen").
+  #recoveredTextTurnId: string | null = null;
   #resultCallId: string | null;
   #resultTurnId: string | null;
   #semanticResultTextBoundary: number | null = null;
@@ -493,6 +500,13 @@ class OpenCodeHarnessSession implements HarnessSession {
     if (this.#activeTurnId && this.#terminalTurns.has(this.#activeTurnId)) {
       this.#activeTurnId = null;
     }
+    if (
+      input.snapshot &&
+      this.#activeTurnId &&
+      (input.snapshot as { opencodeCompletedTextSeen?: unknown })
+        .opencodeCompletedTextSeen !== false
+    )
+      this.#recoveredTextTurnId = this.#activeTurnId;
     this.#emit(input.snapshot ? "session.resumed" : "session.started", {
       driverSessionId: input.providerSessionId,
       providerSessionId: input.providerSessionId,
@@ -544,6 +558,8 @@ class OpenCodeHarnessSession implements HarnessSession {
     this.#completedTextPartIds.clear();
     this.#completedReasoningPartIds.clear();
     this.#completedTextParts.length = 0;
+    this.#recoveredTextTurnId = null;
+    this.#interruptedTurns.clear();
     // `#terminalTurns` clears here for its own persisted-snapshot bookkeeping.
     // The late-frame gate in `#emit` does not depend on this map: it compares
     // against `#activeTurnId` directly, so a frame for the just-finished turn
@@ -575,6 +591,8 @@ class OpenCodeHarnessSession implements HarnessSession {
       throw new Error("OpenCode session already has an active turn");
     const turnId = `turn-${randomBytes(12).toString("hex")}`;
     this.#activeTurnId = turnId;
+    this.#interruptedTurns.clear();
+    this.#recoveredTextTurnId = null;
     this.#emit("turn.submitted", {
       envelopeSchema: this.#taskEnvelope.schema,
       text: input.message.text,
@@ -633,12 +651,14 @@ class OpenCodeHarnessSession implements HarnessSession {
       input.turnId !== this.#activeTurnId
     )
       throw new Error("stale OpenCode turn");
+    const interruptedTurnId = input.turnId ?? this.#activeTurnId;
     await api(
       this.#fetch,
       this.#runtime,
       `/session/${encodeURIComponent(this.#providerSessionId)}/abort`,
       { method: "POST" },
     );
+    if (interruptedTurnId) this.#interruptedTurns.add(interruptedTurnId);
   }
 
   pendingRuntimeRequests(): HarnessRuntimeRequest[] {
@@ -850,7 +870,9 @@ class OpenCodeHarnessSession implements HarnessSession {
   }
 
   async snapshot(): Promise<PersistedHarnessSession> {
-    return {
+    const snapshot: PersistedHarnessSession & {
+      opencodeCompletedTextSeen?: boolean;
+    } = {
       driverKind: OPENCODE_SERVER_DRIVER_KIND,
       driverSessionId: this.#providerSessionId,
       providerSessionId: this.#providerSessionId,
@@ -872,7 +894,12 @@ class OpenCodeHarnessSession implements HarnessSession {
       })),
       pendingRuntimeRequests: this.pendingRuntimeRequests(),
       lastSourceSequence: this.#sourceSequence,
+      opencodeCompletedTextSeen:
+        this.#completedTextParts.length > 0 ||
+        (this.#activeTurnId !== null &&
+          this.#recoveredTextTurnId === this.#activeTurnId),
     };
+    return snapshot;
   }
 
   async close(): Promise<void> {
@@ -1341,6 +1368,49 @@ class OpenCodeHarnessSession implements HarnessSession {
             code: "opencode_sse_failed",
             message: redact(String(error), this.#runtime.sensitiveValues),
           });
+          const lostTurnId = this.#activeTurnId;
+          if (lostTurnId && !this.#terminalTurns.has(lostTurnId)) {
+            // A turn with an unanswered user_input (question.asked) request
+            // must not be terminated (or have the request settled) here: the
+            // harness backend only recovers type==="input" governed waits,
+            // turning the stream failure into runtime_request.expired
+            // provider_process_lost + turn.interrupted. Permission-pending
+            // (permission_approval) turns are not recovered that way, so they
+            // fall through to settle the requests and emit turn.failed.
+            const hasPendingRequest = [
+              ...this.#pendingRuntimeRequests.values(),
+            ].some(
+              (pending) =>
+                pending.request.turnId === lostTurnId &&
+                pending.request.requestKind === "user_input",
+            );
+            if (hasPendingRequest) {
+              this.#events.fail(error);
+              return;
+            }
+            // Emit before clearing the active turn: `#emit` drops frames for
+            // any turn that is not the active one.
+            this.#settlePendingRuntimeRequestsForTurn(lostTurnId);
+            this.#emit(
+              "turn.failed",
+              {
+                status: "failed",
+                error: terminalCauseFailure(
+                  "client-disconnect",
+                  redact(
+                    error instanceof Error ? error.message : String(error),
+                    this.#runtime.sensitiveValues,
+                  ).slice(0, 1_000),
+                ),
+              },
+              { turnId: lostTurnId },
+            );
+            this.#terminalTurns.set(
+              lostTurnId,
+              canonicalJson({ status: "failed" }),
+            );
+            this.#activeTurnId = null;
+          }
           this.#events.fail(error);
           return;
         }
@@ -1572,12 +1642,27 @@ class OpenCodeHarnessSession implements HarnessSession {
           text(record(properties.status).type) === "idle")) &&
       turnId
     ) {
-      const fingerprint = canonicalJson({
-        status: "completed",
-        semanticResult: this.#resultFingerprint,
-      });
-      this.#terminalTurns.set(turnId, fingerprint);
       this.#emitSettledFinalAgentMessage(turnId);
+      // An idle with no assistant text at all and no accepted semantic result
+      // produced nothing; surface it as a classified failure, not a success.
+      const emptyCompletion =
+        this.#completedTextParts.length === 0 &&
+        !this.#resultFingerprint &&
+        this.#recoveredTextTurnId !== turnId;
+      const interruptedEmpty =
+        emptyCompletion && this.#interruptedTurns.has(turnId);
+      this.#interruptedTurns.delete(turnId);
+      this.#terminalTurns.set(
+        turnId,
+        interruptedEmpty
+          ? canonicalJson({ status: "cancelled" })
+          : emptyCompletion
+          ? canonicalJson({ status: "failed" })
+          : canonicalJson({
+              status: "completed",
+              semanticResult: this.#resultFingerprint,
+            }),
+      );
       const workspace = this.#workspaceChangesByTurn.get(turnId);
       if (workspace !== undefined)
         this.#emit(
@@ -1592,7 +1677,34 @@ class OpenCodeHarnessSession implements HarnessSession {
       // Emit while this turn is still `#activeTurnId`; the gate in `#emit`
       // drops any frame whose turnId is not the active turn, so nulling it
       // first would make `#emit` drop this very event.
-      this.#emit("turn.completed", { status: "completed" }, { turnId });
+      if (interruptedEmpty) {
+        this.#emit(
+          "turn.cancelled",
+          {
+            status: "cancelled",
+            error: {
+              code: "interrupted",
+              message:
+                "OpenCode session went idle after an interrupt was requested.",
+            },
+          },
+          { turnId },
+        );
+      } else if (emptyCompletion) {
+        this.#emit(
+          "turn.failed",
+          {
+            status: "failed",
+            error: terminalCauseFailure(
+              "empty-completion",
+              "OpenCode reported the session idle without any assistant text or accepted semantic result.",
+            ),
+          },
+          { turnId },
+        );
+      } else {
+        this.#emit("turn.completed", { status: "completed" }, { turnId });
+      }
       this.#activeTurnId = null;
       return;
     }
@@ -1648,9 +1760,35 @@ class OpenCodeHarnessSession implements HarnessSession {
       // event, so a consumer that stops reading at that terminal event still
       // observes the settlement.
       this.#settlePendingRuntimeRequestsForTurn(turnId);
+      const errorCause = classifySessionError(properties.error);
+      const providerErrorMessage = redact(
+        text(providerErrorData.message, text(providerError.message)),
+        this.#runtime.sensitiveValues,
+      ).slice(0, 1_000);
+      const providerStatus = providerErrorData.statusCode;
+      const failureDetail = [
+        providerErrorMessage,
+        typeof providerStatus === "number" ? `(status ${providerStatus})` : "",
+      ]
+        .filter(Boolean)
+        .join(" ");
+      this.#interruptedTurns.delete(turnId);
+      const sanitizedProviderError = sanitizeProviderError(
+        bounded(properties.error ?? properties),
+        this.#runtime.sensitiveValues,
+      ) as Record<string, unknown>;
+      const failureError: Record<string, unknown> = errorCause
+        ? {
+            ...sanitizedProviderError,
+            ...terminalCauseFailure(errorCause, failureDetail),
+          }
+        : sanitizedProviderError;
+      if (!errorCause && !text(failureError.message).trim())
+        failureError.message =
+          failureDetail || "OpenCode session failed without a provider message.";
       this.#emit(
         "turn.failed",
-        { status: "failed", error: bounded(properties.error ?? properties) },
+        { status: "failed", error: failureError },
         { turnId },
       );
       this.#terminalTurns.set(turnId, canonicalJson({ status: "failed" }));
@@ -2674,6 +2812,26 @@ function bounded(value: unknown): Record<string, unknown> {
     return { omitted: true, reason: "payload_limit" };
   const parsed = JSON.parse(serialized) as unknown;
   return isRecord(parsed) ? parsed : { value: parsed };
+}
+
+/** Redact configured secrets in every string and drop raw HTTP echo keys. */
+function sanitizeProviderError(
+  value: unknown,
+  sensitiveValues: readonly (string | undefined)[],
+): unknown {
+  if (typeof value === "string") return redact(value, sensitiveValues);
+  if (Array.isArray(value))
+    return value.map((item) => sanitizeProviderError(item, sensitiveValues));
+  if (isRecord(value)) {
+    const out: Record<string, unknown> = {};
+    for (const [key, item] of Object.entries(value)) {
+      if (key === "responseBody" || key === "responseHeaders") continue;
+      if (key === "__proto__") continue;
+      out[key] = sanitizeProviderError(item, sensitiveValues);
+    }
+    return out;
+  }
+  return value;
 }
 
 function record(value: unknown): Record<string, unknown> {
