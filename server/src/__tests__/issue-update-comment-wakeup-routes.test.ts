@@ -47,6 +47,23 @@ const mockRunnerGoalService = vi.hoisted(() => ({
   act: vi.fn(),
 }));
 
+const mockWakeupDbSelectLimit = vi.hoisted(() => vi.fn(async () => []));
+const mockWakeupDbSelectWhere = vi.hoisted(() =>
+  vi.fn(() => ({ limit: mockWakeupDbSelectLimit })),
+);
+const mockWakeupDbSelectInnerJoin = vi.hoisted(() =>
+  vi.fn(() => ({ where: mockWakeupDbSelectWhere })),
+);
+const mockWakeupDbSelectFrom = vi.hoisted(() =>
+  vi.fn(() => ({ innerJoin: mockWakeupDbSelectInnerJoin })),
+);
+const mockWakeupDbSelect = vi.hoisted(() =>
+  vi.fn(() => ({ from: mockWakeupDbSelectFrom })),
+);
+const mockWakeupDb = vi.hoisted(() => ({
+  select: mockWakeupDbSelect,
+}));
+
 vi.mock("../services/native-runtime/native-question-bridge.js", () => ({
   deliverNativeQuestionResponse: vi.fn(async () => "not_native"),
   nativeQuestionRunToCancel: vi.fn(async () => null),
@@ -221,6 +238,7 @@ async function createApp(transaction: (callback: (tx: Record<string, never>) => 
     next();
   });
   app.use("/api", issueRoutes({
+    select: mockWakeupDb.select,
     transaction,
   } as any, {} as any));
   app.use(errorHandler);
@@ -247,6 +265,21 @@ function makeIssue(overrides: Record<string, unknown> = {}) {
     ...overrides,
   };
 }
+
+// The src/routes/issues.js dependency graph costs 13-30s to execute for the
+// first time on a cold, loaded shard (see the testTimeout note in
+// server/vitest.config.ts). With isolate:true each test file runs in a fresh
+// forked process, so whichever test runs first used to absorb that one-time
+// module execution inside its own 15s testTimeout and time out (measured:
+// "rejects post board messages under an inherited pause" 30.4s, of which the
+// request itself was ~115ms — the route and its mocks were never the problem).
+// Prime the graph during file collection, which is not subject to
+// testTimeout; beforeEach's vi.resetModules() still re-executes a warm copy
+// per test (~2s).
+await Promise.all([
+  vi.importActual<typeof import("../middleware/index.js")>("../middleware/index.js"),
+  vi.importActual<typeof import("../routes/issues.js")>("../routes/issues.js"),
+]);
 
 describe("issue update comment wakeups", () => {
   beforeEach(() => {

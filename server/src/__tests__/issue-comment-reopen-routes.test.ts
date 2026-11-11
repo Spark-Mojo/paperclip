@@ -45,18 +45,23 @@ const mockTxInsert = vi.hoisted(() =>
 const mockTx = vi.hoisted(() => ({
   insert: mockTxInsert,
 }));
+const mockDbSelectLimit = vi.hoisted(() => vi.fn(async () => []));
 const mockDbSelectOrderBy = vi.hoisted(() => vi.fn(async () => []));
 const mockDbSelectWhere = vi.hoisted(() =>
   vi.fn(() => ({
     orderBy: mockDbSelectOrderBy,
+    limit: mockDbSelectLimit,
     then: (
       onFulfilled: (rows: unknown[]) => unknown,
       onRejected?: (reason: unknown) => unknown,
     ) => Promise.resolve([]).then(onFulfilled, onRejected),
   })),
 );
-const mockDbSelectFrom = vi.hoisted(() =>
+const mockDbSelectInnerJoin = vi.hoisted(() =>
   vi.fn(() => ({ where: mockDbSelectWhere })),
+);
+const mockDbSelectFrom = vi.hoisted(() =>
+  vi.fn(() => ({ where: mockDbSelectWhere, innerJoin: mockDbSelectInnerJoin })),
 );
 const mockDbSelect = vi.hoisted(() =>
   vi.fn(() => ({ from: mockDbSelectFrom })),
@@ -317,6 +322,19 @@ async function waitForWakeup(assertion: () => void) {
   await vi.waitFor(assertion);
 }
 
+// The src/routes/issues.js dependency graph costs 13-30s to execute for the
+// first time on a cold, loaded shard (see the testTimeout note in
+// server/vitest.config.ts). With isolate:true each test file runs in a fresh
+// forked process, so the first test used to absorb that one-time module
+// execution inside its own 15s testTimeout and time out. Prime the graph
+// during file collection, which is not subject to testTimeout; installActor
+// then imports a warm copy (reopen tests reuse the module registry, so only
+// collection pays).
+await Promise.all([
+  import("../middleware/index.js"),
+  import("../routes/issues.js"),
+]);
+
 describe("issue comment reopen routes", () => {
   beforeEach(() => {
     vi.clearAllMocks();
@@ -359,20 +377,25 @@ describe("issue comment reopen routes", () => {
     mockTxInsert.mockReset();
     mockDbSelect.mockReset();
     mockDbSelectFrom.mockReset();
+    mockDbSelectInnerJoin.mockReset();
     mockDbSelectWhere.mockReset();
+    mockDbSelectLimit.mockReset();
     mockDbSelectOrderBy.mockReset();
     mockDb.transaction.mockReset();
     mockTxInsertValues.mockResolvedValue(undefined);
     mockTxInsert.mockImplementation(() => ({ values: mockTxInsertValues }));
     mockDbSelectOrderBy.mockResolvedValue([]);
+    mockDbSelectLimit.mockResolvedValue([]);
     mockDbSelectWhere.mockImplementation(() => ({
       orderBy: mockDbSelectOrderBy,
+      limit: mockDbSelectLimit,
       then: (
         onFulfilled: (rows: unknown[]) => unknown,
         onRejected?: (reason: unknown) => unknown,
       ) => Promise.resolve([]).then(onFulfilled, onRejected),
     }));
-    mockDbSelectFrom.mockImplementation(() => ({ where: mockDbSelectWhere }));
+    mockDbSelectInnerJoin.mockImplementation(() => ({ where: mockDbSelectWhere }));
+    mockDbSelectFrom.mockImplementation(() => ({ where: mockDbSelectWhere, innerJoin: mockDbSelectInnerJoin }));
     mockDbSelect.mockImplementation(() => ({ from: mockDbSelectFrom }));
     mockDb.transaction.mockImplementation(
       async (fn: (tx: typeof mockTx) => Promise<unknown>) => fn(mockTx),
@@ -1471,6 +1494,8 @@ describe("issue comment reopen routes", () => {
   it("derives compact presentation for comments from source-scoped recovery runs", async () => {
     mockIssueService.getById.mockResolvedValue(makeIssue("in_progress"));
     mockDbSelectWhere.mockImplementation(() => ({
+      orderBy: mockDbSelectOrderBy,
+      limit: mockDbSelectLimit,
       then: (
         onFulfilled: (rows: unknown[]) => unknown,
         onRejected?: (reason: unknown) => unknown,
@@ -1544,6 +1569,8 @@ describe("issue comment reopen routes", () => {
   it("keeps successful-run missing-state recovery comments fully visible", async () => {
     mockIssueService.getById.mockResolvedValue(makeIssue("in_progress"));
     mockDbSelectWhere.mockImplementation(() => ({
+      orderBy: mockDbSelectOrderBy,
+      limit: mockDbSelectLimit,
       then: (
         onFulfilled: (rows: unknown[]) => unknown,
         onRejected?: (reason: unknown) => unknown,
