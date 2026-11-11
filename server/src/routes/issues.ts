@@ -13601,6 +13601,9 @@ export function issueRoutes(
       const assertLockedReviewPolicyAllowsMutation = async (
         tx: Parameters<typeof svc.update>[2],
       ) => {
+        if (req.body.blockedByIssueIds !== undefined) {
+          await svc.acquireIssueRelationWriteLock(tx, existing.companyId);
+        }
         const lockedExisting = await svc.getByIdForUpdate(id, tx);
         if (!lockedExisting) return false;
         const lockedPolicyChangeRequested =
