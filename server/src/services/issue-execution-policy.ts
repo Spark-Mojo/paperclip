@@ -1,4 +1,7 @@
 import { randomUUID } from "node:crypto";
+import { and, eq } from "drizzle-orm";
+import type { Db } from "@paperclipai/db";
+import { companies, companyMemberships } from "@paperclipai/db";
 import type {
   IssueExecutionDecision,
   IssueExecutionMonitorClearReason,
@@ -46,6 +49,7 @@ type TransitionInput = {
   issue: IssueLike;
   policy: IssueExecutionPolicy | null;
   previousPolicy?: IssueExecutionPolicy | null;
+  companyDefaultResponsibleUserId?: string | null;
   requestedStatus?: string;
   requestedAssigneePatch: RequestedAssigneePatch;
   actor: ActorLike;
@@ -67,6 +71,27 @@ type TransitionResult = {
  * override via `maxReviewRounds`; human decisions always reset the counter.
  */
 export const DEFAULT_MAX_REVIEW_ROUNDS = 3;
+
+export async function validatedCompanyDefaultResponsibleUserId(
+  db: Db,
+  companyId: string,
+): Promise<string | null> {
+  const [membership] = await db
+    .select({ principalId: companyMemberships.principalId })
+    .from(companies)
+    .innerJoin(
+      companyMemberships,
+      and(
+        eq(companyMemberships.companyId, companies.id),
+        eq(companyMemberships.principalType, "user"),
+        eq(companyMemberships.principalId, companies.defaultResponsibleUserId),
+        eq(companyMemberships.status, "active"),
+      ),
+    )
+    .where(eq(companies.id, companyId))
+    .limit(1);
+  return membership?.principalId ?? null;
+}
 
 const COMPLETED_STATUS: IssueExecutionState["status"] = "completed";
 const PENDING_STATUS: IssueExecutionState["status"] = "pending";
@@ -453,12 +478,27 @@ function resolveMaxReviewRounds(policy: IssueExecutionPolicy | null): number {
  * changes-requested rounds. Without one the loop keeps handing back to the
  * return assignee (pre-existing behavior) rather than stalling the stage.
  */
-function reviewEscalationUserId(issue: IssueLike): string | null {
-  const responsible = issue.responsibleUserId?.trim();
-  if (responsible) return responsible;
-  const creator = issue.createdByUserId?.trim();
-  if (creator) return creator;
-  return null;
+const LEGACY_BOARD_USER_SENTINEL = "local-board";
+
+function humanUserId(value: string | null | undefined): string | null {
+  const trimmed = value?.trim();
+  return trimmed && trimmed !== LEGACY_BOARD_USER_SENTINEL ? trimmed : null;
+}
+
+function reviewEscalationUserId(input: {
+  issue: IssueLike;
+  companyDefaultResponsibleUserId?: string | null;
+}): string | null {
+  const responsible = input.issue.responsibleUserId?.trim();
+  const responsibleHuman = humanUserId(responsible);
+  if (responsibleHuman) return responsibleHuman;
+
+  if (responsible === LEGACY_BOARD_USER_SENTINEL) {
+    const companyDefault = humanUserId(input.companyDefaultResponsibleUserId);
+    if (companyDefault) return companyDefault;
+  }
+
+  return humanUserId(input.issue.createdByUserId);
 }
 
 function findStageById(policy: IssueExecutionPolicy, stageId: string | null | undefined) {
@@ -866,7 +906,10 @@ function applyIssueExecutionStageTransition(input: TransitionInput): TransitionR
         const actorIsHuman = actor?.type === "user";
         const nextRounds = actorIsHuman ? 0 : (existingState.changesRequestedCount ?? 0) + 1;
         if (!actorIsHuman && nextRounds >= resolveMaxReviewRounds(input.policy)) {
-          const escalationUserId = reviewEscalationUserId(input.issue);
+          const escalationUserId = reviewEscalationUserId({
+            issue: input.issue,
+            companyDefaultResponsibleUserId: input.companyDefaultResponsibleUserId,
+          });
           if (escalationUserId) {
             // Rounds exhausted: keep the stage pending but hand it to the
             // responsible human instead of bouncing back to the implementer.
