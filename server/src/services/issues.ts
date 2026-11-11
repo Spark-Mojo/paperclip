@@ -188,6 +188,7 @@ import {
   type IssueLivenessFinding,
 } from "./recovery/issue-graph-liveness.js";
 import { visibleIssueCondition } from "./issue-visibility.js";
+import { runIssueRelationGuardTestHook } from "./issue-relation-test-seam.js";
 import { finalizeStatusCardsForStalledGeneration } from "./status-card-finalization.js";
 import { finalizeSummarySlotsForTerminalIssue } from "./summary-slot-finalization.js";
 import {
@@ -7456,6 +7457,12 @@ export function issueService(db: Db) {
         );
       }
       await assertNoBlockingCycles(companyId, issueId, deduped, dbOrTx);
+      await runIssueRelationGuardTestHook({
+        phase: "after-cycle-check",
+        companyId,
+        issueId,
+        blockerIssueIds: deduped,
+      });
     }
 
     await dbOrTx
