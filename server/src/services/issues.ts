@@ -7382,6 +7382,21 @@ export function issueService(db: Db) {
     }));
   }
 
+  // Serializes all issue "blocks" relation writes per company with a
+  // transaction-scoped advisory lock so the cycle check and the edge write are
+  // atomic with respect to other writers. Re-entrant within one session, so
+  // repeated acquires inside one transaction are harmless. Lock order is always
+  // advisory lock first, then issue row locks, to avoid ABBA deadlocks.
+  // Coverage: W1/W2 go through syncBlockedByIssueIds (which takes the lock);
+  // W4/W5/W3 reach it via that funnel (callers also take it early / read under
+  // it). Out of scope per R0 inventory: W6 (delete-only recovery unlink) and
+  // W7 (company-portability import).
+  async function acquireIssueRelationWriteLock(dbOrTx: any, companyId: string) {
+    await dbOrTx.execute(
+      sql`SELECT pg_advisory_xact_lock(hashtextextended('issue_relations:' || ${companyId}, 0))`,
+    );
+  }
+
   async function assertNoBlockingCycles(
     companyId: string,
     issueId: string,
@@ -7432,6 +7447,7 @@ export function issueService(db: Db) {
     actor: { agentId?: string | null; userId?: string | null } = {},
     dbOrTx: any = db,
   ) {
+    await acquireIssueRelationWriteLock(dbOrTx, companyId);
     const deduped = [...new Set(blockedByIssueIds)];
     if (deduped.some((candidate) => candidate === issueId)) {
       throw unprocessable("Issue cannot be blocked by itself");
@@ -9401,27 +9417,32 @@ export function issueService(db: Db) {
       });
 
       if (blockParentUntilDone) {
-        const existingBlockers = await db
-          .select({ blockerIssueId: issueRelations.issueId })
-          .from(issueRelations)
-          .where(
-            and(
-              eq(issueRelations.companyId, parent.companyId),
-              eq(issueRelations.relatedIssueId, parent.id),
-              eq(issueRelations.type, "blocks"),
-            ),
+        await db.transaction(async (tx) => {
+          // Take the lock before reading so concurrent additions are not lost.
+          await acquireIssueRelationWriteLock(tx, parent.companyId);
+          const existingBlockers = await tx
+            .select({ blockerIssueId: issueRelations.issueId })
+            .from(issueRelations)
+            .where(
+              and(
+                eq(issueRelations.companyId, parent.companyId),
+                eq(issueRelations.relatedIssueId, parent.id),
+                eq(issueRelations.type, "blocks"),
+              ),
+            );
+          await syncBlockedByIssueIds(
+            parent.id,
+            parent.companyId,
+            [
+              ...new Set([
+                ...existingBlockers.map((row) => row.blockerIssueId),
+                child.id,
+              ]),
+            ],
+            { agentId: actorAgentId ?? null, userId: actorUserId ?? null },
+            tx,
           );
-        await syncBlockedByIssueIds(
-          parent.id,
-          parent.companyId,
-          [
-            ...new Set([
-              ...existingBlockers.map((row) => row.blockerIssueId),
-              child.id,
-            ]),
-          ],
-          { agentId: actorAgentId ?? null, userId: actorUserId ?? null },
-        );
+        });
         [child] = await withIssueRelationSummaries(
           parent.companyId,
           [child],
@@ -9855,6 +9876,10 @@ export function issueService(db: Db) {
         throw unprocessable("in_progress issues require an assignee");
       }
       const persist = async (tx: DbTransaction) => {
+        // Lock order: relation advisory lock first, then issue row locks.
+        if (blockedByIssueIds !== undefined) {
+          await acquireIssueRelationWriteLock(tx, companyId);
+        }
         await assertExecutionTaskParent(tx as unknown as Db, companyId, issueData.parentId);
         if (issueData.conversationAgentId && issueData.conversationUserId) {
           const identity = `conversation:${companyId}:${issueData.conversationAgentId}:${issueData.conversationUserId}`;
@@ -10642,6 +10667,11 @@ export function issueService(db: Db) {
       });
     },
 
+    // Exposed so runner/route code can serialize relation writes: call
+    // svc.acquireIssueRelationWriteLock(tx, companyId) FIRST, then take any
+    // issue/run row locks (lock order: relation advisory lock first).
+    acquireIssueRelationWriteLock,
+
     update: async (
       id: string,
       data: Partial<typeof issues.$inferInsert> & {
@@ -10962,6 +10992,10 @@ export function issueService(db: Db) {
       }
 
       const runUpdate = async (tx: any) => {
+        // Lock order: relation advisory lock first, then issue row locks.
+        if (blockedByIssueIds !== undefined) {
+          await acquireIssueRelationWriteLock(tx, existing.companyId);
+        }
         // The receipt baseline must be read under the same row lock as the
         // write. Otherwise a concurrent update can be mistaken for a change
         // made by this request.
