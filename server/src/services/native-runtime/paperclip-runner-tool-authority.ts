@@ -1041,7 +1041,7 @@ export class PaperclipRunnerToolAuthority {
         workMode: "standard" as const,
         priority,
         assigneeAgentId,
-        blockedByIssueIds,
+        ...(blockedByIssueIds.length > 0 ? { blockedByIssueIds } : {}),
         blockParentUntilDone: false,
         createdByAgentId: this.binding.agentId,
         originKind: "manual" as const,
@@ -1103,7 +1103,11 @@ export class PaperclipRunnerToolAuthority {
           assigneeActorId: child.assigneeAgentId,
         },
       };
-    }, { beforeReceiptReplay: async (tx, context) => { await authorizeCreate(tx, context); } }) as Record<string, unknown>;
+    }, {
+      // Only creates carrying blockedBy edges reach the relation write funnel.
+      takeRelationLock: blockedByIssueIds.length > 0,
+      beforeReceiptReplay: async (tx, context) => { await authorizeCreate(tx, context); },
+    }) as Record<string, unknown>;
 
     if (publication) publishActivity(publication);
     const task = record(result.task);
@@ -1340,7 +1344,7 @@ export class PaperclipRunnerToolAuthority {
         entityRefs: [updated.id, ...blockedByIssueIds],
         scheduledWakeIds: [],
       };
-    });
+    }, { takeRelationLock: true });
   }
 
   async #registerDeliverable(input: Record<string, unknown>): Promise<unknown> {
@@ -1689,6 +1693,8 @@ export class PaperclipRunnerToolAuthority {
       },
     ) => Promise<unknown>,
     options: {
+      // Take the per-company issue-relation advisory lock before any row lock.
+      takeRelationLock?: boolean;
       onDefinitePreCommitFailure?: () => Promise<void>;
       beforeReceiptReplay?: (
         tx: Db,
@@ -1704,6 +1710,7 @@ export class PaperclipRunnerToolAuthority {
       try {
         const context = await this.#lockAuthorizedMutationContext(
           tx as unknown as Db,
+          { takeRelationLock: options.takeRelationLock },
         );
         const isFilePreparation =
           operationId === "register_deliverable" ||
@@ -1794,11 +1801,21 @@ export class PaperclipRunnerToolAuthority {
     });
   }
 
-  async #lockAuthorizedMutationContext(tx: Db): Promise<{
+  async #lockAuthorizedMutationContext(
+    tx: Db,
+    options: { takeRelationLock?: boolean } = {},
+  ): Promise<{
     run: typeof heartbeatRuns.$inferSelect;
     issue: typeof issues.$inferSelect;
     actor: typeof agents.$inferSelect;
   }> {
+    // Lock-order law: the per-company relation advisory lock comes FIRST, before
+    // any issue/run row lock. Only mutations that can write blockedBy relations
+    // opt in, so other runner writes are not serialized per company. The company
+    // id comes from the runner binding, so no row is read before the lock.
+    if (options.takeRelationLock) {
+      await issueService(tx).acquireIssueRelationWriteLock(tx, this.binding.companyId);
+    }
     // Match identity activation and queue mutations before locking the run.
     await tx.select({ id: issues.id }).from(issues).where(and(
       eq(issues.id, this.binding.issueId), eq(issues.companyId, this.binding.companyId),
