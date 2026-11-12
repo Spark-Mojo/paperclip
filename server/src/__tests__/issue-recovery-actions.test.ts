@@ -2894,4 +2894,479 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       .where(eq(issueRecoveryActions.id, action.id));
     expect(actionRow?.status).toBe("active");
   });
+
+  // SPA-16692 R3: pin the R1 fail-closed evidence gate shipped by SPA-16691 on
+  // POST /issues/:id/recovery-actions/resolve. Refusal cells below must be RED
+  // per-test on the unpatched base (no gate there -> the same request resolves
+  // 200). Proceed-control cells are documented base-green by nature and must
+  // stay green on both legs.
+  describe("[R3] recovery resolution evidence gates", () => {
+    const R3_RUN_ID = "41603709934";
+
+    afterEach(() => {
+      ghStub.impl = null;
+      ghStub.calls.length = 0;
+    });
+
+    function stubRunLookup(
+      outcome:
+        | { kind: "missing" }
+        | { kind: "concluded"; conclusion: string }
+        | { kind: "outage" },
+    ) {
+      ghStub.impl = async () => {
+        if (outcome.kind === "outage") {
+          throw new Error("r3: github lookup outage");
+        }
+        if (outcome.kind === "missing") {
+          return { status: 404, ok: false } as unknown as Response;
+        }
+        return {
+          status: 200,
+          ok: true,
+          json: async () => ({ conclusion: outcome.conclusion }),
+        } as unknown as Response;
+      };
+    }
+
+    async function seedGateCard(input: {
+      withWorkProduct?: boolean;
+      status?: string;
+    }) {
+      const fixture = await seedCompany();
+      if (input.status !== undefined) {
+        await db
+          .update(issues)
+          .set({ status: input.status })
+          .where(eq(issues.id, fixture.sourceIssueId));
+      }
+      if (input.withWorkProduct) {
+        // Exactly one pull-request work product gives the card exactly one
+        // distinct repo signal, so a bare `run <id>` citation resolves to it.
+        // (The cascade FK on issues cleans this row up in afterEach.)
+        await db.insert(issueWorkProducts).values({
+          companyId: fixture.companyId,
+          issueId: fixture.sourceIssueId,
+          type: "pull_request",
+          provider: "github",
+          title: "Fix card-bridge retry",
+          url: "https://github.com/Spark-Mojo/spark-mojo-platform/pull/416",
+          externalId: "Spark-Mojo/spark-mojo-platform#416",
+          status: "open",
+        });
+      }
+      const action = await issueRecoveryActionService(db).upsertSourceScoped({
+        companyId: fixture.companyId,
+        sourceIssueId: fixture.sourceIssueId,
+        kind: "missing_disposition",
+        ownerType: "agent",
+        ownerAgentId: fixture.coderId,
+        cause: "successful_run_missing_issue_disposition",
+        fingerprint: "missing-disposition:r3-evidence-gate",
+        evidence: { sourceRunId: "run-1" },
+        nextAction: "Choose a valid issue disposition.",
+        wakePolicy: { type: "wake_owner" },
+      });
+      return {
+        companyId: fixture.companyId,
+        issueId: fixture.sourceIssueId,
+        action,
+      };
+    }
+
+    function resolveCard(issueId: string, body: Record<string, unknown>) {
+      return request(createApp())
+        .post(`/api/issues/${issueId}/recovery-actions/resolve`)
+        .send({ outcome: "restored", sourceIssueStatus: "done", ...body });
+    }
+
+    async function expectRefusal(input: {
+      response: { status: number; body: any };
+      cause: string;
+      cited: string;
+      actionId: string;
+      issueId: string;
+      expectedStatus: string;
+    }) {
+      const { response } = input;
+      expect(response.status, JSON.stringify(response.body)).toBe(422);
+      expect(response.body).toMatchObject({
+        code: "recovery_evidence_unverified",
+        details: {
+          code: "recovery_evidence_unverified",
+          cause: input.cause,
+          recoveryActionId: input.actionId,
+        },
+      });
+      expect(typeof response.body.error).toBe("string");
+      expect(response.body.details.citedArtifact).toContain(input.cited);
+      const [issueRow] = await db
+        .select({ status: issues.status })
+        .from(issues)
+        .where(eq(issues.id, input.issueId));
+      expect(issueRow?.status).toBe(input.expectedStatus);
+      const [actionRow] = await db
+        .select()
+        .from(issueRecoveryActions)
+        .where(eq(issueRecoveryActions.id, input.actionId));
+      expect(actionRow?.status).toBe("active");
+      const refusals = await db
+        .select()
+        .from(activityLog)
+        .where(
+          and(
+            eq(activityLog.entityId, input.issueId),
+            eq(activityLog.action, "issue.recovery_evidence_refused"),
+          ),
+        );
+      expect(refusals).toHaveLength(1);
+      expect(refusals[0]?.details).toMatchObject({
+        code: "recovery_evidence_unverified",
+        cause: input.cause,
+      });
+      const refusalDetails = refusals[0]?.details as Record<string, unknown>;
+      expect(String(refusalDetails.citedArtifact)).toContain(input.cited);
+    }
+
+    it("[R3: R1] refuses resolution when the cited retry run does not exist", async () => {
+      const { issueId, action } = await seedGateCard({ withWorkProduct: true });
+      stubRunLookup({ kind: "missing" });
+      const response = await resolveCard(issueId, {
+        actionId: action.id,
+        resolutionNote: `card-bridge retry run ${R3_RUN_ID} succeeded`,
+      });
+      await expectRefusal({
+        response,
+        cause: "run_not_found",
+        cited: R3_RUN_ID,
+        actionId: action.id,
+        issueId,
+        expectedStatus: "in_progress",
+      });
+    });
+
+    it("[R3: R1] refuses resolution when the cited run concluded without success", async () => {
+      const { issueId, action } = await seedGateCard({ withWorkProduct: true });
+      stubRunLookup({ kind: "concluded", conclusion: "failure" });
+      const response = await resolveCard(issueId, {
+        actionId: action.id,
+        resolutionNote: `card-bridge retry run ${R3_RUN_ID} completed`,
+      });
+      await expectRefusal({
+        response,
+        cause: "run_not_success",
+        cited: R3_RUN_ID,
+        actionId: action.id,
+        issueId,
+        expectedStatus: "in_progress",
+      });
+    });
+
+    it("[R3: R1] resolves a verified run and receipt marker only after engaging the GitHub lookup", async () => {
+      // No PR signal anywhere on the card: the URL-form citation carries its
+      // own owner/repo, so R2 stays silent and only the R1 lookup decides.
+      const { companyId, issueId, action } = await seedGateCard({});
+      await db.insert(issueComments).values({
+        companyId,
+        issueId,
+        authorUserId: "board-user",
+        body: `<!-- card-bridge:v1 activation receipt run=${R3_RUN_ID} posted -->`,
+      });
+      stubRunLookup({ kind: "concluded", conclusion: "success" });
+      const response = await resolveCard(issueId, {
+        actionId: action.id,
+        resolutionNote: `successful bridge run https://github.com/Spark-Mojo/spark-mojo-platform/actions/runs/${R3_RUN_ID}; bridge posted the receipt`,
+      });
+      // Base-red engagement proof: at the unpatched base no gate exists, so
+      // this cell still resolves (200) but the stubbed lookup is never called.
+      expect(
+        ghStub.calls.some((url) => url.includes(`/actions/runs/${R3_RUN_ID}`)),
+        `expected the gate to engage the GitHub lookup for /actions/runs/${R3_RUN_ID}; saw: ${JSON.stringify(ghStub.calls)}`,
+      ).toBe(true);
+      expect(response.status, JSON.stringify(response.body)).toBe(200);
+      expect(response.body.issue).toMatchObject({
+        id: issueId,
+        status: "done",
+      });
+      expect(response.body.recoveryAction).toMatchObject({
+        id: action.id,
+        status: "resolved",
+        outcome: "owner_completed",
+      });
+      expect(
+        await issueRecoveryActionService(db).getActiveForIssue(companyId, issueId),
+      ).toBeNull();
+    });
+
+    it("[R3: R1] fails closed when the GitHub lookup raises", async () => {
+      const { issueId, action } = await seedGateCard({ withWorkProduct: true });
+      stubRunLookup({ kind: "outage" });
+      const response = await resolveCard(issueId, {
+        actionId: action.id,
+        resolutionNote: `card-bridge retry run ${R3_RUN_ID} succeeded`,
+      });
+      await expectRefusal({
+        response,
+        cause: "run_lookup_error",
+        cited: R3_RUN_ID,
+        actionId: action.id,
+        issueId,
+        expectedStatus: "in_progress",
+      });
+    });
+
+    // Base-green proceed control: a citation-free terminal resolution must
+    // keep resolving on the unpatched base AND on the gated head.
+    it("[R3: R1] allows a citation-free terminal resolution", async () => {
+      const { companyId, issueId, action } = await seedGateCard({});
+      const response = await resolveCard(issueId, {
+        actionId: action.id,
+        resolutionNote: "owner completed the work",
+      });
+      expect(response.status, JSON.stringify(response.body)).toBe(200);
+      expect(response.body.issue).toMatchObject({
+        id: issueId,
+        status: "done",
+      });
+      expect(
+        await issueRecoveryActionService(db).getActiveForIssue(companyId, issueId),
+      ).toBeNull();
+    });
+
+    it("[R3: R1 closed set] refuses a bare run citation when the run is unverifiable", async () => {
+      const { issueId, action } = await seedGateCard({ withWorkProduct: true });
+      stubRunLookup({ kind: "missing" });
+      const response = await resolveCard(issueId, {
+        actionId: action.id,
+        resolutionNote: `run ${R3_RUN_ID}`,
+      });
+      await expectRefusal({
+        response,
+        cause: "run_not_found",
+        cited: R3_RUN_ID,
+        actionId: action.id,
+        issueId,
+        expectedStatus: "in_progress",
+      });
+    });
+
+    it("[R3: R1 closed set] refuses a backtick-wrapped run citation when the run is unverifiable", async () => {
+      const { issueId, action } = await seedGateCard({ withWorkProduct: true });
+      stubRunLookup({ kind: "missing" });
+      const response = await resolveCard(issueId, {
+        actionId: action.id,
+        resolutionNote: `successful bridge run \`${R3_RUN_ID}\``,
+      });
+      await expectRefusal({
+        response,
+        cause: "run_not_found",
+        cited: R3_RUN_ID,
+        actionId: action.id,
+        issueId,
+        expectedStatus: "in_progress",
+      });
+    });
+
+    it("[R3: R1 closed set] refuses a GitHub Actions URL citation when the run is unverifiable", async () => {
+      // No card signal needed: the URL citation carries owner/repo itself, so
+      // the refusal must not depend on card-side repo resolution.
+      const { issueId, action } = await seedGateCard({});
+      stubRunLookup({ kind: "missing" });
+      const response = await resolveCard(issueId, {
+        actionId: action.id,
+        resolutionNote: `evidence: https://github.com/Spark-Mojo/spark-mojo-platform/actions/runs/${R3_RUN_ID}`,
+      });
+      await expectRefusal({
+        response,
+        cause: "run_not_found",
+        cited: R3_RUN_ID,
+        actionId: action.id,
+        issueId,
+        expectedStatus: "in_progress",
+      });
+    });
+
+    it("[R3: R1 closed set] refuses a posted-activation-receipt claim without the receipt marker", async () => {
+      const { issueId, action } = await seedGateCard({});
+      const response = await resolveCard(issueId, {
+        actionId: action.id,
+        resolutionNote: "agent posted the activation receipt",
+      });
+      await expectRefusal({
+        response,
+        cause: "receipt_absent",
+        cited: "posted the activation receipt",
+        actionId: action.id,
+        issueId,
+        expectedStatus: "in_progress",
+      });
+    });
+
+    it("[R3: R1 closed set] refuses a bridge-posted-receipt claim without the receipt marker", async () => {
+      const { issueId, action } = await seedGateCard({});
+      const response = await resolveCard(issueId, {
+        actionId: action.id,
+        resolutionNote: "bridge posted the receipt",
+      });
+      await expectRefusal({
+        response,
+        cause: "receipt_absent",
+        cited: "bridge posted the receipt",
+        actionId: action.id,
+        issueId,
+        expectedStatus: "in_progress",
+      });
+    });
+
+    // Base-green proceed control: a backed receipt claim must keep resolving
+    // on the unpatched base AND on the gated head.
+    it("[R3: R1 closed set] accepts a receipt claim backed by the marker comment", async () => {
+      const { companyId, issueId, action } = await seedGateCard({});
+      await db.insert(issueComments).values({
+        companyId,
+        issueId,
+        authorUserId: "board-user",
+        body: "<!-- card-bridge:v1 receipt marker present -->",
+      });
+      const response = await resolveCard(issueId, {
+        actionId: action.id,
+        resolutionNote: "bridge posted the receipt",
+      });
+      expect(response.status, JSON.stringify(response.body)).toBe(200);
+      expect(response.body.issue).toMatchObject({
+        id: issueId,
+        status: "done",
+      });
+      expect(
+        await issueRecoveryActionService(db).getActiveForIssue(companyId, issueId),
+      ).toBeNull();
+    });
+
+    // Base-green proceed control: text outside the closed citation set must
+    // neither verify nor refuse - the resolution proceeds on both legs.
+    it("[R3: R1 closed set] does not treat a non-run decimal as a citation", async () => {
+      const { issueId, action } = await seedGateCard({});
+      const response = await resolveCard(issueId, {
+        actionId: action.id,
+        resolutionNote: "tracked follow-up issue 123456789012",
+      });
+      expect(response.status, JSON.stringify(response.body)).toBe(200);
+      expect(response.body.issue).toMatchObject({
+        id: issueId,
+        status: "done",
+      });
+    });
+
+    it("[R3: R1 re-scope] refuses a phantom citation when the card is already terminal with no status change", async () => {
+      // REV 3 re-scope: the gate also runs on the no-status-change path, so an
+      // already-done card cannot be closed out through an unverifiable citation.
+      const { issueId, action } = await seedGateCard({
+        withWorkProduct: true,
+        status: "done",
+      });
+      stubRunLookup({ kind: "missing" });
+      const response = await resolveCard(issueId, {
+        actionId: action.id,
+        sourceIssueStatus: "done",
+        resolutionNote: `card-bridge retry run ${R3_RUN_ID} succeeded`,
+      });
+      await expectRefusal({
+        response,
+        cause: "run_not_found",
+        cited: R3_RUN_ID,
+        actionId: action.id,
+        issueId,
+        expectedStatus: "done",
+      });
+    });
+  });
+
+  // SPA-16692 R3 activity-surface membership pins. The recovery evidence
+  // refusal activity record must publish on the user-participation activity
+  // surface and must never land on the local-inbox surface. Both arrays are
+  // module-private (cannot be imported), so the pins parse each array's own
+  // declaration span out of the source text instead of grepping the whole
+  // file - a file-wide match could not tell the two surfaces apart.
+  describe("[R3] recovery refusal activity surface membership", () => {
+    async function readIssueServiceSource(): Promise<string> {
+      return await fs.readFile(
+        fileURLToPath(new URL("../services/issues.ts", import.meta.url)),
+        "utf8",
+      );
+    }
+
+    function extractActivityActionArraySpan(
+      source: string,
+      arrayName: string,
+    ): string {
+      const declMarker = `const ${arrayName} = [`;
+      const declStart = source.indexOf(declMarker);
+      if (declStart === -1) return "";
+      // Both arrays terminate with `] as const;` on its own line. A generic
+      // `];` probe never matches that terminator and over-extends the span
+      // hundreds of lines into unrelated code, so anchor the end on it.
+      const bodyStart = declStart + declMarker.length;
+      const endMatch = source.slice(bodyStart).match(/^\] as const;/m);
+      if (!endMatch || endMatch.index === undefined) return "";
+      const spanEnd = bodyStart + endMatch.index + endMatch[0].length;
+      return source.slice(declStart, spanEnd);
+    }
+
+    it("pins the issue.recovery_evidence_refused action to the user-participation activity actions", async () => {
+      const span = extractActivityActionArraySpan(
+        await readIssueServiceSource(),
+        "ISSUE_USER_PARTICIPATION_ACTIVITY_ACTIONS",
+      );
+      // Sanity: the extracted span must actually be the participation array,
+      // so a future rename cannot turn this pin into a vacuous pass.
+      expect(span).toContain("ISSUE_USER_PARTICIPATION_ACTIVITY_ACTIONS = [");
+      expect(span).not.toContain("ISSUE_LOCAL_INBOX_ACTIVITY_ACTIONS = [");
+      expect(
+        span,
+        `expected issue.recovery_evidence_refused inside the ISSUE_USER_PARTICIPATION_ACTIVITY_ACTIONS span:\n${span}`,
+      ).toContain("issue.recovery_evidence_refused");
+    });
+
+    it("keeps the issue.recovery_evidence_refused action off the local-inbox activity actions", async () => {
+      const span = extractActivityActionArraySpan(
+        await readIssueServiceSource(),
+        "ISSUE_LOCAL_INBOX_ACTIVITY_ACTIONS",
+      );
+      expect(span).toContain("ISSUE_LOCAL_INBOX_ACTIVITY_ACTIONS = [");
+      expect(span).not.toContain(
+        "ISSUE_USER_PARTICIPATION_ACTIVITY_ACTIONS = [",
+      );
+      expect(
+        span,
+        `issue.recovery_evidence_refused must stay outside the ISSUE_LOCAL_INBOX_ACTIVITY_ACTIONS span:\n${span}`,
+      ).not.toContain("issue.recovery_evidence_refused");
+    });
+  });
 });
+
+const ghStub = vi.hoisted(() => ({
+  calls: [] as string[],
+  impl: null as null | ((url: string, init?: RequestInit) => Promise<Response>),
+}));
+
+// SPA-16692 R3 passthrough mock: records every GitHub URL the evidence gate
+// engages and delegates to a per-test impl when one is installed, otherwise to
+// the real module. At the unpatched base the routes do not import this module
+// at all, so the factory never runs and the stub stays inert there.
+vi.mock("../services/github-fetch.js", async (importOriginal) => {
+  const actual =
+    await importOriginal<typeof import("../services/github-fetch.js")>();
+  return {
+    ...actual,
+    ghFetch: async (url: string, init?: RequestInit): Promise<Response> => {
+      ghStub.calls.push(url);
+      if (ghStub.impl) {
+        return await ghStub.impl(url, init);
+      }
+      return actual.ghFetch(url, init);
+    },
+  };
+});
+
+import { fileURLToPath } from "node:url";
+import { issueWorkProducts } from "@paperclipai/db";
