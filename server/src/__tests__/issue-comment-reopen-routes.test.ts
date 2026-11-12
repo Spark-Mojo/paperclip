@@ -1,6 +1,6 @@
 import express from "express";
 import request from "supertest";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { HttpError } from "../errors.js";
 
 const mockIssueService = vi.hoisted(() => ({
@@ -42,9 +42,13 @@ const mockTxInsertValues = vi.hoisted(() => vi.fn(async () => undefined));
 const mockTxInsert = vi.hoisted(() =>
   vi.fn(() => ({ values: mockTxInsertValues })),
 );
-const mockTx = vi.hoisted(() => ({
-  insert: mockTxInsert,
-}));
+const mockTxUpdateWhere = vi.hoisted(() => vi.fn(async () => undefined));
+const mockTxUpdateSet = vi.hoisted(() =>
+  vi.fn(() => ({ where: mockTxUpdateWhere })),
+);
+const mockTxUpdate = vi.hoisted(() =>
+  vi.fn(() => ({ set: mockTxUpdateSet })),
+);
 const mockDbSelectOrderBy = vi.hoisted(() => vi.fn(async () => []));
 const mockDbSelectWhere = vi.hoisted(() =>
   vi.fn(() => ({
@@ -61,8 +65,15 @@ const mockDbSelectFrom = vi.hoisted(() =>
 const mockDbSelect = vi.hoisted(() =>
   vi.fn(() => ({ from: mockDbSelectFrom })),
 );
+const mockTx = vi.hoisted(() => ({
+  select: mockDbSelect,
+  insert: mockTxInsert,
+  update: mockTxUpdate,
+}));
 const mockDb = vi.hoisted(() => ({
   select: mockDbSelect,
+  insert: mockTxInsert,
+  update: mockTxUpdate,
   transaction: vi.fn(async (fn: (tx: typeof mockTx) => Promise<unknown>) =>
     fn(mockTx),
   ),
@@ -215,6 +226,13 @@ vi.mock("../services/cross-issue-influence-limit.js", () => ({
   crossIssueInfluenceRunContextError: mockCrossIssueInfluenceRunContextError,
 }));
 
+const testModulesPromise = Promise.all([
+  import("../routes/issues.js"),
+  import("../middleware/index.js"),
+  import("../services/issue-execution-policy.js"),
+]);
+let testModules: Awaited<typeof testModulesPromise>;
+
 function createApp() {
   const app = express();
   app.use(express.json());
@@ -225,10 +243,7 @@ async function installActor(
   app: express.Express,
   actor?: Record<string, unknown>,
 ) {
-  const [{ issueRoutes }, { errorHandler }] = await Promise.all([
-    import("../routes/issues.js"),
-    import("../middleware/index.js"),
-  ]);
+  const [{ issueRoutes }, { errorHandler }] = testModules;
   app.use((req, _res, next) => {
     (req as any).actor = actor ?? {
       type: "board",
@@ -253,9 +268,7 @@ async function normalizePolicy(input: {
     >;
   }>;
 }) {
-  const { normalizeIssueExecutionPolicy } =
-    await import("../services/issue-execution-policy.js");
-  return normalizeIssueExecutionPolicy(input);
+  return testModules[2].normalizeIssueExecutionPolicy(input);
 }
 
 function makeIssue(
@@ -317,7 +330,38 @@ async function waitForWakeup(assertion: () => void) {
   await vi.waitFor(assertion);
 }
 
+function expectOrdinaryCommentTransaction(
+  body: string,
+  source?: { runId: string; agentId: string },
+) {
+  expect(mockDb.transaction).toHaveBeenCalledTimes(1);
+  expect(mockIssueService.addComment).toHaveBeenCalledWith(
+    "11111111-1111-4111-8111-111111111111",
+    body,
+    expect.any(Object),
+    expect.objectContaining({
+      attachmentIds: undefined,
+      metadata: null,
+      presentation: null,
+      sourceTrust: source
+        ? {
+            preset: "low_trust_review",
+            disposition: "quarantined",
+            sourceIssueId: "11111111-1111-4111-8111-111111111111",
+            sourceRunId: source.runId,
+            sourceAgentId: source.agentId,
+          }
+        : null,
+    }),
+    mockTx,
+  );
+}
+
 describe("issue comment reopen routes", () => {
+  beforeAll(async () => {
+    testModules = await testModulesPromise;
+  }, 120_000);
+
   beforeEach(() => {
     vi.clearAllMocks();
     mockIssueService.getById.mockReset();
@@ -357,6 +401,9 @@ describe("issue comment reopen routes", () => {
     mockCrossIssueInfluenceRunContextError.mockReset();
     mockTxInsertValues.mockReset();
     mockTxInsert.mockReset();
+    mockTxUpdateWhere.mockReset();
+    mockTxUpdateSet.mockReset();
+    mockTxUpdate.mockReset();
     mockDbSelect.mockReset();
     mockDbSelectFrom.mockReset();
     mockDbSelectWhere.mockReset();
@@ -364,6 +411,9 @@ describe("issue comment reopen routes", () => {
     mockDb.transaction.mockReset();
     mockTxInsertValues.mockResolvedValue(undefined);
     mockTxInsert.mockImplementation(() => ({ values: mockTxInsertValues }));
+    mockTxUpdateWhere.mockResolvedValue(undefined);
+    mockTxUpdateSet.mockImplementation(() => ({ where: mockTxUpdateWhere }));
+    mockTxUpdate.mockImplementation(() => ({ set: mockTxUpdateSet }));
     mockDbSelectOrderBy.mockResolvedValue([]);
     mockDbSelectWhere.mockImplementation(() => ({
       orderBy: mockDbSelectOrderBy,
@@ -530,11 +580,12 @@ describe("issue comment reopen routes", () => {
       "33333333-3333-4333-8333-333333333333",
     );
     expect(mockLogActivity).toHaveBeenCalledWith(
-      expect.anything(),
+      mockTx,
       expect.objectContaining({
         action: "issue.updated",
         details: expect.not.objectContaining({ reopened: true }),
       }),
+      expect.any(Array),
     );
   });
 
@@ -566,7 +617,13 @@ describe("issue comment reopen routes", () => {
       issue.id,
       "Inspect the file",
       expect.anything(),
-      expect.objectContaining({ attachmentIds: [id], clientRequestId: "77777777-7777-4777-8777-777777777777" }),
+      expect.objectContaining({
+        attachmentIds: [id],
+        authorizationReason: expect.any(String),
+        clientRequestId: "77777777-7777-4777-8777-777777777777",
+        mirrorToSlack: true,
+        sourceTrust: null,
+      }),
       mockTx,
     );
   });
@@ -632,9 +689,10 @@ describe("issue comment reopen routes", () => {
         actorAgentId: null,
         actorUserId: "local-board",
       }),
+      mockTx,
     );
     expect(mockLogActivity).toHaveBeenCalledWith(
-      expect.anything(),
+      mockTx,
       expect.objectContaining({
         action: "issue.updated",
         details: expect.objectContaining({
@@ -643,6 +701,7 @@ describe("issue comment reopen routes", () => {
           status: "todo",
         }),
       }),
+      expect.any(Array),
     );
   });
 
@@ -669,6 +728,7 @@ describe("issue comment reopen routes", () => {
       expect.objectContaining({
         assigneeAgentId: "33333333-3333-4333-8333-333333333333",
       }),
+      mockTx,
     );
   });
 
@@ -720,9 +780,10 @@ describe("issue comment reopen routes", () => {
         actorAgentId: null,
         actorUserId: "local-board",
       }),
+      mockTx,
     );
     expect(mockLogActivity).toHaveBeenCalledWith(
-      expect.anything(),
+      mockTx,
       expect.objectContaining({
         action: "issue.updated",
         details: expect.objectContaining({
@@ -731,6 +792,7 @@ describe("issue comment reopen routes", () => {
           status: "todo",
         }),
       }),
+      expect.any(Array),
     );
   });
 
@@ -1079,9 +1141,10 @@ describe("issue comment reopen routes", () => {
         assigneeAgentId: otherAgentId,
         status: "todo",
       }),
+      mockTx,
     );
     expect(mockLogActivity).toHaveBeenCalledWith(
-      expect.anything(),
+      mockTx,
       expect.objectContaining({
         action: "issue.updated",
         details: expect.objectContaining({
@@ -1090,6 +1153,7 @@ describe("issue comment reopen routes", () => {
           status: "todo",
         }),
       }),
+      expect.any(Array),
     );
   });
 
@@ -1174,8 +1238,18 @@ describe("issue comment reopen routes", () => {
       { status: "todo" },
     );
     expect(mockHeartbeatService.cancelRun).toHaveBeenCalledWith("retry-run-1");
-    expect(mockLogActivity).toHaveBeenCalledWith(
-      expect.anything(),
+    expect(
+      mockLogActivity.mock.calls.map(([, activity]) => activity.action),
+    ).toEqual([
+      "heartbeat.cancelled",
+      "issue.updated",
+      "issue.comment_added",
+    ]);
+    const issueUpdatedCall = mockLogActivity.mock.calls.find(
+      ([, activity]) => activity.action === "issue.updated",
+    );
+    expect(issueUpdatedCall).toEqual([
+      mockDb,
       expect.objectContaining({
         action: "issue.updated",
         details: expect.objectContaining({
@@ -1185,7 +1259,7 @@ describe("issue comment reopen routes", () => {
           cancelledScheduledRetryRunId: "retry-run-1",
         }),
       }),
-    );
+    ]);
     await waitForWakeup(() =>
       expect(mockHeartbeatService.wakeup).toHaveBeenCalledWith(
         "22222222-2222-4222-8222-222222222222",
@@ -1435,7 +1509,7 @@ describe("issue comment reopen routes", () => {
         metadata,
         sourceTrust: null,
       },
-      mockDb,
+      mockTx,
     );
   });
 
@@ -1515,7 +1589,7 @@ describe("issue comment reopen routes", () => {
           density: "compact",
         },
       }),
-      mockDb,
+      mockTx,
     );
   });
 
@@ -1537,7 +1611,7 @@ describe("issue comment reopen routes", () => {
         onBehalfOfUserId: null,
       },
       expect.objectContaining({ attachmentIds: undefined, presentation: null }),
-      mockDb,
+      mockTx,
     );
   });
 
@@ -1576,7 +1650,7 @@ describe("issue comment reopen routes", () => {
         onBehalfOfUserId: null,
       },
       expect.objectContaining({ attachmentIds: undefined, presentation: null }),
-      mockDb,
+      mockTx,
     );
   });
 
@@ -1864,6 +1938,7 @@ describe("issue comment reopen routes", () => {
         actorAgentId: null,
         actorUserId: "local-board",
       }),
+      mockTx,
     );
     await waitForWakeup(() =>
       expect(mockHeartbeatService.wakeup).toHaveBeenCalledWith(
@@ -1924,6 +1999,7 @@ describe("issue comment reopen routes", () => {
         actorAgentId: null,
         actorUserId: "local-board",
       }),
+      mockTx,
     );
     expect(mockHeartbeatService.cancelRun).toHaveBeenCalledWith("retry-run-1");
     await waitForWakeup(() =>
@@ -2041,6 +2117,7 @@ describe("issue comment reopen routes", () => {
         actorAgentId: null,
         actorUserId: "local-board",
       }),
+      mockTx,
     );
     expect(mockIssueService.update).not.toHaveBeenCalledWith(
       "11111111-1111-4111-8111-111111111111",
@@ -2248,9 +2325,10 @@ describe("issue comment reopen routes", () => {
         actorAgentId: "22222222-2222-4222-8222-222222222222",
         actorUserId: null,
       }),
+      mockTx,
     );
     expect(mockLogActivity).toHaveBeenCalledWith(
-      expect.anything(),
+      mockTx,
       expect.objectContaining({
         action: "issue.comment_added",
         details: expect.objectContaining({
@@ -2259,6 +2337,7 @@ describe("issue comment reopen routes", () => {
           followUpRequested: true,
         }),
       }),
+      expect.any(Array),
     );
     expect(mockHeartbeatService.wakeup).toHaveBeenCalledWith(
       "22222222-2222-4222-8222-222222222222",
@@ -2307,7 +2386,7 @@ describe("issue comment reopen routes", () => {
       { status: "todo" },
     );
     expect(mockLogActivity).toHaveBeenCalledWith(
-      expect.anything(),
+      mockTx,
       expect.objectContaining({
         action: "issue.comment_added",
         details: expect.objectContaining({
@@ -2316,6 +2395,7 @@ describe("issue comment reopen routes", () => {
           followUpRequested: true,
         }),
       }),
+      expect.any(Array),
     );
     expect(mockHeartbeatService.wakeup).toHaveBeenCalledWith(
       "22222222-2222-4222-8222-222222222222",
@@ -2899,13 +2979,52 @@ describe("issue comment reopen routes", () => {
         _tx: tx,
       }),
     );
+    const ordinaryCommentInsertValues = vi.fn(async () => undefined);
+    const ordinaryCommentTx = {
+      ...mockTx,
+      insert: vi.fn(() => ({ values: ordinaryCommentInsertValues })),
+    };
+    const decisionInsertValues = vi.fn(async () => undefined);
+    const decisionTx = {
+      ...mockTx,
+      insert: vi.fn(() => ({ values: decisionInsertValues })),
+    };
+    mockDb.transaction
+      .mockImplementationOnce(
+        async (fn: (tx: typeof mockTx) => Promise<unknown>) => fn(decisionTx),
+      )
+      .mockImplementationOnce(
+        async (fn: (tx: typeof mockTx) => Promise<unknown>) =>
+          fn(ordinaryCommentTx),
+      );
 
     const res = await request(await installActor(createApp()))
       .patch("/api/issues/11111111-1111-4111-8111-111111111111")
       .send({ status: "done", comment: "Approved for ship" });
 
     expect(res.status).toBe(200);
-    expect(mockDb.transaction).toHaveBeenCalledTimes(1);
+    expect(mockDb.transaction).toHaveBeenCalledTimes(2);
+    expect(mockIssueService.addComment).toHaveBeenCalledTimes(1);
+    const addCommentCall = mockIssueService.addComment.mock.calls[0];
+    expect(addCommentCall?.[0]).toBe(
+      "11111111-1111-4111-8111-111111111111",
+    );
+    expect(addCommentCall?.[1]).toBe("Approved for ship");
+    const commentActor = addCommentCall?.[2];
+    expect(commentActor?.userId).toBe("local-board");
+    expect(commentActor?.agentId).toBeUndefined();
+    expect(commentActor?.runId).toBeNull();
+    expect(commentActor?.onBehalfOfUserId).toBeUndefined();
+    const commentOptions = addCommentCall?.[3];
+    expect(commentOptions?.authorizationReason).toBe("allow_board_actor");
+    expect(commentOptions?.mirrorToSlack).toBe(true);
+    expect(commentOptions?.sourceTrust).toBeNull();
+    expect(commentOptions?.metadata ?? null).toBeNull();
+    expect(commentOptions?.presentation ?? null).toBeNull();
+    expect(commentOptions?.attachmentIds).toBeUndefined();
+    expect(commentOptions?.clientRequestId).toBeUndefined();
+    expect(addCommentCall?.[4]).toBe(ordinaryCommentTx);
+    expect(mockIssueService.update).toHaveBeenCalledTimes(1);
     expect(mockIssueService.update).toHaveBeenCalledWith(
       "11111111-1111-4111-8111-111111111111",
       expect.objectContaining({
@@ -2915,7 +3034,7 @@ describe("issue comment reopen routes", () => {
           lastDecisionOutcome: "approved",
         }),
       }),
-      mockTx,
+      decisionTx,
       expect.any(Array),
       expect.any(Array),
     );
@@ -2924,7 +3043,10 @@ describe("issue comment reopen routes", () => {
       any
     >;
     const decisionId = updatePatch.executionState.lastDecisionId;
-    expect(mockTxInsertValues).toHaveBeenCalledWith(
+    expect(mockIssueService.update.mock.calls[0]?.[2]).toBe(decisionTx);
+    expect(ordinaryCommentTx.insert).not.toHaveBeenCalled();
+    expect(decisionTx.insert).toHaveBeenCalledTimes(1);
+    expect(decisionInsertValues).toHaveBeenCalledWith(
       expect.objectContaining({
         id: decisionId,
         issueId: "11111111-1111-4111-8111-111111111111",
@@ -3341,7 +3463,7 @@ describe("issue comment reopen routes", () => {
       .send({ body: reviewBody });
 
     expect(res.status).toBe(201);
-    expect(mockDb.transaction).not.toHaveBeenCalled();
+    expectOrdinaryCommentTransaction(reviewBody);
     expect(mockIssueService.update).not.toHaveBeenCalled();
     expect(mockHeartbeatService.wakeup).not.toHaveBeenCalledWith(
       expect.any(String),
@@ -3409,8 +3531,12 @@ describe("issue comment reopen routes", () => {
       .send({ body: reviewBody });
 
     expect(res.status).toBe(201);
-    expect(mockDb.transaction).not.toHaveBeenCalled();
+    expectOrdinaryCommentTransaction(reviewBody, {
+      runId: "run-kind-mismatch",
+      agentId: sharedId,
+    });
     expect(mockIssueService.update).not.toHaveBeenCalled();
+    expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
   });
 
   it("does not auto-approve structured metadata separated by a blank line", async () => {
@@ -3472,8 +3598,12 @@ describe("issue comment reopen routes", () => {
       .send({ body: reviewBody });
 
     expect(res.status).toBe(201);
-    expect(mockDb.transaction).not.toHaveBeenCalled();
+    expectOrdinaryCommentTransaction(reviewBody, {
+      runId: "run-blank-line-metadata",
+      agentId: reviewerAgentId,
+    });
     expect(mockIssueService.update).not.toHaveBeenCalled();
+    expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
   });
 
   it("does not auto-approve reviewer comments without an approval marker", async () => {
@@ -3533,7 +3663,10 @@ describe("issue comment reopen routes", () => {
       .send({ body: reviewBody });
 
     expect(res.status).toBe(201);
-    expect(mockDb.transaction).not.toHaveBeenCalled();
+    expectOrdinaryCommentTransaction(reviewBody, {
+      runId: "run-review-5",
+      agentId: reviewerAgentId,
+    });
     expect(mockIssueService.update).not.toHaveBeenCalled();
     expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
   });
@@ -3595,7 +3728,10 @@ describe("issue comment reopen routes", () => {
       .send({ body: reviewBody });
 
     expect(res.status).toBe(201);
-    expect(mockDb.transaction).not.toHaveBeenCalled();
+    expectOrdinaryCommentTransaction(reviewBody, {
+      runId: "run-review-6",
+      agentId: reviewerAgentId,
+    });
     expect(mockIssueService.update).not.toHaveBeenCalled();
     expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
   });
@@ -3682,7 +3818,10 @@ describe("issue comment reopen routes", () => {
         .send({ body });
 
       expect(res.status).toBe(201);
-      expect(mockDb.transaction).not.toHaveBeenCalled();
+      expectOrdinaryCommentTransaction(body, {
+        runId: "run-review-negated",
+        agentId: reviewerAgentId,
+      });
       expect(mockIssueService.update).not.toHaveBeenCalled();
       expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
     });
@@ -3774,7 +3913,7 @@ describe("issue comment reopen routes", () => {
         expect.any(Array),
       );
       expect(mockLogActivity).toHaveBeenCalledWith(
-        expect.anything(),
+        mockTx,
         expect.objectContaining({
           action: "issue.updated",
           details: expect.objectContaining({
@@ -3783,6 +3922,7 @@ describe("issue comment reopen routes", () => {
             _previous: { status: "in_review" },
           }),
         }),
+        expect.any(Array),
       );
     });
   });

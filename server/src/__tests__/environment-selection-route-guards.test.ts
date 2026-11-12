@@ -147,7 +147,7 @@ function createProjectApp() {
 
 function createIssueApp() {
   issueServer ??= buildApp((expressApp) => {
-    expressApp.use("/api", issueRoutes({} as any, {} as any));
+    expressApp.use("/api", issueRoutes({ transaction: async (effect: (tx: unknown) => unknown) => effect({}) } as any, {} as any));
   }).listen(0);
   return issueServer;
 }

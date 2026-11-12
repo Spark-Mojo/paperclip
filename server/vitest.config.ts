@@ -30,9 +30,15 @@ export default defineConfig({
     // file pays the one-time transform cost inside its own timeout budget. On
     // the loaded serial shard (maxWorkers=1) that cost can cross vitest's
     // default 5s testTimeout and fail the first test, which also lets its
-    // fire-and-forget wake leak into the next test. Give each test generous
-    // headroom; 15s is far above the observed module-load cost yet still
-    // catches a genuinely hung test well inside the 20 minute job limit.
+    // fire-and-forget wake leak into the next test.
+    // Calibration as of 2026-11-10 (SPA-18748 O1/O2; SPA-18769 R3 direct
+    // measurement): the observed one-time cold import of large route-module
+    // graphs on this box is ~26-37s. 15000ms is BELOW that one-time cost and
+    // relies on per-suite warm-up hooks (SPA-17642 pattern) to absorb it.
+    // Standing rule, self-contained: each new warm-up leaf re-measures the
+    // cold import and flags when a fresh measurement exceeds ~2x the
+    // ~26-37s band stated here. 15000ms still catches a genuinely hung test
+    // well inside the 20 minute job limit.
     testTimeout: 15000,
     isolate: true,
     maxConcurrency: 1,

@@ -50,6 +50,47 @@ const mockRunnerGoalService = vi.hoisted(() => ({
 
 const mockLogActivity = vi.hoisted(() => vi.fn(async () => undefined));
 
+const mockTxInsertValues = vi.hoisted(() => vi.fn(async () => undefined));
+const mockTxInsert = vi.hoisted(() =>
+  vi.fn(() => ({ values: mockTxInsertValues })),
+);
+const mockTxUpdateWhere = vi.hoisted(() => vi.fn(async () => undefined));
+const mockTxUpdateSet = vi.hoisted(() =>
+  vi.fn(() => ({ where: mockTxUpdateWhere })),
+);
+const mockTxUpdate = vi.hoisted(() =>
+  vi.fn(() => ({ set: mockTxUpdateSet })),
+);
+const mockDbSelectOrderBy = vi.hoisted(() => vi.fn(async () => []));
+const mockDbSelectWhere = vi.hoisted(() =>
+  vi.fn(() => ({
+    orderBy: mockDbSelectOrderBy,
+    then: (
+      onFulfilled: (rows: unknown[]) => unknown,
+      onRejected?: (reason: unknown) => unknown,
+    ) => Promise.resolve([]).then(onFulfilled, onRejected),
+  })),
+);
+const mockDbSelectFrom = vi.hoisted(() =>
+  vi.fn(() => ({ where: mockDbSelectWhere })),
+);
+const mockDbSelect = vi.hoisted(() =>
+  vi.fn(() => ({ from: mockDbSelectFrom })),
+);
+const mockTx = vi.hoisted(() => ({
+  select: mockDbSelect,
+  insert: mockTxInsert,
+  update: mockTxUpdate,
+}));
+const mockDb = vi.hoisted(() => ({
+  select: mockDbSelect,
+  insert: mockTxInsert,
+  update: mockTxUpdate,
+  transaction: vi.fn(async (fn: (tx: typeof mockTx) => Promise<unknown>) =>
+    fn(mockTx),
+  ),
+}));
+
 function registerServiceMocks() {
   vi.doMock("../routes/authz.js", async () => vi.importActual("../routes/authz.js"));
 
@@ -227,7 +268,7 @@ describe("closed isolated workspace issue routes", () => {
       };
       next();
     });
-    app.use("/api", issueRoutes({} as any, {} as any));
+    app.use("/api", issueRoutes(mockDb as any, {} as any));
     app.use(errorHandler);
     return app;
   }

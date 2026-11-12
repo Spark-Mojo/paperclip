@@ -1,6 +1,6 @@
 import express from "express";
 import request from "supertest";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { normalizeIssueExecutionPolicy } from "../services/issue-execution-policy.ts";
 
 const mockIssueService = vi.hoisted(() => ({
@@ -31,6 +31,17 @@ const mockAccessService = vi.hoisted(() => ({
   decide: vi.fn(),
   hasPermission: vi.fn(async () => false),
 }));
+const mockDbInsertValues = vi.hoisted(() => vi.fn(async () => undefined));
+const mockDbInsert = vi.hoisted(() =>
+  vi.fn(() => ({ values: mockDbInsertValues })),
+);
+const mockDbUpdateWhere = vi.hoisted(() => vi.fn(async () => undefined));
+const mockDbUpdateSet = vi.hoisted(() =>
+  vi.fn(() => ({ where: mockDbUpdateWhere })),
+);
+const mockDbUpdate = vi.hoisted(() =>
+  vi.fn(() => ({ set: mockDbUpdateSet })),
+);
 const mockDbSelectWhere = vi.hoisted(() => vi.fn(() => ({
   for: () => ({
     then: (onFulfilled: (rows: unknown[]) => unknown, onRejected?: (reason: unknown) => unknown) =>
@@ -53,10 +64,17 @@ const mockDbSelectWhere = vi.hoisted(() => vi.fn(() => ({
 })));
 const mockDbSelectFrom = vi.hoisted(() => vi.fn(() => ({ where: mockDbSelectWhere })));
 const mockDbSelect = vi.hoisted(() => vi.fn(() => ({ from: mockDbSelectFrom })));
+const mockTx = vi.hoisted(() => ({
+  select: mockDbSelect,
+  insert: mockDbInsert,
+  update: mockDbUpdate,
+}));
 const mockDb = vi.hoisted(() => ({
   select: mockDbSelect,
-  transaction: vi.fn(async (callback: (tx: { select: typeof mockDbSelect }) => Promise<unknown>) =>
-    callback({ select: mockDbSelect })),
+  insert: mockDbInsert,
+  update: mockDbUpdate,
+  transaction: vi.fn(async (callback: (tx: typeof mockTx) => Promise<unknown>) =>
+    callback(mockTx)),
 }));
 
 const mockLogActivity = vi.hoisted(() => vi.fn(async () => undefined));
@@ -158,6 +176,19 @@ function registerModuleMocks() {
   }));
 }
 
+registerModuleMocks();
+
+let routeModules: Awaited<
+  ReturnType<typeof loadRouteModules>
+>;
+
+function loadRouteModules() {
+  return Promise.all([
+    import("../middleware/index.js"),
+    import("../routes/issues.js"),
+  ]);
+}
+
 type TestActor =
   | {
       type: "board";
@@ -174,10 +205,7 @@ type TestActor =
     };
 
 async function createApp(actor?: TestActor) {
-  const [{ errorHandler }, { issueRoutes }] = await Promise.all([
-    import("../middleware/index.js"),
-    import("../routes/issues.js"),
-  ]);
+  const [{ errorHandler }, { issueRoutes }] = routeModules;
   const app = express();
   app.use(express.json());
   app.use((req, _res, next) => {
@@ -196,12 +224,11 @@ async function createApp(actor?: TestActor) {
 }
 
 describe("issue execution policy routes", () => {
+  beforeAll(async () => {
+    routeModules = await loadRouteModules();
+  }, 120_000);
+
   beforeEach(() => {
-    vi.resetModules();
-    vi.doUnmock("../services/index.js");
-    vi.doUnmock("../routes/issues.js");
-    vi.doUnmock("../middleware/index.js");
-    registerModuleMocks();
     vi.clearAllMocks();
     mockIssueService.assertCheckoutOwner.mockResolvedValue({ adoptedFromRunId: null });
     mockIssueService.getByIdForUpdate.mockImplementation(async () => mockIssueService.getById());
@@ -212,6 +239,27 @@ describe("issue execution policy routes", () => {
     mockIssueThreadInteractionService.listForIssue.mockResolvedValue([]);
     mockIssueThreadInteractionService.expireRequestConfirmationsSupersededByComment.mockResolvedValue([]);
     mockIssueApprovalService.listApprovalsForIssue.mockResolvedValue([]);
+    mockHeartbeatService.wakeup.mockResolvedValue(undefined);
+    mockHeartbeatService.triggerIssueMonitor.mockResolvedValue({ outcome: "triggered" });
+    mockHeartbeatService.reportRunActivity.mockResolvedValue(undefined);
+    mockHeartbeatService.getRun.mockResolvedValue(null);
+    mockHeartbeatService.getActiveRunForAgent.mockResolvedValue(null);
+    mockHeartbeatService.cancelRun.mockResolvedValue(null);
+    mockLogActivity.mockResolvedValue(undefined);
+    mockDb.transaction.mockReset();
+    mockDb.transaction.mockImplementation(
+      async (callback: (tx: typeof mockTx) => Promise<unknown>) => callback(mockTx),
+    );
+    mockDbInsertValues.mockReset();
+    mockDbInsertValues.mockResolvedValue(undefined);
+    mockDbInsert.mockReset();
+    mockDbInsert.mockImplementation(() => ({ values: mockDbInsertValues }));
+    mockDbUpdateWhere.mockReset();
+    mockDbUpdateWhere.mockResolvedValue(undefined);
+    mockDbUpdateSet.mockReset();
+    mockDbUpdateSet.mockImplementation(() => ({ where: mockDbUpdateWhere }));
+    mockDbUpdate.mockReset();
+    mockDbUpdate.mockImplementation(() => ({ set: mockDbUpdateSet }));
     mockDbSelect.mockImplementation(() => ({ from: mockDbSelectFrom }));
     mockDbSelectFrom.mockImplementation(() => ({ where: mockDbSelectWhere }));
     mockDbSelectWhere.mockImplementation(() => ({
@@ -382,10 +430,10 @@ describe("issue execution policy routes", () => {
     expect(mockIssueService.update).toHaveBeenCalledWith(
       "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
       expect.objectContaining({ status: "in_review" }),
-      expect.anything(),
+      mockTx,
     );
     expect(mockLogActivity).toHaveBeenCalledWith(
-      expect.anything(),
+      mockTx,
       expect.objectContaining({
         action: "issue.updated",
         details: expect.not.objectContaining({ reviewInteractionId: expect.anything() }),
@@ -439,10 +487,10 @@ describe("issue execution policy routes", () => {
     expect(mockIssueService.update).toHaveBeenCalledWith(
       "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
       expect.not.objectContaining({ reviewInteractionId: expect.anything() }),
-      expect.anything(),
+      mockTx,
     );
     expect(mockLogActivity).toHaveBeenCalledWith(
-      expect.anything(),
+      mockTx,
       expect.objectContaining({
         action: "issue.updated",
         details: expect.objectContaining({
@@ -494,10 +542,10 @@ describe("issue execution policy routes", () => {
     expect(mockIssueService.update).toHaveBeenCalledWith(
       "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
       expect.not.objectContaining({ reviewInteractionId: expect.anything() }),
-      expect.anything(),
+      mockTx,
     );
     expect(mockLogActivity).toHaveBeenCalledWith(
-      expect.anything(),
+      mockTx,
       expect.objectContaining({
         action: "issue.updated",
         actorType: "user",
@@ -653,7 +701,7 @@ describe("issue execution policy routes", () => {
           }),
         }),
       }),
-      expect.anything(),
+      mockTx,
     );
   });
 
@@ -707,7 +755,7 @@ describe("issue execution policy routes", () => {
         status: "in_review",
         monitorNextCheckAt: new Date("2026-12-01T12:00:00.000Z"),
       }),
-      expect.anything(),
+      mockTx,
     );
   });
 
@@ -738,7 +786,7 @@ describe("issue execution policy routes", () => {
     expect(res.status).toBe(200);
     expect(mockDb.transaction).toHaveBeenCalled();
     expect(mockLogActivity).toHaveBeenCalledWith(
-      expect.anything(),
+      mockTx,
       expect.objectContaining({
         action: "issue.updated",
         actorType: "user",
@@ -804,7 +852,7 @@ describe("issue execution policy routes", () => {
         actorAgentId: null,
         actorUserId: "local-board",
       }),
-      expect.anything(),
+      mockTx,
       undefined,
       expect.any(Array),
     );
@@ -863,7 +911,7 @@ describe("issue execution policy routes", () => {
         actorAgentId: null,
         actorUserId: "local-board",
       }),
-      expect.anything(),
+      mockTx,
       undefined,
       expect.any(Array),
     );
@@ -1027,6 +1075,7 @@ describe("issue execution policy routes", () => {
         actorAgentId: null,
         actorUserId: "local-board",
       }),
+      mockTx,
     );
     const updatePatch = mockIssueService.update.mock.calls[0]?.[1] as Record<string, unknown>;
     expect(updatePatch.status).toBeUndefined();

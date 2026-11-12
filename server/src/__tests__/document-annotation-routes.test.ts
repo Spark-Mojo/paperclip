@@ -1,6 +1,6 @@
 import express from "express";
 import request from "supertest";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 
 const issueId = "11111111-1111-4111-8111-111111111111";
 const companyId = "22222222-2222-4222-8222-222222222222";
@@ -187,6 +187,16 @@ async function createApp(actor: "board" | "agent" = "board", actorCompanyId = co
 }
 
 describe("document annotation routes", () => {
+  // One-time warm-up: the first createApp() pays the one-time transform/
+  // import cost of the routes/issues.js graph (~30-40s cold on this box),
+  // which exceeds the 15s default per-test budget. Hoisting it here under
+  // a generous hook timeout keeps that cost off the tests' per-test
+  // budgets. The built app is discarded (no listen socket, no state
+  // leaks); each test still builds its own isolated app via createApp().
+  beforeAll(async () => {
+    await createApp();
+  }, 120_000);
+
   beforeEach(() => {
     vi.resetModules();
     vi.doUnmock("../routes/issues.js");
