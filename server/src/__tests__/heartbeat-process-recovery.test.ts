@@ -121,6 +121,12 @@ const mockTelemetryClient = vi.hoisted(() => ({
   hashPrivateRef: vi.fn(() => "test-private-reference"),
 }));
 const mockTrackAgentFirstHeartbeat = vi.hoisted(() => vi.fn());
+const mockRecoveryCycleGuard = vi.hoisted(() => ({
+  sourceIssueId: null as string | null,
+  error: null as Error | null,
+  attempts: [] as string[][],
+  updates: [] as Array<Record<string, unknown>>,
+}));
 const mockTerminateLocalService = vi.hoisted(() => vi.fn());
 const mockDetachNativeSessionsForRestart = vi.hoisted(() => vi.fn());
 const mockCloseIdleWarmNativeSessionsForRestart = vi.hoisted(() => vi.fn());
@@ -188,6 +194,41 @@ vi.mock("../services/local-service-supervisor.js", async () => {
   return {
     ...actual,
     terminateLocalService: mockTerminateLocalService,
+  };
+});
+
+vi.mock("../services/issues.js", async () => {
+  const actual = await vi.importActual<typeof import("../services/issues.js")>(
+    "../services/issues.js",
+  );
+  return {
+    ...actual,
+    issueService: (...args: Parameters<typeof actual.issueService>) => {
+      const service = actual.issueService(...args);
+      return {
+        ...service,
+        update: async (...updateArgs: Parameters<typeof service.update>) => {
+          const [issueId, data] = updateArgs;
+          if (issueId === mockRecoveryCycleGuard.sourceIssueId) {
+            mockRecoveryCycleGuard.updates.push({ ...data });
+            if (Array.isArray(data.blockedByIssueIds)) {
+              mockRecoveryCycleGuard.attempts.push([...data.blockedByIssueIds]);
+              if (mockRecoveryCycleGuard.error) {
+                throw mockRecoveryCycleGuard.error;
+              }
+              const { HttpError } = await vi.importActual<
+                typeof import("../errors.js")
+              >("../errors.js");
+              throw new HttpError(
+                422,
+                "Blocking relations cannot contain cycles",
+              );
+            }
+          }
+          return service.update(...updateArgs);
+        },
+      };
+    },
   };
 });
 
@@ -486,6 +527,10 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
   }, 20_000);
 
   afterEach(async () => {
+    mockRecoveryCycleGuard.sourceIssueId = null;
+    mockRecoveryCycleGuard.error = null;
+    mockRecoveryCycleGuard.attempts.length = 0;
+    mockRecoveryCycleGuard.updates.length = 0;
     vi.clearAllMocks();
     // A recovery policy can stop before adapter dispatch; do not leak an
     // unused one-shot failure into the next test's otherwise healthy run.
@@ -15927,5 +15972,1193 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       .from(heartbeatRuns)
       .where(eq(heartbeatRuns.id, runId));
     expect(runs).toHaveLength(1);
+  });
+
+  it("excludes downstream cyclic candidates in continuation waiting-on-review instead of emitting 422s (SPA-15845)", async () => {
+    // R1 shape: the source directly blocks its own open children (source is
+    // the upstream blocker), including a transitively-downstream case
+    // (source -> mid -> transitChild). Every candidate is refused by the
+    // cycle guard, so the sweeper must filter all of them, persist
+    // queryable evidence, and still leave the source visibly blocked.
+    const { companyId, agentId, issueId } = await seedStrandedIssueFixture({
+      status: "in_progress",
+      runStatus: "cancelled",
+      retryReason: "issue_continuation_needed",
+      runErrorCode: "issue_continuation_waiting_on_review",
+      runError: "Continuation parked: issue is waiting on review/approval",
+    });
+    const issuePrefix = `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+    const directChildId = randomUUID();
+    const midId = randomUUID();
+    const transitChildId = randomUUID();
+    await db.insert(issues).values([
+      {
+        id: directChildId,
+        companyId,
+        parentId: issueId,
+        title: "Directly cyclic sub-task",
+        status: "todo",
+        priority: "medium",
+        issueNumber: 10,
+        identifier: `${issuePrefix}-10`,
+      },
+      {
+        id: midId,
+        companyId,
+        title: "Intermediate downstream issue",
+        status: "in_progress",
+        priority: "medium",
+        issueNumber: 11,
+        identifier: `${issuePrefix}-11`,
+      },
+      {
+        id: transitChildId,
+        companyId,
+        parentId: issueId,
+        title: "Transitively cyclic sub-task",
+        status: "todo",
+        priority: "medium",
+        issueNumber: 12,
+        identifier: `${issuePrefix}-12`,
+      },
+    ]);
+    await db.insert(issueRelations).values([
+      { companyId, issueId, relatedIssueId: directChildId, type: "blocks" },
+      { companyId, issueId, relatedIssueId: midId, type: "blocks" },
+      { companyId, issueId: midId, relatedIssueId: transitChildId, type: "blocks" },
+    ]);
+
+    const heartbeat = heartbeatService(db);
+    let sweepError: unknown = null;
+    const result = await heartbeat
+      .reconcileStrandedAssignedIssues()
+      .catch((error: unknown) => {
+        sweepError = error;
+        return null;
+      });
+    // Zero 422s escape the sweep: the refused shape is filtered, not thrown.
+    expect(sweepError).toBeNull();
+    expect(result).not.toBeNull();
+    expect(Object.keys(result ?? {})).toEqual(
+      expect.arrayContaining([
+        "waitingOnReviewResolved",
+        "escalated",
+        "skipped",
+        "issueIds",
+      ]),
+    );
+
+    // All-excluded source stays terminal-visible: blocked, never disappeared.
+    const source = await db
+      .select()
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0] ?? null);
+    expect(source?.status).toBe("blocked");
+    expect(source?.assigneeAgentId).toBe(agentId);
+    await expect(sourceBlockerIssueIds(companyId, issueId)).resolves.toEqual(
+      [],
+    );
+
+    // Every excluded id is queryable on a recovery record and/or comment.
+    const actions = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(
+        and(
+          eq(issueRecoveryActions.companyId, companyId),
+          eq(issueRecoveryActions.sourceIssueId, issueId),
+        ),
+      );
+    const comments = await db
+      .select()
+      .from(issueComments)
+      .where(eq(issueComments.issueId, issueId));
+    const evidenceText = JSON.stringify({ actions, comments });
+    expect(evidenceText).toContain(directChildId);
+    expect(evidenceText).toContain(transitChildId);
+  });
+
+  it("excludes downstream cyclic blockers in stranded escalation instead of emitting 422s (SPA-15845)", async () => {
+    // Same R1 shape through the second caller: existing unresolved blockers
+    // that are also downstream of the source (directly, and transitively via
+    // source -> mid -> transitBlocker) must be filtered before the
+    // blockedByIssueIds write, with evidence, while the source still ends
+    // visibly blocked.
+    const { companyId, agentId, issueId } = await seedStrandedIssueFixture({
+      status: "in_progress",
+      runStatus: "failed",
+      runErrorCode: "budget_blocked",
+      runError: "Budget exceeded; refusing to dispatch.",
+    });
+    const issuePrefix = `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+    const directChildId = randomUUID();
+    const midId = randomUUID();
+    const transitBlockerId = randomUUID();
+    await db.insert(issues).values([
+      {
+        id: directChildId,
+        companyId,
+        parentId: issueId,
+        title: "Directly cyclic child blocker",
+        status: "todo",
+        priority: "medium",
+        issueNumber: 10,
+        identifier: `${issuePrefix}-10`,
+      },
+      {
+        id: midId,
+        companyId,
+        title: "Intermediate downstream issue",
+        status: "in_progress",
+        priority: "medium",
+        issueNumber: 11,
+        identifier: `${issuePrefix}-11`,
+      },
+      {
+        id: transitBlockerId,
+        companyId,
+        parentId: issueId,
+        title: "Transitively cyclic child blocker",
+        status: "todo",
+        priority: "medium",
+        issueNumber: 12,
+        identifier: `${issuePrefix}-12`,
+      },
+    ]);
+    await db.insert(issueRelations).values([
+      { companyId, issueId: directChildId, relatedIssueId: issueId, type: "blocks" },
+      { companyId, issueId, relatedIssueId: directChildId, type: "blocks" },
+      { companyId, issueId: transitBlockerId, relatedIssueId: issueId, type: "blocks" },
+      { companyId, issueId, relatedIssueId: midId, type: "blocks" },
+      { companyId, issueId: midId, relatedIssueId: transitBlockerId, type: "blocks" },
+    ]);
+
+    const heartbeat = heartbeatService(db);
+    let sweepError: unknown = null;
+    const result = await heartbeat
+      .reconcileStrandedAssignedIssues()
+      .catch((error: unknown) => {
+        sweepError = error;
+        return null;
+      });
+    expect(sweepError).toBeNull();
+    expect(result).not.toBeNull();
+
+    const source = await db
+      .select()
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0] ?? null);
+    expect(source?.status).toBe("blocked");
+    expect(source?.assigneeAgentId).toBe(agentId);
+    await expect(
+      sourceBlockerIssueIds(companyId, issueId).then((ids) => ids.sort()),
+    ).resolves.toEqual([directChildId, transitBlockerId].sort());
+
+    const actions = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.sourceIssueId, issueId));
+    expect(actions.length).toBeGreaterThanOrEqual(1);
+    expect(actions[0]).toMatchObject({
+      status: "resolved",
+      outcome: "blocked",
+      resolutionNote: "healthy_children_cycle_excluded",
+      previousOwnerAgentId: agentId,
+      evidence: {
+        recoveryBlockerRefusals: expect.arrayContaining([
+          expect.objectContaining({
+            cycleInvolvedExistingIds: expect.arrayContaining([
+              directChildId,
+              transitBlockerId,
+            ]),
+            reason: "cycle",
+          }),
+        ]),
+      },
+    });
+    const comments = await db
+      .select()
+      .from(issueComments)
+      .where(eq(issueComments.issueId, issueId));
+    const evidenceText = JSON.stringify({ actions, comments });
+    expect(evidenceText).toContain(directChildId);
+    expect(evidenceText).toContain(transitBlockerId);
+  });
+
+  it("does not rewrite recovery action evidence on the second sweep (SPA-15845)", async () => {
+    // Bound/backoff: over the unchanged cyclic shape, the second sweep must
+    // not emit another blocker write or mutate the same recovery action.
+    const { companyId, issueId } = await seedStrandedIssueFixture({
+      status: "in_progress",
+      runStatus: "failed",
+      runErrorCode: "budget_blocked",
+      runError: "Budget exceeded; refusing to dispatch.",
+    });
+    const issuePrefix = `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+    const directChildId = randomUUID();
+    const midId = randomUUID();
+    const transitChildId = randomUUID();
+    await db.insert(issues).values([
+      {
+        id: directChildId,
+        companyId,
+        parentId: issueId,
+        title: "Directly cyclic sub-task",
+        status: "todo",
+        priority: "medium",
+        issueNumber: 10,
+        identifier: `${issuePrefix}-10`,
+      },
+      {
+        id: midId,
+        companyId,
+        title: "Intermediate downstream issue",
+        status: "in_progress",
+        priority: "medium",
+        issueNumber: 11,
+        identifier: `${issuePrefix}-11`,
+      },
+      {
+        id: transitChildId,
+        companyId,
+        parentId: issueId,
+        title: "Transitively cyclic sub-task",
+        status: "todo",
+        priority: "medium",
+        issueNumber: 12,
+        identifier: `${issuePrefix}-12`,
+      },
+    ]);
+    await db.insert(issueRelations).values([
+      { companyId, issueId, relatedIssueId: directChildId, type: "blocks" },
+      { companyId, issueId, relatedIssueId: midId, type: "blocks" },
+      { companyId, issueId: midId, relatedIssueId: transitChildId, type: "blocks" },
+    ]);
+
+    const heartbeat = heartbeatService(db);
+    let firstError: unknown = null;
+    const first = await heartbeat
+      .reconcileStrandedAssignedIssues()
+      .catch((error: unknown) => {
+        firstError = error;
+        return null;
+      });
+    expect(firstError).toBeNull();
+    expect(first).not.toBeNull();
+    const sourceAfterFirst = await db
+      .select()
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0] ?? null);
+    expect(sourceAfterFirst?.status).toBe("blocked");
+    const blockersAfterFirst = await sourceBlockerIssueIds(companyId, issueId);
+    const commentIdsAfterFirst = await db
+      .select({ id: issueComments.id })
+      .from(issueComments)
+      .where(eq(issueComments.issueId, issueId))
+      .then((rows) => rows.map((row) => row.id));
+    const actionsAfterFirst = await db
+      .select({
+        id: issueRecoveryActions.id,
+        evidence: issueRecoveryActions.evidence,
+        updatedAt: issueRecoveryActions.updatedAt,
+      })
+      .from(issueRecoveryActions)
+      .where(
+        and(
+          eq(issueRecoveryActions.companyId, companyId),
+          eq(issueRecoveryActions.sourceIssueId, issueId),
+        ),
+      );
+    expect(actionsAfterFirst.length).toBeGreaterThanOrEqual(1);
+    const activityAfterFirst = await db
+      .select({
+        id: activityLog.id,
+        action: activityLog.action,
+        entityId: activityLog.entityId,
+        details: activityLog.details,
+      })
+      .from(activityLog)
+      .where(eq(activityLog.companyId, companyId));
+    expect(activityAfterFirst.length).toBeGreaterThanOrEqual(1);
+
+    let secondError: unknown = null;
+    const second = await heartbeat
+      .reconcileStrandedAssignedIssues()
+      .catch((error: unknown) => {
+        secondError = error;
+        return null;
+      });
+    expect(secondError).toBeNull();
+    expect(second).not.toBeNull();
+    expect(second?.waitingOnReviewResolved).toBe(0);
+    expect(second?.escalated).toBe(0);
+    await expect(sourceBlockerIssueIds(companyId, issueId)).resolves.toEqual(
+      blockersAfterFirst,
+    );
+    await expect(
+      db
+        .select({ id: issueComments.id })
+        .from(issueComments)
+        .where(eq(issueComments.issueId, issueId))
+        .then((rows) => rows.map((row) => row.id)),
+    ).resolves.toEqual(commentIdsAfterFirst);
+    await expect(
+      db
+        .select({
+          id: issueRecoveryActions.id,
+          evidence: issueRecoveryActions.evidence,
+          updatedAt: issueRecoveryActions.updatedAt,
+        })
+        .from(issueRecoveryActions)
+        .where(
+          and(
+            eq(issueRecoveryActions.companyId, companyId),
+            eq(issueRecoveryActions.sourceIssueId, issueId),
+          ),
+        ),
+    ).resolves.toEqual(actionsAfterFirst);
+    await expect(
+      db
+        .select({
+          id: activityLog.id,
+          action: activityLog.action,
+          entityId: activityLog.entityId,
+          details: activityLog.details,
+        })
+        .from(activityLog)
+        .where(eq(activityLog.companyId, companyId)),
+    ).resolves.toEqual(activityAfterFirst);
+  });
+
+  async function seedExceptionalDirectAppendFixture() {
+    const { companyId, issueId } = await seedStrandedIssueFixture({
+      status: "in_progress",
+      runStatus: "cancelled",
+      retryReason: "issue_continuation_needed",
+      runErrorCode: "issue_continuation_waiting_on_review",
+      runError: "Continuation parked: issue is waiting on review/approval",
+    });
+    const issuePrefix = `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+    const cycleInvolvedExistingId = randomUUID();
+    const safeProposedId = randomUUID();
+    await db.insert(issues).values([
+      {
+        id: cycleInvolvedExistingId,
+        companyId,
+        title: "Persisted cycle-involved blocker",
+        status: "in_progress",
+        priority: "medium",
+        issueNumber: 20,
+        identifier: `${issuePrefix}-20`,
+      },
+      {
+        id: safeProposedId,
+        companyId,
+        parentId: issueId,
+        title: "Safe proposed child for exceptional append",
+        status: "todo",
+        priority: "medium",
+        issueNumber: 21,
+        identifier: `${issuePrefix}-21`,
+      },
+    ]);
+    await db.insert(issueRelations).values([
+      {
+        companyId,
+        issueId: cycleInvolvedExistingId,
+        relatedIssueId: issueId,
+        type: "blocks",
+      },
+      {
+        companyId,
+        issueId,
+        relatedIssueId: cycleInvolvedExistingId,
+        type: "blocks",
+      },
+    ]);
+    return { companyId, issueId, cycleInvolvedExistingId, safeProposedId };
+  }
+
+  async function expectWriteTimeCycleGuardRefusal(input: {
+    caller: "resolveContinuationWaitingOnReview" | "escalateStrandedAssignedIssue";
+  }) {
+    const source = await seedStrandedIssueFixture(
+      input.caller === "resolveContinuationWaitingOnReview"
+        ? {
+            status: "in_progress",
+            runStatus: "cancelled",
+            retryReason: "issue_continuation_needed",
+            runErrorCode: "issue_continuation_waiting_on_review",
+            runError: "Continuation parked: issue is waiting on review/approval",
+          }
+        : {
+            status: "in_progress",
+            runStatus: "failed",
+            runErrorCode: "budget_blocked",
+            runError: "Budget exceeded; refusing to dispatch.",
+          },
+    );
+    const { companyId, issueId } = source;
+    const refusedCandidateId = randomUUID();
+    const issuePrefix = `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+    await db.insert(issues).values({
+      id: refusedCandidateId,
+      companyId,
+      parentId:
+        input.caller === "resolveContinuationWaitingOnReview" ? issueId : null,
+      title: "Candidate made cyclic after recovery pre-filter",
+      status: "todo",
+      priority: "medium",
+      issueNumber: 20,
+      identifier: `${issuePrefix}-20`,
+    });
+    if (input.caller === "escalateStrandedAssignedIssue") {
+      await db.insert(issueRelations).values({
+        companyId,
+        issueId: refusedCandidateId,
+        relatedIssueId: issueId,
+        type: "blocks",
+      });
+    }
+    const refusedCandidateIds = [refusedCandidateId];
+    mockRecoveryCycleGuard.sourceIssueId = issueId;
+    const heartbeat = heartbeatService(db);
+    let sweepError: unknown = null;
+    const first = await heartbeat
+      .reconcileStrandedAssignedIssues()
+      .catch((error: unknown) => {
+        sweepError = error;
+        return null;
+      });
+
+    expect(sweepError).toBeNull();
+    expect(first).not.toBeNull();
+    expect(mockRecoveryCycleGuard.attempts).toEqual([refusedCandidateIds]);
+    const sourceAfterFirst = await db
+      .select()
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0] ?? null);
+    expect(sourceAfterFirst?.status).toBe("blocked");
+    await expect(sourceBlockerIssueIds(companyId, issueId)).resolves.toEqual(
+      input.caller === "escalateStrandedAssignedIssue"
+        ? [refusedCandidateId]
+        : [],
+    );
+
+    const actionAfterFirst = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.sourceIssueId, issueId))
+      .then((rows) => rows[0] ?? null);
+    expect(actionAfterFirst).not.toBeNull();
+    const refusalEvidence = (actionAfterFirst?.evidence ?? {}) as Record<
+      string,
+      unknown
+    >;
+    const refusals = refusalEvidence.recoveryBlockerRefusals as Array<
+      Record<string, unknown>
+    >;
+    expect(refusals).toHaveLength(1);
+    expect(refusals[0]).toMatchObject({
+      reason: "cycle_guard_refused",
+      excludedIds: refusedCandidateIds,
+    });
+    expect(JSON.parse(String(refusals[0]?.fingerprint))).toMatchObject({
+      reason: "cycle_guard_refused",
+    });
+    const writeDeferred = refusalEvidence.recoveryBlockerWriteDeferred as Record<
+      string,
+      unknown
+    >;
+    expect(writeDeferred).toMatchObject({
+      reason: "cycle_guard_refused",
+      retryNotBefore: expect.any(String),
+    });
+    expect(JSON.parse(String(writeDeferred.fingerprint))).toMatchObject({
+      reason: "cycle_guard_refused",
+    });
+    const retryNotBefore = String(writeDeferred.retryNotBefore);
+    expect(new Date(retryNotBefore).getTime()).toBeGreaterThan(Date.now());
+    expect(actionAfterFirst?.wakePolicy).toMatchObject({ retryNotBefore });
+    const attemptsAfterFirst = mockRecoveryCycleGuard.attempts.length;
+
+    const second = await heartbeat.reconcileStrandedAssignedIssues();
+    expect(second.waitingOnReviewResolved).toBe(0);
+    expect(second.escalated).toBe(0);
+    expect(mockRecoveryCycleGuard.attempts).toHaveLength(attemptsAfterFirst);
+    await expect(
+      db
+        .select()
+        .from(issueRecoveryActions)
+        .where(eq(issueRecoveryActions.id, actionAfterFirst!.id))
+        .then((rows) => rows[0] ?? null),
+    ).resolves.toEqual(actionAfterFirst);
+  }
+
+  it.each([
+    "resolveContinuationWaitingOnReview",
+    "escalateStrandedAssignedIssue",
+  ] as const)(
+    "isolates an exact write-time cycle-guard 422 in %s with visible fallback and backoff (SPA-15845)",
+    async (caller) => {
+      await expectWriteTimeCycleGuardRefusal({ caller });
+    },
+  );
+
+  async function expectWriteTimeCycleGuardLookalikeToPropagate(input: {
+    caller: "resolveContinuationWaitingOnReview" | "escalateStrandedAssignedIssue";
+    errorKind: "non_422_http_error" | "plain_error";
+  }) {
+    const source = await seedStrandedIssueFixture(
+      input.caller === "resolveContinuationWaitingOnReview"
+        ? {
+            status: "in_progress",
+            runStatus: "cancelled",
+            retryReason: "issue_continuation_needed",
+            runErrorCode: "issue_continuation_waiting_on_review",
+            runError: "Continuation parked: issue is waiting on review/approval",
+          }
+        : {
+            status: "in_progress",
+            runStatus: "failed",
+            runErrorCode: "budget_blocked",
+            runError: "Budget exceeded; refusing to dispatch.",
+          },
+    );
+    const { companyId, issueId } = source;
+    const candidateId = randomUUID();
+    const issuePrefix = `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+    await db.insert(issues).values({
+      id: candidateId,
+      companyId,
+      parentId:
+        input.caller === "resolveContinuationWaitingOnReview" ? issueId : null,
+      title: "Exact-message non-cycle-guard candidate",
+      status: "todo",
+      priority: "medium",
+      issueNumber: 20,
+      identifier: `${issuePrefix}-20`,
+    });
+    if (input.caller === "escalateStrandedAssignedIssue") {
+      await db.insert(issueRelations).values({
+        companyId,
+        issueId: candidateId,
+        relatedIssueId: issueId,
+        type: "blocks",
+      });
+    }
+    const canonicalMessage = "Blocking relations cannot contain cycles";
+    const { HttpError } = await vi.importActual<
+      typeof import("../errors.js")
+    >("../errors.js");
+    const lookalike =
+      input.errorKind === "non_422_http_error"
+        ? new HttpError(409, canonicalMessage)
+        : new Error(canonicalMessage);
+    mockRecoveryCycleGuard.sourceIssueId = issueId;
+    mockRecoveryCycleGuard.error = lookalike;
+
+    await expect(
+      heartbeatService(db).reconcileStrandedAssignedIssues(),
+    ).rejects.toBe(lookalike);
+    expect(mockRecoveryCycleGuard.attempts).toEqual([[candidateId]]);
+    expect(mockRecoveryCycleGuard.updates).toEqual([
+      expect.objectContaining({
+        status: "blocked",
+        blockedByIssueIds: [candidateId],
+      }),
+    ]);
+    expect(
+      mockRecoveryCycleGuard.updates.some(
+        (update) =>
+          update.status === "blocked" &&
+          !Object.prototype.hasOwnProperty.call(update, "blockedByIssueIds"),
+      ),
+    ).toBe(false);
+
+    const sourceAfter = await db
+      .select()
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0] ?? null);
+    expect(sourceAfter?.status).toBe("in_progress");
+    const actionAfter = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.sourceIssueId, issueId))
+      .then((rows) => rows[0] ?? null);
+    const evidence = (actionAfter?.evidence ?? {}) as Record<string, unknown>;
+    expect(evidence.recoveryBlockerRefusals).toBeUndefined();
+    expect(evidence.recoveryBlockerWriteDeferred).toBeUndefined();
+    expect(
+      (actionAfter?.wakePolicy as Record<string, unknown> | null | undefined)
+        ?.retryNotBefore,
+    ).toBeUndefined();
+  }
+
+  it.each(
+    [
+      ["resolveContinuationWaitingOnReview", "non_422_http_error"],
+      ["resolveContinuationWaitingOnReview", "plain_error"],
+      ["escalateStrandedAssignedIssue", "non_422_http_error"],
+      ["escalateStrandedAssignedIssue", "plain_error"],
+    ] as const,
+  )(
+    "propagates an exact-message error from %s (%s) without refusal evidence, status fallback, or backoff (SPA-15845)",
+    async (caller, errorKind) => {
+      await expectWriteTimeCycleGuardLookalikeToPropagate({ caller, errorKind });
+    },
+  );
+
+  it.each([
+    "resolveContinuationWaitingOnReview",
+    "escalateStrandedAssignedIssue",
+  ] as const)(
+    "propagates an unrelated write-time HttpError 422 from %s without refusal evidence, status fallback, or backoff (SPA-15845)",
+    async (caller) => {
+      const source = await seedStrandedIssueFixture(
+        caller === "resolveContinuationWaitingOnReview"
+          ? {
+              status: "in_progress",
+              runStatus: "cancelled",
+              retryReason: "issue_continuation_needed",
+              runErrorCode: "issue_continuation_waiting_on_review",
+              runError: "Continuation parked: issue is waiting on review/approval",
+            }
+          : {
+              status: "in_progress",
+              runStatus: "failed",
+              runErrorCode: "budget_blocked",
+              runError: "Budget exceeded; refusing to dispatch.",
+            },
+      );
+      const { companyId, issueId } = source;
+      const candidateId = randomUUID();
+      const issuePrefix = `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+      await db.insert(issues).values({
+        id: candidateId,
+        companyId,
+        parentId:
+          caller === "resolveContinuationWaitingOnReview" ? issueId : null,
+        title: "Unrelated validation failure candidate",
+        status: "todo",
+        priority: "medium",
+        issueNumber: 20,
+        identifier: `${issuePrefix}-20`,
+      });
+      if (caller === "escalateStrandedAssignedIssue") {
+        await db.insert(issueRelations).values({
+          companyId,
+          issueId: candidateId,
+          relatedIssueId: issueId,
+          type: "blocks",
+        });
+      }
+      const { HttpError } = await vi.importActual<
+        typeof import("../errors.js")
+      >("../errors.js");
+      const unrelated = new HttpError(422, "Unrelated validation failure", {
+        error: "Different validation details",
+      });
+      mockRecoveryCycleGuard.sourceIssueId = issueId;
+      mockRecoveryCycleGuard.error = unrelated;
+
+      await expect(
+        heartbeatService(db).reconcileStrandedAssignedIssues(),
+      ).rejects.toBe(unrelated);
+      expect(mockRecoveryCycleGuard.attempts).toEqual([[candidateId]]);
+      expect(mockRecoveryCycleGuard.updates).toEqual([
+        expect.objectContaining({
+          status: "blocked",
+          blockedByIssueIds: [candidateId],
+        }),
+      ]);
+      expect(
+        mockRecoveryCycleGuard.updates.some(
+          (update) =>
+            update.status === "blocked" &&
+            !Object.prototype.hasOwnProperty.call(update, "blockedByIssueIds"),
+        ),
+      ).toBe(false);
+
+      const sourceAfter = await db
+        .select()
+        .from(issues)
+        .where(eq(issues.id, issueId))
+        .then((rows) => rows[0] ?? null);
+      expect(sourceAfter?.status).toBe("in_progress");
+      const actionAfter = await db
+        .select()
+        .from(issueRecoveryActions)
+        .where(eq(issueRecoveryActions.sourceIssueId, issueId))
+        .then((rows) => rows[0] ?? null);
+      const evidence = (actionAfter?.evidence ?? {}) as Record<string, unknown>;
+      expect(evidence.recoveryBlockerRefusals).toBeUndefined();
+      expect(evidence.recoveryBlockerWriteDeferred).toBeUndefined();
+      expect(
+        (actionAfter?.wakePolicy as Record<string, unknown> | null | undefined)
+          ?.retryNotBefore,
+      ).toBeUndefined();
+    },
+  );
+
+  it.each(
+    [
+      ["resolveContinuationWaitingOnReview", "message"],
+      ["resolveContinuationWaitingOnReview", "error"],
+      ["escalateStrandedAssignedIssue", "message"],
+      ["escalateStrandedAssignedIssue", "error"],
+    ] as const,
+  )(
+    "propagates a write-time HttpError 422 with unrelated top-level text from %s when details.%s contains cycle text (SPA-15845)",
+    async (caller, detailsField) => {
+      const source = await seedStrandedIssueFixture(
+        caller === "resolveContinuationWaitingOnReview"
+          ? {
+              status: "in_progress",
+              runStatus: "cancelled",
+              retryReason: "issue_continuation_needed",
+              runErrorCode: "issue_continuation_waiting_on_review",
+              runError: "Continuation parked: issue is waiting on review/approval",
+            }
+          : {
+              status: "in_progress",
+              runStatus: "failed",
+              runErrorCode: "budget_blocked",
+              runError: "Budget exceeded; refusing to dispatch.",
+            },
+      );
+      const { companyId, issueId } = source;
+      const candidateId = randomUUID();
+      const issuePrefix = `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+      await db.insert(issues).values({
+        id: candidateId,
+        companyId,
+        parentId:
+          caller === "resolveContinuationWaitingOnReview" ? issueId : null,
+        title: "Structurally misleading cycle detail candidate",
+        status: "todo",
+        priority: "medium",
+        issueNumber: 20,
+        identifier: `${issuePrefix}-20`,
+      });
+      if (caller === "escalateStrandedAssignedIssue") {
+        await db.insert(issueRelations).values({
+          companyId,
+          issueId: candidateId,
+          relatedIssueId: issueId,
+          type: "blocks",
+        });
+      }
+      const { HttpError } = await vi.importActual<
+        typeof import("../errors.js")
+      >("../errors.js");
+      const unrelated = new HttpError(422, "Unrelated validation failure", {
+        [detailsField]: "Blocking relations cannot contain cycles",
+      });
+      mockRecoveryCycleGuard.sourceIssueId = issueId;
+      mockRecoveryCycleGuard.error = unrelated;
+
+      await expect(
+        heartbeatService(db).reconcileStrandedAssignedIssues(),
+      ).rejects.toBe(unrelated);
+      expect(mockRecoveryCycleGuard.attempts).toEqual([[candidateId]]);
+      expect(
+        mockRecoveryCycleGuard.updates.some(
+          (update) =>
+            update.status === "blocked" &&
+            !Object.prototype.hasOwnProperty.call(update, "blockedByIssueIds"),
+        ),
+      ).toBe(false);
+
+      const sourceAfter = await db
+        .select()
+        .from(issues)
+        .where(eq(issues.id, issueId))
+        .then((rows) => rows[0] ?? null);
+      expect(sourceAfter?.status).toBe("in_progress");
+      const actionAfter = await db
+        .select()
+        .from(issueRecoveryActions)
+        .where(eq(issueRecoveryActions.sourceIssueId, issueId))
+        .then((rows) => rows[0] ?? null);
+      const evidence = (actionAfter?.evidence ?? {}) as Record<string, unknown>;
+      expect(evidence.recoveryBlockerRefusals).toBeUndefined();
+      expect(evidence.recoveryBlockerWriteDeferred).toBeUndefined();
+      expect(
+        (actionAfter?.wakePolicy as Record<string, unknown> | null | undefined)
+          ?.retryNotBefore,
+      ).toBeUndefined();
+    },
+  );
+
+  it("bounds exceptional direct-append lock failures, persists cycle_race backoff, and makes an immediate sweep inert (SPA-15845)", async () => {
+    const {
+      companyId,
+      issueId,
+      cycleInvolvedExistingId,
+      safeProposedId,
+    } = await seedExceptionalDirectAppendFixture();
+    const suffix = randomUUID().replace(/-/g, "").slice(0, 12);
+    const appendSequence = `test_recovery_append_attempt_seq_${suffix}`;
+    const updateSequence = `test_recovery_update_attempt_seq_${suffix}`;
+    const appendFunction = `test_recovery_append_attempt_fn_${suffix}`;
+    const updateFunction = `test_recovery_update_attempt_fn_${suffix}`;
+    const appendTrigger = `test_recovery_append_attempt_trg_${suffix}`;
+    const updateTrigger = `test_recovery_update_attempt_trg_${suffix}`;
+    await db.execute(sql.raw(`create sequence ${appendSequence}`));
+    await db.execute(sql.raw(`create sequence ${updateSequence}`));
+    await db.execute(sql.raw(`
+      create function ${appendFunction}() returns trigger language plpgsql as $$
+      begin
+        if new.company_id = '${companyId}'::uuid
+          and new.issue_id = '${safeProposedId}'::uuid
+          and new.related_issue_id = '${issueId}'::uuid then
+          perform nextval('${appendSequence}');
+          raise exception using errcode = '55P03', message = 'deterministic exceptional append lock timeout';
+        end if;
+        return new;
+      end $$
+    `));
+    await db.execute(sql.raw(`
+      create function ${updateFunction}() returns trigger language plpgsql as $$
+      begin
+        if new.id = '${issueId}'::uuid then
+          perform nextval('${updateSequence}');
+        end if;
+        return new;
+      end $$
+    `));
+    await db.execute(sql.raw(`
+      create trigger ${appendTrigger} before insert on issue_relations
+      for each row execute function ${appendFunction}()
+    `));
+    await db.execute(sql.raw(`
+      create trigger ${updateTrigger} before update on issues
+      for each row execute function ${updateFunction}()
+    `));
+
+    const readSequence = async (name: string) => {
+      const [row] = await db.execute(
+        sql.raw(`select last_value::integer as count from ${name}`),
+      );
+      return Number(row?.count);
+    };
+
+    try {
+      const updatesBeforeSweep = await readSequence(updateSequence);
+      const beforeFirstSweep = Date.now();
+      const heartbeat = heartbeatService(db);
+      const first = await heartbeat.reconcileStrandedAssignedIssues();
+      expect(first.waitingOnReviewResolved).toBe(1);
+
+      // Each failed append can only be reached after the exceptional table-lock
+      // branch and its status update. Three failed attempts are followed by one
+      // status-only fallback update, with no safe relation committed.
+      expect(await readSequence(appendSequence)).toBe(3);
+      expect(await readSequence(updateSequence)).toBe(updatesBeforeSweep + 4);
+      await expect(sourceBlockerIssueIds(companyId, issueId)).resolves.toEqual([
+        cycleInvolvedExistingId,
+      ]);
+      const source = await db
+        .select()
+        .from(issues)
+        .where(eq(issues.id, issueId))
+        .then((rows) => rows[0] ?? null);
+      expect(source?.status).toBe("blocked");
+
+      const actionAfterFirst = await db
+        .select()
+        .from(issueRecoveryActions)
+        .where(
+          and(
+            eq(issueRecoveryActions.companyId, companyId),
+            eq(issueRecoveryActions.sourceIssueId, issueId),
+          ),
+        )
+        .then((rows) => rows[0] ?? null);
+      expect(actionAfterFirst).not.toBeNull();
+      expect(actionAfterFirst?.evidence).toMatchObject({
+        recoveryBlockerRefusals: expect.arrayContaining([
+          expect.objectContaining({
+            reason: "cycle_race",
+            excludedIds: [safeProposedId],
+            cycleInvolvedExistingIds: [cycleInvolvedExistingId],
+          }),
+        ]),
+        recoveryBlockerWriteDeferred: expect.objectContaining({
+          reason: "cycle_race",
+          retryNotBefore: expect.any(String),
+        }),
+      });
+      const deferred = (
+        actionAfterFirst?.evidence as Record<string, unknown>
+      ).recoveryBlockerWriteDeferred as Record<string, unknown>;
+      const retryNotBefore = String(deferred.retryNotBefore);
+      expect(new Date(retryNotBefore).getTime()).toBeGreaterThan(beforeFirstSweep);
+      expect(actionAfterFirst?.wakePolicy).toMatchObject({ retryNotBefore });
+
+      const commentsAfterFirst = await db
+        .select()
+        .from(issueComments)
+        .where(eq(issueComments.issueId, issueId));
+      expect(commentsAfterFirst.flatMap(commentMetadataRows)).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            label: "Race-refused proposed issues",
+            value: expect.stringContaining(safeProposedId),
+          }),
+          expect.objectContaining({
+            label: "Preserved cycle-involved blockers",
+            value: expect.stringContaining(cycleInvolvedExistingId),
+          }),
+        ]),
+      );
+      const activityAfterFirst = await db
+        .select()
+        .from(activityLog)
+        .where(eq(activityLog.companyId, companyId));
+
+      // This sweep is deliberately immediate: the persisted future timestamp,
+      // not a sleep or wall-clock race, must suppress every graph write attempt.
+      expect(new Date(retryNotBefore).getTime()).toBeGreaterThan(Date.now());
+      const second = await heartbeat.reconcileStrandedAssignedIssues();
+      expect(second.waitingOnReviewResolved).toBe(0);
+      expect(second.escalated).toBe(0);
+      expect(await readSequence(appendSequence)).toBe(3);
+      expect(await readSequence(updateSequence)).toBe(updatesBeforeSweep + 4);
+      await expect(sourceBlockerIssueIds(companyId, issueId)).resolves.toEqual([
+        cycleInvolvedExistingId,
+      ]);
+      await expect(
+        db
+          .select()
+          .from(issueRecoveryActions)
+          .where(eq(issueRecoveryActions.id, actionAfterFirst!.id))
+          .then((rows) => rows[0] ?? null),
+      ).resolves.toEqual(actionAfterFirst);
+      await expect(
+        db
+          .select()
+          .from(issueComments)
+          .where(eq(issueComments.issueId, issueId)),
+      ).resolves.toEqual(commentsAfterFirst);
+      await expect(
+        db.select().from(activityLog).where(eq(activityLog.companyId, companyId)),
+      ).resolves.toEqual(activityAfterFirst);
+    } finally {
+      await db.execute(
+        sql.raw(`drop trigger if exists ${appendTrigger} on issue_relations`),
+      );
+      await db.execute(
+        sql.raw(`drop trigger if exists ${updateTrigger} on issues`),
+      );
+      await db.execute(sql.raw(`drop function if exists ${appendFunction}()`));
+      await db.execute(sql.raw(`drop function if exists ${updateFunction}()`));
+      await db.execute(sql.raw(`drop sequence if exists ${appendSequence}`));
+      await db.execute(sql.raw(`drop sequence if exists ${updateSequence}`));
+    }
+  });
+
+  it("commits one relation and one activity when the exceptional direct append succeeds after one retry (SPA-15845)", async () => {
+    const {
+      companyId,
+      issueId,
+      cycleInvolvedExistingId,
+      safeProposedId,
+    } = await seedExceptionalDirectAppendFixture();
+    const suffix = randomUUID().replace(/-/g, "").slice(0, 12);
+    const sequenceName = `test_recovery_transient_append_seq_${suffix}`;
+    const functionName = `test_recovery_transient_append_fn_${suffix}`;
+    const triggerName = `test_recovery_transient_append_trg_${suffix}`;
+    await db.execute(sql.raw(`create sequence ${sequenceName}`));
+    await db.execute(sql.raw(`
+      create function ${functionName}() returns trigger language plpgsql as $$
+      declare attempt_number bigint;
+      begin
+        if new.company_id = '${companyId}'::uuid
+          and new.issue_id = '${safeProposedId}'::uuid
+          and new.related_issue_id = '${issueId}'::uuid then
+          attempt_number := nextval('${sequenceName}');
+          if attempt_number = 1 then
+            raise exception using errcode = '40P01', message = 'deterministic one-shot direct append deadlock';
+          end if;
+        end if;
+        return new;
+      end $$
+    `));
+    await db.execute(sql.raw(`
+      create trigger ${triggerName} before insert on issue_relations
+      for each row execute function ${functionName}()
+    `));
+
+    try {
+      const result = await heartbeatService(db).reconcileStrandedAssignedIssues();
+      expect(result.waitingOnReviewResolved).toBe(1);
+      const [attempts] = await db.execute(
+        sql.raw(`select last_value::integer as count from ${sequenceName}`),
+      );
+      expect(Number(attempts?.count)).toBe(2);
+      await expect(
+        sourceBlockerIssueIds(companyId, issueId).then((ids) => ids.sort()),
+      ).resolves.toEqual([cycleInvolvedExistingId, safeProposedId].sort());
+      const committedSafeRelations = await db
+        .select({ id: issueRelations.issueId })
+        .from(issueRelations)
+        .where(
+          and(
+            eq(issueRelations.companyId, companyId),
+            eq(issueRelations.issueId, safeProposedId),
+            eq(issueRelations.relatedIssueId, issueId),
+            eq(issueRelations.type, "blocks"),
+          ),
+        );
+      expect(committedSafeRelations).toHaveLength(1);
+      const directAppendActivities = (await db
+        .select()
+        .from(activityLog)
+        .where(
+          and(
+            eq(activityLog.companyId, companyId),
+            eq(activityLog.action, "issue.blockers_updated"),
+            eq(activityLog.entityId, issueId),
+          ),
+        )).filter(
+          (row) =>
+            (row.details as Record<string, unknown> | null)?.source ===
+            "recovery.cycle_safe_blocker_append",
+        );
+      expect(directAppendActivities).toHaveLength(1);
+      expect(directAppendActivities[0]?.details).toMatchObject({
+        addedBlockedByIssueIds: [safeProposedId],
+      });
+    } finally {
+      await db.execute(
+        sql.raw(`drop trigger if exists ${triggerName} on issue_relations`),
+      );
+      await db.execute(sql.raw(`drop function if exists ${functionName}()`));
+      await db.execute(sql.raw(`drop sequence if exists ${sequenceName}`));
+    }
+  });
+
+  it("preserves a cycle-involved existing blocker while adding safe and excluding cyclic proposed children (SPA-15845 control)", async () => {
+    // Mixed fixture: the persisted blocker is itself downstream of the source,
+    // while a separate proposed child is safe. Preserve the corrupt existing
+    // relation, append the safe child, and retain queryable refusal evidence.
+    const { companyId, agentId, issueId } = await seedStrandedIssueFixture({
+      status: "in_progress",
+      runStatus: "cancelled",
+      retryReason: "issue_continuation_needed",
+      runErrorCode: "issue_continuation_waiting_on_review",
+      runError: "Continuation parked: issue is waiting on review/approval",
+    });
+    const issuePrefix = `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+    const cyclicExistingBlockerId = randomUUID();
+    const safeChildId = randomUUID();
+    const cyclicProposedChildId = randomUUID();
+    await db.insert(issues).values([
+      {
+        id: cyclicExistingBlockerId,
+        companyId,
+        title: "Persisted cycle-involved blocker",
+        status: "in_progress",
+        priority: "medium",
+        issueNumber: 20,
+        identifier: `${issuePrefix}-20`,
+      },
+      {
+        id: safeChildId,
+        companyId,
+        parentId: issueId,
+        title: "Separate safe open sub-task",
+        status: "todo",
+        priority: "medium",
+        issueNumber: 10,
+        identifier: `${issuePrefix}-10`,
+      },
+      {
+        id: cyclicProposedChildId,
+        companyId,
+        parentId: issueId,
+        title: "Separate cycle-causing proposed sub-task",
+        status: "todo",
+        priority: "medium",
+        issueNumber: 11,
+        identifier: `${issuePrefix}-11`,
+      },
+    ]);
+    await db.insert(issueRelations).values([
+      {
+        companyId,
+        issueId: cyclicExistingBlockerId,
+        relatedIssueId: issueId,
+        type: "blocks",
+      },
+      {
+        companyId,
+        issueId,
+        relatedIssueId: cyclicExistingBlockerId,
+        type: "blocks",
+      },
+      {
+        companyId,
+        issueId,
+        relatedIssueId: cyclicProposedChildId,
+        type: "blocks",
+      },
+    ]);
+
+    const heartbeat = heartbeatService(db);
+    let sweepError: unknown = null;
+    const result = await heartbeat
+      .reconcileStrandedAssignedIssues()
+      .catch((error: unknown) => {
+        sweepError = error;
+        return null;
+      });
+    expect(sweepError).toBeNull();
+    expect(result).not.toBeNull();
+
+    const source = await db
+      .select()
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0] ?? null);
+    expect(source?.status).toBe("blocked");
+    expect(source?.assigneeAgentId).toBe(agentId);
+
+    // The persisted cycle-involved relation survives, the unrelated safe child
+    // is appended, and the cycle-causing proposed child is not persisted.
+    const blockers = await sourceBlockerIssueIds(companyId, issueId);
+    expect(blockers.sort()).toEqual(
+      [cyclicExistingBlockerId, safeChildId].sort(),
+    );
+    expect(blockers).not.toContain(cyclicProposedChildId);
+
+    const comments = await db
+      .select()
+      .from(issueComments)
+      .where(eq(issueComments.issueId, issueId));
+    const refusalRows = comments.flatMap(commentMetadataRows).filter(
+      (row) =>
+        row.label === "Cycle-excluded proposed issues" ||
+        row.label === "Preserved cycle-involved blockers",
+    );
+    expect(refusalRows).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          label: "Cycle-excluded proposed issues",
+          value: expect.stringContaining(cyclicProposedChildId),
+        }),
+        expect.objectContaining({
+          label: "Preserved cycle-involved blockers",
+          value: expect.stringContaining(cyclicExistingBlockerId),
+        }),
+      ]),
+    );
   });
 });
